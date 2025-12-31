@@ -33,71 +33,8 @@ impl CvcStore {
     }
 
     pub fn init(&self) -> Result<()> {
-        // Simple manual migration for now
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS conversations (
-                id TEXT PRIMARY KEY,
-                title TEXT,
-                created_at INTEGER
-            )",
-            [],
-        )?;
-
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS interactions (
-                id TEXT PRIMARY KEY,
-                conversation_id TEXT,
-                parent_id TEXT,
-                timestamp INTEGER,
-                author TEXT,
-                user_prompt TEXT,
-                model_name TEXT,
-                model_cot TEXT,
-                model_response TEXT,
-                FOREIGN KEY(conversation_id) REFERENCES conversations(id),
-                FOREIGN KEY(parent_id) REFERENCES interactions(id)
-            )",
-            [],
-        )?;
-
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS context_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                interaction_id TEXT,
-                file_path TEXT,
-                git_blob_sha TEXT,
-                dirty_patch TEXT,
-                start_line INTEGER,
-                end_line INTEGER,
-                FOREIGN KEY(interaction_id) REFERENCES interactions(id)
-            )",
-            [],
-        )?;
-
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS tool_executions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                interaction_id TEXT,
-                tool_protocol TEXT,
-                tool_name TEXT,
-                arguments TEXT,
-                status TEXT,
-                FOREIGN KEY(interaction_id) REFERENCES interactions(id)
-            )",
-            [],
-        )?;
-
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS artifact_links (
-                interaction_id TEXT,
-                git_commit_hash TEXT,
-                link_type TEXT,
-                PRIMARY KEY (interaction_id, git_commit_hash),
-                FOREIGN KEY(interaction_id) REFERENCES interactions(id)
-            )",
-            [],
-        )?;
-
+        self.conn
+            .execute_batch(include_str!("../migrations/0001_initial_schema.sql"))?;
         Ok(())
     }
 
