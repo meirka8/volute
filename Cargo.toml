@@ -1,5 +1,6 @@
 [workspace]
 members = [
     "cvc-core",
+    "cvc-mcp",
 ]
 resolver = "2"
