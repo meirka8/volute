@@ -1,7 +1,7 @@
 use crate::models::{ContextItem, InteractionId};
 use git2::{Diff, DiffOptions, Repository, Status, StatusOptions};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Component, Path};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -12,12 +12,26 @@ pub enum GitError {
     Io(#[from] std::io::Error),
     #[error("Path error: {0}")]
     Path(String),
+    #[error("UTF-8 error: {0}")]
+    Utf8(#[from] std::str::Utf8Error),
 }
 
 pub type Result<T> = std::result::Result<T, GitError>;
 
 pub fn open_repo<P: AsRef<Path>>(path: P) -> Result<Repository> {
     Ok(Repository::open(path)?)
+}
+
+fn validate_path(path: &Path) -> Result<()> {
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                return Err(GitError::Path("Path traversal detected (..) ".into()))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub fn snapshot_context(
@@ -36,15 +50,21 @@ pub fn snapshot_context(
         }
 
         let path = Path::new(file_path);
-        // Ensure path is relative to repo root
-        // If absolute, make relative
+
+        // Fix Windows path stripping logic:
+        // 1. If absolute, strip workdir.
+        // 2. If relative, use as is (but validate).
         let rel_path = if path.is_absolute() {
-            path.strip_prefix(workdir)
-                .or_else(|_| path.strip_prefix("/"))
-                .unwrap_or(path)
+            path.strip_prefix(workdir).map_err(|_| {
+                GitError::Path(format!("Path {} is not inside workdir", path.display()))
+            })?
         } else {
+            // Check if it starts with explicit current dir or root component which might be invalid for relative
             path
         };
+
+        validate_path(rel_path)?;
+
         let rel_path_str = rel_path.to_string_lossy().to_string();
 
         // Check status
@@ -122,20 +142,45 @@ pub fn snapshot_context(
 
 fn diff_to_string(diff: &Diff) -> Result<String> {
     let mut patch_content = String::new();
+    // We need to capture errors from closure.
+    // git2 callback signature returns bool (continue?) or specialized error handling?
+    // print returns Result. The callback return value determines continuation.
+    // Invalid UTF-8 inside closure: we can default to replacement char or return error?
+    // The user requirement is: "Consider returning an error or logging a warning when UTF-8 conversion fails."
+    // git2::Diff::print callback CANNOT return Result to outer scope easily.
+    // However, if we encounter error, we can return `false` to stop usage, but we need to extract error.
+    // Use a RefCell or similar to capture error?
+    // Or check line content carefully.
+
+    // Better approach: Check if content is valid utf8.
+    let mut utf8_error: Option<std::str::Utf8Error> = None;
+
     diff.print(git2::DiffFormat::Patch, |_, _, line| {
-        let content = std::str::from_utf8(line.content()).unwrap_or("");
-        let origin = line.origin();
-        match origin {
-            '+' | '-' | ' ' => {
-                patch_content.push(origin);
-                patch_content.push_str(content);
+        match std::str::from_utf8(line.content()) {
+            Ok(content) => {
+                let origin = line.origin();
+                match origin {
+                    '+' | '-' | ' ' => {
+                        patch_content.push(origin);
+                        patch_content.push_str(content);
+                    }
+                    _ => {
+                        patch_content.push_str(content);
+                    }
+                }
+                true
             }
-            _ => {
-                patch_content.push_str(content);
+            Err(e) => {
+                utf8_error = Some(e);
+                false // Stop iteration
             }
         }
-        true
     })?;
+
+    if let Some(e) = utf8_error {
+        return Err(GitError::Utf8(e));
+    }
+
     Ok(patch_content)
 }
 
