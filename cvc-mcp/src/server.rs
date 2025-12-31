@@ -92,7 +92,17 @@ async fn handle_request(req: JsonRpcRequest, store: Arc<Mutex<CvcStore>>) -> Jso
         })),
         "notifications/initialized" => Ok(json!({})),
         "tools/list" => Ok(tools::list_tools()),
-        "tools/call" => tools::call_tool(req.params.unwrap_or(Value::Null), store).await,
+        "tools/call" => {
+            if let Some(params) = req.params {
+                tools::call_tool(params, store).await
+            } else {
+                Err(JsonRpcError {
+                    code: -32602,
+                    message: "Missing params argument".to_string(),
+                    data: None,
+                })
+            }
+        }
         _ => Err(JsonRpcError {
             code: -32601,
             message: "Method not found".to_string(),
