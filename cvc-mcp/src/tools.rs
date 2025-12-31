@@ -108,7 +108,7 @@ async fn commit_thought(args: Value, store: Arc<Mutex<CvcStore>>) -> Result<Valu
     // OR: Assume a "Global Agent Conversation" with a known ID?
     // Let's use a "Default Agent Conversation".
 
-    let conversation_id = "agent-session-default".to_string(); // TODO: Manage sessions propertly
+    let conversation_id = "agent-session-default".to_string(); // TODO: Manage sessions properly
 
     // Ensure conversation exists
     let store_clone = store.clone();
