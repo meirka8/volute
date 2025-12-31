@@ -1,17 +1,15 @@
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct InteractionId(String);
+pub struct InteractionId(Uuid);
 
 impl InteractionId {
     pub fn new() -> Self {
-        Self(Uuid::new_v4().to_string())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
+        Self(Uuid::new_v4())
     }
 }
 
@@ -21,9 +19,23 @@ impl Default for InteractionId {
     }
 }
 
-impl From<String> for InteractionId {
-    fn from(s: String) -> Self {
-        Self(s)
+impl fmt::Display for InteractionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for InteractionId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::from_str(s)?))
+    }
+}
+
+impl InteractionId {
+    pub fn as_str(&self) -> String {
+        self.0.to_string()
     }
 }
 
@@ -53,10 +65,10 @@ pub struct Interaction {
     pub conversation_id: String,
     pub parent_id: Option<InteractionId>,
     pub timestamp: DateTime<Utc>,
-    
+
     pub author: Author,
     pub user_prompt: String,
-    
+
     pub model_name: Option<String>,
     pub model_cot: Option<String>,
     pub model_response: Option<String>,
@@ -76,10 +88,10 @@ pub struct ContextItem {
     pub id: Option<i64>, // Database ID, None for new items
     pub interaction_id: InteractionId,
     pub file_path: String,
-    
+
     pub git_blob_sha: Option<String>,
     pub dirty_patch: Option<String>,
-    
+
     pub start_line: Option<i32>,
     pub end_line: Option<i32>,
 }
@@ -88,11 +100,11 @@ pub struct ContextItem {
 pub struct ToolExecution {
     pub id: Option<i64>, // Database ID
     pub interaction_id: InteractionId,
-    
+
     pub tool_protocol: String, // 'mcp', 'native'
     pub tool_name: String,
     pub arguments: String, // JSON string
-    
+
     pub status: ToolStatus,
 }
 

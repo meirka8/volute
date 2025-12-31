@@ -28,7 +28,25 @@ pub struct SyncNode {
     pub artifact_links: Vec<ArtifactLink>,
 }
 
+pub fn validate_ref_name(ref_name: &str) -> bool {
+    // Simple validation: must start with refs/cvc/ and not contain dangerous characters
+    if !ref_name.starts_with("refs/cvc/") {
+        return false;
+    }
+    // Check for ".." to prevent traversal if file system backend is somehow involved (though git refs are usually safe)
+    // and ensuring valid git ref characters is complex, but checking basic constraints is good.
+    // Git ref validation is strict: https://git-scm.com/docs/git-check-ref-format
+    // For now, we allow alphanumerics, slash, dash, underscore.
+    ref_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_')
+}
+
 pub fn push_to_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<()> {
+    if !validate_ref_name(ref_name) {
+        return Err(SyncError::Ref(format!("Invalid ref name: {}", ref_name)));
+    }
+
     // 1. Get all interaction IDs from DB
     let all_ids = db.get_all_interaction_ids()?;
 
@@ -86,6 +104,10 @@ pub fn push_to_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<(
 }
 
 pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<()> {
+    if !validate_ref_name(ref_name) {
+        return Err(SyncError::Ref(format!("Invalid ref name: {}", ref_name)));
+    }
+
     // 1. Resolve Ref
     let reference = match repo.find_reference(ref_name) {
         Ok(r) => r,

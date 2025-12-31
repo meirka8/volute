@@ -13,6 +13,8 @@ pub enum DbError {
     Sqlite(#[from] rusqlite::Error),
     #[error("Migration error: {0}")]
     Migration(String),
+    #[error("Timestamp error: invalid timestamp {0}")]
+    Timestamp(i64),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -55,10 +57,17 @@ impl CvcStore {
                 params![id],
                 |row| {
                     let timestamp: i64 = row.get(2)?;
+                    let dt = Utc.timestamp_opt(timestamp, 0).single().ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Integer,
+                            Box::new(DbError::Timestamp(timestamp)),
+                        )
+                    })?;
                     Ok(Conversation {
                         id: row.get(0)?,
                         title: row.get(1)?,
-                        created_at: Utc.timestamp_opt(timestamp, 0).single().unwrap_or_default(),
+                        created_at: dt,
                     })
                 },
             )
@@ -80,7 +89,7 @@ impl CvcStore {
                 model_name, model_cot, model_response
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                inter.id.as_str(),
+                inter.id.to_string(),
                 inter.conversation_id,
                 parent_id,
                 inter.timestamp.timestamp(),
@@ -112,11 +121,25 @@ impl CvcStore {
                         _ => Author::External,
                     };
 
+                    let dt = Utc.timestamp_opt(timestamp, 0).single().ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Integer,
+                            Box::new(DbError::Timestamp(timestamp)),
+                        )
+                    })?;
+
                     Ok(Interaction {
-                        id: InteractionId::from(row.get::<_, String>(0)?),
+                        id: row.get::<_, String>(0)?.parse().map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?,
                         conversation_id: row.get(1)?,
-                        parent_id: parent_id_str.map(InteractionId::from),
-                        timestamp: Utc.timestamp_opt(timestamp, 0).single().unwrap_or_default(),
+                        parent_id: parent_id_str.map(|s| s.parse().unwrap_or_default()), // Fallback or fail? Ideally fail. But map is easier. Let's make it robust.
+                        timestamp: dt,
                         author,
                         user_prompt: row.get(5)?,
                         model_name: row.get(6)?,
@@ -136,7 +159,7 @@ impl CvcStore {
             "INSERT INTO context_items (interaction_id, file_path, git_blob_sha, dirty_patch, start_line, end_line)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                item.interaction_id.as_str(),
+                item.interaction_id.to_string(),
                 item.file_path,
                 item.git_blob_sha,
                 item.dirty_patch,
@@ -170,11 +193,25 @@ impl CvcStore {
                 _ => Author::External,
             };
 
+            let dt = Utc.timestamp_opt(timestamp, 0).single().ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Integer,
+                    Box::new(DbError::Timestamp(timestamp)),
+                )
+            })?;
+
             Ok(Interaction {
-                id: InteractionId::from(row.get::<_, String>(0)?),
+                id: row.get::<_, String>(0)?.parse().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
                 conversation_id: row.get(1)?,
-                parent_id: parent_id_str.map(InteractionId::from),
-                timestamp: Utc.timestamp_opt(timestamp, 0).single().unwrap_or_default(),
+                parent_id: parent_id_str.map(|s| s.parse().unwrap_or_default()),
+                timestamp: dt,
                 author,
                 user_prompt: row.get(5)?,
                 model_name: row.get(6)?,
@@ -201,7 +238,7 @@ impl CvcStore {
         self.conn.execute(
             "INSERT OR IGNORE INTO artifact_links (interaction_id, git_commit_hash, link_type) VALUES (?1, ?2, ?3)",
             params![
-                interaction_id.as_str(),
+                interaction_id.to_string(),
                 commit_sha.as_str(),
                 link_type
             ]
@@ -218,7 +255,7 @@ impl CvcStore {
         self.conn.execute(
             "INSERT INTO tool_executions (interaction_id, tool_protocol, tool_name, arguments, status) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                exe.interaction_id.as_str(),
+                exe.interaction_id.to_string(),
                 exe.tool_protocol,
                 exe.tool_name,
                 exe.arguments,
@@ -230,7 +267,16 @@ impl CvcStore {
 
     pub fn get_all_interaction_ids(&self) -> Result<Vec<InteractionId>> {
         let mut stmt = self.conn.prepare("SELECT id FROM interactions")?;
-        let rows = stmt.query_map([], |row| Ok(InteractionId::from(row.get::<_, String>(0)?)))?;
+        let rows = stmt.query_map([], |row| {
+            let s: String = row.get(0)?;
+            s.parse().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })?;
         let mut ids = Vec::new();
         for id in rows {
             ids.push(id?);
@@ -241,10 +287,16 @@ impl CvcStore {
     pub fn get_context_items(&self, interaction_id: &InteractionId) -> Result<Vec<ContextItem>> {
         let mut stmt = self.conn.prepare("SELECT id, interaction_id, file_path, git_blob_sha, dirty_patch, start_line, end_line FROM context_items WHERE interaction_id = ?1")?;
 
-        let rows = stmt.query_map(params![interaction_id.as_str()], |row| {
+        let rows = stmt.query_map(params![interaction_id.to_string()], |row| {
             Ok(ContextItem {
                 id: Some(row.get(0)?),
-                interaction_id: InteractionId::from(row.get::<_, String>(1)?),
+                interaction_id: row.get::<_, String>(1)?.parse().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
                 file_path: row.get(2)?,
                 git_blob_sha: row.get(3)?,
                 dirty_patch: row.get(4)?,
@@ -265,7 +317,7 @@ impl CvcStore {
     ) -> Result<Vec<ToolExecution>> {
         let mut stmt = self.conn.prepare("SELECT id, interaction_id, tool_protocol, tool_name, arguments, status FROM tool_executions WHERE interaction_id = ?1")?;
 
-        let rows = stmt.query_map(params![interaction_id.as_str()], |row| {
+        let rows = stmt.query_map(params![interaction_id.to_string()], |row| {
             let status_str: String = row.get(5)?;
             let status = match status_str.as_str() {
                 "success" => ToolStatus::Success,
@@ -274,7 +326,13 @@ impl CvcStore {
 
             Ok(ToolExecution {
                 id: Some(row.get(0)?),
-                interaction_id: InteractionId::from(row.get::<_, String>(1)?),
+                interaction_id: row.get::<_, String>(1)?.parse().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
                 tool_protocol: row.get(2)?,
                 tool_name: row.get(3)?,
                 arguments: row.get(4)?,
@@ -291,9 +349,15 @@ impl CvcStore {
     pub fn get_artifact_links(&self, interaction_id: &InteractionId) -> Result<Vec<ArtifactLink>> {
         let mut stmt = self.conn.prepare("SELECT interaction_id, git_commit_hash, link_type FROM artifact_links WHERE interaction_id = ?1")?;
 
-        let rows = stmt.query_map(params![interaction_id.as_str()], |row| {
+        let rows = stmt.query_map(params![interaction_id.to_string()], |row| {
             Ok(ArtifactLink {
-                interaction_id: InteractionId::from(row.get::<_, String>(0)?),
+                interaction_id: row.get::<_, String>(0)?.parse().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
                 git_commit_hash: CommitSha::new(row.get::<_, String>(1)?),
                 link_type: row.get(2)?,
             })
