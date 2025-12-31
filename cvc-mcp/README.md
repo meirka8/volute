@@ -4,14 +4,14 @@ This guide provides instructions on how to build the `cvc-mcp` server and config
 
 ## 1. Building the Server
 
-First, build the release binary. Run this command from the project root (`/path/to/ptoject/root`):
+First, build the release binary. Run this command from the project root (`/path/to/project/root`):
 
 ```bash
 cargo build --release -p cvc-mcp
 ```
 
 The binary will be located at:
-`/path/to/ptoject/root/target/release/cvc-mcp`
+`/path/to/project/root/target/release/cvc-mcp`
 
 ## 2. Configuration for IDEs and Claude Desktop
 
@@ -29,7 +29,7 @@ Add the following entry to the `mcpServers` object:
 {
   "mcpServers": {
     "cvc": {
-      "command": "/path/to/ptoject/root/target/release/cvc-mcp",
+      "command": "/path/to/project/root/target/release/cvc-mcp",
       "args": [],
       "env": {
         "RUST_LOG": "info"
