@@ -28,8 +28,9 @@ impl CvcStore {
         let conn = Connection::open(path)?;
 
         // Pragmas
-        conn.execute("PRAGMA journal_mode=WAL;", [])?;
-        conn.execute("PRAGMA foreign_keys=ON;", [])?;
+        // Pragmas
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
 
         Ok(Self { conn })
     }
