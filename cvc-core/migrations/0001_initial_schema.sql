@@ -1,12 +1,12 @@
 -- The Container: Grouping interaction trees into logical sessions
-CREATE TABLE conversations (
+CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY, -- UUID
     title TEXT,          -- Auto-generated summary (e.g. "Refactoring Auth")
     created_at INTEGER
 );
 
 -- The primary nodes in the graph
-CREATE TABLE interactions (
+CREATE TABLE IF NOT EXISTS interactions (
     id TEXT PRIMARY KEY, -- SHA-256 of content
     conversation_id TEXT, -- The logic container
     parent_id TEXT,      -- Pointer to previous thought (DAG structure)
@@ -27,7 +27,7 @@ CREATE TABLE interactions (
 );
 
 -- Efficient Context Storage (The "Git Link")
-CREATE TABLE context_items (
+CREATE TABLE IF NOT EXISTS context_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     interaction_id TEXT,
     file_path TEXT,
@@ -47,7 +47,7 @@ CREATE TABLE context_items (
 
 -- Explicit Tool Usage Tracking (MCP, Function Calling)
 -- Tracks the specific "actions" the model attempted during an interaction
-CREATE TABLE tool_executions (
+CREATE TABLE IF NOT EXISTS tool_executions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     interaction_id TEXT,
     
@@ -68,7 +68,7 @@ CREATE TABLE tool_executions (
 
 -- Mapping thoughts to code
 -- Supports Many-to-One: Multiple interaction nodes can link to a single Git commit.
-CREATE TABLE artifact_links (
+CREATE TABLE IF NOT EXISTS artifact_links (
     interaction_id TEXT,
     git_commit_hash TEXT,
     link_type TEXT, -- e.g., 'generated', 'verified', 'refactored'
@@ -76,5 +76,5 @@ CREATE TABLE artifact_links (
 );
 
 -- Performance Indexes
-CREATE INDEX idx_interactions_conversation_id ON interactions(conversation_id);
-CREATE INDEX idx_artifact_links_commit_hash ON artifact_links(git_commit_hash);
+CREATE INDEX IF NOT EXISTS idx_interactions_conversation_id ON interactions(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_artifact_links_commit_hash ON artifact_links(git_commit_hash);
