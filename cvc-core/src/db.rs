@@ -27,10 +27,8 @@ impl CvcStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
 
-        // Pragmas
-        // journal_mode returns a row, so we must consume it to avoid "Execute returned results" error
-        let _: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
-        conn.execute("PRAGMA foreign_keys=ON;", [])?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
 
         Ok(Self { conn })
     }
