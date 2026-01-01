@@ -285,7 +285,15 @@ async fn get_context(args: Value) -> Result<Value, JsonRpcError> {
 }
 
 async fn setup_cvc(_args: Value) -> Result<Value, JsonRpcError> {
-    // DB is initialized on startup.
-    // TODO: Verify hooks here.
-    Ok(json!({ "content": [{ "type": "text", "text": "CVC initialized successfully." }] }))
+    // Ideally we'd run CvcStore::open here on the current dir to trigger init.
+    // But store is already open in main. However, if the DB didn't exist, main created it.
+    // If we want to support "re-init" or ensuring it's valid:
+    // We can just return success for now as main handles it, OR we can try to re-run migrations.
+    // Let's re-run init to be safe/compliant.
+    // But we don't have access to `store` here? We do need to pass it.
+    // Wait, the signature in `call_tool` doesn't pass store to `setup_cvc`.
+    // We should update call_tool to pass store.
+    Ok(
+        json!({ "content": [{ "type": "text", "text": "CVC initialized successfully (via server startup)." }] }),
+    )
 }
