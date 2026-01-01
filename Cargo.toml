@@ -2,5 +2,6 @@
 members = [
     "cvc-core",
     "cvc-mcp",
+    "cvc-cli",
 ]
 resolver = "2"

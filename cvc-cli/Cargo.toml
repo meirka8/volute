@@ -1,0 +1,15 @@
+[package]
+name = "cvc-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+cvc-core = { path = "../cvc-core" }
+git2 = "0.19"
+uuid = { version = "1.10", features = ["v4"] }
+chrono = "0.4"
+
+
