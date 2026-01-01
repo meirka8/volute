@@ -198,3 +198,9 @@ pub fn calculate_context_hash(prompt: &str, context_items: &[ContextItem]) -> St
     }
     hex::encode(hasher.finalize())
 }
+
+pub fn get_head_commit_hash(repo: &Repository) -> Result<String> {
+    let head = repo.head()?;
+    let commit = head.peel_to_commit()?;
+    Ok(commit.id().to_string())
+}
