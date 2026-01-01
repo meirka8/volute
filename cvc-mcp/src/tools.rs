@@ -90,7 +90,16 @@ async fn commit_thought(args: Value, store: Arc<Mutex<CvcStore>>) -> Result<Valu
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    // context handling postponed
+    let context = args
+        .get("context")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    let full_cot = if !context.is_empty() {
+        format!("{}\n\nContext Summary:\n{}", reasoning, context)
+    } else {
+        reasoning
+    };
 
     // Create a new Conversation ID for this session if we don't have one?
     // The spec says "Conversation maps 1:1 with a VS Code Chat Session ID".
@@ -140,7 +149,7 @@ async fn commit_thought(args: Value, store: Arc<Mutex<CvcStore>>) -> Result<Valu
             author: Author::Agent,
             user_prompt: prompt,
             model_name: Some("agent-model".to_string()),
-            model_cot: Some(reasoning),
+            model_cot: Some(full_cot),
             model_response: None, // The agent IS the model, so reasoning is CoT. Response is what it does next.
         };
 
