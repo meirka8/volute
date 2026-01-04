@@ -5,7 +5,7 @@ use cvc_core::git::{self, open_repo};
 use cvc_core::models::{Author, Interaction, InteractionId};
 use std::env;
 use std::process::{Command, Stdio};
-
+use uuid::Uuid;
 pub async fn run(args: Vec<String>) -> Result<()> {
     if args.is_empty() {
         bail!("No command provided to run.");
@@ -44,58 +44,86 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         .args(cmd_args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped()) // Capture stderr too
         .spawn()
         .context(format!("Failed to execute command: {}", cmd_name))?;
 
     let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     print!("{}", stdout);
+    eprint!("{}", stderr); // Pipe stderr back to user
 
     if !cvc_dir.exists() {
         return Ok(());
     }
 
     // 3. Save Interaction
+    let combined_response = if stderr.is_empty() {
+        stdout
+    } else {
+        format!("{}\n\n[STDERR]\n{}", stdout, stderr)
+    };
+
     if let Some(_repo) = repo_opt {
-        if let Ok(store) = CvcStore::open(&db_path) {
-            let interaction_id = InteractionId::new();
+        // Warn if we can't open store but CVC dir exists
+        match CvcStore::open(&db_path) {
+            Ok(store) => {
+                let interaction_id = InteractionId::new();
 
-            // Ensure conversation exists
-            let session_id = "cli-session";
-            if store.get_conversation(session_id)?.is_none() {
-                store.create_conversation(&cvc_core::models::Conversation {
-                    id: session_id.to_string(),
-                    title: "CLI Session".to_string(),
+                // Generate a unique session ID for this run to keep it distinct
+                // Or use a persistent one if we could track shell sessions.
+                // For now, unique per run as requested.
+                let session_id = format!("run-{}", Uuid::new_v4());
+
+                // Ensure session exists
+                if let Err(e) = store.create_conversation(&cvc_core::models::Conversation {
+                    id: session_id.clone(),
+                    title: format!("Run: {}", cmd_name),
                     created_at: Utc::now(),
-                })?;
+                }) {
+                    // Optimization: create_conversation might fail if ID exists? unique so unlikely.
+                    // But if db error, log it.
+                    eprintln!("CVC Warning: Failed to create conversation: {}", e);
+                }
+
+                // Update context items with real ID
+                let final_context_items: Vec<_> = context_items
+                    .into_iter()
+                    .map(|mut item| {
+                        item.interaction_id = interaction_id.clone();
+                        item
+                    })
+                    .collect();
+
+                let interaction = Interaction {
+                    id: interaction_id.clone(),
+                    conversation_id: session_id,
+                    parent_id: None,
+                    timestamp: Utc::now(),
+                    author: Author::System,
+                    user_prompt: prompt_str,
+                    model_name: Some("process-shim".to_string()),
+                    model_cot: None,
+                    model_response: Some(combined_response),
+                };
+
+                if let Err(e) = store.create_interaction(&interaction) {
+                    eprintln!("CVC Warning: Failed to save interaction: {}", e);
+                } else {
+                    for item in final_context_items {
+                        if let Err(e) = store.add_context_item(&item) {
+                            eprintln!("CVC Warning: Failed to save context item: {}", e);
+                        }
+                    }
+                }
             }
-
-            // Update context items with real ID
-            let final_context_items: Vec<_> = context_items
-                .into_iter()
-                .map(|mut item| {
-                    item.interaction_id = interaction_id.clone();
-                    item
-                })
-                .collect();
-
-            let interaction = Interaction {
-                id: interaction_id.clone(),
-                conversation_id: session_id.to_string(),
-                parent_id: None,
-                timestamp: Utc::now(),
-                author: Author::System,
-                user_prompt: prompt_str,
-                model_name: Some("process-shim".to_string()),
-                model_cot: None,
-                model_response: Some(stdout),
-            };
-
-            store.create_interaction(&interaction)?;
-            for item in final_context_items {
-                store.add_context_item(&item)?;
+            Err(e) => {
+                eprintln!(
+                    "CVC Warning: Failed to open database despite CVC initialization: {}",
+                    e
+                );
             }
         }
     }

@@ -20,7 +20,7 @@ pub async fn run() -> Result<()> {
     println!("CVC Status for {}", current_dir.display());
     println!("----------------------------------------");
     println!("Total Interactions:      {}", all_ids.len());
-    println!("Floating Nodes (Unlinked): {}", floating.len());
+    println!("Floating Interactions (Unlinked): {}", floating.len());
 
     // Future improvement: Check divergence with refs/cvc/main
 

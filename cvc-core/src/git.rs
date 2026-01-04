@@ -205,6 +205,14 @@ pub fn get_head_commit_hash(repo: &Repository) -> Result<String> {
     Ok(commit.id().to_string())
 }
 
+/// Returns a list of all files that have "dirty" status in the working directory.
+///
+/// This includes:
+/// - Untracked files (New)
+/// - Modified files (Staged or Unstaged)
+/// - Deleted files
+///
+/// It does NOT distinguish between staged and unstaged changes.
 pub fn get_dirty_files(repo: &Repository) -> Result<Vec<String>> {
     let mut status_opts = StatusOptions::new();
     status_opts.include_untracked(true);
