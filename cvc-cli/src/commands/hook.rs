@@ -12,7 +12,7 @@ pub async fn post_commit() -> Result<()> {
         eprintln!("CVC Hook Warning: Failed to link artifacts: {}", e);
     }
 
-    Ok(())
+    Ok(()) // Explicitly return Ok to ensure we don't fail the hook script
 }
 
 fn run_post_commit_logic(current_dir: &std::path::Path) -> Result<()> {
