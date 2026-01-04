@@ -1,6 +1,7 @@
 import { Route, Switch, Redirect } from "wouter";
 import { AuthProvider, useAuth } from "./auth/AuthContext";
 import Login from "./pages/Login";
+import { DebugView } from "./DebugView";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 const queryClient = new QueryClient({
@@ -20,8 +21,8 @@ function Dashboard() {
   return (
     <div className="p-10 text-white">
       <h1 className="text-2xl font-bold">Welcome to CVC Reviewer</h1>
-      <p className="mt-4">You are authenticated.</p>
-      <button onClick={logout} className="mt-4 px-4 py-2 bg-red-600 rounded">Logout</button>
+      <DebugView />
+      <button onClick={logout} className="mt-8 px-4 py-2 bg-red-900/50 text-red-200 border border-red-900 rounded hover:bg-red-900">Logout</button>
     </div>
   );
 }
@@ -37,8 +38,11 @@ function Routes() {
       <Route path="/app">
         {isAuthenticated ? <Dashboard /> : <Redirect to="/login" />}
       </Route>
+      <Route path="/debug">
+        <DebugView />
+      </Route>
       <Route path="/">
-        <Redirect to={isAuthenticated ? "/app" : "/login"} />
+        <Redirect to="/debug" />
       </Route>
     </Switch>
   );
