@@ -285,15 +285,54 @@ async fn get_context(args: Value) -> Result<Value, JsonRpcError> {
 }
 
 async fn setup_cvc(_args: Value) -> Result<Value, JsonRpcError> {
-    // Ideally we'd run CvcStore::open here on the current dir to trigger init.
-    // But store is already open in main. However, if the DB didn't exist, main created it.
-    // If we want to support "re-init" or ensuring it's valid:
-    // We can just return success for now as main handles it, OR we can try to re-run migrations.
-    // Let's re-run init to be safe/compliant.
-    // But we don't have access to `store` here? We do need to pass it.
-    // Wait, the signature in `call_tool` doesn't pass store to `setup_cvc`.
-    // We should update call_tool to pass store.
+    // We assume the current directory is the repo root for now, or arguments should pass it.
+    // The spec doesn't provide path in args, so we use current dir.
+    let current_dir = std::env::current_dir().map_err(|e| JsonRpcError {
+        code: -32603,
+        message: format!("Failed to get current directory: {}", e),
+        data: None,
+    })?;
+
+    let res = tokio::task::spawn_blocking(move || {
+        // 1. Initialize DB (idempotent)
+        let cvc_dir = current_dir.join(".git").join("cvc");
+        let db_path = cvc_dir.join("index.db");
+
+        // Ensure parent dir exists
+        if !cvc_dir.exists() {
+            std::fs::create_dir_all(&cvc_dir)
+                .map_err(|e| anyhow::anyhow!("Failed to create cvc dir: {}", e))?;
+        }
+
+        // Open store and init schema
+        let store = cvc_core::db::CvcStore::open(&db_path)
+            .map_err(|e| anyhow::anyhow!("Failed to open DB: {}", e))?;
+        store
+            .init()
+            .map_err(|e| anyhow::anyhow!("Failed to init DB schema: {}", e))?;
+
+        // 2. Install Hooks (idempotent)
+        cvc_core::hooks::install(&current_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to install hooks: {}", e))?;
+
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| JsonRpcError {
+        code: -32603,
+        message: format!("Internal Error: {}", e),
+        data: None,
+    })?;
+
+    if let Err(e) = res {
+        return Err(JsonRpcError {
+            code: -32603,
+            message: format!("Setup Failed: {}", e),
+            data: None,
+        });
+    }
+
     Ok(
-        json!({ "content": [{ "type": "text", "text": "CVC initialized successfully (via server startup)." }] }),
+        json!({ "content": [{ "type": "text", "text": "CVC initialized and hooks installed successfully." }] }),
     )
 }
