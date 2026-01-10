@@ -284,16 +284,67 @@ async fn get_context(args: Value) -> Result<Value, JsonRpcError> {
     }
 }
 
-async fn setup_cvc(_args: Value) -> Result<Value, JsonRpcError> {
-    // Ideally we'd run CvcStore::open here on the current dir to trigger init.
-    // But store is already open in main. However, if the DB didn't exist, main created it.
-    // If we want to support "re-init" or ensuring it's valid:
-    // We can just return success for now as main handles it, OR we can try to re-run migrations.
-    // Let's re-run init to be safe/compliant.
-    // But we don't have access to `store` here? We do need to pass it.
-    // Wait, the signature in `call_tool` doesn't pass store to `setup_cvc`.
-    // We should update call_tool to pass store.
+async fn setup_cvc(args: Value) -> Result<Value, JsonRpcError> {
+    // We allow "cwd" argument for testing purposes, or default to current_dir.
+    let current_dir = if let Some(cwd) = args.get("cwd").and_then(|v| v.as_str()) {
+        std::path::PathBuf::from(cwd)
+    } else {
+        std::env::current_dir().map_err(|e| JsonRpcError {
+            code: -32603,
+            message: format!("Failed to get current directory: {}", e),
+            data: None,
+        })?
+    };
+
+    let res = tokio::task::spawn_blocking(move || {
+        // 0. Validate Git Repo
+        // Ensure we are in a valid git repository before doing anything.
+        // We use discovery to find the repo root if we are in a subdir.
+        let repo = cvc_core::git::open_repo(&current_dir)
+            .map_err(|_| anyhow::anyhow!("Current directory is not a git repository. CVC requires a git repository to function."))?;
+        
+        // We use the workdir as root for hooks installation
+        let repo_root = repo.workdir().unwrap_or(&current_dir).to_path_buf();
+
+        // 1. Initialize DB (idempotent)
+        let cvc_dir = repo_root.join(".git").join("cvc");
+        let db_path = cvc_dir.join("index.db");
+
+        // Ensure parent dir exists
+        if !cvc_dir.exists() {
+            std::fs::create_dir_all(&cvc_dir)
+                .map_err(|e| anyhow::anyhow!("Failed to create cvc dir: {}", e))?;
+        }
+
+        // Open store and init schema
+        let store = cvc_core::db::CvcStore::open(&db_path)
+            .map_err(|e| anyhow::anyhow!("Failed to open DB: {}", e))?;
+        store
+            .init()
+            .map_err(|e| anyhow::anyhow!("Failed to init DB schema: {}", e))?;
+
+        // 2. Install Hooks (idempotent)
+        cvc_core::hooks::install(&current_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to install hooks: {}", e))?;
+
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| JsonRpcError {
+        code: -32603,
+        message: format!("Internal Error: {}", e),
+        data: None,
+    })?;
+
+    if let Err(e) = res {
+        return Err(JsonRpcError {
+            code: -32603,
+            message: format!("Setup Failed: {}", e),
+            data: None,
+        });
+    }
+
     Ok(
-        json!({ "content": [{ "type": "text", "text": "CVC initialized successfully (via server startup)." }] }),
+        json!({ "content": [{ "type": "text", "text": "CVC initialized and hooks installed successfully." }] }),
     )
 }
