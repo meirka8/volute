@@ -284,18 +284,30 @@ async fn get_context(args: Value) -> Result<Value, JsonRpcError> {
     }
 }
 
-async fn setup_cvc(_args: Value) -> Result<Value, JsonRpcError> {
-    // We assume the current directory is the repo root for now, or arguments should pass it.
-    // The spec doesn't provide path in args, so we use current dir.
-    let current_dir = std::env::current_dir().map_err(|e| JsonRpcError {
-        code: -32603,
-        message: format!("Failed to get current directory: {}", e),
-        data: None,
-    })?;
+async fn setup_cvc(args: Value) -> Result<Value, JsonRpcError> {
+    // We allow "cwd" argument for testing purposes, or default to current_dir.
+    let current_dir = if let Some(cwd) = args.get("cwd").and_then(|v| v.as_str()) {
+        std::path::PathBuf::from(cwd)
+    } else {
+        std::env::current_dir().map_err(|e| JsonRpcError {
+            code: -32603,
+            message: format!("Failed to get current directory: {}", e),
+            data: None,
+        })?
+    };
 
     let res = tokio::task::spawn_blocking(move || {
+        // 0. Validate Git Repo
+        // Ensure we are in a valid git repository before doing anything.
+        // We use discovery to find the repo root if we are in a subdir.
+        let repo = cvc_core::git::open_repo(&current_dir)
+            .map_err(|_| anyhow::anyhow!("Current directory is not a git repository. CVC requires a git repository to function."))?;
+        
+        // We use the workdir as root for hooks installation
+        let repo_root = repo.workdir().unwrap_or(&current_dir).to_path_buf();
+
         // 1. Initialize DB (idempotent)
-        let cvc_dir = current_dir.join(".git").join("cvc");
+        let cvc_dir = repo_root.join(".git").join("cvc");
         let db_path = cvc_dir.join("index.db");
 
         // Ensure parent dir exists

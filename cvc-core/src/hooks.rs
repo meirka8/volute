@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use git2;
+use git2::Repository;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
@@ -12,7 +12,7 @@ pub fn install(repo_root: &Path) -> Result<()> {
     let mut hooks_dir = repo_root.join(".git").join("hooks");
 
     if git_config.exists() {
-        if let Ok(repo) = git2::Repository::open(repo_root) {
+        if let Ok(repo) = Repository::open(repo_root) {
             if let Ok(config) = repo.config() {
                 if let Ok(custom_path) = config.get_string("core.hooksPath") {
                     // Determine if custom_path is absolute or relative
