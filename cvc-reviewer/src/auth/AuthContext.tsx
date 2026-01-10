@@ -10,16 +10,12 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-export function AuthProvider({ children }: { children: React.ReactNode }) {
-    // Initialize from sessionStorage to survive reloads, but clear on browser close ideally
-    // "Alcatraz" doctrine says: "Stores Token in Memory". 
-    // We'll use React State for memory, but for dev convenience often we want persistence.
-    // The design says: "Stores Token in Memory". 
-    // However, Task 1.2 says: "Implement StorageService: Encrypted sessionStorage wrapper".
-    // Let's implement basic state first for strict memory-only compliance, or checking sessionStorage.
+import { StorageService } from './StorageService';
 
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+    // Initialize from StorageService
     const [token, setToken] = useState<string | null>(() => {
-        return sessionStorage.getItem('cvc_pat');
+        return StorageService.getToken();
     });
 
     const isAuthenticated = !!token;
@@ -29,14 +25,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         try {
             const response = await fetch('https://api.github.com/user', {
                 headers: {
-                    Authorization: `token ${newToken}`,
+                    Authorization: `Bearer ${newToken}`,
                     Accept: 'application/vnd.github.v3+json',
                 },
             });
 
             if (response.ok) {
                 setToken(newToken);
-                sessionStorage.setItem('cvc_pat', newToken); // Persist for session
+                StorageService.setToken(newToken);
                 return true;
             }
             return false;
@@ -48,7 +44,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     const logout = () => {
         setToken(null);
-        sessionStorage.removeItem('cvc_pat');
+        StorageService.clear();
     };
 
     return (
