@@ -56,7 +56,7 @@ pub fn install(repo_root: &Path) -> Result<()> {
         }
     } else {
         let mut file = fs::File::create(&post_commit_path)?;
-        file.write_all(b"#!/bin/sh")?;
+        file.write_all(b"#!/bin/sh\n")?;
         file.write_all(hook_cmd.as_bytes())?;
         println!("Created new post-commit hook at {:?}", post_commit_path);
     }
