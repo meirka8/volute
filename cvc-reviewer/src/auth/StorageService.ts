@@ -1,7 +1,7 @@
 /**
  * StorageService
  * 
- * Provides a wrapper around sessionStorage with basic obfuscation to preventing
+ * Provides a wrapper around sessionStorage with basic obfuscation to prevent
  * plain-text secrets from being easily read by casual inspection or simple scrapers.
  * 
  * NOTE: Since this is a client-side only application without a user-provided password
