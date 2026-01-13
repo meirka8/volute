@@ -1,0 +1,176 @@
+import { useState } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import {
+  User,
+  Bot,
+  Terminal,
+  ExternalLink,
+  ChevronDown,
+  ChevronRight,
+  GitCommit
+} from 'lucide-react';
+import { clsx } from 'clsx';
+import type { InteractionNode } from '../../types/cvc';
+
+interface TimelineNodeProps {
+  interaction: InteractionNode;
+  isSelected?: boolean;
+  onSelect?: () => void;
+}
+
+function getAuthorIcon(author: InteractionNode['author']) {
+  switch (author) {
+    case 'human':
+      return <User size={16} className="text-[#ededed]" />;
+    case 'agent':
+      return <Bot size={16} className="text-[#5e6ad2]" />;
+    case 'system':
+      return <Terminal size={16} className="text-[#f59e0b]" />;
+    case 'external':
+      return <ExternalLink size={16} className="text-[#888888]" />;
+    default:
+      return <User size={16} className="text-[#888888]" />;
+  }
+}
+
+function getAuthorLabel(author: InteractionNode['author']) {
+  switch (author) {
+    case 'human':
+      return 'User';
+    case 'agent':
+      return 'AI Agent';
+    case 'system':
+      return 'System';
+    case 'external':
+      return 'External';
+    default:
+      return 'Unknown';
+  }
+}
+
+function formatTimestamp(timestamp: number): string {
+  const date = new Date(timestamp);
+  return date.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+export function TimelineNode({
+  interaction,
+  isSelected = false,
+  onSelect,
+}: TimelineNodeProps) {
+  const [isReasoningExpanded, setIsReasoningExpanded] = useState(false);
+
+  const hasReasoning = !!interaction.model_cot;
+  const hasResponse = !!interaction.model_response;
+
+  return (
+    <motion.div
+      layout
+      initial={{ opacity: 0, x: 20 }}
+      animate={{ opacity: 1, x: 0 }}
+      exit={{ opacity: 0, x: -20 }}
+      transition={{ duration: 0.15 }}
+      className={clsx(
+        'border-l-2 pl-4 py-3 cursor-pointer transition-colors',
+        isSelected
+          ? 'border-[#5e6ad2] bg-[#5e6ad2]/10'
+          : 'border-[#262626] hover:border-[#555555] hover:bg-[#111111]'
+      )}
+      onClick={onSelect}
+    >
+      {/* Header: Author + Timestamp */}
+      <div className="flex items-center gap-2 mb-2">
+        <div className="w-7 h-7 rounded-full bg-[#1c1c1c] flex items-center justify-center">
+          {getAuthorIcon(interaction.author)}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-[#ededed]">
+              {getAuthorLabel(interaction.author)}
+            </span>
+            <span className="text-xs text-[#555555]">
+              {formatTimestamp(interaction.timestamp)}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* User Prompt */}
+      {interaction.user_prompt && (
+        <div className="mb-2">
+          <p className="text-sm text-[#ededed] whitespace-pre-wrap line-clamp-3">
+            {interaction.user_prompt}
+          </p>
+        </div>
+      )}
+
+      {/* Model Response Preview */}
+      {hasResponse && (
+        <div className="mb-2 pl-3 border-l border-[#5e6ad2]/50">
+          <p className="text-sm text-[#888888] whitespace-pre-wrap line-clamp-2">
+            {interaction.model_response}
+          </p>
+        </div>
+      )}
+
+      {/* Chain of Thought (Reasoning) Accordion */}
+      {hasReasoning && (
+        <div className="mt-3">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsReasoningExpanded(!isReasoningExpanded);
+            }}
+            className="flex items-center gap-1.5 text-xs text-[#5e6ad2] hover:text-[#7c86e2] transition-colors"
+          >
+            {isReasoningExpanded ? (
+              <ChevronDown size={14} />
+            ) : (
+              <ChevronRight size={14} />
+            )}
+            <span>View reasoning</span>
+          </button>
+
+          <AnimatePresence>
+            {isReasoningExpanded && (
+              <motion.div
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.15, ease: 'easeInOut' }}
+                className="overflow-hidden"
+              >
+                <div className="mt-2 p-3 bg-[#0d0d0d] rounded border border-[#262626]">
+                  <pre className="text-xs text-[#888888] whitespace-pre-wrap font-mono overflow-x-auto">
+                    {interaction.model_cot}
+                  </pre>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+      )}
+
+      {/* Artifact Links */}
+      {interaction.artifact_links && interaction.artifact_links.length > 0 && (
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          {interaction.artifact_links.map((link, idx) => (
+            <span
+              key={idx}
+              className="inline-flex items-center gap-1 px-2 py-0.5 bg-[#1c1c1c] rounded text-xs text-[#888888]"
+            >
+              <GitCommit size={10} />
+              <span className="font-mono">{link.git_commit_hash.substring(0, 7)}</span>
+              <span className="text-[#555555]">({link.link_type})</span>
+            </span>
+          ))}
+        </div>
+      )}
+    </motion.div>
+  );
+}

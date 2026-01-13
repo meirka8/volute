@@ -1,26 +1,131 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* Tell Tailwind v4 where to find classes */
+@source "../index.html";
+@source "./**/*.{js,ts,jsx,tsx}";
 
 :root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
+    /* CVC Design System - Linear-Grade Dark Theme */
+    --cvc-bg-primary: #080808;
+    --cvc-bg-secondary: #0d0d0d;
+    --cvc-bg-tertiary: #111111;
+    --cvc-border: #1c1c1c;
+    --cvc-border-subtle: #262626;
 
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
+    --cvc-text-primary: #ededed;
+    --cvc-text-secondary: #888888;
+    --cvc-text-muted: #555555;
 
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+    --cvc-accent-ai: #5e6ad2;
+    --cvc-accent-ai-dim: #3d4494;
+    --cvc-accent-success: #27a300;
+    --cvc-accent-warning: #f59e0b;
+    --cvc-accent-error: #ef4444;
+
+    /* Typography */
+    font-family:
+        Inter,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        sans-serif;
+    line-height: 1.5;
+    font-weight: 400;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
 }
 
-body {
-  margin: 0;
-  display: flex;
-  place-items: center;
-  min-width: 320px;
-  min-height: 100vh;
+* {
+    box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+    margin: 0;
+    padding: 0;
+    min-height: 100vh;
+    background-color: var(--cvc-bg-primary);
+    color: var(--cvc-text-primary);
+}
+
+/* Monospace for code */
+.font-mono {
+    font-family: "SF Mono", "Fira Code", "JetBrains Mono", Consolas, monospace;
+}
+
+/* Scrollbar styling for dark theme */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--cvc-bg-secondary);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--cvc-border-subtle);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--cvc-text-muted);
+}
+
+/* Focus styles for keyboard navigation */
+:focus-visible {
+    outline: 2px solid var(--cvc-accent-ai);
+    outline-offset: 2px;
+}
+
+/* Selection styling */
+::selection {
+    background-color: var(--cvc-accent-ai-dim);
+    color: var(--cvc-text-primary);
+}
+
+/* react-diff-view base styles */
+.diff-unified,
+.diff-split {
+    font-family: "SF Mono", "Fira Code", "JetBrains Mono", Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.diff-gutter {
+    background: var(--cvc-bg-secondary);
+    color: var(--cvc-text-muted);
+    padding: 0 8px;
+    user-select: none;
+    cursor: pointer;
+}
+
+.diff-gutter:hover {
+    background: var(--cvc-border-subtle);
+}
+
+.diff-code {
+    padding: 0 16px;
+    white-space: pre;
+}
+
+.diff-code-insert {
+    background: rgba(39, 163, 0, 0.15);
+}
+
+.diff-code-delete {
+    background: rgba(239, 68, 68, 0.15);
+}
+
+.diff-gutter-insert {
+    background: rgba(39, 163, 0, 0.25);
+    color: var(--cvc-accent-success);
+}
+
+.diff-gutter-delete {
+    background: rgba(239, 68, 68, 0.25);
+    color: var(--cvc-accent-error);
 }
