@@ -34,6 +34,16 @@ enum Commands {
     },
     /// View the interaction log
     Log,
+    /// Manage CVC components (lsp, mcp)
+    Component {
+        #[command(subcommand)]
+        command: ComponentCommands,
+    },
+    /// Manage authentication
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -69,7 +79,34 @@ async fn main() -> Result<()> {
         Commands::Log => {
             commands::log::run().await?;
         }
+        Commands::Component { command } => match command {
+            ComponentCommands::List => commands::component::list().await?,
+            ComponentCommands::Install { name } => commands::component::install(&name).await?,
+            ComponentCommands::Update { name } => commands::component::update(&name).await?,
+        },
+        Commands::Auth { command } => match command {
+            AuthCommands::Login => commands::auth::login().await?,
+            AuthCommands::Status => commands::auth::status().await?,
+        },
     }
 
     Ok(())
+}
+
+#[derive(Subcommand)]
+enum ComponentCommands {
+    /// List available components
+    List,
+    /// Install a component
+    Install { name: String },
+    /// Update a component
+    Update { name: String },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Log in to CVC Config
+    Login,
+    /// Check authentication status
+    Status,
 }
