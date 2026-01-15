@@ -1,7 +1,3 @@
 [workspace]
-members = [
-    "cvc-core",
-    "cvc-mcp",
-    "cvc-cli", "cvc-lsp",
-]
+members = ["cvc-core", "cvc-mcp", "cvc-cli", "cvc-lsp"]
 resolver = "2"
