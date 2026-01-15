@@ -73,34 +73,39 @@ export class VoloteChatParticipant {
     });
 
     try {
-      // Find available language models
-      const models = await vscode.lm.selectChatModels({
-        vendor: "copilot",
-      });
+      // Find available language models - try without vendor filter first for broader compatibility
+      let models = await vscode.lm.selectChatModels();
+
+      this.outputChannel.appendLine(
+        `[Turn ${turnId}] Available models: ${models.map((m) => `${m.vendor}/${m.name} (${m.family})`).join(", ")}`,
+      );
 
       if (models.length === 0) {
-        // Try without vendor filter as fallback
-        const allModels = await vscode.lm.selectChatModels();
-        if (allModels.length === 0) {
-          stream.markdown(
-            "No language models available. Please ensure GitHub Copilot is installed and signed in.",
-          );
+        stream.markdown(
+          "No language models available. Please ensure GitHub Copilot is installed and signed in.",
+        );
 
-          await this.lspClient.sendTurnEnd({
-            id: turnId,
-            response: "Error: No language models available",
-            model: undefined,
-          });
+        await this.lspClient.sendTurnEnd({
+          id: turnId,
+          response: "Error: No language models available",
+          model: undefined,
+        });
 
-          return { metadata: { turnId, error: "no_models" } };
-        }
-        models.push(...allModels);
+        return { metadata: { turnId, error: "no_models" } };
       }
 
-      // Select the best available model (first one)
-      const model = models[0];
+      // Prefer GPT-4 class models, fall back to any available
+      let model = models.find(
+        (m) =>
+          m.family.toLowerCase().includes("gpt-4") ||
+          m.family.toLowerCase().includes("claude"),
+      );
+      if (!model) {
+        model = models[0];
+      }
+
       this.outputChannel.appendLine(
-        `[Turn ${turnId}] Using model: ${model.name} (${model.vendor})`,
+        `[Turn ${turnId}] Using model: ${model.name} (vendor: ${model.vendor}, family: ${model.family}, id: ${model.id})`,
       );
 
       // Build messages for the LM
@@ -264,6 +269,10 @@ export class VoloteChatParticipant {
     const chunks: string[] = [];
 
     try {
+      this.outputChannel.appendLine(
+        `[Turn ${turnId}] Sending request with ${messages.length} messages`,
+      );
+
       const response = await model.sendRequest(messages, {}, token);
 
       for await (const chunk of response.text) {
@@ -278,10 +287,20 @@ export class VoloteChatParticipant {
     } catch (error) {
       if (error instanceof vscode.LanguageModelError) {
         this.outputChannel.appendLine(
-          `[Turn ${turnId}] LM Error: ${error.message} (code: ${error.code})`,
+          `[Turn ${turnId}] LM Error: ${error.message} (code: ${error.code}, cause: ${error.cause})`,
         );
+        // Provide more context about the error
+        if (
+          error.code === "model_not_supported" ||
+          error.message.includes("model_not_supported")
+        ) {
+          this.outputChannel.appendLine(
+            `[Turn ${turnId}] Model ${model.name} (${model.id}) is not supported for chat requests`,
+          );
+        }
         throw error;
       }
+      this.outputChannel.appendLine(`[Turn ${turnId}] Unknown error: ${error}`);
       throw error;
     }
 
