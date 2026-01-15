@@ -20,9 +20,12 @@ import {
 } from "./protocol";
 
 /**
- * CVC Language Client - manages the connection to the cvc-lsp server
+ * Volute VC Language Client - manages the connection to the volute-lsp server
+ *
+ * Note: The LSP server binary is still named 'cvc-lsp' for backwards compatibility
+ * with the existing Rust codebase. The protocol methods also retain the 'cvc' prefix.
  */
-export class CvcLanguageClient {
+export class VoluteLanguageClient {
   private client: LanguageClient | undefined;
   private readonly context: vscode.ExtensionContext;
   private readonly outputChannel: vscode.OutputChannel;
@@ -43,11 +46,11 @@ export class CvcLanguageClient {
 
     if (!serverPath) {
       throw new Error(
-        "Could not find cvc-lsp binary. Please set cvc.lspPath in settings or ensure the binary is built.",
+        "Could not find volute-lsp binary. Please set volute.lspPath in settings or ensure the binary is built.",
       );
     }
 
-    this.outputChannel.appendLine(`Using cvc-lsp binary: ${serverPath}`);
+    this.outputChannel.appendLine(`Using volute-lsp binary: ${serverPath}`);
 
     const serverOptions: ServerOptions = {
       run: {
@@ -68,7 +71,7 @@ export class CvcLanguageClient {
     };
 
     const clientOptions: LanguageClientOptions = {
-      // CVC doesn't target specific file types - it's a general purpose cognitive tracker
+      // Volute doesn't target specific file types - it's a general purpose cognitive tracker
       // We use a broad document selector but the server will handle filtering
       documentSelector: [{ scheme: "file" }],
       outputChannel: this.outputChannel,
@@ -80,12 +83,12 @@ export class CvcLanguageClient {
     };
 
     // Get trace setting
-    const config = vscode.workspace.getConfiguration("cvc");
+    const config = vscode.workspace.getConfiguration("volute");
     const trace = config.get<string>("trace.server", "off");
 
     this.client = new LanguageClient(
-      "cvc-lsp",
-      "CVC Language Server",
+      "volute-lsp",
+      "Volute Language Server",
       serverOptions,
       clientOptions,
     );
@@ -244,16 +247,16 @@ export class CvcLanguageClient {
   }
 
   /**
-   * Find the cvc-lsp binary
+   * Find the volute-lsp binary (still named cvc-lsp in the Rust codebase)
    * Priority:
-   * 1. User-configured path (cvc.lspPath setting)
+   * 1. User-configured path (volute.lspPath setting)
    * 2. Bundled binary in extension
    * 3. Development build in workspace
    * 4. System PATH
    */
   private async findServerBinary(): Promise<string | undefined> {
     // 1. Check user configuration
-    const config = vscode.workspace.getConfiguration("cvc");
+    const config = vscode.workspace.getConfiguration("volute");
     const configuredPath = config.get<string>("lspPath");
 
     if (configuredPath && configuredPath.trim() !== "") {

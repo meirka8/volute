@@ -92,14 +92,41 @@
 
 ## 5. Polish & Packaging
 
-- [ ] **Task 5.1: Icons & Assets**
+- [x] **Task 5.1: Icons & Assets**
     
-    - [ ] Create high-res icons for the Activity Bar and Tree Items.
+    - [x] Create high-res icons for the Activity Bar and Tree Items.
         
-    - [ ] Design the Extension Marketplace banner.
+    - [x] Design the Extension Marketplace banner.
         
-- [ ] **Task 5.2: Configuration**
+- [x] **Task 5.2: Configuration**
     
-    - [ ] Add settings: `cvc.lspPath` (custom binary path), `cvc.trace.server` (debug logging).
+    - [x] Add settings: `cvc.lspPath` (custom binary path), `cvc.trace.server` (debug logging).
         
-    - [ ] Add "Welcome" walk-through for first-time users.
+    - [x] Add "Welcome" walk-through for first-time users.
+
+---
+
+## Notes
+
+### Branding Update
+The extension has been rebranded from "CVC" to **Volute VC** as per the branding guidelines in `/branding_and_design/`. Key changes:
+
+- Extension name: `volute-vc`
+- Display name: `Volute VC`
+- Chat participant: `@volute`
+- Command prefix: `volute.*`
+- Settings prefix: `volute.*`
+
+### Brand Colors Applied
+The Volute VC brand colors have been applied to the webview:
+- **Git Orange** (`#F05032`) - Response section accent, errors
+- **Electric Teal** (`#64FFDA`) - Prompt section accent, buttons, links
+- **Cognitive Navy** (`#0A192F`) - Backgrounds
+- **Void Slate** (`#112240`) - Secondary backgrounds
+- **Text White** (`#E6F1FF`) - Primary text
+- **Text Muted** (`#8892B0`) - Secondary text
+
+### Assets Created
+- `resources/icon.svg` - Extension icon (colored, with background)
+- `resources/icon.png` - Extension icon for marketplace (128x128)
+- `resources/activitybar-icon.svg` - Monochrome icon for Activity Bar

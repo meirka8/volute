@@ -1,40 +1,42 @@
 import * as vscode from "vscode";
-import { CvcLanguageClient } from "./lsp/client";
-import { CvcChatParticipant } from "./chat/participant";
+import { VoluteLanguageClient } from "./lsp/client";
+import { VoloteChatParticipant } from "./chat/participant";
 import { TimelineTreeProvider } from "./timeline/provider";
 import { ThoughtDetailPanel } from "./webview/thoughtDetailPanel";
 
-let client: CvcLanguageClient | undefined;
-let chatParticipant: CvcChatParticipant | undefined;
+let client: VoluteLanguageClient | undefined;
+let chatParticipant: VoloteChatParticipant | undefined;
 let timelineProvider: TimelineTreeProvider | undefined;
 
 export async function activate(
   context: vscode.ExtensionContext,
 ): Promise<void> {
-  const outputChannel = vscode.window.createOutputChannel("CVC");
-  outputChannel.appendLine("Activating Cognitive Version Control extension...");
+  const outputChannel = vscode.window.createOutputChannel("Volute VC");
+  outputChannel.appendLine("Activating Volute VC extension...");
 
   // Initialize and start the LSP client
-  client = new CvcLanguageClient(context, outputChannel);
+  client = new VoluteLanguageClient(context, outputChannel);
 
   try {
     await client.start();
-    outputChannel.appendLine("CVC Language Server started successfully");
+    outputChannel.appendLine("Volute Language Server started successfully");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    outputChannel.appendLine(`Failed to start CVC Language Server: ${message}`);
+    outputChannel.appendLine(
+      `Failed to start Volute Language Server: ${message}`,
+    );
     vscode.window.showErrorMessage(
-      `CVC: Failed to start language server. ${message}`,
+      `Volute VC: Failed to start language server. ${message}`,
     );
   }
 
-  // Register the @cvc chat participant
-  chatParticipant = new CvcChatParticipant(outputChannel, client);
+  // Register the @volute chat participant
+  chatParticipant = new VoloteChatParticipant(outputChannel, client);
   chatParticipant.register(context);
 
   // Register the Cognitive Timeline tree view
   timelineProvider = new TimelineTreeProvider(outputChannel, client);
-  const treeView = vscode.window.createTreeView("cvc.timeline", {
+  const treeView = vscode.window.createTreeView("volute.timeline", {
     treeDataProvider: timelineProvider,
     showCollapseAll: true,
   });
@@ -52,23 +54,23 @@ export async function activate(
 
   // Register commands
   context.subscriptions.push(
-    vscode.commands.registerCommand("cvc.restartServer", async () => {
+    vscode.commands.registerCommand("volute.restartServer", async () => {
       if (client) {
-        outputChannel.appendLine("Restarting CVC Language Server...");
+        outputChannel.appendLine("Restarting Volute Language Server...");
         await client.restart();
-        outputChannel.appendLine("CVC Language Server restarted");
+        outputChannel.appendLine("Volute Language Server restarted");
         // Refresh timeline after server restart
         timelineProvider?.refresh();
       }
     }),
 
-    vscode.commands.registerCommand("cvc.refreshTimeline", () => {
+    vscode.commands.registerCommand("volute.refreshTimeline", () => {
       outputChannel.appendLine("Timeline refresh requested");
       timelineProvider?.refresh();
     }),
 
     vscode.commands.registerCommand(
-      "cvc.openThoughtDetail",
+      "volute.openThoughtDetail",
       (interactionId: string) => {
         if (!interactionId) {
           outputChannel.appendLine("No interaction ID provided");

@@ -1,19 +1,21 @@
 {
-  "name": "cvc-vscode",
-  "displayName": "Cognitive Version Control",
-  "description": "Track the trajectory of intent alongside your code changes",
+  "name": "volute-vc",
+  "displayName": "Volute VC",
+  "description": "Git, Augmented. Track the trajectory of intent alongside your code changes.",
   "version": "0.1.0",
   "publisher": "helixthought",
   "license": "MIT",
+  "icon": "resources/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/helixthought/cvc"
+    "url": "https://github.com/helixthought/volute-vc"
   },
+  "homepage": "https://volutevc.com",
   "engines": {
     "vscode": "^1.90.0"
   },
   "categories": [
-    "Programming Languages",
+    "Machine Learning",
     "Other"
   ],
   "keywords": [
@@ -21,7 +23,11 @@
     "version control",
     "ai",
     "chat",
-    "copilot"
+    "copilot",
+    "git",
+    "context",
+    "thought",
+    "volute"
   ],
   "activationEvents": [
     "workspaceContains:.git"
@@ -29,14 +35,14 @@
   "main": "./dist/extension.js",
   "contributes": {
     "configuration": {
-      "title": "Cognitive Version Control",
+      "title": "Volute VC",
       "properties": {
-        "cvc.lspPath": {
+        "volute.lspPath": {
           "type": "string",
           "default": "",
-          "description": "Custom path to the cvc-lsp binary. Leave empty to use the bundled or auto-downloaded binary."
+          "description": "Custom path to the volute-lsp binary. Leave empty to use the bundled or auto-downloaded binary."
         },
-        "cvc.trace.server": {
+        "volute.trace.server": {
           "type": "string",
           "enum": [
             "off",
@@ -44,62 +50,103 @@
             "verbose"
           ],
           "default": "off",
-          "description": "Traces the communication between VS Code and the CVC language server."
+          "description": "Traces the communication between VS Code and the Volute language server."
         }
       }
     },
     "commands": [
       {
-        "command": "cvc.refreshTimeline",
+        "command": "volute.refreshTimeline",
         "title": "Refresh Timeline",
-        "category": "CVC",
+        "category": "Volute",
         "icon": "$(refresh)"
       },
       {
-        "command": "cvc.openThoughtDetail",
+        "command": "volute.openThoughtDetail",
         "title": "Open Thought Detail",
-        "category": "CVC"
+        "category": "Volute"
       },
       {
-        "command": "cvc.restartServer",
+        "command": "volute.restartServer",
         "title": "Restart Language Server",
-        "category": "CVC"
+        "category": "Volute"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "cvc-explorer",
-          "title": "Cognitive Version Control",
-          "icon": "$(lightbulb)"
+          "id": "volute-explorer",
+          "title": "Volute VC",
+          "icon": "resources/activitybar-icon.svg"
         }
       ]
     },
     "views": {
-      "cvc-explorer": [
+      "volute-explorer": [
         {
-          "id": "cvc.timeline",
+          "id": "volute.timeline",
           "name": "Cognitive Timeline",
-          "contextualTitle": "CVC Timeline"
+          "contextualTitle": "Volute Timeline"
         }
       ]
     },
     "menus": {
       "view/title": [
         {
-          "command": "cvc.refreshTimeline",
-          "when": "view == cvc.timeline",
+          "command": "volute.refreshTimeline",
+          "when": "view == volute.timeline",
           "group": "navigation"
         }
       ]
     },
     "chatParticipants": [
       {
-        "id": "cvc.chat",
-        "fullName": "Cognitive Version Control",
-        "name": "cvc",
+        "id": "volute.chat",
+        "fullName": "Volute VC",
+        "name": "volute",
         "description": "Chat with AI while automatically logging your thought process",
         "isSticky": true
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "volute.welcome",
+        "title": "Get Started with Volute VC",
+        "description": "Learn how to track your cognitive process alongside your code",
+        "steps": [
+          {
+            "id": "volute.welcome.intro",
+            "title": "Welcome to Volute VC",
+            "description": "Volute VC augments Git by tracking the 'why' alongside the 'what'. Your AI conversations, reasoning, and context are preserved and linked to your commits.\n\n[Learn More](https://volutevc.com/docs)",
+            "media": {
+              "markdown": "# Git, Augmented\n\nVolute creates a **Shadow DAG** - a parallel history of reasoning that accompanies your code changes."
+            }
+          },
+          {
+            "id": "volute.welcome.chat",
+            "title": "Use the @volute Chat Participant",
+            "description": "Type `@volute` in the GitHub Copilot Chat to automatically log your AI conversations.\n\n[Open Chat](command:workbench.action.chat.open)",
+            "media": {
+              "markdown": "## The Native Delegate\n\nThe `@volute` participant intercepts your prompts, delegates to your existing LLM, and logs everything to the cognitive timeline."
+            }
+          },
+          {
+            "id": "volute.welcome.timeline",
+            "title": "View Your Cognitive Timeline",
+            "description": "Open the Volute panel in the Activity Bar to see your pending thoughts and historical context.\n\n[Open Timeline](command:volute.timeline.focus)",
+            "media": {
+              "markdown": "## Pending Thoughts\n\nSee your floating thoughts before committing. They'll be automatically linked to your next `git commit`."
+            }
+          },
+          {
+            "id": "volute.welcome.commit",
+            "title": "Commit Your Code",
+            "description": "When you run `git commit`, all pending thoughts are automatically linked to that commit. The 'why' is now permanently bound to the 'what'.",
+            "media": {
+              "markdown": "## Late Binding\n\nVolute uses an **Immediate Persistence, Late Binding** model. Thoughts are saved immediately, but linked to commits only when you commit."
+            }
+          }
+        ]
       }
     ]
   },
