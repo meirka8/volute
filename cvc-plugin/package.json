@@ -116,6 +116,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
+    "@types/uuid": "^9.0.0",
     "@types/vscode": "^1.90.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
@@ -127,6 +128,7 @@
     "typescript": "^5.4.0"
   },
   "dependencies": {
+    "uuid": "^9.0.0",
     "vscode-languageclient": "^9.0.1"
   }
 }

@@ -23,27 +23,27 @@
 
 ## 2. Feature: Native Chat Participant (`@cvc`)
 
-- [ ] **Task 2.1: Participant Registration**
+- [x] **Task 2.1: Participant Registration**
     
-    - [ ] Register `cvc.chat` in `package.json`.
+    - [x] Register `cvc.chat` in `package.json`.
         
-    - [ ] Implement `vscode.chat.createChatParticipant`.
+    - [x] Implement `vscode.chat.createChatParticipant`.
         
-- [ ] **Task 2.2: Delegation Logic**
+- [x] **Task 2.2: Delegation Logic**
     
-    - [ ] Query `vscode.lm.selectChatModels` to find available models (Copilot/GPT-4).
+    - [x] Query `vscode.lm.selectChatModels` to find available models (Copilot/GPT-4).
         
-    - [ ] Implement the request forwarding loop (User Prompt -> LM -> Stream Response).
+    - [x] Implement the request forwarding loop (User Prompt -> LM -> Stream Response).
         
-- [ ] **Task 2.3: Telemetry Dispatch**
+- [x] **Task 2.3: Telemetry Dispatch**
     
-    - [ ] Construct `StartTurn` payload (User prompt, Active Editor context).
+    - [x] Construct `StartTurn` payload (User prompt, Active Editor context).
         
-    - [ ] Send `$/cvc/turn/start` via LSP.
+    - [x] Send `$/cvc/turn/start` via LSP.
         
-    - [ ] Accumulate LM response stream.
+    - [x] Accumulate LM response stream.
         
-    - [ ] Send `$/cvc/turn/end` via LSP upon completion.
+    - [x] Send `$/cvc/turn/end` via LSP upon completion.
         
 
 ## 3. Feature: Cognitive Timeline (Tree View)
