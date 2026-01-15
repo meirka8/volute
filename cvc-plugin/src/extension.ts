@@ -1,11 +1,13 @@
 import * as vscode from "vscode";
 import { VoluteLanguageClient } from "./lsp/client";
 import { VoloteChatParticipant } from "./chat/participant";
+import { ChatSessionWatcher } from "./watcher/chatSessionWatcher";
 import { TimelineTreeProvider } from "./timeline/provider";
 import { ThoughtDetailPanel } from "./webview/thoughtDetailPanel";
 
 let client: VoluteLanguageClient | undefined;
 let chatParticipant: VoloteChatParticipant | undefined;
+let chatSessionWatcher: ChatSessionWatcher | undefined;
 let timelineProvider: TimelineTreeProvider | undefined;
 
 export async function activate(
@@ -30,7 +32,20 @@ export async function activate(
     );
   }
 
-  // Register the @volute chat participant
+  // Start the Chat Session Watcher (passive Copilot observation)
+  chatSessionWatcher = new ChatSessionWatcher(outputChannel, client);
+  try {
+    await chatSessionWatcher.start(context);
+    outputChannel.appendLine("Chat Session Watcher started successfully");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    outputChannel.appendLine(
+      `Failed to start Chat Session Watcher: ${message}`,
+    );
+    // Non-fatal - the extension can still work without passive observation
+  }
+
+  // Register the @volute chat participant (alternative explicit logging mode)
   chatParticipant = new VoloteChatParticipant(outputChannel, client);
   chatParticipant.register(context);
 
@@ -96,6 +111,9 @@ export async function activate(
 }
 
 export async function deactivate(): Promise<void> {
+  if (chatSessionWatcher) {
+    chatSessionWatcher.stop();
+  }
   if (chatParticipant) {
     chatParticipant.dispose();
   }

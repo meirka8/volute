@@ -74,7 +74,7 @@ export class VoloteChatParticipant {
 
     try {
       // Find available language models - try without vendor filter first for broader compatibility
-      let models = await vscode.lm.selectChatModels();
+      const models = await vscode.lm.selectChatModels();
 
       this.outputChannel.appendLine(
         `[Turn ${turnId}] Available models: ${models.map((m) => `${m.vendor}/${m.name} (${m.family})`).join(", ")}`,
@@ -108,8 +108,8 @@ export class VoloteChatParticipant {
         `[Turn ${turnId}] Using model: ${model.name} (vendor: ${model.vendor}, family: ${model.family}, id: ${model.id})`,
       );
 
-      // Build messages for the LM
-      const messages = this.buildMessages(request, context);
+      // Build messages for the LM with workspace context
+      const messages = await this.buildMessages(request, context);
 
       // Stream the response
       const response = await this.streamModelResponse(
@@ -197,17 +197,25 @@ export class VoloteChatParticipant {
 
   /**
    * Build the message array for the language model
+   * Includes workspace context and file contents for richer responses
    */
-  private buildMessages(
+  private async buildMessages(
     request: vscode.ChatRequest,
     chatContext: vscode.ChatContext,
-  ): vscode.LanguageModelChatMessage[] {
+  ): Promise<vscode.LanguageModelChatMessage[]> {
     const messages: vscode.LanguageModelChatMessage[] = [];
 
-    // Add system message with Volute context
+    // Build rich context about the workspace and project
+    const workspaceContext = await this.buildWorkspaceContext(request);
+
+    // Add system message with rich context
     messages.push(
       vscode.LanguageModelChatMessage.User(
-        "You are a helpful coding assistant. The user is working in VS Code and may reference files or code in their questions.",
+        `You are a helpful coding assistant working in VS Code. You have access to the user's workspace and can help with coding tasks.
+
+${workspaceContext}
+
+Please provide helpful, accurate responses based on the context provided.`,
       ),
     );
 
@@ -237,18 +245,119 @@ export class VoloteChatParticipant {
     // Add current request with any file context
     let currentPrompt = request.prompt;
 
-    // Include referenced file contents if available
-    for (const ref of request.references) {
-      if (ref.id === "vscode.file" && ref.value instanceof vscode.Uri) {
-        // The file content is typically included automatically by VS Code
-        // We just note the reference
-        currentPrompt = `[File: ${ref.value.fsPath}]\n\n${currentPrompt}`;
-      }
+    // Include referenced file contents
+    const fileContents = await this.getReferencedFileContents(request);
+    if (fileContents) {
+      currentPrompt = `${fileContents}\n\nUser request: ${currentPrompt}`;
     }
 
     messages.push(vscode.LanguageModelChatMessage.User(currentPrompt));
 
     return messages;
+  }
+
+  /**
+   * Build workspace context string with project info
+   */
+  private async buildWorkspaceContext(
+    _request: vscode.ChatRequest,
+  ): Promise<string> {
+    const parts: string[] = [];
+
+    // Add workspace info
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (workspaceFolders && workspaceFolders.length > 0) {
+      parts.push(`Workspace: ${workspaceFolders[0].name}`);
+    }
+
+    // Add active editor context
+    const activeEditor = vscode.window.activeTextEditor;
+    if (activeEditor) {
+      const doc = activeEditor.document;
+      const relativePath = vscode.workspace.asRelativePath(doc.uri);
+      const languageId = doc.languageId;
+
+      parts.push(`\nCurrently open file: ${relativePath} (${languageId})`);
+
+      // Include visible code around cursor
+      const selection = activeEditor.selection;
+      if (!selection.isEmpty) {
+        const selectedText = doc.getText(selection);
+        if (selectedText.length < 2000) {
+          parts.push(
+            `\nSelected code:\n\`\`\`${languageId}\n${selectedText}\n\`\`\``,
+          );
+        }
+      } else {
+        // Include some context around the cursor
+        const cursorLine = selection.active.line;
+        const startLine = Math.max(0, cursorLine - 10);
+        const endLine = Math.min(doc.lineCount - 1, cursorLine + 10);
+        const range = new vscode.Range(
+          startLine,
+          0,
+          endLine,
+          doc.lineAt(endLine).text.length,
+        );
+        const visibleCode = doc.getText(range);
+        if (visibleCode.length < 2000) {
+          parts.push(
+            `\nCode around cursor (lines ${startLine + 1}-${endLine + 1}):\n\`\`\`${languageId}\n${visibleCode}\n\`\`\``,
+          );
+        }
+      }
+    }
+
+    return parts.join("\n");
+  }
+
+  /**
+   * Get contents of referenced files
+   */
+  private async getReferencedFileContents(
+    request: vscode.ChatRequest,
+  ): Promise<string | undefined> {
+    const fileParts: string[] = [];
+
+    for (const ref of request.references) {
+      try {
+        let uri: vscode.Uri | undefined;
+
+        if (ref.id === "vscode.file" && ref.value instanceof vscode.Uri) {
+          uri = ref.value;
+        } else if (
+          ref.id === "vscode.editor" &&
+          ref.value instanceof vscode.Location
+        ) {
+          uri = ref.value.uri;
+        }
+
+        if (uri) {
+          const doc = await vscode.workspace.openTextDocument(uri);
+          const content = doc.getText();
+          const relativePath = vscode.workspace.asRelativePath(uri);
+          const languageId = doc.languageId;
+
+          // Limit file size to avoid token limits
+          if (content.length < 10000) {
+            fileParts.push(
+              `File: ${relativePath}\n\`\`\`${languageId}\n${content}\n\`\`\``,
+            );
+          } else {
+            // Include truncated version
+            fileParts.push(
+              `File: ${relativePath} (truncated, ${content.length} chars)\n\`\`\`${languageId}\n${content.substring(0, 5000)}\n...[truncated]...\n\`\`\``,
+            );
+          }
+        }
+      } catch (error) {
+        this.outputChannel.appendLine(
+          `Failed to read referenced file: ${error}`,
+        );
+      }
+    }
+
+    return fileParts.length > 0 ? fileParts.join("\n\n") : undefined;
   }
 
   /**
