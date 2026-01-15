@@ -1,0 +1,132 @@
+{
+  "name": "cvc-vscode",
+  "displayName": "Cognitive Version Control",
+  "description": "Track the trajectory of intent alongside your code changes",
+  "version": "0.1.0",
+  "publisher": "helixthought",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/helixthought/cvc"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "cognitive",
+    "version control",
+    "ai",
+    "chat",
+    "copilot"
+  ],
+  "activationEvents": [
+    "workspaceContains:.git"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Cognitive Version Control",
+      "properties": {
+        "cvc.lspPath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom path to the cvc-lsp binary. Leave empty to use the bundled or auto-downloaded binary."
+        },
+        "cvc.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the CVC language server."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "cvc.refreshTimeline",
+        "title": "Refresh Timeline",
+        "category": "CVC",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cvc.openThoughtDetail",
+        "title": "Open Thought Detail",
+        "category": "CVC"
+      },
+      {
+        "command": "cvc.restartServer",
+        "title": "Restart Language Server",
+        "category": "CVC"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cvc-explorer",
+          "title": "Cognitive Version Control",
+          "icon": "$(lightbulb)"
+        }
+      ]
+    },
+    "views": {
+      "cvc-explorer": [
+        {
+          "id": "cvc.timeline",
+          "name": "Cognitive Timeline",
+          "contextualTitle": "CVC Timeline"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "cvc.refreshTimeline",
+          "when": "view == cvc.timeline",
+          "group": "navigation"
+        }
+      ]
+    },
+    "chatParticipants": [
+      {
+        "id": "cvc.chat",
+        "fullName": "Cognitive Version Control",
+        "name": "cvc",
+        "description": "Chat with AI while automatically logging your thought process",
+        "isSticky": true
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && node esbuild.js --production",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "@vscode/test-cli": "^0.0.10",
+    "@vscode/test-electron": "^2.4.0",
+    "esbuild": "^0.21.0",
+    "eslint": "^8.57.0",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

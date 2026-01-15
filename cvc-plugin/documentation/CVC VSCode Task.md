@@ -2,23 +2,23 @@
 
 ## 1. Project Setup & Scaffolding
 
-- [ ] **Task 1.1: Extension Skeleton**
+- [x] **Task 1.1: Extension Skeleton**
     
-    - [ ] Initialize project with `yo code` (TypeScript + Webpack).
+    - [x] Initialize project with `yo code` (TypeScript + Webpack).
         
-    - [ ] Configure `esbuild` for minification.
+    - [x] Configure `esbuild` for minification.
         
-    - [ ] Set up debugging launch configuration for "Extension + Server".
+    - [x] Set up debugging launch configuration for "Extension + Server".
         
-- [ ] **Task 1.2: LSP Client Implementation**
+- [x] **Task 1.2: LSP Client Implementation**
     
-    - [ ] Install `vscode-languageclient`.
+    - [x] Install `vscode-languageclient`.
         
-    - [ ] Implement logic to locate/download the `cvc-lsp` binary.
+    - [x] Implement logic to locate/download the `cvc-lsp` binary.
         
-    - [ ] Implement `LanguageClient` activation logic.
+    - [x] Implement `LanguageClient` activation logic.
         
-    - [ ] **Deliverable:** Extension starts and successfully launches the Rust binary.
+    - [x] **Deliverable:** Extension starts and successfully launches the Rust binary.
         
 
 ## 2. Feature: Native Chat Participant (`@cvc`)
