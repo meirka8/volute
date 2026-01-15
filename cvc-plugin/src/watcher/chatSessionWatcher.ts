@@ -69,9 +69,13 @@ export class ChatSessionWatcher {
   // Track processed requests to avoid duplicates
   private processedRequests: Set<string> = new Set();
 
-  // Debounce timer for file changes
-  private debounceTimer: NodeJS.Timeout | undefined;
-  private readonly debounceMs = 1000;
+  // Debounce timers for file changes (per-file)
+  private debounceTimers: Map<string, NodeJS.Timeout> = new Map();
+  private readonly debounceMs = 500;
+
+  // Polling interval for backup detection
+  private pollingInterval: NodeJS.Timeout | undefined;
+  private readonly pollingMs = 3000;
 
   constructor(
     outputChannel: vscode.OutputChannel,
@@ -114,6 +118,9 @@ export class ChatSessionWatcher {
     // Do an initial scan of existing sessions
     await this.scanExistingSessions();
 
+    // Start polling as a backup mechanism (file watchers can be unreliable)
+    this.startPolling();
+
     this.outputChannel.appendLine("ChatSessionWatcher: Started successfully");
   }
 
@@ -121,12 +128,51 @@ export class ChatSessionWatcher {
    * Stop watching
    */
   stop(): void {
-    if (this.debounceTimer) {
-      clearTimeout(this.debounceTimer);
+    // Clear all debounce timers
+    for (const timer of this.debounceTimers.values()) {
+      clearTimeout(timer);
     }
+    this.debounceTimers.clear();
+
+    // Stop polling
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = undefined;
+    }
+
     this.watcher?.dispose();
     this.watcher = undefined;
     this.outputChannel.appendLine("ChatSessionWatcher: Stopped");
+  }
+
+  /**
+   * Start polling for changes as a backup mechanism
+   */
+  private startPolling(): void {
+    this.pollingInterval = setInterval(() => {
+      this.pollForChanges();
+    }, this.pollingMs);
+  }
+
+  /**
+   * Poll all session files for new requests
+   */
+  private async pollForChanges(): Promise<void> {
+    if (!this.chatSessionsDir) {
+      return;
+    }
+
+    try {
+      const files = await fs.promises.readdir(this.chatSessionsDir);
+      const jsonFiles = files.filter((f) => f.endsWith(".json"));
+
+      for (const file of jsonFiles) {
+        const filePath = path.join(this.chatSessionsDir, file);
+        await this.processSessionFile(filePath);
+      }
+    } catch {
+      // Ignore polling errors
+    }
   }
 
   /**
@@ -234,14 +280,20 @@ export class ChatSessionWatcher {
    * Handle a chat session file change
    */
   private onSessionFileChanged(uri: vscode.Uri): void {
-    // Debounce to avoid processing incomplete writes
-    if (this.debounceTimer) {
-      clearTimeout(this.debounceTimer);
+    const filePath = uri.fsPath;
+
+    // Debounce per-file to avoid processing incomplete writes
+    const existingTimer = this.debounceTimers.get(filePath);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
     }
 
-    this.debounceTimer = setTimeout(() => {
-      this.processSessionFile(uri.fsPath);
+    const timer = setTimeout(() => {
+      this.debounceTimers.delete(filePath);
+      this.processSessionFile(filePath);
     }, this.debounceMs);
+
+    this.debounceTimers.set(filePath, timer);
   }
 
   /**
