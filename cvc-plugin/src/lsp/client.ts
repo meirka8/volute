@@ -15,6 +15,8 @@ import {
   LinkCommitParams,
   TimelineGetParams,
   TimelineGetResponse,
+  InteractionGetParams,
+  InteractionDetail,
 } from "./protocol";
 
 /**
@@ -213,6 +215,32 @@ export class CvcLanguageClient {
       return { dispose: () => {} };
     }
     return this.client.onNotification("cvc/timeline/refresh", handler);
+  }
+
+  /**
+   * Request full details of a specific interaction from the server
+   */
+  async sendInteractionGet(
+    params: InteractionGetParams,
+  ): Promise<InteractionDetail | null> {
+    if (!this.client?.isRunning()) {
+      this.outputChannel.appendLine(
+        "Warning: Cannot send interaction/get - client not running",
+      );
+      return null;
+    }
+    try {
+      const response = await this.client.sendRequest<InteractionDetail>(
+        "cvc/interaction/get",
+        params,
+      );
+      return response;
+    } catch (error) {
+      this.outputChannel.appendLine(
+        `Interaction request failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return null;
+    }
   }
 
   /**

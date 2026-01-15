@@ -73,21 +73,21 @@
 
 ## 4. Feature: Thought Detail View (Webview)
 
-- [ ] **Task 4.1: Webview Panel Logic**
+- [x] **Task 4.1: Webview Panel Logic**
     
-    - [ ] Register command `cvc.openThoughtDetail`.
+    - [x] Register command `cvc.openThoughtDetail`.
         
-    - [ ] Create/Focus a Webview Panel in the editor area (column 2 usually).
+    - [x] Create/Focus a Webview Panel in the editor area (column 2 usually).
         
-    - [ ] Implement fetching full details for `InteractionId` from LSP (may need a new LSP method `cvc/interaction/get` or reuse existing).
+    - [x] Implement fetching full details for `InteractionId` from LSP (may need a new LSP method `cvc/interaction/get` or reuse existing).
         
-- [ ] **Task 4.2: React/HTML Content**
+- [x] **Task 4.2: React/HTML Content**
     
-    - [ ] Create a simple React or pure HTML template for the thought detail.
+    - [x] Create a simple React or pure HTML template for the thought detail.
         
-    - [ ] Use `@vscode/webview-ui-toolkit` for native buttons/colors.
+    - [x] Use `@vscode/webview-ui-toolkit` for native buttons/colors.
         
-    - [ ] Render Markdown content (Prompt/Response) using a sanitizer (e.g., `dompurify`).
+    - [x] Render Markdown content (Prompt/Response) using a sanitizer (e.g., `dompurify`).
         
 
 ## 5. Polish & Packaging

@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { CvcLanguageClient } from "./lsp/client";
 import { CvcChatParticipant } from "./chat/participant";
 import { TimelineTreeProvider } from "./timeline/provider";
+import { ThoughtDetailPanel } from "./webview/thoughtDetailPanel";
 
 let client: CvcLanguageClient | undefined;
 let chatParticipant: CvcChatParticipant | undefined;
@@ -69,10 +70,21 @@ export async function activate(
     vscode.commands.registerCommand(
       "cvc.openThoughtDetail",
       (interactionId: string) => {
-        // TODO: Implement thought detail webview when Feature 4 is added
-        outputChannel.appendLine(
-          `Open thought detail requested: ${interactionId}`,
-        );
+        if (!interactionId) {
+          outputChannel.appendLine("No interaction ID provided");
+          return;
+        }
+
+        outputChannel.appendLine(`Opening thought detail: ${interactionId}`);
+
+        if (client) {
+          ThoughtDetailPanel.createOrShow(
+            context.extensionUri,
+            outputChannel,
+            client,
+            interactionId,
+          );
+        }
       },
     ),
   );
