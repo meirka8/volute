@@ -26,28 +26,31 @@ pub async fn handle_turn_start(client: &Client, state: Arc<AppState>, params: Tu
     client
         .log_message(
             MessageType::INFO,
-            format!("Turn started. Prompt: {}", params.prompt),
+            format!(
+                "Turn started (ID: {}). Prompt: {}",
+                params.id, params.prompt
+            ),
         )
         .await;
 
-    // Store the prompt temporarily in state
-    if let Ok(mut pending) = state.pending_prompt.lock() {
-        *pending = Some(params.prompt.clone());
-    }
+    // Concurrent insert
+    state.pending_turns.insert(params.id, params.prompt);
 }
 
 pub async fn handle_turn_end(client: &Client, state: Arc<AppState>, params: TurnEndParams) {
-    // Retrieve pending prompt
-    let prompt = {
-        let mut pending = state.pending_prompt.lock().unwrap();
-        pending
-            .take()
-            .unwrap_or_else(|| "Unknown prompt".to_string())
-    };
+    // Concurrent retrieval
+    let prompt = state
+        .pending_turns
+        .remove(&params.id)
+        .map(|(_, p)| p)
+        .unwrap_or_else(|| {
+            // Warn if prompt missing (unbalanced calls)
+            // Ideally we'd log this warning to client
+            "Unknown prompt".to_string()
+        });
 
     let state_clone = state.clone();
-    let client_clone = client.clone(); // Client is cheap to clone (Arc internal) probably?
-                                       // Wait, tower_lsp::Client is Clone? Yes.
+    let client_clone = client.clone();
 
     let interaction = Interaction {
         id: InteractionId::new(),
@@ -63,7 +66,9 @@ pub async fn handle_turn_end(client: &Client, state: Arc<AppState>, params: Turn
 
     // Offload DB write to background thread
     let result = task::spawn_blocking(move || {
-        let store_guard = state_clone.store.lock().unwrap();
+        // Safer lock handling
+        let store_guard = state_clone.store.lock().expect("CVC Store mutex poisoned");
+
         if let Some(store) = store_guard.as_ref() {
             store.create_interaction(&interaction)
         } else {

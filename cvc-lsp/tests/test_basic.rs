@@ -66,6 +66,7 @@ fn test_lsp_turn_lifecycle() {
         "jsonrpc": "2.0",
         "method": "$/cvc/turn/start",
         "params": {
+            "id": "turn-1",
             "prompt": "Hello CVC",
             "author": "human"
         }
@@ -78,6 +79,7 @@ fn test_lsp_turn_lifecycle() {
         "jsonrpc": "2.0",
         "method": "$/cvc/turn/end",
         "params": {
+            "id": "turn-1",
             "response": "Hello Human",
             "chain_of_thought": "Thinking...",
             "model": "gpt-4"
