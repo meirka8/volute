@@ -1,9 +1,11 @@
 import * as vscode from "vscode";
 import { CvcLanguageClient } from "./lsp/client";
 import { CvcChatParticipant } from "./chat/participant";
+import { TimelineTreeProvider } from "./timeline/provider";
 
 let client: CvcLanguageClient | undefined;
 let chatParticipant: CvcChatParticipant | undefined;
+let timelineProvider: TimelineTreeProvider | undefined;
 
 export async function activate(
   context: vscode.ExtensionContext,
@@ -29,6 +31,24 @@ export async function activate(
   chatParticipant = new CvcChatParticipant(outputChannel, client);
   chatParticipant.register(context);
 
+  // Register the Cognitive Timeline tree view
+  timelineProvider = new TimelineTreeProvider(outputChannel, client);
+  const treeView = vscode.window.createTreeView("cvc.timeline", {
+    treeDataProvider: timelineProvider,
+    showCollapseAll: true,
+  });
+  context.subscriptions.push(treeView);
+
+  // Register for timeline refresh notifications from server
+  context.subscriptions.push(
+    client.onTimelineRefresh(() => {
+      timelineProvider?.refresh();
+    }),
+  );
+
+  // Initial timeline load
+  timelineProvider.refresh();
+
   // Register commands
   context.subscriptions.push(
     vscode.commands.registerCommand("cvc.restartServer", async () => {
@@ -36,12 +56,14 @@ export async function activate(
         outputChannel.appendLine("Restarting CVC Language Server...");
         await client.restart();
         outputChannel.appendLine("CVC Language Server restarted");
+        // Refresh timeline after server restart
+        timelineProvider?.refresh();
       }
     }),
 
     vscode.commands.registerCommand("cvc.refreshTimeline", () => {
-      // TODO: Implement timeline refresh when TreeView is added
       outputChannel.appendLine("Timeline refresh requested");
+      timelineProvider?.refresh();
     }),
 
     vscode.commands.registerCommand(

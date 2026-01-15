@@ -48,27 +48,27 @@
 
 ## 3. Feature: Cognitive Timeline (Tree View)
 
-- [ ] **Task 3.1: Tree Data Provider**
+- [x] **Task 3.1: Tree Data Provider**
     
-    - [ ] Create `TimelineTreeProvider` implementing `vscode.TreeDataProvider`.
+    - [x] Create `TimelineTreeProvider` implementing `vscode.TreeDataProvider`.
         
-    - [ ] Define Tree Items: `PendingGroup`, `CommitGroup`, `InteractionItem`.
+    - [x] Define Tree Items: `PendingGroup`, `CommitGroup`, `InteractionItem`.
         
-    - [ ] Implement `getTreeItem` and `getChildren`.
+    - [x] Implement `getTreeItem` and `getChildren`.
         
-- [ ] **Task 3.2: Data Fetching (LSP Communication)**
+- [x] **Task 3.2: Data Fetching (LSP Communication)**
     
-    - [ ] Add `sendRequest("cvc/timeline/get")` wrapper to the Language Client.
+    - [x] Add `sendRequest("cvc/timeline/get")` wrapper to the Language Client.
         
-    - [ ] Implement `refresh()` method triggered by `cvc/timeline/refresh` notification from server.
+    - [x] Implement `refresh()` method triggered by `cvc/timeline/refresh` notification from server.
         
-    - [ ] Register command `cvc.refreshTimeline` for manual refresh.
+    - [x] Register command `cvc.refreshTimeline` for manual refresh.
         
-- [ ] **Task 3.3: UI Interaction**
+- [x] **Task 3.3: UI Interaction**
     
-    - [ ] Implement "Click" handler for Tree Items.
+    - [x] Implement "Click" handler for Tree Items.
         
-    - [ ] Logic: When clicked, execute command `cvc.openThoughtDetail` with the Interaction ID.
+    - [x] Logic: When clicked, execute command `cvc.openThoughtDetail` with the Interaction ID.
         
 
 ## 4. Feature: Thought Detail View (Webview)

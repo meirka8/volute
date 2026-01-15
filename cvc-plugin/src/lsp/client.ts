@@ -13,6 +13,8 @@ import {
   TurnStartParams,
   TurnEndParams,
   LinkCommitParams,
+  TimelineGetParams,
+  TimelineGetResponse,
 } from "./protocol";
 
 /**
@@ -175,6 +177,42 @@ export class CvcLanguageClient {
       return;
     }
     await this.client.sendNotification("$/cvc/link/commit", params);
+  }
+
+  /**
+   * Request timeline data from the server
+   */
+  async sendTimelineGet(
+    params: TimelineGetParams,
+  ): Promise<TimelineGetResponse | null> {
+    if (!this.client?.isRunning()) {
+      this.outputChannel.appendLine(
+        "Warning: Cannot send timeline/get - client not running",
+      );
+      return null;
+    }
+    try {
+      const response = await this.client.sendRequest<TimelineGetResponse>(
+        "cvc/timeline/get",
+        params,
+      );
+      return response;
+    } catch (error) {
+      this.outputChannel.appendLine(
+        `Timeline request failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Register a handler for timeline refresh notifications from server
+   */
+  onTimelineRefresh(handler: () => void): vscode.Disposable {
+    if (!this.client) {
+      return { dispose: () => {} };
+    }
+    return this.client.onNotification("cvc/timeline/refresh", handler);
   }
 
   /**
