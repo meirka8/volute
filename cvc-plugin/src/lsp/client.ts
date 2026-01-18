@@ -155,6 +155,9 @@ export class VoluteLanguageClient {
       );
       return;
     }
+    this.outputChannel.appendLine(
+      `LSP: Sending turn/start (id: ${params.id}, prompt: ${params.prompt.substring(0, 50)}...)`,
+    );
     await this.client.sendNotification("$/cvc/turn/start", params);
   }
 
@@ -168,6 +171,9 @@ export class VoluteLanguageClient {
       );
       return;
     }
+    this.outputChannel.appendLine(
+      `LSP: Sending turn/end (id: ${params.id}, response length: ${params.response?.length ?? 0}, model: ${params.model})`,
+    );
     await this.client.sendNotification("$/cvc/turn/end", params);
   }
 

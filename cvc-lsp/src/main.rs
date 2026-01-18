@@ -33,7 +33,7 @@ async fn main() {
             let state = backend.state.clone();
             async move {
                 handlers::handle_session_start(&client, state, params).await;
-                Ok::<serde_json::Value, tower_lsp::jsonrpc::Error>(serde_json::Value::Null)
+                // Return () to indicate this is a notification, not a request
             }
         },
     )
@@ -44,7 +44,7 @@ async fn main() {
             let state = backend.state.clone();
             async move {
                 handlers::handle_turn_start(&client, state, params).await;
-                Ok::<serde_json::Value, tower_lsp::jsonrpc::Error>(serde_json::Value::Null)
+                // Return () to indicate this is a notification, not a request
             }
         },
     )
@@ -55,7 +55,7 @@ async fn main() {
             let state = backend.state.clone();
             async move {
                 handlers::handle_turn_end(&client, state, params).await;
-                Ok::<serde_json::Value, tower_lsp::jsonrpc::Error>(serde_json::Value::Null)
+                // Return () to indicate this is a notification, not a request
             }
         },
     )
@@ -66,7 +66,7 @@ async fn main() {
             let state = backend.state.clone();
             async move {
                 handlers::handle_link_commit(&client, state, params).await;
-                Ok::<serde_json::Value, tower_lsp::jsonrpc::Error>(serde_json::Value::Null)
+                // Return () to indicate this is a notification, not a request
             }
         },
     )

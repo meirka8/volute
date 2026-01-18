@@ -1,6 +1,7 @@
 use crate::protocol::*;
 use crate::state::AppState;
-use cvc_core::models::{Author, Interaction, InteractionId};
+use chrono::Utc;
+use cvc_core::models::{Author, Conversation, Interaction, InteractionId};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::task;
@@ -71,6 +72,16 @@ pub async fn handle_turn_end(client: &Client, state: Arc<AppState>, params: Turn
         let store_guard = state_clone.store.lock().expect("CVC Store mutex poisoned");
 
         if let Some(store) = store_guard.as_ref() {
+            // Ensure conversation exists before creating interaction (FK constraint)
+            let conv_id = &interaction.conversation_id;
+            if store.get_conversation(conv_id)?.is_none() {
+                store.create_conversation(&Conversation {
+                    id: conv_id.clone(),
+                    title: "Copilot Chat Session".to_string(),
+                    created_at: Utc::now(),
+                })?;
+            }
+
             store.create_interaction(&interaction)
         } else {
             Err(cvc_core::db::DbError::Migration("DB not open".to_string()))

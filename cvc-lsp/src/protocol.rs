@@ -8,6 +8,7 @@ pub struct SessionStartParams {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnStartParams {
     pub id: String, // Correlation ID for start/end
     pub prompt: String,
@@ -16,6 +17,7 @@ pub struct TurnStartParams {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnEndParams {
     pub id: String, // Correlation ID
     pub response: Option<String>,

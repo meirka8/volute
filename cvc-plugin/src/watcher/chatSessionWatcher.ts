@@ -166,9 +166,20 @@ export class ChatSessionWatcher {
       const files = await fs.promises.readdir(this.chatSessionsDir);
       const jsonFiles = files.filter((f) => f.endsWith(".json"));
 
+      let foundNew = false;
       for (const file of jsonFiles) {
         const filePath = path.join(this.chatSessionsDir, file);
+        const beforeCount = this.processedRequests.size;
         await this.processSessionFile(filePath);
+        if (this.processedRequests.size > beforeCount) {
+          foundNew = true;
+        }
+      }
+
+      if (foundNew) {
+        this.outputChannel.appendLine(
+          `ChatSessionWatcher: Polling found new requests (total indexed: ${this.processedRequests.size})`,
+        );
       }
     } catch {
       // Ignore polling errors
@@ -281,6 +292,10 @@ export class ChatSessionWatcher {
    */
   private onSessionFileChanged(uri: vscode.Uri): void {
     const filePath = uri.fsPath;
+
+    this.outputChannel.appendLine(
+      `ChatSessionWatcher: File change detected: ${path.basename(filePath)}`,
+    );
 
     // Debounce per-file to avoid processing incomplete writes
     const existingTimer = this.debounceTimers.get(filePath);
