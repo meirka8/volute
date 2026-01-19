@@ -7,3 +7,4 @@ pub use models::*;
 pub mod hooks;
 pub mod linker;
 pub mod sync;
+pub mod vscode;

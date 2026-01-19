@@ -1,4 +1,5 @@
 use cvc_core::models::Author;
+use cvc_core::vscode::ResponsePartRaw;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -23,6 +24,7 @@ pub struct TurnEndParams {
     pub response: Option<String>,
     pub chain_of_thought: Option<String>,
     pub model: Option<String>,
+    pub raw_response: Option<Vec<ResponsePartRaw>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

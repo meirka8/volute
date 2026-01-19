@@ -53,16 +53,26 @@ To support the UI features, we extend the standard LSP with custom methods:
     
     2. **File Watching:** Uses `vscode.workspace.createFileSystemWatcher()` to monitor the `chatSessions` directory for changes.
     
-    3. **Parsing:** When a chat session file is modified, parses the JSON to extract new interactions.
+    3. **Parsing:** When a chat session file is modified, it reads the content.
     
-    4. **Logging:** Sends `$/cvc/turn/start` and `$/cvc/turn/end` notifications to the LSP with extracted data.
+    4. **Processing:** The raw JSON content (or file path) is processed by `cvc-core` (via `cvc-lsp`) to reconstruct the full fidelity of the conversation, including:
+        - User prompts and context variables
+        - Full model responses (including multiple parts)
+        - Tool invocations (MCP, local tools) and their outputs
+        - Code edits (TextEditGroups)
+        - Chain of Thought (Thinking blocks)
 
 - **Data Extracted:**
 
+    The parser ensures complete reconstruction of the session, handling the complex `requests[].response` list which contains mixed content types (text, tool calls, edits).
+
     - `requests[].message.text` - User prompt
-    - `requests[].variableData.variables` - File references and context
-    - `requests[].response[].kind: "thinking"` - Chain of thought (when available)
-    - `requests[].response[].value` - Model response (markdown content)
+    - `requests[].variableData.variables` - Context
+    - `requests[].response[]` - Complex list of response parts:
+        - `value` (Text content)
+        - `kind: "thinking"` (Chain of thought)
+        - `kind: "toolInvocationSerialized"` (Tool usage)
+        - `kind: "textEditGroup"` (Code application)
     - `inputState.selectedModel` - Model identifier
 
 - **Chat Session File Location:**

@@ -2,6 +2,7 @@ use crate::protocol::*;
 use crate::state::AppState;
 use chrono::Utc;
 use cvc_core::models::{Author, Conversation, Interaction, InteractionId};
+use cvc_core::vscode::ChatRequest;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::task;
@@ -54,6 +55,12 @@ pub async fn handle_turn_end(client: &Client, state: Arc<AppState>, params: Turn
     let state_clone = state.clone();
     let client_clone = client.clone();
 
+    let model_response = if let Some(raw) = &params.raw_response {
+        Some(ChatRequest::reconstruct_from_parts(raw))
+    } else {
+        params.response.clone()
+    };
+
     let interaction = Interaction {
         id: InteractionId::new(),
         conversation_id: "default-session".to_string(),
@@ -63,7 +70,7 @@ pub async fn handle_turn_end(client: &Client, state: Arc<AppState>, params: Turn
         user_prompt: prompt,
         model_name: params.model,
         model_cot: params.chain_of_thought,
-        model_response: params.response,
+        model_response: model_response,
     };
 
     // Offload DB write to background thread
