@@ -107,7 +107,7 @@ export class ChatSessionWatcher {
     );
 
     // Create file system watcher for JSON files in the chat sessions directory
-    const pattern = new vscode.RelativePattern(this.chatSessionsDir, "*.json");
+    const pattern = new vscode.RelativePattern(this.chatSessionsDir, "*.json*");
     this.watcher = vscode.workspace.createFileSystemWatcher(pattern);
 
     // Watch for changes (which includes new content being written)
@@ -165,7 +165,7 @@ export class ChatSessionWatcher {
 
     try {
       const files = await fs.promises.readdir(this.chatSessionsDir);
-      const jsonFiles = files.filter((f) => f.endsWith(".json"));
+      const jsonFiles = files.filter((f) => f.endsWith(".json") || f.endsWith(".jsonl"));
 
       for (const file of jsonFiles) {
         const filePath = path.join(this.chatSessionsDir, file);
@@ -311,7 +311,7 @@ export class ChatSessionWatcher {
 
     try {
       const files = await fs.promises.readdir(this.chatSessionsDir);
-      const jsonFiles = files.filter((f) => f.endsWith(".json"));
+      const jsonFiles = files.filter((f) => f.endsWith(".json") || f.endsWith(".jsonl"));
 
       this.outputChannel.appendLine(
         `ChatSessionWatcher: Found ${jsonFiles.length} existing session files`,
@@ -340,7 +340,11 @@ export class ChatSessionWatcher {
   private async indexSessionFile(filePath: string): Promise<void> {
     try {
       const content = await fs.promises.readFile(filePath, "utf-8");
-      const session: ChatSessionFile = JSON.parse(content);
+      const session = this.parseSessionFile(content, filePath);
+
+      if (!session) {
+        return;
+      }
 
       for (const request of session.requests || []) {
         if (request.requestId) {
@@ -359,7 +363,11 @@ export class ChatSessionWatcher {
   private async processSessionFile(filePath: string): Promise<void> {
     try {
       const content = await fs.promises.readFile(filePath, "utf-8");
-      const session: ChatSessionFile = JSON.parse(content);
+      const session = this.parseSessionFile(content, filePath);
+
+      if (!session) {
+        return;
+      }
 
       const modelName = this.extractModelName(session);
 
@@ -391,6 +399,84 @@ export class ChatSessionWatcher {
   }
 
   /**
+   * Parse a session file, handling both JSON and JSONL formats
+   */
+  private parseSessionFile(content: string, filePath: string): ChatSessionFile | undefined {
+    if (filePath.endsWith(".json")) {
+      return JSON.parse(content);
+    } else if (filePath.endsWith(".jsonl")) {
+      return this.reconstructJsonlSession(content);
+    }
+    return undefined;
+  }
+
+  /**
+   * Reconstruct a ChatSessionFile from a .jsonl incremental log
+   */
+  private reconstructJsonlSession(content: string): ChatSessionFile | undefined {
+    const lines = content.split('\n').filter(line => line.trim().length > 0);
+    if (lines.length === 0) {
+      return undefined;
+    }
+
+    // Line 0 is the base state (kind: 0)
+    let session: ChatSessionFile | undefined;
+    try {
+      const firstLine = JSON.parse(lines[0]);
+      if (firstLine.kind === 0 && firstLine.v) {
+        session = firstLine.v;
+      }
+    } catch (e) {
+      return undefined;
+    }
+
+    if (!session) {
+      return undefined;
+    }
+
+    // Apply updates from subsequent lines
+    for (const line of lines.slice(1)) {
+      try {
+        const update = JSON.parse(line);
+        // We only care about updates (kind: 2)
+        if (update.kind === 2 && update.k && update.v !== undefined) {
+          this.applyUpdate(session, update.k, update.v);
+        }
+      } catch (e) {
+        // Ignore malformed lines
+      }
+    }
+
+    return session;
+  }
+
+  /**
+   * Apply a delta update to the session object
+   * k is an array of keys/indices path, v is the value to set or merge
+   */
+  private applyUpdate(obj: any, path: (string | number)[], value: any): void {
+    let current = obj;
+    for (let i = 0; i < path.length - 1; i++) {
+      const key = path[i];
+      if (current[key] === undefined) {
+        // Creating missing structure if needed - simplistic approach
+        current[key] = typeof path[i + 1] === 'number' ? [] : {};
+      }
+      current = current[key];
+    }
+
+    const lastKey = path[path.length - 1];
+
+    // If the target is an array and we're just setting a value, it works.
+    // But sometimes we might need to merge. For now, strict replacement based on observataion.
+    // Observation from example: "k":["requests",0,"response"],"v":[...]
+    // This implies replacement of that field.
+    if (current) {
+      current[lastKey] = value;
+    }
+  }
+
+  /**
    * Calculate a stable checksum for the request content
    */
   private calculateChecksum(request: ChatRequest): string {
@@ -398,13 +484,20 @@ export class ChatSessionWatcher {
     // We skip timestamps/progress/execution metadata that changes frequently without content change
     const partsToHash = (request.response || [])
       .filter(p => ["text", "markdownContent", "toolInvocationSerialized", "thinking"].includes(p.kind))
-      .map(p => ({
-        kind: p.kind,
-        value: p.value,
-        // Include nested messages for tools
-        // Note: we're lenient here, just capturing content structure
-        extra: JSON.stringify(p)
-      }));
+      .map(p => {
+        // Only hash stable fields that represent content
+        const stablePart: any = {
+          kind: p.kind,
+          value: p.value,
+        };
+
+        // Include URIs if present (important for file references)
+        if (p.uris) {
+          stablePart.uris = p.uris;
+        }
+
+        return stablePart;
+      });
 
     const content = JSON.stringify({
       prompt: request.message.text,
