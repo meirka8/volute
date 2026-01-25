@@ -172,7 +172,7 @@ export class VoluteLanguageClient {
       return;
     }
     this.outputChannel.appendLine(
-      `LSP: Sending turn/end (id: ${params.id}, response length: ${params.response?.length ?? 0}, model: ${params.model})`,
+      `LSP: Sending turn/end (id: ${params.id}, response length: ${params.response?.length ?? 0}, raw parts: ${params.rawResponse?.length ?? 0}, model: ${params.model})`,
     );
     await this.client.sendNotification("$/cvc/turn/end", params);
   }
@@ -221,7 +221,7 @@ export class VoluteLanguageClient {
    */
   onTimelineRefresh(handler: () => void): vscode.Disposable {
     if (!this.client) {
-      return { dispose: () => {} };
+      return { dispose: () => { } };
     }
     return this.client.onNotification("cvc/timeline/refresh", handler);
   }

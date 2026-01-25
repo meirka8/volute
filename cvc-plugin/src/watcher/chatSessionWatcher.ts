@@ -1,3 +1,4 @@
+import * as crypto from "crypto";
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
@@ -66,8 +67,8 @@ export class ChatSessionWatcher {
   private watcher: vscode.FileSystemWatcher | undefined;
   private chatSessionsDir: string | undefined;
 
-  // Track processed requests to avoid duplicates
-  private processedRequests: Set<string> = new Set();
+  // Track checksums of processed requests to detect actual changes
+  private requestChecksums: Map<string, string> = new Map();
 
   // Debounce timers for file changes (per-file)
   private debounceTimers: Map<string, NodeJS.Timeout> = new Map();
@@ -166,20 +167,9 @@ export class ChatSessionWatcher {
       const files = await fs.promises.readdir(this.chatSessionsDir);
       const jsonFiles = files.filter((f) => f.endsWith(".json"));
 
-      let foundNew = false;
       for (const file of jsonFiles) {
         const filePath = path.join(this.chatSessionsDir, file);
-        const beforeCount = this.processedRequests.size;
         await this.processSessionFile(filePath);
-        if (this.processedRequests.size > beforeCount) {
-          foundNew = true;
-        }
-      }
-
-      if (foundNew) {
-        this.outputChannel.appendLine(
-          `ChatSessionWatcher: Polling found new requests (total indexed: ${this.processedRequests.size})`,
-        );
       }
     } catch {
       // Ignore polling errors
@@ -327,7 +317,7 @@ export class ChatSessionWatcher {
         `ChatSessionWatcher: Found ${jsonFiles.length} existing session files`,
       );
 
-      // Process each file to build the set of already-processed requests
+      // Process each file to build the set of known checksums
       // We don't send these to LSP on startup to avoid duplicates
       for (const file of jsonFiles) {
         const filePath = path.join(this.chatSessionsDir, file);
@@ -335,7 +325,7 @@ export class ChatSessionWatcher {
       }
 
       this.outputChannel.appendLine(
-        `ChatSessionWatcher: Indexed ${this.processedRequests.size} existing requests`,
+        `ChatSessionWatcher: Indexed ${this.requestChecksums.size} existing requests`,
       );
     } catch (error) {
       this.outputChannel.appendLine(
@@ -354,7 +344,8 @@ export class ChatSessionWatcher {
 
       for (const request of session.requests || []) {
         if (request.requestId) {
-          this.processedRequests.add(request.requestId);
+          const checksum = this.calculateChecksum(request);
+          this.requestChecksums.set(request.requestId, checksum);
         }
       }
     } catch {
@@ -363,7 +354,7 @@ export class ChatSessionWatcher {
   }
 
   /**
-   * Process a session file and extract new interactions
+   * Process a session file and extract new/updated interactions
    */
   private async processSessionFile(filePath: string): Promise<void> {
     try {
@@ -373,24 +364,23 @@ export class ChatSessionWatcher {
       const modelName = this.extractModelName(session);
 
       for (const request of session.requests || []) {
-        // Skip if already processed
-        if (this.processedRequests.has(request.requestId)) {
-          continue;
-        }
+        // Calculate current checksum of content
+        const currentChecksum = this.calculateChecksum(request);
+        const lastChecksum = this.requestChecksums.get(request.requestId);
 
-        // Check if the response is complete
-        if (!this.isResponseComplete(request)) {
+        // If content hasn't changed, skip
+        if (currentChecksum === lastChecksum) {
           continue;
         }
 
         this.outputChannel.appendLine(
-          `ChatSessionWatcher: Processing new request ${request.requestId}`,
+          `ChatSessionWatcher: Processing request update ${request.requestId} (checksum changed)`,
         );
 
-        // Mark as processed
-        this.processedRequests.add(request.requestId);
+        // Update tracking
+        this.requestChecksums.set(request.requestId, currentChecksum);
 
-        // Extract the interaction data
+        // Extract and send interaction data
         await this.sendInteractionToLsp(request, session.sessionId, modelName);
       }
     } catch (error) {
@@ -401,39 +391,27 @@ export class ChatSessionWatcher {
   }
 
   /**
-   * Check if a response appears to be complete
+   * Calculate a stable checksum for the request content
    */
-  private isResponseComplete(request: ChatRequest): boolean {
-    if (!request.response || request.response.length === 0) {
-      return false;
-    }
+  private calculateChecksum(request: ChatRequest): string {
+    // We only hash relevant parts to determine if meaningful content changed
+    // We skip timestamps/progress/execution metadata that changes frequently without content change
+    const partsToHash = (request.response || [])
+      .filter(p => ["text", "markdownContent", "toolInvocationSerialized", "thinking"].includes(p.kind))
+      .map(p => ({
+        kind: p.kind,
+        value: p.value,
+        // Include nested messages for tools
+        // Note: we're lenient here, just capturing content structure
+        extra: JSON.stringify(p)
+      }));
 
-    // Look for completion markers
-    const lastParts = request.response.slice(-3);
-    for (const part of lastParts) {
-      // Check for reasoning done marker
-      if (part.metadata?.vscodeReasoningDone) {
-        return true;
-      }
-      // Check for stop reason
-      if (part.metadata?.stopReason) {
-        return true;
-      }
-      // If we have actual markdown content, it's likely complete
-      if (
-        part.kind === "markdownContent" ||
-        (part.value && part.value.length > 50)
-      ) {
-        return true;
-      }
-    }
+    const content = JSON.stringify({
+      prompt: request.message.text,
+      parts: partsToHash
+    });
 
-    // If there's substantial response content, consider it complete
-    const totalLength = request.response.reduce((sum, part) => {
-      return sum + (part.value?.length || 0);
-    }, 0);
-
-    return totalLength > 100;
+    return crypto.createHash('md5').update(content).digest('hex');
   }
 
   /**
@@ -488,6 +466,7 @@ export class ChatSessionWatcher {
       response,
       chainOfThought,
       model: modelName,
+      rawResponse: request.response,
     });
 
     this.outputChannel.appendLine(

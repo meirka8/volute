@@ -49,6 +49,8 @@ export interface TurnEndParams {
   chainOfThought?: string;
   /** Model name/identifier */
   model?: string;
+  /** Raw response parts for robust parsing on server */
+  rawResponse?: any[];
 }
 
 /**
