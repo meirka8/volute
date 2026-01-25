@@ -15,6 +15,8 @@ pub enum DbError {
     Migration(String),
     #[error("Timestamp error: invalid timestamp {0}")]
     Timestamp(i64),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -25,6 +27,10 @@ pub struct CvcStore {
 
 impl CvcStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = Connection::open(path)?;
 
         conn.pragma_update(None, "journal_mode", "WAL")?;
