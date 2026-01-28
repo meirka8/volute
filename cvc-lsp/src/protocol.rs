@@ -33,6 +33,37 @@ pub struct LinkCommitParams {
     pub interaction_ids: Vec<String>,
 }
 
+// --- Batch Turn Types (for Chat Session Watcher) ---
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnBatchParams {
+    /// The VS Code requestId - used for deduplication.
+    /// When re-processing the same request, old interactions are deleted first.
+    pub source_request_id: String,
+    /// The session/conversation ID to group interactions under.
+    pub session_id: String,
+    /// Model name/identifier used for all segments.
+    pub model: Option<String>,
+    /// Ordered list of interaction segments (human turn first, then agent turns).
+    pub interactions: Vec<InteractionSegment>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractionSegment {
+    /// Author of this segment: "human" for the initial prompt turn, "agent" for model reasoning turns.
+    pub author: Author,
+    /// The user prompt (only present on the first/human segment).
+    pub user_prompt: Option<String>,
+    /// Chain of thought / thinking block (only on agent segments).
+    pub chain_of_thought: Option<String>,
+    /// The visible response text for this segment.
+    pub response: Option<String>,
+    /// Context files attached to this segment (typically only on human segment).
+    pub context_files: Option<Vec<String>>,
+}
+
 // --- Timeline Request/Response Types ---
 
 #[derive(Debug, Serialize, Deserialize)]

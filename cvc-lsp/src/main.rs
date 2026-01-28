@@ -6,7 +6,7 @@ mod state;
 use backend::Backend;
 use protocol::{
     InteractionDetail, InteractionGetParams, LinkCommitParams, SessionStartParams,
-    TimelineGetParams, TimelineGetResponse, TurnEndParams, TurnStartParams,
+    TimelineGetParams, TimelineGetResponse, TurnBatchParams, TurnEndParams, TurnStartParams,
 };
 use state::AppState;
 use std::sync::Arc;
@@ -56,6 +56,16 @@ async fn main() {
             async move {
                 handlers::handle_turn_end(&client, state, params).await;
                 // Return () to indicate this is a notification, not a request
+            }
+        },
+    )
+    .custom_method(
+        "$/cvc/turn/batch",
+        |backend: &Backend, params: TurnBatchParams| {
+            let client = backend.client.clone();
+            let state = backend.state.clone();
+            async move {
+                handlers::handle_turn_batch(&client, state, params).await;
             }
         },
     )

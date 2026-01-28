@@ -54,6 +54,40 @@ export interface TurnEndParams {
 }
 
 /**
+ * Parameters for $/cvc/turn/batch notification
+ * Sends a complete set of segmented interactions for a single VS Code chat request.
+ * Used by the Chat Session Watcher for retroactive parsing.
+ */
+export interface TurnBatchParams {
+  /** The VS Code requestId - used for deduplication */
+  sourceRequestId: string;
+  /** The session/conversation ID */
+  sessionId: string;
+  /** Model name/identifier */
+  model?: string;
+  /** Ordered list of interaction segments */
+  interactions: InteractionSegment[];
+}
+
+/**
+ * A single segment of a chat interaction.
+ * The first segment is typically author: "human" with the prompt.
+ * Subsequent segments are author: "agent" with chain of thought + response.
+ */
+export interface InteractionSegment {
+  /** Author of this segment */
+  author: Author;
+  /** User prompt (only on human segments) */
+  userPrompt?: string;
+  /** Chain of thought / thinking block (only on agent segments) */
+  chainOfThought?: string;
+  /** Visible response text */
+  response?: string;
+  /** Context files (typically only on human segment) */
+  contextFiles?: string[];
+}
+
+/**
  * Parameters for $/cvc/link/commit notification
  * Associates interactions with a Git commit
  */

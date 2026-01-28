@@ -71,6 +71,7 @@ pub async fn handle_turn_end(client: &Client, state: Arc<AppState>, params: Turn
         model_name: params.model,
         model_cot: params.chain_of_thought,
         model_response: model_response,
+        source_request_id: None,
     };
 
     // Offload DB write to background thread
@@ -107,6 +108,105 @@ pub async fn handle_turn_end(client: &Client, state: Arc<AppState>, params: Turn
                 .log_message(
                     MessageType::ERROR,
                     format!("Failed to save interaction: {}", e),
+                )
+                .await;
+        }
+        Err(e) => {
+            client_clone
+                .log_message(MessageType::ERROR, format!("Join error: {}", e))
+                .await;
+        }
+    }
+}
+
+/// Handle a batch of segmented interactions from the Chat Session Watcher.
+///
+/// This replaces the turn/start + turn/end flow for the watcher use-case.
+/// It processes a complete VS Code chat request as multiple interaction segments
+/// (human turn + agent reasoning turns), linked via parent_id.
+pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: TurnBatchParams) {
+    let segment_count = params.interactions.len();
+    client
+        .log_message(
+            MessageType::INFO,
+            format!(
+                "Turn batch (source: {}, session: {}, segments: {})",
+                params.source_request_id, params.session_id, segment_count
+            ),
+        )
+        .await;
+
+    let state_clone = state.clone();
+    let client_clone = client.clone();
+    let source_id_for_log = params.source_request_id.clone();
+
+    let result = task::spawn_blocking(move || {
+        let store_guard = state_clone.store.lock().expect("CVC Store mutex poisoned");
+
+        if let Some(store) = store_guard.as_ref() {
+            // Ensure conversation exists
+            if store.get_conversation(&params.session_id)?.is_none() {
+                store.create_conversation(&Conversation {
+                    id: params.session_id.clone(),
+                    title: "Copilot Chat Session".to_string(),
+                    created_at: Utc::now(),
+                })?;
+            }
+
+            // Delete previous interactions from this source request (deduplication)
+            store.delete_interactions_by_source_request_id(&params.source_request_id)?;
+
+            // Insert new segmented interactions with parent chaining
+            let mut previous_id: Option<InteractionId> = None;
+
+            for segment in &params.interactions {
+                let id = InteractionId::new();
+
+                let author = match segment.author {
+                    Author::Human => Author::Human,
+                    Author::Agent => Author::Agent,
+                    Author::System => Author::System,
+                    Author::External => Author::External,
+                };
+
+                let interaction = Interaction {
+                    id: id.clone(),
+                    conversation_id: params.session_id.clone(),
+                    parent_id: previous_id.clone(),
+                    timestamp: Utc::now(),
+                    author,
+                    user_prompt: segment.user_prompt.clone().unwrap_or_default(),
+                    model_name: params.model.clone(),
+                    model_cot: segment.chain_of_thought.clone(),
+                    model_response: segment.response.clone(),
+                    source_request_id: Some(params.source_request_id.clone()),
+                };
+
+                store.create_interaction(&interaction)?;
+                previous_id = Some(id);
+            }
+
+            Ok(())
+        } else {
+            Err(cvc_core::db::DbError::Migration("DB not open".to_string()))
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_)) => {
+            client_clone
+                .log_message(
+                    MessageType::INFO,
+                    format!("Batch saved: {} segments for source {}", segment_count, source_id_for_log),
+                )
+                .await;
+        }
+        Ok(Err(e)) => {
+            client_clone
+                .log_message(
+                    MessageType::ERROR,
+                    format!("Failed to save batch: {}", e),
                 )
                 .await;
         }

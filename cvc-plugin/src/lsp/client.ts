@@ -12,6 +12,7 @@ import {
   SessionStartParams,
   TurnStartParams,
   TurnEndParams,
+  TurnBatchParams,
   LinkCommitParams,
   TimelineGetParams,
   TimelineGetResponse,
@@ -175,6 +176,23 @@ export class VoluteLanguageClient {
       `LSP: Sending turn/end (id: ${params.id}, response length: ${params.response?.length ?? 0}, raw parts: ${params.rawResponse?.length ?? 0}, model: ${params.model})`,
     );
     await this.client.sendNotification("$/cvc/turn/end", params);
+  }
+
+  /**
+   * Send a batch of segmented interactions to the server.
+   * Used by the Chat Session Watcher for retroactive parsing of complete requests.
+   */
+  async sendTurnBatch(params: TurnBatchParams): Promise<void> {
+    if (!this.client?.isRunning()) {
+      this.outputChannel.appendLine(
+        "Warning: Cannot send turn/batch - client not running",
+      );
+      return;
+    }
+    this.outputChannel.appendLine(
+      `LSP: Sending turn/batch (source: ${params.sourceRequestId}, segments: ${params.interactions.length}, model: ${params.model})`,
+    );
+    await this.client.sendNotification("$/cvc/turn/batch", params);
   }
 
   /**

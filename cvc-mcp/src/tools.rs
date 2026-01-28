@@ -170,6 +170,7 @@ async fn commit_thought(args: Value, store: Arc<Mutex<CvcStore>>) -> Result<Valu
             model_name: Some("agent".to_string()),
             model_cot: Some(full_cot), // The agent's reasoning/chain of thought
             model_response: response,  // The agent's response/action taken
+            source_request_id: None,
         };
 
         store.create_interaction(&interaction)?;

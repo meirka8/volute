@@ -33,6 +33,7 @@ fn test_linker_workflow() -> anyhow::Result<()> {
         model_name: None,
         model_cot: None,
         model_response: None,
+        source_request_id: None,
     };
     store.create_conversation(&Conversation {
         id: "conv-1".to_string(),

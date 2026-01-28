@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
 import { VoluteLanguageClient } from "../lsp/client";
+import type { InteractionSegment } from "../lsp/protocol";
 
 /**
  * Structure of a chat session file (partial - only fields we care about)
@@ -519,7 +520,13 @@ export class ChatSessionWatcher {
   }
 
   /**
-   * Send an interaction to the LSP server
+   * Send segmented interactions to the LSP server via the batch notification.
+   *
+   * Segments a single VS Code chat request into multiple interaction records:
+   * - First segment (author: human): user prompt + initial response (before first thinking block)
+   * - Subsequent segments (author: agent): thinking block + response until next thinking block
+   *
+   * This preserves the turn structure for traceability in the cognitive timeline.
    */
   private async sendInteractionToLsp(
     request: ChatRequest,
@@ -536,60 +543,89 @@ export class ChatSessionWatcher {
       }
     }
 
-    // Extract the prompt
     const prompt = request.message.text || "";
+    const segments = this.segmentResponse(request, prompt, contextFiles);
 
-    // Extract chain of thought and response
-    const { chainOfThought, response } = this.extractResponse(request);
-
-    // Generate a unique turn ID
-    const turnId = request.requestId;
-
-    // Send turn start
-    await this.lspClient.sendTurnStart({
-      id: turnId,
-      prompt,
-      author: "human",
-      contextFiles,
-    });
-
-    // Send turn end with response
-    await this.lspClient.sendTurnEnd({
-      id: turnId,
-      response,
-      chainOfThought,
+    await this.lspClient.sendTurnBatch({
+      sourceRequestId: request.requestId,
+      sessionId,
       model: modelName,
-      rawResponse: request.response,
+      interactions: segments,
     });
 
     this.outputChannel.appendLine(
-      `ChatSessionWatcher: Logged interaction ${turnId} (${prompt.substring(0, 50)}...)`,
+      `ChatSessionWatcher: Logged ${segments.length} segment(s) for request ${request.requestId} (${prompt.substring(0, 50)}...)`,
     );
   }
 
   /**
-   * Extract chain of thought and response from request
+   * Segment the response parts of a chat request into interaction segments.
+   *
+   * Algorithm: walk response parts in order. Each "thinking" block starts a new
+   * agent segment. Content before the first thinking block goes into the human
+   * segment (along with the prompt). Content after a thinking block goes into
+   * that agent segment's response.
    */
-  private extractResponse(request: ChatRequest): {
-    chainOfThought: string | undefined;
-    response: string;
-  } {
-    const thinkingParts: string[] = [];
-    const responseParts: string[] = [];
+  private segmentResponse(
+    request: ChatRequest,
+    prompt: string,
+    contextFiles: string[],
+  ): InteractionSegment[] {
+    const segments: InteractionSegment[] = [];
+    let currentResponseParts: string[] = [];
+    let currentCot: string | undefined;
+
+    const ignoredKinds = new Set([
+      "progressTaskSerialized",
+      "undoStop",
+      "prepareToolInvocation",
+      "mcpServersStarting",
+    ]);
 
     for (const part of request.response || []) {
       if (part.kind === "thinking" && part.value) {
-        thinkingParts.push(part.value);
-      } else if (part.value && part.kind !== "progressTaskSerialized") {
-        // Skip progress messages, include actual content
-        responseParts.push(part.value);
+        // Flush the current segment before starting a new one
+        if (segments.length === 0) {
+          // First flush: this is the human turn (prompt + initial response)
+          segments.push({
+            author: "human",
+            userPrompt: prompt,
+            response: currentResponseParts.join("") || undefined,
+            contextFiles: contextFiles.length > 0 ? contextFiles : undefined,
+          });
+        } else if (currentCot || currentResponseParts.length > 0) {
+          // Subsequent flush: agent turn with previous thinking + response
+          segments.push({
+            author: "agent",
+            chainOfThought: currentCot,
+            response: currentResponseParts.join("") || undefined,
+          });
+        }
+        currentResponseParts = [];
+        currentCot = part.value;
+      } else if (part.value && !ignoredKinds.has(part.kind)) {
+        currentResponseParts.push(part.value);
       }
     }
 
-    return {
-      chainOfThought:
-        thinkingParts.length > 0 ? thinkingParts.join("\n\n") : undefined,
-      response: responseParts.join(""),
-    };
+    // Flush final segment
+    if (segments.length === 0) {
+      // No thinking blocks at all - single human turn
+      segments.push({
+        author: "human",
+        userPrompt: prompt,
+        response: currentResponseParts.join("") || undefined,
+        contextFiles: contextFiles.length > 0 ? contextFiles : undefined,
+      });
+    } else {
+      // Final agent segment
+      segments.push({
+        author: "agent",
+        chainOfThought: currentCot,
+        response: currentResponseParts.join("") || undefined,
+      });
+    }
+
+    return segments;
   }
 }

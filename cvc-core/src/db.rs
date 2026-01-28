@@ -42,6 +42,20 @@ impl CvcStore {
     pub fn init(&self) -> Result<()> {
         self.conn
             .execute_batch(include_str!("../migrations/0001_initial_schema.sql"))?;
+
+        // Run additive migrations idempotently.
+        // ALTER TABLE will fail if column already exists, so we check first.
+        let has_source_request_id: bool = self
+            .conn
+            .prepare("PRAGMA table_info(interactions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|name| name.as_deref() == Ok("source_request_id"));
+
+        if !has_source_request_id {
+            self.conn
+                .execute_batch(include_str!("../migrations/0002_add_source_request_id.sql"))?;
+        }
+
         Ok(())
     }
 
@@ -91,8 +105,8 @@ impl CvcStore {
         self.conn.execute(
             "INSERT INTO interactions (
                 id, conversation_id, parent_id, timestamp, author, user_prompt,
-                model_name, model_cot, model_response
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                model_name, model_cot, model_response, source_request_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 inter.id.to_string(),
                 inter.conversation_id,
@@ -103,6 +117,7 @@ impl CvcStore {
                 inter.model_name,
                 inter.model_cot,
                 inter.model_response,
+                inter.source_request_id,
             ],
         )?;
         Ok(())
@@ -112,7 +127,7 @@ impl CvcStore {
         self.conn
             .query_row(
                 "SELECT id, conversation_id, parent_id, timestamp, author, user_prompt,
-                    model_name, model_cot, model_response
+                    model_name, model_cot, model_response, source_request_id
              FROM interactions WHERE id = ?1",
                 params![id.as_str()],
                 |row| {
@@ -150,11 +165,42 @@ impl CvcStore {
                         model_name: row.get(6)?,
                         model_cot: row.get(7)?,
                         model_response: row.get(8)?,
+                        source_request_id: row.get(9)?,
                     })
                 },
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Delete all interactions (and their related context_items, tool_executions, artifact_links)
+    /// that were generated from a specific VS Code chat request.
+    pub fn delete_interactions_by_source_request_id(&self, source_request_id: &str) -> Result<()> {
+        // First collect the interaction IDs to cascade-delete related rows
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM interactions WHERE source_request_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![source_request_id], |row| row.get(0))?;
+            rows.collect::<std::result::Result<Vec<String>, _>>()?
+        };
+
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        for id in &ids {
+            self.conn.execute("DELETE FROM context_items WHERE interaction_id = ?1", params![id])?;
+            self.conn.execute("DELETE FROM tool_executions WHERE interaction_id = ?1", params![id])?;
+            self.conn.execute("DELETE FROM artifact_links WHERE interaction_id = ?1", params![id])?;
+        }
+
+        self.conn.execute(
+            "DELETE FROM interactions WHERE source_request_id = ?1",
+            params![source_request_id],
+        )?;
+
+        Ok(())
     }
 
     // --- Context Items ---
@@ -181,7 +227,7 @@ impl CvcStore {
         // Interactions that are NOT in artifact_links
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.conversation_id, i.parent_id, i.timestamp, i.author, i.user_prompt,
-                    i.model_name, i.model_cot, i.model_response
+                    i.model_name, i.model_cot, i.model_response, i.source_request_id
              FROM interactions i
              LEFT JOIN artifact_links al ON i.id = al.interaction_id
              WHERE al.interaction_id IS NULL",
@@ -222,6 +268,7 @@ impl CvcStore {
                 model_name: row.get(6)?,
                 model_cot: row.get(7)?,
                 model_response: row.get(8)?,
+                source_request_id: row.get(9)?,
             })
         })?;
 
@@ -407,7 +454,7 @@ impl CvcStore {
     pub fn get_interactions_for_commit(&self, commit_sha: &CommitSha) -> Result<Vec<Interaction>> {
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.conversation_id, i.parent_id, i.timestamp, i.author, i.user_prompt,
-                    i.model_name, i.model_cot, i.model_response
+                    i.model_name, i.model_cot, i.model_response, i.source_request_id
              FROM interactions i
              JOIN artifact_links al ON i.id = al.interaction_id
              WHERE al.git_commit_hash = ?1
@@ -449,6 +496,7 @@ impl CvcStore {
                 model_name: row.get(6)?,
                 model_cot: row.get(7)?,
                 model_response: row.get(8)?,
+                source_request_id: row.get(9)?,
             })
         })?;
 

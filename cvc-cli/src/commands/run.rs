@@ -107,6 +107,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
                     model_name: Some("process-shim".to_string()),
                     model_cot: None,
                     model_response: Some(combined_response),
+                    source_request_id: None,
                 };
 
                 if let Err(e) = store.create_interaction(&interaction) {
