@@ -39,6 +39,7 @@ fn test_sync_push_pull() -> anyhow::Result<()> {
         model_name: None,
         model_cot: None,
         model_response: None,
+        source_request_id: None,
     };
     store.create_interaction(&inter)?;
 

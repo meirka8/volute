@@ -34,6 +34,7 @@ fn test_db_workflow() -> anyhow::Result<()> {
         model_name: Some("gpt-4".to_string()),
         model_cot: None,
         model_response: Some("Hi there".to_string()),
+        source_request_id: None,
     };
     store.create_interaction(&interaction)?;
 

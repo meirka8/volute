@@ -10,15 +10,28 @@ pub fn list_tools() -> Value {
         "tools": [
             {
                 "name": "commit_thought",
-                "description": "Log a reasoning step and conversation into CVC.",
+                "description": "Log a reasoning step, task, and response into CVC. Call this after completing a reasoning step or task.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "reasoning": { "type": "string" },
-                        "prompt": { "type": "string" },
-                        "context": { "type": "string" }
+                        "task": {
+                            "type": "string",
+                            "description": "The task or prompt you were asked to complete (what the user requested)"
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "Your internal reasoning, chain of thought, or plan for how to approach the task"
+                        },
+                        "response": {
+                            "type": "string",
+                            "description": "Your response or the action you took to complete the task"
+                        },
+                        "context_summary": {
+                            "type": "string",
+                            "description": "Optional summary of relevant file context or state"
+                        }
                     },
-                    "required": ["reasoning", "prompt"]
+                    "required": ["task", "reasoning"]
                 }
             },
             {
@@ -80,23 +93,29 @@ pub async fn call_tool(params: Value, store: Arc<Mutex<CvcStore>>) -> Result<Val
 }
 
 async fn commit_thought(args: Value, store: Arc<Mutex<CvcStore>>) -> Result<Value, JsonRpcError> {
+    // New schema fields
+    let task = args
+        .get("task")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     let reasoning = args
         .get("reasoning")
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let prompt = args
-        .get("prompt")
+    let response = args
+        .get("response")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let context = args
-        .get("context")
+        .map(|s| s.to_string());
+    let context_summary = args
+        .get("context_summary")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
 
-    let full_cot = if !context.is_empty() {
-        format!("{}\n\nContext Summary:\n{}", reasoning, context)
+    // Build the chain of thought, optionally including context summary
+    let full_cot = if !context_summary.is_empty() {
+        format!("{}\n\nContext Summary:\n{}", reasoning, context_summary)
     } else {
         reasoning
     };
@@ -147,10 +166,11 @@ async fn commit_thought(args: Value, store: Arc<Mutex<CvcStore>>) -> Result<Valu
             parent_id: None, // We don't track parent in this simple tool yet (need history)
             timestamp: Utc::now(),
             author: Author::Agent,
-            user_prompt: prompt,
-            model_name: Some("agent-model".to_string()),
-            model_cot: Some(full_cot),
-            model_response: None, // The agent IS the model, so reasoning is CoT. Response is what it does next.
+            user_prompt: task, // The task/prompt the agent was asked to complete
+            model_name: Some("agent".to_string()),
+            model_cot: Some(full_cot), // The agent's reasoning/chain of thought
+            model_response: response,  // The agent's response/action taken
+            source_request_id: None,
         };
 
         store.create_interaction(&interaction)?;
@@ -302,7 +322,7 @@ async fn setup_cvc(args: Value) -> Result<Value, JsonRpcError> {
         // We use discovery to find the repo root if we are in a subdir.
         let repo = cvc_core::git::open_repo(&current_dir)
             .map_err(|_| anyhow::anyhow!("Current directory is not a git repository. CVC requires a git repository to function."))?;
-        
+
         // We use the workdir as root for hooks installation
         let repo_root = repo.workdir().unwrap_or(&current_dir).to_path_buf();
 

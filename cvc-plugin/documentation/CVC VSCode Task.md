@@ -2,104 +2,131 @@
 
 ## 1. Project Setup & Scaffolding
 
-- [ ] **Task 1.1: Extension Skeleton**
+- [x] **Task 1.1: Extension Skeleton**
     
-    - [ ] Initialize project with `yo code` (TypeScript + Webpack).
+    - [x] Initialize project with `yo code` (TypeScript + Webpack).
         
-    - [ ] Configure `esbuild` for minification.
+    - [x] Configure `esbuild` for minification.
         
-    - [ ] Set up debugging launch configuration for "Extension + Server".
+    - [x] Set up debugging launch configuration for "Extension + Server".
         
-- [ ] **Task 1.2: LSP Client Implementation**
+- [x] **Task 1.2: LSP Client Implementation**
     
-    - [ ] Install `vscode-languageclient`.
+    - [x] Install `vscode-languageclient`.
         
-    - [ ] Implement logic to locate/download the `cvc-lsp` binary.
+    - [x] Implement logic to locate/download the `cvc-lsp` binary.
         
-    - [ ] Implement `LanguageClient` activation logic.
+    - [x] Implement `LanguageClient` activation logic.
         
-    - [ ] **Deliverable:** Extension starts and successfully launches the Rust binary.
+    - [x] **Deliverable:** Extension starts and successfully launches the Rust binary.
         
 
 ## 2. Feature: Native Chat Participant (`@cvc`)
 
-- [ ] **Task 2.1: Participant Registration**
+- [x] **Task 2.1: Participant Registration**
     
-    - [ ] Register `cvc.chat` in `package.json`.
+    - [x] Register `cvc.chat` in `package.json`.
         
-    - [ ] Implement `vscode.chat.createChatParticipant`.
+    - [x] Implement `vscode.chat.createChatParticipant`.
         
-- [ ] **Task 2.2: Delegation Logic**
+- [x] **Task 2.2: Delegation Logic**
     
-    - [ ] Query `vscode.lm.selectChatModels` to find available models (Copilot/GPT-4).
+    - [x] Query `vscode.lm.selectChatModels` to find available models (Copilot/GPT-4).
         
-    - [ ] Implement the request forwarding loop (User Prompt -> LM -> Stream Response).
+    - [x] Implement the request forwarding loop (User Prompt -> LM -> Stream Response).
         
-- [ ] **Task 2.3: Telemetry Dispatch**
+- [x] **Task 2.3: Telemetry Dispatch**
     
-    - [ ] Construct `StartTurn` payload (User prompt, Active Editor context).
+    - [x] Construct `StartTurn` payload (User prompt, Active Editor context).
         
-    - [ ] Send `$/cvc/turn/start` via LSP.
+    - [x] Send `$/cvc/turn/start` via LSP.
         
-    - [ ] Accumulate LM response stream.
+    - [x] Accumulate LM response stream.
         
-    - [ ] Send `$/cvc/turn/end` via LSP upon completion.
+    - [x] Send `$/cvc/turn/end` via LSP upon completion.
         
 
 ## 3. Feature: Cognitive Timeline (Tree View)
 
-- [ ] **Task 3.1: Tree Data Provider**
+- [x] **Task 3.1: Tree Data Provider**
     
-    - [ ] Create `TimelineTreeProvider` implementing `vscode.TreeDataProvider`.
+    - [x] Create `TimelineTreeProvider` implementing `vscode.TreeDataProvider`.
         
-    - [ ] Define Tree Items: `PendingGroup`, `CommitGroup`, `InteractionItem`.
+    - [x] Define Tree Items: `PendingGroup`, `CommitGroup`, `InteractionItem`.
         
-    - [ ] Implement `getTreeItem` and `getChildren`.
+    - [x] Implement `getTreeItem` and `getChildren`.
         
-- [ ] **Task 3.2: Data Fetching (LSP Communication)**
+- [x] **Task 3.2: Data Fetching (LSP Communication)**
     
-    - [ ] Add `sendRequest("cvc/timeline/get")` wrapper to the Language Client.
+    - [x] Add `sendRequest("cvc/timeline/get")` wrapper to the Language Client.
         
-    - [ ] Implement `refresh()` method triggered by `cvc/timeline/refresh` notification from server.
+    - [x] Implement `refresh()` method triggered by `cvc/timeline/refresh` notification from server.
         
-    - [ ] Register command `cvc.refreshTimeline` for manual refresh.
+    - [x] Register command `cvc.refreshTimeline` for manual refresh.
         
-- [ ] **Task 3.3: UI Interaction**
+- [x] **Task 3.3: UI Interaction**
     
-    - [ ] Implement "Click" handler for Tree Items.
+    - [x] Implement "Click" handler for Tree Items.
         
-    - [ ] Logic: When clicked, execute command `cvc.openThoughtDetail` with the Interaction ID.
+    - [x] Logic: When clicked, execute command `cvc.openThoughtDetail` with the Interaction ID.
         
 
 ## 4. Feature: Thought Detail View (Webview)
 
-- [ ] **Task 4.1: Webview Panel Logic**
+- [x] **Task 4.1: Webview Panel Logic**
     
-    - [ ] Register command `cvc.openThoughtDetail`.
+    - [x] Register command `cvc.openThoughtDetail`.
         
-    - [ ] Create/Focus a Webview Panel in the editor area (column 2 usually).
+    - [x] Create/Focus a Webview Panel in the editor area (column 2 usually).
         
-    - [ ] Implement fetching full details for `InteractionId` from LSP (may need a new LSP method `cvc/interaction/get` or reuse existing).
+    - [x] Implement fetching full details for `InteractionId` from LSP (may need a new LSP method `cvc/interaction/get` or reuse existing).
         
-- [ ] **Task 4.2: React/HTML Content**
+- [x] **Task 4.2: React/HTML Content**
     
-    - [ ] Create a simple React or pure HTML template for the thought detail.
+    - [x] Create a simple React or pure HTML template for the thought detail.
         
-    - [ ] Use `@vscode/webview-ui-toolkit` for native buttons/colors.
+    - [x] Use `@vscode/webview-ui-toolkit` for native buttons/colors.
         
-    - [ ] Render Markdown content (Prompt/Response) using a sanitizer (e.g., `dompurify`).
+    - [x] Render Markdown content (Prompt/Response) using a sanitizer (e.g., `dompurify`).
         
 
 ## 5. Polish & Packaging
 
-- [ ] **Task 5.1: Icons & Assets**
+- [x] **Task 5.1: Icons & Assets**
     
-    - [ ] Create high-res icons for the Activity Bar and Tree Items.
+    - [x] Create high-res icons for the Activity Bar and Tree Items.
         
-    - [ ] Design the Extension Marketplace banner.
+    - [x] Design the Extension Marketplace banner.
         
-- [ ] **Task 5.2: Configuration**
+- [x] **Task 5.2: Configuration**
     
-    - [ ] Add settings: `cvc.lspPath` (custom binary path), `cvc.trace.server` (debug logging).
+    - [x] Add settings: `cvc.lspPath` (custom binary path), `cvc.trace.server` (debug logging).
         
-    - [ ] Add "Welcome" walk-through for first-time users.
+    - [x] Add "Welcome" walk-through for first-time users.
+
+---
+
+## Notes
+
+### Branding Update
+The extension has been rebranded from "CVC" to **Volute VC** as per the branding guidelines in `/branding_and_design/`. Key changes:
+
+- Extension name: `volute-vc`
+- Display name: `Volute VC`
+- Chat participant: `@volute`
+- Command prefix: `volute.*`
+- Settings prefix: `volute.*`
+
+### Brand Colors Applied
+The Volute VC brand colors have been applied to the webview:
+- **Git Orange** (`#F05032`) - Response section accent, errors
+- **Electric Teal** (`#64FFDA`) - Prompt section accent, buttons, links
+- **Cognitive Navy** (`#0A192F`) - Backgrounds
+- **Void Slate** (`#112240`) - Secondary backgrounds
+- **Text White** (`#E6F1FF`) - Primary text
+- **Text Muted** (`#8892B0`) - Secondary text
+
+### Assets Created
+- `resources/icon.svg` - Extension icon (colored, with background)
+- `resources/icon.png` - Extension icon for marketplace (128x128)
+- `resources/activitybar-icon.svg` - Monochrome icon for Activity Bar

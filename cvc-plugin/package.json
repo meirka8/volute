@@ -1,0 +1,184 @@
+{
+  "name": "volute-vc",
+  "displayName": "Volute VC",
+  "description": "Git, Augmented. Track the trajectory of intent alongside your code changes.",
+  "version": "0.1.0",
+  "publisher": "helixthought",
+  "license": "MIT",
+  "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/helixthought/volute-vc"
+  },
+  "homepage": "https://volutevc.com",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Other"
+  ],
+  "keywords": [
+    "cognitive",
+    "version control",
+    "ai",
+    "chat",
+    "copilot",
+    "git",
+    "context",
+    "thought",
+    "volute"
+  ],
+  "activationEvents": [
+    "workspaceContains:.git"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Volute VC",
+      "properties": {
+        "volute.lspPath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom path to the volute-lsp binary. Leave empty to use the bundled or auto-downloaded binary."
+        },
+        "volute.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the Volute language server."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "volute.refreshTimeline",
+        "title": "Refresh Timeline",
+        "category": "Volute",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "volute.openThoughtDetail",
+        "title": "Open Thought Detail",
+        "category": "Volute"
+      },
+      {
+        "command": "volute.restartServer",
+        "title": "Restart Language Server",
+        "category": "Volute"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "volute-explorer",
+          "title": "Volute VC",
+          "icon": "resources/activitybar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "volute-explorer": [
+        {
+          "id": "volute.timeline",
+          "name": "Cognitive Timeline",
+          "contextualTitle": "Volute Timeline"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "volute.refreshTimeline",
+          "when": "view == volute.timeline",
+          "group": "navigation"
+        }
+      ]
+    },
+    "chatParticipants": [
+      {
+        "id": "volute.chat",
+        "fullName": "Volute VC",
+        "name": "volute",
+        "description": "Chat with AI while automatically logging your thought process",
+        "isSticky": true
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "volute.welcome",
+        "title": "Get Started with Volute VC",
+        "description": "Learn how to track your cognitive process alongside your code",
+        "steps": [
+          {
+            "id": "volute.welcome.intro",
+            "title": "Welcome to Volute VC",
+            "description": "Volute VC augments Git by tracking the 'why' alongside the 'what'. Your AI conversations, reasoning, and context are preserved and linked to your commits.\n\n[Learn More](https://volutevc.com/docs)",
+            "media": {
+              "markdown": "# Git, Augmented\n\nVolute creates a **Shadow DAG** - a parallel history of reasoning that accompanies your code changes."
+            }
+          },
+          {
+            "id": "volute.welcome.chat",
+            "title": "Use the @volute Chat Participant",
+            "description": "Type `@volute` in the GitHub Copilot Chat to automatically log your AI conversations.\n\n[Open Chat](command:workbench.action.chat.open)",
+            "media": {
+              "markdown": "## The Native Delegate\n\nThe `@volute` participant intercepts your prompts, delegates to your existing LLM, and logs everything to the cognitive timeline."
+            }
+          },
+          {
+            "id": "volute.welcome.timeline",
+            "title": "View Your Cognitive Timeline",
+            "description": "Open the Volute panel in the Activity Bar to see your pending thoughts and historical context.\n\n[Open Timeline](command:volute.timeline.focus)",
+            "media": {
+              "markdown": "## Pending Thoughts\n\nSee your floating thoughts before committing. They'll be automatically linked to your next `git commit`."
+            }
+          },
+          {
+            "id": "volute.welcome.commit",
+            "title": "Commit Your Code",
+            "description": "When you run `git commit`, all pending thoughts are automatically linked to that commit. The 'why' is now permanently bound to the 'what'.",
+            "media": {
+              "markdown": "## Late Binding\n\nVolute uses an **Immediate Persistence, Late Binding** model. Thoughts are saved immediately, but linked to commits only when you commit."
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && node esbuild.js --production",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/uuid": "^9.0.0",
+    "@types/marked": "^5.0.0",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "@vscode/test-cli": "^0.0.10",
+    "@vscode/test-electron": "^2.4.0",
+    "esbuild": "^0.21.0",
+    "eslint": "^8.57.0",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@vscode/webview-ui-toolkit": "^1.4.0",
+    "marked": "^12.0.0",
+    "uuid": "^9.0.0",
+    "vscode-languageclient": "^9.0.1"
+  }
+}

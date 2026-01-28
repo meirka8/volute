@@ -4,7 +4,10 @@ mod protocol;
 mod state;
 
 use backend::Backend;
-use protocol::*;
+use protocol::{
+    InteractionDetail, InteractionGetParams, LinkCommitParams, SessionStartParams,
+    TimelineGetParams, TimelineGetResponse, TurnBatchParams, TurnEndParams, TurnStartParams,
+};
 use state::AppState;
 use std::sync::Arc;
 use tower_lsp::{LspService, Server};
@@ -30,7 +33,7 @@ async fn main() {
             let state = backend.state.clone();
             async move {
                 handlers::handle_session_start(&client, state, params).await;
-                Ok::<serde_json::Value, tower_lsp::jsonrpc::Error>(serde_json::Value::Null)
+                // Return () to indicate this is a notification, not a request
             }
         },
     )
@@ -41,7 +44,7 @@ async fn main() {
             let state = backend.state.clone();
             async move {
                 handlers::handle_turn_start(&client, state, params).await;
-                Ok::<serde_json::Value, tower_lsp::jsonrpc::Error>(serde_json::Value::Null)
+                // Return () to indicate this is a notification, not a request
             }
         },
     )
@@ -52,7 +55,17 @@ async fn main() {
             let state = backend.state.clone();
             async move {
                 handlers::handle_turn_end(&client, state, params).await;
-                Ok::<serde_json::Value, tower_lsp::jsonrpc::Error>(serde_json::Value::Null)
+                // Return () to indicate this is a notification, not a request
+            }
+        },
+    )
+    .custom_method(
+        "$/cvc/turn/batch",
+        |backend: &Backend, params: TurnBatchParams| {
+            let client = backend.client.clone();
+            let state = backend.state.clone();
+            async move {
+                handlers::handle_turn_batch(&client, state, params).await;
             }
         },
     )
@@ -63,7 +76,29 @@ async fn main() {
             let state = backend.state.clone();
             async move {
                 handlers::handle_link_commit(&client, state, params).await;
-                Ok::<serde_json::Value, tower_lsp::jsonrpc::Error>(serde_json::Value::Null)
+                // Return () to indicate this is a notification, not a request
+            }
+        },
+    )
+    .custom_method(
+        "cvc/timeline/get",
+        |backend: &Backend, params: TimelineGetParams| {
+            let client = backend.client.clone();
+            let state = backend.state.clone();
+            async move {
+                let response = handlers::handle_timeline_get(&client, state, params).await;
+                Ok::<TimelineGetResponse, tower_lsp::jsonrpc::Error>(response)
+            }
+        },
+    )
+    .custom_method(
+        "cvc/interaction/get",
+        |backend: &Backend, params: InteractionGetParams| {
+            let client = backend.client.clone();
+            let state = backend.state.clone();
+            async move {
+                let response = handlers::handle_interaction_get(&client, state, params).await;
+                Ok::<Option<InteractionDetail>, tower_lsp::jsonrpc::Error>(response)
             }
         },
     )

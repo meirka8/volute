@@ -15,6 +15,8 @@ pub enum DbError {
     Migration(String),
     #[error("Timestamp error: invalid timestamp {0}")]
     Timestamp(i64),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -25,6 +27,10 @@ pub struct CvcStore {
 
 impl CvcStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = Connection::open(path)?;
 
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -36,6 +42,20 @@ impl CvcStore {
     pub fn init(&self) -> Result<()> {
         self.conn
             .execute_batch(include_str!("../migrations/0001_initial_schema.sql"))?;
+
+        // Run additive migrations idempotently.
+        // ALTER TABLE will fail if column already exists, so we check first.
+        let has_source_request_id: bool = self
+            .conn
+            .prepare("PRAGMA table_info(interactions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|name| name.as_deref() == Ok("source_request_id"));
+
+        if !has_source_request_id {
+            self.conn
+                .execute_batch(include_str!("../migrations/0002_add_source_request_id.sql"))?;
+        }
+
         Ok(())
     }
 
@@ -84,9 +104,9 @@ impl CvcStore {
 
         self.conn.execute(
             "INSERT INTO interactions (
-                id, conversation_id, parent_id, timestamp, author, user_prompt, 
-                model_name, model_cot, model_response
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                id, conversation_id, parent_id, timestamp, author, user_prompt,
+                model_name, model_cot, model_response, source_request_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 inter.id.to_string(),
                 inter.conversation_id,
@@ -97,6 +117,7 @@ impl CvcStore {
                 inter.model_name,
                 inter.model_cot,
                 inter.model_response,
+                inter.source_request_id,
             ],
         )?;
         Ok(())
@@ -105,8 +126,8 @@ impl CvcStore {
     pub fn get_interaction(&self, id: &InteractionId) -> Result<Option<Interaction>> {
         self.conn
             .query_row(
-                "SELECT id, conversation_id, parent_id, timestamp, author, user_prompt, 
-                    model_name, model_cot, model_response 
+                "SELECT id, conversation_id, parent_id, timestamp, author, user_prompt,
+                    model_name, model_cot, model_response, source_request_id
              FROM interactions WHERE id = ?1",
                 params![id.as_str()],
                 |row| {
@@ -144,11 +165,42 @@ impl CvcStore {
                         model_name: row.get(6)?,
                         model_cot: row.get(7)?,
                         model_response: row.get(8)?,
+                        source_request_id: row.get(9)?,
                     })
                 },
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Delete all interactions (and their related context_items, tool_executions, artifact_links)
+    /// that were generated from a specific VS Code chat request.
+    pub fn delete_interactions_by_source_request_id(&self, source_request_id: &str) -> Result<()> {
+        // First collect the interaction IDs to cascade-delete related rows
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM interactions WHERE source_request_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![source_request_id], |row| row.get(0))?;
+            rows.collect::<std::result::Result<Vec<String>, _>>()?
+        };
+
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        for id in &ids {
+            self.conn.execute("DELETE FROM context_items WHERE interaction_id = ?1", params![id])?;
+            self.conn.execute("DELETE FROM tool_executions WHERE interaction_id = ?1", params![id])?;
+            self.conn.execute("DELETE FROM artifact_links WHERE interaction_id = ?1", params![id])?;
+        }
+
+        self.conn.execute(
+            "DELETE FROM interactions WHERE source_request_id = ?1",
+            params![source_request_id],
+        )?;
+
+        Ok(())
     }
 
     // --- Context Items ---
@@ -174,8 +226,8 @@ impl CvcStore {
     pub fn get_floating_interactions(&self) -> Result<Vec<Interaction>> {
         // Interactions that are NOT in artifact_links
         let mut stmt = self.conn.prepare(
-            "SELECT i.id, i.conversation_id, i.parent_id, i.timestamp, i.author, i.user_prompt, 
-                    i.model_name, i.model_cot, i.model_response
+            "SELECT i.id, i.conversation_id, i.parent_id, i.timestamp, i.author, i.user_prompt,
+                    i.model_name, i.model_cot, i.model_response, i.source_request_id
              FROM interactions i
              LEFT JOIN artifact_links al ON i.id = al.interaction_id
              WHERE al.interaction_id IS NULL",
@@ -216,6 +268,7 @@ impl CvcStore {
                 model_name: row.get(6)?,
                 model_cot: row.get(7)?,
                 model_response: row.get(8)?,
+                source_request_id: row.get(9)?,
             })
         })?;
 
@@ -366,5 +419,91 @@ impl CvcStore {
             items.push(item?);
         }
         Ok(items)
+    }
+
+    /// Get all unique commits that have linked interactions, along with their interactions
+    /// Returns a list of (commit_sha, Vec<Interaction>) pairs, ordered by the most recent interaction timestamp
+    pub fn get_commits_with_interactions(&self) -> Result<Vec<(CommitSha, Vec<Interaction>)>> {
+        // First get all unique commits ordered by most recent interaction
+        let mut commit_stmt = self.conn.prepare(
+            "SELECT DISTINCT al.git_commit_hash, MAX(i.timestamp) as max_ts
+             FROM artifact_links al
+             JOIN interactions i ON al.interaction_id = i.id
+             GROUP BY al.git_commit_hash
+             ORDER BY max_ts DESC",
+        )?;
+
+        let commits: Vec<CommitSha> = commit_stmt
+            .query_map([], |row| {
+                let sha: String = row.get(0)?;
+                Ok(CommitSha::new(sha))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Now for each commit, get the linked interactions
+        let mut result = Vec::new();
+        for commit_sha in commits {
+            let interactions = self.get_interactions_for_commit(&commit_sha)?;
+            result.push((commit_sha, interactions));
+        }
+
+        Ok(result)
+    }
+
+    /// Get all interactions linked to a specific commit
+    pub fn get_interactions_for_commit(&self, commit_sha: &CommitSha) -> Result<Vec<Interaction>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.id, i.conversation_id, i.parent_id, i.timestamp, i.author, i.user_prompt,
+                    i.model_name, i.model_cot, i.model_response, i.source_request_id
+             FROM interactions i
+             JOIN artifact_links al ON i.id = al.interaction_id
+             WHERE al.git_commit_hash = ?1
+             ORDER BY i.timestamp DESC",
+        )?;
+
+        let rows = stmt.query_map(params![commit_sha.as_str()], |row| {
+            let parent_id_str: Option<String> = row.get(2)?;
+            let timestamp: i64 = row.get(3)?;
+            let author_str: String = row.get(4)?;
+            let author = match author_str.as_str() {
+                "human" => Author::Human,
+                "agent" => Author::Agent,
+                "system" => Author::System,
+                _ => Author::External,
+            };
+
+            let dt = Utc.timestamp_opt(timestamp, 0).single().ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Integer,
+                    Box::new(DbError::Timestamp(timestamp)),
+                )
+            })?;
+
+            Ok(Interaction {
+                id: row.get::<_, String>(0)?.parse().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                conversation_id: row.get(1)?,
+                parent_id: parent_id_str.map(|s| s.parse().unwrap_or_default()),
+                timestamp: dt,
+                author,
+                user_prompt: row.get(5)?,
+                model_name: row.get(6)?,
+                model_cot: row.get(7)?,
+                model_response: row.get(8)?,
+                source_request_id: row.get(9)?,
+            })
+        })?;
+
+        let mut interactions = Vec::new();
+        for interaction in rows {
+            interactions.push(interaction?);
+        }
+        Ok(interactions)
     }
 }

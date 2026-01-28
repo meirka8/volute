@@ -1,0 +1,15 @@
+<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+  <!-- Volute VC Activity Bar Icon (Monochrome) -->
+  <!-- Simplified scroll/volute shape for small sizes -->
+
+  <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Main scroll body -->
+    <path d="M7,4 L17,4 L17,16 C17,19 14,21 10,21 C6,21 3,19 3,15 L3,7 C3,5 5,4 7,4 Z"/>
+
+    <!-- Inner spiral curl -->
+    <path d="M17,16 C17,18 15,19 12,19 C9,19 8,18 8,16 C8,14.5 9.5,14 11,14"/>
+
+    <!-- Top highlight line -->
+    <line x1="7" y1="4" x2="17" y2="4"/>
+  </g>
+</svg>

@@ -1,0 +1,45 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "npm",
+      "script": "watch",
+      "problemMatcher": "$tsc-watch",
+      "isBackground": true,
+      "presentation": {
+        "reveal": "never"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "label": "npm: watch"
+    },
+    {
+      "type": "npm",
+      "script": "compile",
+      "problemMatcher": "$tsc",
+      "presentation": {
+        "reveal": "silent"
+      },
+      "group": "build",
+      "label": "npm: compile"
+    },
+    {
+      "label": "Build LSP Server",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build", "--package", "cvc-lsp"],
+      "options": {
+        "cwd": "${workspaceFolder}/.."
+      },
+      "problemMatcher": "$rustc",
+      "group": "build"
+    },
+    {
+      "label": "Build All (Extension + Server)",
+      "dependsOn": ["npm: compile", "Build LSP Server"],
+      "group": "build"
+    }
+  ]
+}
