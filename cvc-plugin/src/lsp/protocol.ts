@@ -175,7 +175,7 @@ export interface InteractionDetail {
   /** Model name used */
   modelName?: string;
   /** Chain of thought / reasoning */
-  modelCot?: string;
+  chainOfThought?: string;
   /** Model's response */
   modelResponse?: string;
   /** Context files attached to this interaction */
