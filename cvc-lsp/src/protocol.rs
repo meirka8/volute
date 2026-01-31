@@ -87,6 +87,10 @@ pub struct InteractionSummary {
     pub prompt_preview: String,
     pub timestamp: i64,
     pub author: String,
+    /// Flags indicating which content types are present
+    pub has_prompt: bool,
+    pub has_cot: bool,
+    pub has_response: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

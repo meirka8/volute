@@ -417,12 +417,34 @@ fn interaction_to_summary(interaction: Interaction) -> InteractionSummary {
         interaction.user_prompt.clone()
     };
 
+    // Check which content types have meaningful content
+    let has_prompt = has_meaningful_content(&interaction.user_prompt);
+    let has_cot = interaction
+        .model_cot
+        .as_ref()
+        .map(|s| has_meaningful_content(s))
+        .unwrap_or(false);
+    let has_response = interaction
+        .model_response
+        .as_ref()
+        .map(|s| has_meaningful_content(s))
+        .unwrap_or(false);
+
     InteractionSummary {
         id: interaction.id.to_string(),
         prompt_preview,
         timestamp: interaction.timestamp.timestamp(),
         author: author_str.to_string(),
+        has_prompt,
+        has_cot,
+        has_response,
     }
+}
+
+/// Check if text has meaningful content (not just whitespace, quotes, etc.)
+fn has_meaningful_content(text: &str) -> bool {
+    text.chars()
+        .any(|c| !c.is_whitespace() && c != '"' && c != '\'' && c != '`')
 }
 
 /// Get commit message and timestamp from git
