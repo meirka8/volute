@@ -82,6 +82,13 @@ export function TimelineNode({
           : 'border-[#262626] hover:border-[#555555] hover:bg-[#111111]'
       )}
       onClick={onSelect}
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onSelect?.();
+        }
+      }}
     >
       {/* Header: Author + Timestamp */}
       <div className="flex items-center gap-2 mb-2">
@@ -159,9 +166,9 @@ export function TimelineNode({
       {/* Artifact Links */}
       {interaction.artifact_links && interaction.artifact_links.length > 0 && (
         <div className="mt-3 flex flex-wrap gap-1.5">
-          {interaction.artifact_links.map((link, idx) => (
+          {interaction.artifact_links.map((link) => (
             <span
-              key={idx}
+              key={`${link.git_commit_hash}-${link.link_type}`}
               className="inline-flex items-center gap-1 px-2 py-0.5 bg-[#1c1c1c] rounded text-xs text-[#888888]"
             >
               <GitCommit size={10} />

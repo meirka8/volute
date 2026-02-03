@@ -5,7 +5,6 @@ interface KeyboardNavigationOptions {
   onPrevious: () => void;      // k key
   onExpand: () => void;        // x key
   onMarkViewed: () => void;    // Space key
-  onOpenPalette: () => void;   // Cmd+K (handled separately but included for reference)
   enabled?: boolean;
 }
 

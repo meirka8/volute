@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useEffect } from "react";
 import { useParams } from "wouter";
 import { useQuery } from "@tanstack/react-query";
 import { Eye, LogOut, GitPullRequest, ExternalLink } from "lucide-react";
@@ -99,11 +99,11 @@ export function PRReviewPage() {
   const { getNextFile, getPreviousFile } = useFileNavigation(fileNames);
 
   // Auto-select first file
-  useMemo(() => {
-    if (!selectedFile && files.length > 0) {
-      setSelectedFile(files[0].filename);
+  useEffect(() => {
+    if (files.length > 0) {
+      setSelectedFile((curr) => curr || files[0].filename);
     }
-  }, [files, selectedFile]);
+  }, [files]);
 
   // Handlers
   const handleSelectFile = useCallback((filename: string) => {
@@ -158,7 +158,6 @@ export function PRReviewPage() {
     onPrevious: handlePreviousFile,
     onExpand: handleExpandReasoning,
     onMarkViewed: handleMarkViewed,
-    onOpenPalette: () => {}, // Handled by useCommandPalette
     enabled: !isPaletteOpen,
   });
 

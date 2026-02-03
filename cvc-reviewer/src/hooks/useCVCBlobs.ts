@@ -56,13 +56,17 @@ export function useCVCBlobs(owner: string, repo: string) {
 
         // 3. Fetch all blobs in parallel and normalize them
         // In a real app with thousands of nodes, we would paginate or lazy load.
-        // For this phase, we fetch all.
-        const blobDataList = await Promise.all(
-          blobs.map((blob) => {
-            // The blob.url from getTree is the API url for the blob
-            return fetchBlobJson<CVCBlobData>(blob.url!, token);
-          }),
-        );
+        // For this phase, we fetch all but with concurrency limit.
+        const BATCH_SIZE = 10;
+        const blobDataList: CVCBlobData[] = [];
+
+        for (let i = 0; i < blobs.length; i += BATCH_SIZE) {
+          const batch = blobs.slice(i, i + BATCH_SIZE);
+          const results = await Promise.all(
+            batch.map((blob) => fetchBlobJson<CVCBlobData>(blob.url!, token))
+          );
+          blobDataList.push(...results);
+        }
 
         // 4. Normalize to InteractionNode format
         return blobDataList.map(normalizeInteraction);
