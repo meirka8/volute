@@ -245,18 +245,32 @@ export class ThoughtDetailPanel {
   }
 
   /**
+   * Check if content is meaningful (not just whitespace, newlines, quotes, or special chars).
+   * Returns true if the content has actual text worth displaying.
+   */
+  private hasContent(text: string | undefined | null): boolean {
+    if (!text) {
+      return false;
+    }
+    // Strip whitespace, newlines, quotes, and common "empty" characters
+    const cleaned = text.replace(/[\s\n\r\t"'`]/g, "");
+    return cleaned.length > 0;
+  }
+
+  /**
    * Generate the main detail HTML
    */
   private getDetailHtml(detail: InteractionDetail): string {
-    const promptHtml = this.renderMarkdown(detail.userPrompt);
-    const responseHtml = detail.modelResponse
-      ? this.renderMarkdown(detail.modelResponse)
-      : "<em>No response recorded</em>";
-    const cotHtml = detail.modelCot
-      ? this.renderMarkdown(detail.modelCot)
-      : null;
+    // Only prepare HTML for sections with actual content
+    const hasPrompt = this.hasContent(detail.userPrompt);
+    const hasResponse = this.hasContent(detail.modelResponse);
+    const hasThought = this.hasContent(detail.chainOfThought);
 
-    const timestamp = new Date(detail.timestamp).toLocaleString();
+    const promptHtml = hasPrompt ? this.renderMarkdown(detail.userPrompt) : null;
+    const responseHtml = hasResponse ? this.renderMarkdown(detail.modelResponse!) : null;
+    const thoughtHtml = hasThought ? this.renderMarkdown(detail.chainOfThought!) : null;
+
+    const timestamp = new Date(detail.timestamp * 1000).toLocaleString();
     const authorIcon = detail.author === "human" ? "&#128100;" : "&#129302;";
     const authorLabel =
       detail.author.charAt(0).toUpperCase() + detail.author.slice(1);
@@ -608,6 +622,9 @@ export class ThoughtDetailPanel {
             </div>
         </div>
 
+        ${
+          hasPrompt
+            ? `
         <div class="section">
             <div class="section-title">
                 <span>&#128172;</span> Prompt
@@ -616,6 +633,9 @@ export class ThoughtDetailPanel {
                 ${promptHtml}
             </div>
         </div>
+        `
+            : ""
+        }
 
         ${
           detail.contextFiles && detail.contextFiles.length > 0
@@ -641,6 +661,9 @@ export class ThoughtDetailPanel {
             : ""
         }
 
+        ${
+          hasResponse
+            ? `
         <div class="section">
             <div class="section-title">
                 <span>&#129302;</span> Response
@@ -649,16 +672,19 @@ export class ThoughtDetailPanel {
                 ${responseHtml}
             </div>
         </div>
+        `
+            : ""
+        }
 
         ${
-          cotHtml
+          hasThought
             ? `
         <div class="section">
             <div class="section-title collapsible" onclick="toggleCollapse(this)">
                 <span>&#129504;</span> Chain of Thought
             </div>
             <div class="section-content cot collapsible-content">
-                ${cotHtml}
+                ${thoughtHtml}
             </div>
         </div>
         `

@@ -158,6 +158,9 @@ export class TimelineTreeProvider implements vscode.TreeDataProvider<TimelineTre
         timestamp: thought.timestamp,
         author: thought.author,
         parentType: "pending",
+        hasPrompt: thought.hasPrompt,
+        hasCot: thought.hasCot,
+        hasResponse: thought.hasResponse,
       };
       return new TimelineTreeItem(
         data,
@@ -185,6 +188,9 @@ export class TimelineTreeProvider implements vscode.TreeDataProvider<TimelineTre
         author: thought.author,
         parentType: "commit",
         parentId: commitSha,
+        hasPrompt: thought.hasPrompt,
+        hasCot: thought.hasCot,
+        hasResponse: thought.hasResponse,
       };
       return new TimelineTreeItem(
         data,

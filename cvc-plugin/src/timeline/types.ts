@@ -44,6 +44,10 @@ export interface InteractionItemData extends TimelineItemData {
   author: string;
   parentType: "pending" | "commit";
   parentId?: string; // commit SHA if parent is commit
+  /** Content type flags - indicates what will be shown in detail view */
+  hasPrompt: boolean;
+  hasCot: boolean;
+  hasResponse: boolean;
 }
 
 /**
@@ -111,11 +115,20 @@ export class TimelineTreeItem extends vscode.TreeItem {
             ? new vscode.ThemeColor("charts.yellow")
             : new vscode.ThemeColor("charts.blue");
         this.iconPath = new vscode.ThemeIcon(iconId, iconColor);
-        this.description = this.formatTimestamp(this.data.timestamp);
+
+        // Build content type indicators (matching the full view icons)
+        const contentIcons = this.getContentTypeIcons(
+          this.data.hasPrompt,
+          this.data.hasCot,
+          this.data.hasResponse,
+        );
+        this.description = `${contentIcons} ${this.formatTimestamp(this.data.timestamp)}`;
+
         this.tooltip = new vscode.MarkdownString(
           `**${this.capitalizeFirst(this.data.author)}**\n\n` +
             `${this.escapeMarkdown(this.data.promptPreview)}\n\n` +
-            `_${new Date(this.data.timestamp).toLocaleString()}_`,
+            `Contains: ${this.getContentTypeLabels(this.data.hasPrompt, this.data.hasCot, this.data.hasResponse)}\n\n` +
+            `_${new Date(this.data.timestamp * 1000).toLocaleString()}_`,
         );
         // Make interaction items clickable
         this.command = {
@@ -148,9 +161,10 @@ export class TimelineTreeItem extends vscode.TreeItem {
 
   /**
    * Format timestamp as relative time
+   * Note: timestamp is Unix seconds, needs conversion to JS milliseconds
    */
   private formatTimestamp(timestamp: number): string {
-    const date = new Date(timestamp);
+    const date = new Date(timestamp * 1000);
     const now = new Date();
     const diffMs = now.getTime() - date.getTime();
     const diffMins = Math.floor(diffMs / 60000);
@@ -175,6 +189,37 @@ export class TimelineTreeItem extends vscode.TreeItem {
    */
   private escapeMarkdown(text: string): string {
     return text.replace(/[*_`[\]]/g, "\\$&");
+  }
+
+  /**
+   * Get content type icons matching the full detail view
+   * Icons: 💬 Prompt, 🧠 CoT, 🤖 Response
+   */
+  private getContentTypeIcons(
+    hasPrompt: boolean,
+    hasCot: boolean,
+    hasResponse: boolean,
+  ): string {
+    const icons: string[] = [];
+    if (hasPrompt) icons.push("💬");
+    if (hasCot) icons.push("🧠");
+    if (hasResponse) icons.push("🤖");
+    return icons.join("");
+  }
+
+  /**
+   * Get content type labels for tooltip
+   */
+  private getContentTypeLabels(
+    hasPrompt: boolean,
+    hasCot: boolean,
+    hasResponse: boolean,
+  ): string {
+    const labels: string[] = [];
+    if (hasPrompt) labels.push("Prompt");
+    if (hasCot) labels.push("Chain of Thought");
+    if (hasResponse) labels.push("Response");
+    return labels.length > 0 ? labels.join(", ") : "Empty";
   }
 
   /**

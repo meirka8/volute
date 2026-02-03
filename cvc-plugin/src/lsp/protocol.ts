@@ -50,7 +50,7 @@ export interface TurnEndParams {
   /** Model name/identifier */
   model?: string;
   /** Raw response parts for robust parsing on server */
-  rawResponse?: any[];
+  rawResponse?: unknown[];
 }
 
 /**
@@ -131,6 +131,10 @@ export interface InteractionSummary {
   timestamp: number;
   /** Author type */
   author: Author;
+  /** Flags indicating which content types are present */
+  hasPrompt: boolean;
+  hasCot: boolean;
+  hasResponse: boolean;
 }
 
 /**
@@ -175,7 +179,7 @@ export interface InteractionDetail {
   /** Model name used */
   modelName?: string;
   /** Chain of thought / reasoning */
-  modelCot?: string;
+  chainOfThought?: string;
   /** Model's response */
   modelResponse?: string;
   /** Context files attached to this interaction */
