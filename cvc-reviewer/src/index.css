@@ -87,10 +87,36 @@ body,
     color: var(--cvc-text-primary);
 }
 
-/* react-diff-view base styles */
+/* react-diff-view theme overrides via CSS custom properties */
+:root {
+    --diff-background-color: var(--cvc-bg-primary);
+    --diff-text-color: var(--cvc-text-primary);
+    --diff-font-family:
+        "SF Mono", "Fira Code", "JetBrains Mono", Consolas, monospace;
+    --diff-selection-background-color: var(--cvc-accent-ai-dim);
+    --diff-selection-text-color: var(--cvc-text-primary);
+    --diff-gutter-insert-background-color: rgba(39, 163, 0, 0.25);
+    --diff-gutter-insert-text-color: var(--cvc-accent-success);
+    --diff-gutter-delete-background-color: rgba(239, 68, 68, 0.25);
+    --diff-gutter-delete-text-color: var(--cvc-accent-error);
+    --diff-gutter-selected-background-color: var(--cvc-border-subtle);
+    --diff-gutter-selected-text-color: var(--cvc-text-primary);
+    --diff-code-insert-background-color: rgba(39, 163, 0, 0.15);
+    --diff-code-insert-text-color: var(--cvc-text-primary);
+    --diff-code-delete-background-color: rgba(239, 68, 68, 0.15);
+    --diff-code-delete-text-color: var(--cvc-text-primary);
+    --diff-code-insert-edit-background-color: rgba(39, 163, 0, 0.35);
+    --diff-code-insert-edit-text-color: var(--cvc-text-primary);
+    --diff-code-delete-edit-background-color: rgba(239, 68, 68, 0.35);
+    --diff-code-delete-edit-text-color: var(--cvc-text-primary);
+    --diff-code-selected-background-color: var(--cvc-border-subtle);
+    --diff-code-selected-text-color: var(--cvc-text-primary);
+    --diff-omit-gutter-line-color: var(--cvc-accent-error);
+}
+
+/* react-diff-view additional overrides */
 .diff-unified,
 .diff-split {
-    font-family: "SF Mono", "Fira Code", "JetBrains Mono", Consolas, monospace;
     font-size: 13px;
     line-height: 1.5;
 }
@@ -99,8 +125,6 @@ body,
     background: var(--cvc-bg-secondary);
     color: var(--cvc-text-muted);
     padding: 0 8px;
-    user-select: none;
-    cursor: pointer;
 }
 
 .diff-gutter:hover {
@@ -109,23 +133,4 @@ body,
 
 .diff-code {
     padding: 0 16px;
-    white-space: pre;
-}
-
-.diff-code-insert {
-    background: rgba(39, 163, 0, 0.15);
-}
-
-.diff-code-delete {
-    background: rgba(239, 68, 68, 0.15);
-}
-
-.diff-gutter-insert {
-    background: rgba(39, 163, 0, 0.25);
-    color: var(--cvc-accent-success);
-}
-
-.diff-gutter-delete {
-    background: rgba(239, 68, 68, 0.25);
-    color: var(--cvc-accent-error);
 }
