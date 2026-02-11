@@ -1,18 +1,40 @@
 use cvc_core::vscode::ChatSession;
-use std::fs;
-use std::path::PathBuf;
 
 #[test]
 fn test_parse_vscode_session() {
-    // Navigate up from cvc-core/tests/ to project root, then to common_data
-    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    d.pop(); // cvc-core
-    d.push("common_data/chatSessions/47083254-cdd2-4c61-be6c-5e3a7fd17d33.json");
+    let json_content = r#"{
+      "version": 1,
+      "requests": [
+        {
+          "requestId": "req-1",
+          "message": {
+            "text": "Implement todo list"
+          },
+          "response": [
+            {
+              "kind": "text",
+              "value": "I'll help you implement a todo list."
+            },
+            {
+              "kind": "toolInvocationSerialized",
+              "toolName": "read_file",
+              "pastTenseMessage": {
+                  "value": "Read [](file:///path/to/file)"
+              }
+            },
+            {
+              "kind": "text",
+              "value": "Created 3 todos for you."
+            }
+          ]
+        }
+      ]
+    }"#;
 
-    println!("Reading file from: {:?}", d);
-    let content = fs::read_to_string(&d).expect("Failed to read test file");
+    println!("Using embedded test fixture");
+    let content = json_content;
 
-    let session = ChatSession::parse(&content).expect("Failed to parse session");
+    let session = ChatSession::parse(content).expect("Failed to parse session");
 
     assert!(!session.requests.is_empty());
 
@@ -23,7 +45,7 @@ fn test_parse_vscode_session() {
     println!("{}", full_response);
     println!("--------------------------------------------");
 
-    // Verification against known content in 470.md
+    // Verification against embedded content
     assert!(
         full_response.contains("I'll help you implement"),
         "Missing introduction text"

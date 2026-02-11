@@ -52,13 +52,21 @@ pub fn push_to_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<(
 
     // 2. Load TreeBuilder from current ref
     let mut tree_builder = repo.treebuilder(None)?;
+    let mut parent_commit = None;
 
-    // Check if ref exists and points to a tree
+    // Check if ref exists and points to a tree or commit
     if let Ok(reference) = repo.find_reference(ref_name) {
-        if let Ok(obj) = reference.peel(ObjectType::Tree) {
+        // Try peeling to commit first (normal case after migration)
+        if let Ok(commit) = reference.peel_to_commit() {
+            let tree = commit.tree()?;
+            tree_builder = repo.treebuilder(Some(&tree))?;
+            parent_commit = Some(commit);
+        } else if let Ok(obj) = reference.peel(ObjectType::Tree) {
+            // Legacy case: ref points directly to tree
             if let Some(tree) = obj.as_tree() {
                 tree_builder = repo.treebuilder(Some(tree))?;
             }
+            // No parent commit in this case, we start a fresh history or valid parent is missing
         }
     }
 
@@ -97,8 +105,36 @@ pub fn push_to_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<(
     // 4. Write Tree
     let new_tree_oid = tree_builder.write()?;
 
-    // 5. Update Ref
-    repo.reference(ref_name, new_tree_oid, true, "cvc sync")?;
+    // Optimization: Skip commit if tree hasn't changed
+    if let Some(parent) = &parent_commit {
+        if parent.tree_id() == new_tree_oid {
+            return Ok(());
+        }
+    }
+
+    let new_tree = repo.find_tree(new_tree_oid)?;
+
+    // 5. Create Commit
+    // Try getting user signature, fallback to default if config missing, but propagate errors if critical
+    let sig = match repo.signature() {
+        Ok(s) => s,
+        Err(_) => git2::Signature::now("cvc", "cvc@local")?,
+    };
+
+    let parents = if let Some(ref p) = parent_commit {
+        vec![p]
+    } else {
+        vec![]
+    };
+
+    let _commit_oid = repo.commit(
+        Some(ref_name),
+        &sig,
+        &sig,
+        "Sync interactions",
+        &new_tree,
+        &parents,
+    )?;
 
     Ok(())
 }
