@@ -29,8 +29,8 @@ pub struct SyncNode {
 }
 
 pub fn validate_ref_name(ref_name: &str) -> bool {
-    // Simple validation: must start with refs/cvc/ and not contain dangerous characters
-    if !ref_name.starts_with("refs/cvc/") {
+    // Simple validation: must start with refs/cvc/ OR refs/remotes/ (for pulling)
+    if !ref_name.starts_with("refs/cvc/") && !ref_name.starts_with("refs/remotes/") {
         return false;
     }
     // Check for ".." to prevent traversal if file system backend is somehow involved (though git refs are usually safe)

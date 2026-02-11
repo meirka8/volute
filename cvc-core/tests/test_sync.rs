@@ -214,3 +214,146 @@ fn test_sync_idempotency() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_sync_divergence_recovery() -> anyhow::Result<()> {
+    // 1. Setup Remote Repo (Bare)
+    let temp_dir = TempDir::new()?;
+    let remote_path = temp_dir.path().join("remote");
+    let _remote_repo = Repository::init_bare(&remote_path)?;
+
+    // 2. Setup Local Repo A (User A)
+    let local_a_path = temp_dir.path().join("local_a");
+    let repo_a = Repository::clone(remote_path.to_str().unwrap(), &local_a_path)?;
+
+    // Config signature
+    let mut config_a = repo_a.config()?;
+    config_a.set_str("user.name", "User A")?;
+    config_a.set_str("user.email", "a@example.com")?;
+
+    let db_path_a = local_a_path.join(".git/cvc/index.db");
+    let store_a = CvcStore::open(&db_path_a)?;
+    store_a.init()?;
+
+    // Create conversation for A
+    let conv_a = Conversation {
+        id: "conv-1".to_string(),
+        title: "Conv A".to_string(),
+        created_at: Utc::now(),
+    };
+    store_a.create_conversation(&conv_a)?;
+
+    // 3. Setup Local Repo B (User B)
+    let local_b_path = temp_dir.path().join("local_b");
+    let repo_b = Repository::clone(remote_path.to_str().unwrap(), &local_b_path)?;
+
+    // Config signature
+    let mut config_b = repo_b.config()?;
+    config_b.set_str("user.name", "User B")?;
+    config_b.set_str("user.email", "b@example.com")?;
+
+    let db_path_b = local_b_path.join(".git/cvc/index.db");
+    let store_b = CvcStore::open(&db_path_b)?;
+    store_b.init()?;
+
+    // Create conversation for B
+    let conv_b = Conversation {
+        id: "conv-2".to_string(),
+        title: "Conv B".to_string(),
+        created_at: Utc::now(),
+    };
+    store_b.create_conversation(&conv_b)?;
+
+    // 4. User A creates thought and pushes
+    let inter_a = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "conv-1".to_string(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "Thought A".to_string(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store_a.create_interaction(&inter_a)?;
+
+    let ref_name = "refs/cvc/main";
+    sync::push_to_ref(&repo_a, &store_a, ref_name)?;
+
+    // Push ref to remote
+    let mut remote_callbacks = git2::RemoteCallbacks::new();
+    remote_callbacks.credentials(|_, _, _| git2::Cred::default());
+    let mut push_opts = git2::PushOptions::new();
+    push_opts.remote_callbacks(remote_callbacks);
+
+    let mut origin_a = repo_a.find_remote("origin")?;
+    origin_a.push(
+        &[format!("{}:{}", ref_name, ref_name)],
+        Some(&mut push_opts),
+    )?;
+
+    // 5. User B creates thought (Divergence!)
+    let inter_b = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "conv-2".to_string(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "Thought B".to_string(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store_b.create_interaction(&inter_b)?;
+
+    // B pushes locally
+    sync::push_to_ref(&repo_b, &store_b, ref_name)?;
+
+    // 6. User B tries to push and fails (Simulation)
+
+    // 7. Recovery Logic (Simulating what cvc pull will do)
+    let mut origin_b = repo_b.find_remote("origin")?;
+    let remote_tracking_ref = "refs/remotes/origin/cvc/main";
+
+    // Fetch specifically the cvc ref
+    origin_b.fetch(
+        &[format!("{}:{}", ref_name, remote_tracking_ref)],
+        None,
+        None,
+    )?;
+
+    // Pull/Ingest from remote ref
+    sync::pull_from_ref(&repo_b, &store_b, remote_tracking_ref)?;
+
+    // Verify we have A's thought
+    assert!(store_b.get_interaction(&inter_a.id)?.is_some());
+
+    // Reset local ref to remote ref (The Fix)
+    let remote_ref = repo_b.find_reference(remote_tracking_ref)?;
+    let remote_oid = remote_ref.target().unwrap();
+    repo_b.reference(ref_name, remote_oid, true, "Reset to remote")?;
+
+    // Push local again (Should now be a merge/union on top of A)
+    sync::push_to_ref(&repo_b, &store_b, ref_name)?;
+
+    // Push to remote (Should succeed)
+    origin_b.push(
+        &[format!("{}:{}", ref_name, ref_name)],
+        Some(&mut push_opts),
+    )?;
+
+    // 8. Verify Remote has both via A
+    origin_a.fetch(
+        &[format!("{}:{}", ref_name, remote_tracking_ref)],
+        None,
+        None,
+    )?;
+    sync::pull_from_ref(&repo_a, &store_a, remote_tracking_ref)?;
+
+    assert!(store_a.get_interaction(&inter_b.id)?.is_some());
+
+    Ok(())
+}
