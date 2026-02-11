@@ -58,9 +58,8 @@ pub fn push_to_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<(
     if let Ok(reference) = repo.find_reference(ref_name) {
         // Try peeling to commit first (normal case after migration)
         if let Ok(commit) = reference.peel_to_commit() {
-            if let Ok(tree) = commit.tree() {
-                tree_builder = repo.treebuilder(Some(&tree))?;
-            }
+            let tree = commit.tree()?;
+            tree_builder = repo.treebuilder(Some(&tree))?;
             parent_commit = Some(commit);
         } else if let Ok(obj) = reference.peel(ObjectType::Tree) {
             // Legacy case: ref points directly to tree
@@ -105,12 +104,22 @@ pub fn push_to_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<(
 
     // 4. Write Tree
     let new_tree_oid = tree_builder.write()?;
+
+    // Optimization: Skip commit if tree hasn't changed
+    if let Some(parent) = &parent_commit {
+        if parent.tree_id() == new_tree_oid {
+            return Ok(());
+        }
+    }
+
     let new_tree = repo.find_tree(new_tree_oid)?;
 
     // 5. Create Commit
-    let sig = repo
-        .signature()
-        .unwrap_or_else(|_| git2::Signature::now("cvc", "cvc@local").unwrap());
+    // Try getting user signature, fallback to default if config missing, but propagate errors if critical
+    let sig = match repo.signature() {
+        Ok(s) => s,
+        Err(_) => git2::Signature::now("cvc", "cvc@local")?,
+    };
 
     let parents = if let Some(ref p) = parent_commit {
         vec![p]
