@@ -61,33 +61,36 @@ pub async fn pull() -> Result<()> {
     // We use a custom fetch refspec to map refs/cvc/main -> refs/remotes/<origin>/cvc/main
     let refspec = format!("{}:{}", ref_name, remote_tracking_ref);
 
-    let mut callbacks = git2::RemoteCallbacks::new();
-    callbacks.credentials(|_url, username_from_url, _allowed_types| {
-        git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
-    });
+    // Try using git CLI first (better auth support)
+    println!("Fetching with git CLI...");
+    let status = std::process::Command::new("git")
+        .arg("fetch")
+        .arg(remote_name)
+        .arg(&refspec)
+        .status();
 
-    let mut fetch_opts = git2::FetchOptions::new();
-    fetch_opts.remote_callbacks(callbacks);
+    // If git CLI works, great. If not, fallback to libgit2.
+    let git_cli_success = match status {
+        Ok(s) => s.success(),
+        Err(_) => false,
+    };
 
-    // Note: Fetch might fail if network is down or credentials are wrong.
-    // We should try to handle standard credentials.
-    // For CLI tools, using the git binary might be more robust for auth, but we try libgit2 first.
-    // If libgit2 fails due to auth, we might fall back or just error out.
-    // For now, let's try standard ssh agent.
+    if !git_cli_success {
+        println!("Git CLI fetch failed/missing. Falling back to internal libgit2...");
 
-    // Actually, credential handling in libgit2 is tricky.
-    // A simpler approach for the User might be running the git command if they have complex auth (MFA, helpers).
-    // However, the requirement was to use libgit2.
-    // Let's try with default credentials (agent).
+        let mut callbacks = git2::RemoteCallbacks::new();
+        callbacks.credentials(|_url, username_from_url, _allowed_types| {
+            git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
+        });
 
-    match remote.fetch(&[&refspec], Some(&mut fetch_opts), None) {
-        Ok(_) => {}
-        Err(e) => {
-            println!(
-                "Warning: specific fetch failed: {}. Trying generic fetch...",
-                e
-            );
-            // Fallback: maybe the ref doesn't exist on remote yet?
+        let mut fetch_opts = git2::FetchOptions::new();
+        fetch_opts.remote_callbacks(callbacks);
+
+        match remote.fetch(&[&refspec], Some(&mut fetch_opts), None) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("Warning: internal fetch failed: {}", e);
+            }
         }
     }
 

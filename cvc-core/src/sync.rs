@@ -163,6 +163,8 @@ pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result
         .map(|id| id.as_str().to_string())
         .collect();
 
+    let mut nodes_to_insert = Vec::new();
+
     for entry in tree.iter() {
         let name = entry.name().unwrap_or_default();
         if !name.ends_with(".json") {
@@ -182,13 +184,46 @@ pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result
         let content = std::str::from_utf8(blob.content())
             .map_err(|e| SyncError::Serde(serde_json::Error::custom(e.to_string())))?;
 
-        // 4. Provide SyncNode
+        // 4. Parse SyncNode
         let node: SyncNode = serde_json::from_str(content)?;
+        nodes_to_insert.push(node);
+    }
 
-        // 5. Insert into DB
+    // 5. Robust Topological Sort (DFS)
+    // We need to ensure that if B depends on A (B.parent_id = A.id), A is inserted first.
+
+    use std::collections::HashMap;
+    let mut node_map: HashMap<String, SyncNode> = HashMap::new();
+    for node in nodes_to_insert {
+        node_map.insert(node.interaction.id.to_string(), node);
+    }
+
+    let mut sorted_nodes = Vec::new();
+    let mut visited = HashSet::new();
+    let mut visiting = HashSet::new(); // Detect cycles if any (shouldn't exist)
+
+    // We need a recursive helper, but Rust closures with recursion are tricky.
+    // Iterative logic or defined function is better.
+    // Or we can just use a stack for iterative DFS.
+
+    // keys() gives us random order.
+    let keys: Vec<String> = node_map.keys().cloned().collect();
+
+    for id in keys {
+        topo_visit(
+            &id,
+            &mut node_map,
+            &mut sorted_nodes,
+            &mut visited,
+            &mut visiting,
+        )?;
+    }
+
+    // 6. Insert into DB
+    for node in sorted_nodes {
         let conv_id = &node.interaction.conversation_id;
+        // ... (rest of insert logic)
         if db.get_conversation(conv_id)?.is_none() {
-            // Create placeholder
             db.create_conversation(&crate::models::Conversation {
                 id: conv_id.clone(),
                 title: "Synced Conversation".into(),
@@ -206,6 +241,52 @@ pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result
         for link in &node.artifact_links {
             db.link_interaction(&link.interaction_id, &link.git_commit_hash, &link.link_type)?;
         }
+    }
+
+    Ok(())
+}
+
+fn topo_visit(
+    id: &str,
+    node_map: &mut std::collections::HashMap<String, SyncNode>,
+    sorted_nodes: &mut Vec<SyncNode>,
+    visited: &mut HashSet<String>,
+    visiting: &mut HashSet<String>,
+) -> Result<()> {
+    if visited.contains(id) {
+        return Ok(());
+    }
+    if visiting.contains(id) {
+        // Cycle detected. Log warning or error?
+        // For robustness, break cycle by just processing.
+        return Ok(());
+    }
+
+    visiting.insert(id.to_string());
+
+    // Process dependencies (parent)
+    if let Some(node) = node_map.get(id) {
+        if let Some(parent_id) = &node.interaction.parent_id {
+            // parent_id is InteractionId. We need string string.
+            let p_id = parent_id.to_string();
+            // If parent is in our batch, visit it first.
+            // If it's not in the batch, we assume it's in DB or missing (which will fail FK).
+            if node_map.contains_key(&p_id) {
+                topo_visit(&p_id, node_map, sorted_nodes, visited, visiting)?;
+            }
+        }
+    }
+
+    visiting.remove(id);
+    visited.insert(id.to_string());
+
+    // Move from map to sorted list
+    // Note: This removes from map, so if multiple nodes depend on A,
+    // the second time we check A it won't be in map.
+    // BUT we check `visited` first. If A is visited, we return Ok.
+    // So we don't need A in map anymore.
+    if let Some(node) = node_map.remove(id) {
+        sorted_nodes.push(node);
     }
 
     Ok(())
