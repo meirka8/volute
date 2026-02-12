@@ -198,16 +198,16 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
             client_clone
                 .log_message(
                     MessageType::INFO,
-                    format!("Batch saved: {} segments for source {}", segment_count, source_id_for_log),
+                    format!(
+                        "Batch saved: {} segments for source {}",
+                        segment_count, source_id_for_log
+                    ),
                 )
                 .await;
         }
         Ok(Err(e)) => {
             client_clone
-                .log_message(
-                    MessageType::ERROR,
-                    format!("Failed to save batch: {}", e),
-                )
+                .log_message(MessageType::ERROR, format!("Failed to save batch: {}", e))
                 .await;
         }
         Err(e) => {
@@ -239,13 +239,14 @@ pub async fn handle_timeline_get(
 ) -> TimelineGetResponse {
     let max_items = params.max_items.unwrap_or(50) as usize;
     let include_unbound = params.include_unbound.unwrap_or(true);
+    let head_sha = params.head_sha.clone();
 
     client
         .log_message(
             MessageType::INFO,
             format!(
-                "Timeline get: max_items={}, include_unbound={}",
-                max_items, include_unbound
+                "Timeline get: max_items={}, include_unbound={}, head_sha={:?}",
+                max_items, include_unbound, head_sha
             ),
         )
         .await;
@@ -253,7 +254,7 @@ pub async fn handle_timeline_get(
     let state_clone = state.clone();
     let root_path = state.root_path.lock().unwrap().clone();
 
-    // Run DB operations in blocking thread
+    // Run DB and Git operations in blocking thread
     let result = task::spawn_blocking(move || {
         let store_guard = state_clone.store.lock().expect("CVC Store mutex poisoned");
 
@@ -272,7 +273,32 @@ pub async fn handle_timeline_get(
             };
 
             // Get commits with their linked interactions
-            let commits_data = store.get_commits_with_interactions().unwrap_or_default();
+            let mut commits_data = store.get_commits_with_interactions().unwrap_or_default();
+
+            // Filter commits by reachability from HEAD if provided
+            if let Some(sha_str) = head_sha {
+                if let Some(path) = root_path.as_ref() {
+                    if let Ok(repo) = git2::Repository::open(path) {
+                        if let Ok(head_oid) = git2::Oid::from_str(&sha_str) {
+                            commits_data.retain(|(commit_sha, _)| {
+                                if let Ok(commit_oid) = git2::Oid::from_str(commit_sha.as_str()) {
+                                    // graph_descendant_of(a, b) returns true if a is a descendant of b
+                                    // We want to keep commit if IS AN ANCESTOR of HEAD.
+                                    // So we check if HEAD is a descendant of commit.
+                                    match repo.graph_descendant_of(head_oid, commit_oid) {
+                                        Ok(is_descendant) => {
+                                            is_descendant || head_oid == commit_oid
+                                        }
+                                        Err(_) => false,
+                                    }
+                                } else {
+                                    false
+                                }
+                            });
+                        }
+                    }
+                }
+            }
 
             // Convert to protocol format, getting commit messages from git
             let commits: Vec<CommitWithThoughts> = commits_data
