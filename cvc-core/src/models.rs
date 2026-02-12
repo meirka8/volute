@@ -72,6 +72,10 @@ pub struct Interaction {
     pub model_name: Option<String>,
     pub model_cot: Option<String>,
     pub model_response: Option<String>,
+
+    /// Tracks which VS Code chat request generated this interaction.
+    /// Used for deduplication when re-processing the same request.
+    pub source_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
