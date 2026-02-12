@@ -76,7 +76,7 @@ pub async fn pull() -> Result<()> {
     };
 
     if !git_cli_success {
-        println!("Git CLI fetch failed/missing. Falling back to internal libgit2...");
+        eprintln!("Git CLI fetch failed/missing. Falling back to internal libgit2...");
 
         let mut callbacks = git2::RemoteCallbacks::new();
         callbacks.credentials(|_url, username_from_url, _allowed_types| {
@@ -89,7 +89,18 @@ pub async fn pull() -> Result<()> {
         match remote.fetch(&[&refspec], Some(&mut fetch_opts), None) {
             Ok(_) => {}
             Err(e) => {
-                println!("Warning: internal fetch failed: {}", e);
+                eprintln!("Warning: internal fetch failed: {}", e);
+                // If both failed, we must error out to prevent ingesting stale data.
+                if repo.find_reference(&remote_tracking_ref).is_err() {
+                    // Only error if we strictly needed this fetch to proceed,
+                    // i.e., correct tracking ref might not exist or be stale.
+                    // But user feedback says: "return an error ... when it didn't".
+                    return Err(anyhow::anyhow!(
+                        "Failed to fetch from remote (both CLI and internal failed). Aborting."
+                    ));
+                } else {
+                    eprintln!("Warning: Proceeding with potentially stale tracking ref.");
+                }
             }
         }
     }

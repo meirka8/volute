@@ -224,7 +224,7 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
 
     // 2. Setup Local Repo A (User A)
     let local_a_path = temp_dir.path().join("local_a");
-    let repo_a = Repository::clone(remote_path.to_str().unwrap(), &local_a_path)?;
+    let repo_a = Repository::clone(remote_path.to_str().expect("Path not UTF-8"), &local_a_path)?;
 
     // Config signature
     let mut config_a = repo_a.config()?;
@@ -245,7 +245,7 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
 
     // 3. Setup Local Repo B (User B)
     let local_b_path = temp_dir.path().join("local_b");
-    let repo_b = Repository::clone(remote_path.to_str().unwrap(), &local_b_path)?;
+    let repo_b = Repository::clone(remote_path.to_str().expect("Path not UTF-8"), &local_b_path)?;
 
     // Config signature
     let mut config_b = repo_b.config()?;
@@ -313,6 +313,19 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
     sync::push_to_ref(&repo_b, &store_b, ref_name)?;
 
     // 6. User B tries to push and fails (Simulation)
+    // We expect this to fail because remote has A's work, which is not in B's history.
+    let mut origin_b = repo_b.find_remote("origin")?;
+
+    let mut callbacks_b = git2::RemoteCallbacks::new();
+    callbacks_b.credentials(|_, _, _| git2::Cred::default());
+    let mut push_opts_b = git2::PushOptions::new();
+    push_opts_b.remote_callbacks(callbacks_b);
+
+    let result = origin_b.push(
+        &[format!("{}:{}", ref_name, ref_name)],
+        Some(&mut push_opts_b),
+    );
+    assert!(result.is_err(), "Push should fail due to non-fast-forward");
 
     // 7. Recovery Logic (Simulating what cvc pull will do)
     let mut origin_b = repo_b.find_remote("origin")?;

@@ -222,7 +222,7 @@ pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result
     // 6. Insert into DB
     for node in sorted_nodes {
         let conv_id = &node.interaction.conversation_id;
-        // ... (rest of insert logic)
+
         if db.get_conversation(conv_id)?.is_none() {
             db.create_conversation(&crate::models::Conversation {
                 id: conv_id.clone(),
