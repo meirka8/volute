@@ -257,9 +257,10 @@ fn topo_visit(
         return Ok(());
     }
     if visiting.contains(id) {
-        // Cycle detected. Log warning or error?
-        // For robustness, break cycle by just processing.
-        return Ok(());
+        return Err(SyncError::Ref(format!(
+            "Cycle detected in interaction dependencies: {}",
+            id
+        )));
     }
 
     visiting.insert(id.to_string());

@@ -1,8 +1,8 @@
 use chrono::Utc;
 use cvc_core::db::CvcStore;
 use cvc_core::models::*;
-use cvc_core::sync;
-use git2::{Repository, Signature};
+use cvc_core::sync::{self, SyncNode};
+use git2::{FileMode, Repository, Signature};
 use tempfile::TempDir;
 
 #[test]
@@ -354,6 +354,121 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
     sync::pull_from_ref(&repo_a, &store_a, remote_tracking_ref)?;
 
     assert!(store_a.get_interaction(&inter_b.id)?.is_some());
+
+    Ok(())
+}
+
+#[test]
+fn test_sync_cycle_detection() -> anyhow::Result<()> {
+    // 1. Setup Repo and DB
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+
+    // Create initial commit
+    let signature = Signature::now("Test User", "test@example.com")?;
+    let tree_oid = repo.index()?.write_tree()?;
+    let tree = repo.find_tree(tree_oid)?;
+    repo.commit(Some("HEAD"), &signature, &signature, "Init", &tree, &[])?;
+
+    let db_path = temp_dir.path().join("cvc.db");
+    let store = CvcStore::open(&db_path)?;
+    store.init()?;
+
+    // 2. Insert Data manually to force a cycle (A -> B -> A)
+    let id_a = InteractionId::new();
+    let id_b = InteractionId::new();
+
+    // We also need conversations to avoid FK error on conversation_id if we didn't create them.
+    // The sync logic creates conversation placeholders if missing, so that's fine.
+
+    let node_a = SyncNode {
+        interaction: Interaction {
+            id: id_a.clone(),
+            conversation_id: "conv-cycle".to_string(),
+            parent_id: Some(id_b.clone()), // A depends on B
+            timestamp: Utc::now(),
+            author: Author::Human,
+            user_prompt: "A".to_string(),
+            model_name: None,
+            model_cot: None,
+            model_response: None,
+            source_request_id: None,
+        },
+        context_items: vec![],
+        tool_executions: vec![],
+        artifact_links: vec![],
+    };
+
+    let node_b = SyncNode {
+        interaction: Interaction {
+            id: id_b.clone(),
+            conversation_id: "conv-cycle".to_string(),
+            parent_id: Some(id_a.clone()), // B depends on A
+            timestamp: Utc::now(),
+            author: Author::Human,
+            user_prompt: "B".to_string(),
+            model_name: None,
+            model_cot: None,
+            model_response: None,
+            source_request_id: None,
+        },
+        context_items: vec![],
+        tool_executions: vec![],
+        artifact_links: vec![],
+    };
+
+    // Write these to the git ref manually
+    let mut tree_builder = repo.treebuilder(None)?;
+
+    let json_a = serde_json::to_string_pretty(&node_a)?;
+    let oid_a = repo.blob(json_a.as_bytes())?;
+    tree_builder.insert(
+        format!("{}.json", id_a).as_str(),
+        oid_a,
+        FileMode::Blob.into(),
+    )?;
+
+    let json_b = serde_json::to_string_pretty(&node_b)?;
+    let oid_b = repo.blob(json_b.as_bytes())?;
+    tree_builder.insert(
+        format!("{}.json", id_b).as_str(),
+        oid_b,
+        FileMode::Blob.into(),
+    )?;
+
+    let tree_oid = tree_builder.write()?;
+    let new_tree = repo.find_tree(tree_oid)?;
+
+    repo.commit(
+        Some("refs/cvc/cycle"),
+        &signature,
+        &signature,
+        "Cyclic Sync",
+        &new_tree,
+        &[],
+    )?;
+
+    // 3. Try to Pull
+    // This should FAIL with Cycle detected error.
+    let result = sync::pull_from_ref(&repo, &store, "refs/cvc/cycle");
+    assert!(result.is_err(), "Pull should fail on cycle");
+
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("Cycle detected"),
+        "Error should be about cycle, got: {}",
+        err
+    );
+
+    // 4. Verify NOTHING was ingested (Atomic failure would be nice, but here we fail before insert loop starts sort of?)
+    // Actually, `pull_from_ref` sorts ALL nodes before inserting ANY.
+    // So if sort fails, NOTHING is inserted.
+
+    let fetched_a = store.get_interaction(&id_a)?;
+    assert!(
+        fetched_a.is_none(),
+        "Node A should NOT be ingested if cycle detected"
+    );
 
     Ok(())
 }
