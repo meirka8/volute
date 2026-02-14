@@ -25,22 +25,16 @@ case "$OS" in
         ;;
 esac
 
-case "$ARCH" in
     x86_64)
         ARCH_TAG="x86_64"
         ;;
     arm64|aarch64)
-        if [ "$OS" = "Darwin" ]; then
-            ARCH_TAG="aarch64"
-        else
-            ARCH_TAG="aarch64" # Assuming linux aarch64 support
-        fi
+        ARCH_TAG="aarch64"
         ;;
     *)
         echo "Unsupported Architecture: $ARCH"
         exit 1
         ;;
-esac
 
 ASSET_NAME="cvc-${ARCH_TAG}-${OS_TAG}.tar.gz"
 

@@ -1,18 +1,17 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use reqwest::header::USER_AGENT;
 use serde::Deserialize;
 use std::fs;
-use std::io::Cursor;
-use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct Asset {
     name: String,
     browser_download_url: String,
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct Release {
     tag_name: String,
     assets: Vec<Asset>,
@@ -38,7 +37,8 @@ pub async fn install(name: &str) -> Result<()> {
     fs::create_dir_all(&bin_dir)?;
 
     let target_arch = get_target_arch();
-    let asset_name = format!("{}-{}.tar.gz", name, target_arch);
+    let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
+    let asset_name = format!("{}-{}.{}", name, target_arch, extension);
 
     println!("Looking for asset: {}", asset_name);
     // Placeholder URL - in real logic we'd fetch the release JSON and find the asset url
