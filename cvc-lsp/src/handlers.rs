@@ -292,6 +292,10 @@ pub async fn handle_timeline_get(
                                         Err(_) => false,
                                     }
                                 } else {
+                                    log::warn!(
+                                        "Invalid commit SHA in database: {}",
+                                        commit_sha.as_str()
+                                    );
                                     false
                                 }
                             });
