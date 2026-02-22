@@ -26,6 +26,7 @@ export class TimelineTreeProvider implements vscode.TreeDataProvider<TimelineTre
   private pendingThoughts: InteractionSummary[] = [];
   private commits: CommitWithThoughts[] = [];
   private isLoading = false;
+  private disposables: vscode.Disposable[] = [];
 
   constructor(
     outputChannel: vscode.OutputChannel,
@@ -47,10 +48,11 @@ export class TimelineTreeProvider implements vscode.TreeDataProvider<TimelineTre
         const api = gitExtension.getAPI(1);
         if (api) {
           // Listen for repository opens
-          api.onDidOpenRepository((repo: any) => {
+          const disposable = api.onDidOpenRepository((repo: any) => {
             this.registerRepoListener(repo);
             this.refresh();
           });
+          this.disposables.push(disposable);
 
           // Register for existing repositories
           if (api.repositories) {
@@ -70,8 +72,16 @@ export class TimelineTreeProvider implements vscode.TreeDataProvider<TimelineTre
       // Refresh when git state changes (commit, checkout, etc)
       this.refresh();
     });
-    // We define it but don't strictly track disposables here for simplicity
-    // In a full implementation we should add to subscriptions
+    this.disposables.push(disposable);
+  }
+
+  /**
+   * Clean up resources
+   */
+  dispose() {
+    this.disposables.forEach(d => d.dispose());
+    this.disposables = [];
+    this._onDidChangeTreeData.dispose();
   }
 
   /**
