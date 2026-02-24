@@ -156,10 +156,17 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
             // Delete previous interactions from this source request (deduplication)
             store.delete_interactions_by_source_request_id(&params.source_request_id)?;
 
-            // Insert new segmented interactions with parent chaining
+            // Insert new segmented interactions with parent chaining.
+            // Use a base timestamp with per-segment offset to guarantee unique,
+            // ordered timestamps. Without this, all segments in a batch land on
+            // the same Unix second because the loop completes sub-millisecond
+            // and the DB stores second-precision timestamps.
+            // Anchor the sequence so the last segment is Utc::now().
+            let base_timestamp = Utc::now()
+                - chrono::Duration::seconds(params.interactions.len().saturating_sub(1) as i64);
             let mut previous_id: Option<InteractionId> = None;
 
-            for segment in &params.interactions {
+            for (i, segment) in params.interactions.iter().enumerate() {
                 let id = InteractionId::new();
 
                 let author = match segment.author {
@@ -173,7 +180,7 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
                     id: id.clone(),
                     conversation_id: params.session_id.clone(),
                     parent_id: previous_id.clone(),
-                    timestamp: Utc::now(),
+                    timestamp: base_timestamp + chrono::Duration::seconds(i as i64),
                     author,
                     user_prompt: segment.user_prompt.clone().unwrap_or_default(),
                     model_name: params.model.clone(),
