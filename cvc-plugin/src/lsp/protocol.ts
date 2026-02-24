@@ -107,6 +107,8 @@ export interface TimelineGetParams {
   maxItems?: number;
   /** Include unbound/floating thoughts */
   includeUnbound?: boolean;
+  /** The SHA of the current HEAD commit to filter by */
+  headSha?: string;
 }
 
 /**

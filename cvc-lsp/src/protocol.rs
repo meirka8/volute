@@ -71,6 +71,7 @@ pub struct InteractionSegment {
 pub struct TimelineGetParams {
     pub max_items: Option<u32>,
     pub include_unbound: Option<bool>,
+    pub head_sha: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
