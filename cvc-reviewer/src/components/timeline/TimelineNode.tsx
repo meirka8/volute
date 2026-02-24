@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, type DependencyList } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   User,
@@ -70,7 +70,7 @@ function hasContent(text: string | null | undefined): boolean {
 /**
  * Hook that detects whether an element's text is being truncated by CSS line-clamp.
  */
-function useIsTruncated(deps: unknown[]) {
+function useIsTruncated(deps: DependencyList) {
   const ref = useRef<HTMLParagraphElement>(null);
   const [isTruncated, setIsTruncated] = useState(false);
 
@@ -83,11 +83,20 @@ function useIsTruncated(deps: unknown[]) {
 
   useEffect(() => {
     check();
-    // Re-check on resize
-    window.addEventListener('resize', check);
-    return () => window.removeEventListener('resize', check);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, deps);
+
+    const el = ref.current;
+    if (!el) return;
+
+    const observer = new ResizeObserver(() => {
+      check();
+    });
+
+    observer.observe(el);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [check, ...deps]);
 
   return { ref, isTruncated };
 }

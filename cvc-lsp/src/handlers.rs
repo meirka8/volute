@@ -161,7 +161,9 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
             // ordered timestamps. Without this, all segments in a batch land on
             // the same Unix second because the loop completes sub-millisecond
             // and the DB stores second-precision timestamps.
-            let base_timestamp = Utc::now();
+            // Anchor the sequence so the last segment is Utc::now().
+            let base_timestamp = Utc::now()
+                - chrono::Duration::seconds(params.interactions.len().saturating_sub(1) as i64);
             let mut previous_id: Option<InteractionId> = None;
 
             for (i, segment) in params.interactions.iter().enumerate() {
