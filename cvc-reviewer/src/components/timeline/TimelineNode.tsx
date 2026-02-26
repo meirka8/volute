@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect, useCallback, type DependencyList } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   User,
@@ -58,15 +58,64 @@ function formatTimestamp(timestamp: number): string {
   });
 }
 
+/**
+ * Check if text has meaningful content (not just whitespace, newlines, quotes).
+ */
+function hasContent(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const cleaned = text.replace(/[\s\n\r\t"'`]/g, '');
+  return cleaned.length > 0;
+}
+
+/**
+ * Hook that detects whether an element's text is being truncated by CSS line-clamp.
+ */
+function useIsTruncated(deps: DependencyList) {
+  const ref = useRef<HTMLParagraphElement>(null);
+  const [isTruncated, setIsTruncated] = useState(false);
+
+  const check = useCallback(() => {
+    const el = ref.current;
+    if (el) {
+      setIsTruncated(el.scrollHeight > el.clientHeight + 1);
+    }
+  }, []);
+
+  useEffect(() => {
+    check();
+
+    const el = ref.current;
+    if (!el) return;
+
+    const observer = new ResizeObserver(() => {
+      check();
+    });
+
+    observer.observe(el);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [check, ...deps]);
+
+  return { ref, isTruncated };
+}
+
 export function TimelineNode({
   interaction,
   isSelected = false,
   onSelect,
 }: TimelineNodeProps) {
   const [isReasoningExpanded, setIsReasoningExpanded] = useState(false);
+  const [isPromptExpanded, setIsPromptExpanded] = useState(false);
+  const [isResponseExpanded, setIsResponseExpanded] = useState(false);
 
-  const hasReasoning = !!interaction.model_cot;
-  const hasResponse = !!interaction.model_response;
+  const hasPrompt = hasContent(interaction.user_prompt);
+  const hasReasoning = hasContent(interaction.model_cot);
+  const hasResponse = hasContent(interaction.model_response);
+
+  const promptTruncation = useIsTruncated([interaction.user_prompt, isPromptExpanded]);
+  const responseTruncation = useIsTruncated([interaction.model_response, isResponseExpanded]);
 
   return (
     <motion.div
@@ -108,20 +157,54 @@ export function TimelineNode({
       </div>
 
       {/* User Prompt */}
-      {interaction.user_prompt && (
+      {hasPrompt && (
         <div className="mb-2">
-          <p className="text-sm text-[#ededed] whitespace-pre-wrap line-clamp-3">
+          <p
+            ref={promptTruncation.ref}
+            className={clsx(
+              'text-sm text-[#ededed] whitespace-pre-wrap',
+              !isPromptExpanded && 'line-clamp-3'
+            )}
+          >
             {interaction.user_prompt}
           </p>
+          {(promptTruncation.isTruncated || isPromptExpanded) && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsPromptExpanded(!isPromptExpanded);
+              }}
+              className="mt-1 text-xs text-[#5e6ad2] hover:text-[#7c86e2] transition-colors"
+            >
+              {isPromptExpanded ? 'Show less' : 'Show more'}
+            </button>
+          )}
         </div>
       )}
 
       {/* Model Response Preview */}
       {hasResponse && (
         <div className="mb-2 pl-3 border-l border-[#5e6ad2]/50">
-          <p className="text-sm text-[#888888] whitespace-pre-wrap line-clamp-2">
+          <p
+            ref={responseTruncation.ref}
+            className={clsx(
+              'text-sm text-[#888888] whitespace-pre-wrap',
+              !isResponseExpanded && 'line-clamp-2'
+            )}
+          >
             {interaction.model_response}
           </p>
+          {(responseTruncation.isTruncated || isResponseExpanded) && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsResponseExpanded(!isResponseExpanded);
+              }}
+              className="mt-1 text-xs text-[#5e6ad2] hover:text-[#7c86e2] transition-colors"
+            >
+              {isResponseExpanded ? 'Show less' : 'Show more'}
+            </button>
+          )}
         </div>
       )}
 

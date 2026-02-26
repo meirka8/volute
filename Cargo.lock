@@ -291,9 +291,11 @@ dependencies = [
  "cvc-core",
  "dashmap",
  "env_logger",
+ "git2",
  "log",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower-lsp",
 ]

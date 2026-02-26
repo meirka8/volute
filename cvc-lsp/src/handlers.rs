@@ -156,10 +156,17 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
             // Delete previous interactions from this source request (deduplication)
             store.delete_interactions_by_source_request_id(&params.source_request_id)?;
 
-            // Insert new segmented interactions with parent chaining
+            // Insert new segmented interactions with parent chaining.
+            // Use a base timestamp with per-segment offset to guarantee unique,
+            // ordered timestamps. Without this, all segments in a batch land on
+            // the same Unix second because the loop completes sub-millisecond
+            // and the DB stores second-precision timestamps.
+            // Anchor the sequence so the last segment is Utc::now().
+            let base_timestamp = Utc::now()
+                - chrono::Duration::seconds(params.interactions.len().saturating_sub(1) as i64);
             let mut previous_id: Option<InteractionId> = None;
 
-            for segment in &params.interactions {
+            for (i, segment) in params.interactions.iter().enumerate() {
                 let id = InteractionId::new();
 
                 let author = match segment.author {
@@ -173,7 +180,7 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
                     id: id.clone(),
                     conversation_id: params.session_id.clone(),
                     parent_id: previous_id.clone(),
-                    timestamp: Utc::now(),
+                    timestamp: base_timestamp + chrono::Duration::seconds(i as i64),
                     author,
                     user_prompt: segment.user_prompt.clone().unwrap_or_default(),
                     model_name: params.model.clone(),
@@ -198,16 +205,16 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
             client_clone
                 .log_message(
                     MessageType::INFO,
-                    format!("Batch saved: {} segments for source {}", segment_count, source_id_for_log),
+                    format!(
+                        "Batch saved: {} segments for source {}",
+                        segment_count, source_id_for_log
+                    ),
                 )
                 .await;
         }
         Ok(Err(e)) => {
             client_clone
-                .log_message(
-                    MessageType::ERROR,
-                    format!("Failed to save batch: {}", e),
-                )
+                .log_message(MessageType::ERROR, format!("Failed to save batch: {}", e))
                 .await;
         }
         Err(e) => {
@@ -231,6 +238,60 @@ pub async fn handle_link_commit(client: &Client, _state: Arc<AppState>, params: 
     // TODO: Implement actual linking logic in CVC Store
 }
 
+/// Filters a list of commits, keeping only those that are ancestors of the given HEAD SHA.
+/// If `head_sha` is None, no filtering is performed.
+fn filter_commits_by_reachability(
+    repo_path_opt: Option<&std::path::Path>,
+    head_sha_opt: Option<&str>,
+    commits_data: &mut Vec<(cvc_core::models::CommitSha, Vec<Interaction>)>,
+) {
+    if let Some(sha_str) = head_sha_opt {
+        if let Some(path) = repo_path_opt {
+            if let Ok(repo) = git2::Repository::open(path) {
+                if let Ok(head_oid) = git2::Oid::from_str(sha_str) {
+                    let mut reachable_commits = std::collections::HashSet::new();
+                    match repo.revwalk() {
+                        Ok(mut revwalk) => {
+                            if let Err(e) = revwalk.push(head_oid) {
+                                log::warn!("Failed to push HEAD to revwalk: {}", e);
+                            } else {
+                                for oid_result in revwalk {
+                                    match oid_result {
+                                        Ok(oid) => {
+                                            reachable_commits.insert(oid);
+                                        }
+                                        Err(e) => {
+                                            log::debug!("Error during Revwalk iteration: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to initialize Revwalk: {}", e);
+                        }
+                    }
+
+                    commits_data.retain(|(commit_sha, _)| {
+                        if let Ok(commit_oid) = git2::Oid::from_str(commit_sha.as_str()) {
+                            reachable_commits.contains(&commit_oid)
+                        } else {
+                            log::warn!("Invalid commit SHA in database: {}", commit_sha.as_str());
+                            false
+                        }
+                    });
+                } else {
+                    log::warn!("Invalid HEAD SHA provided by client: {}", sha_str);
+                    // If HEAD SHA is invalid, we might want to clear or leave as is.
+                    // The user requested to handle errors gracefully. If HEAD is invalid, we don't filter.
+                }
+            } else {
+                log::error!("Failed to open Git repository at path: {:?}", path);
+            }
+        }
+    }
+}
+
 /// Handle timeline/get request - returns pending thoughts and commits with linked interactions
 pub async fn handle_timeline_get(
     client: &Client,
@@ -239,13 +300,14 @@ pub async fn handle_timeline_get(
 ) -> TimelineGetResponse {
     let max_items = params.max_items.unwrap_or(50) as usize;
     let include_unbound = params.include_unbound.unwrap_or(true);
+    let head_sha = params.head_sha.clone();
 
     client
         .log_message(
             MessageType::INFO,
             format!(
-                "Timeline get: max_items={}, include_unbound={}",
-                max_items, include_unbound
+                "Timeline get: max_items={}, include_unbound={}, head_sha={:?}",
+                max_items, include_unbound, head_sha
             ),
         )
         .await;
@@ -253,7 +315,7 @@ pub async fn handle_timeline_get(
     let state_clone = state.clone();
     let root_path = state.root_path.lock().unwrap().clone();
 
-    // Run DB operations in blocking thread
+    // Run DB and Git operations in blocking thread
     let result = task::spawn_blocking(move || {
         let store_guard = state_clone.store.lock().expect("CVC Store mutex poisoned");
 
@@ -272,7 +334,14 @@ pub async fn handle_timeline_get(
             };
 
             // Get commits with their linked interactions
-            let commits_data = store.get_commits_with_interactions().unwrap_or_default();
+            let mut commits_data = store.get_commits_with_interactions().unwrap_or_default();
+
+            // Filter commits by reachability from HEAD if provided
+            filter_commits_by_reachability(
+                root_path.as_deref(),
+                head_sha.as_deref(),
+                &mut commits_data,
+            );
 
             // Convert to protocol format, getting commit messages from git
             let commits: Vec<CommitWithThoughts> = commits_data
@@ -473,5 +542,134 @@ fn get_commit_info(sha: &str, root_path: Option<&std::path::Path>) -> (String, i
             }
         }
         _ => (format!("Commit {}", &sha[..7.min(sha.len())]), 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::tempfile::TempDir;
+    use chrono::Utc;
+    use cvc_core::models::{Author, CommitSha, InteractionId};
+    use git2::{Repository, Signature};
+
+    fn create_test_repo() -> (TempDir, String, String, String) {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = Repository::init(temp_dir.path()).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+
+        let mut index = repo.index().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+
+        // 1. Initial commit (Root)
+        let root_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "Initial", &tree, &[])
+            .unwrap();
+        let root_commit = repo.find_commit(root_oid).unwrap();
+
+        // 2. Commit on main
+        let main_oid = repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Main commit",
+                &tree,
+                &[&root_commit],
+            )
+            .unwrap();
+
+        // 3. Create branch feature
+        let _branch = repo.branch("feature", &root_commit, false).unwrap();
+
+        // 4. Commit on feature
+        repo.set_head("refs/heads/feature").unwrap();
+        let feature_oid = repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Feature commit",
+                &tree,
+                &[&root_commit],
+            )
+            .unwrap();
+
+        (
+            temp_dir,
+            root_oid.to_string(),
+            main_oid.to_string(),
+            feature_oid.to_string(),
+        )
+    }
+
+    fn dummy_interaction() -> Interaction {
+        Interaction {
+            id: InteractionId::new(),
+            conversation_id: "test".to_string(),
+            parent_id: None,
+            timestamp: Utc::now(),
+            author: Author::Human,
+            user_prompt: "test".to_string(),
+            model_name: None,
+            model_cot: None,
+            model_response: None,
+            source_request_id: None,
+        }
+    }
+
+    #[test]
+    fn test_filter_commits_by_reachability() {
+        let (temp_dir, root_sha, main_sha, feature_sha) = create_test_repo();
+
+        let commits_data = vec![
+            (CommitSha::new(root_sha.clone()), vec![dummy_interaction()]),
+            (CommitSha::new(main_sha.clone()), vec![dummy_interaction()]),
+            (
+                CommitSha::new(feature_sha.clone()),
+                vec![dummy_interaction()],
+            ),
+        ];
+
+        // 1. Test from main branch (should see main and root, but not feature)
+        let mut data_main = commits_data.clone();
+        filter_commits_by_reachability(Some(temp_dir.path()), Some(&main_sha), &mut data_main);
+        assert_eq!(data_main.len(), 2);
+        let shas: Vec<_> = data_main.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(shas.contains(&root_sha.as_str()));
+        assert!(shas.contains(&main_sha.as_str()));
+
+        // 2. Test from feature branch (should see feature and root, but not main)
+        let mut data_feature = commits_data.clone();
+        filter_commits_by_reachability(
+            Some(temp_dir.path()),
+            Some(&feature_sha),
+            &mut data_feature,
+        );
+        assert_eq!(data_feature.len(), 2);
+        let shas_feature: Vec<_> = data_feature.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(shas_feature.contains(&root_sha.as_str()));
+        assert!(shas_feature.contains(&feature_sha.as_str()));
+
+        // 3. Test with root HEAD (should only see root)
+        let mut data_root = commits_data.clone();
+        filter_commits_by_reachability(Some(temp_dir.path()), Some(&root_sha), &mut data_root);
+        assert_eq!(data_root.len(), 1);
+        assert_eq!(data_root[0].0.as_str(), root_sha);
+
+        // 4. Test with no HEAD (should see all)
+        let mut data_none = commits_data.clone();
+        filter_commits_by_reachability(Some(temp_dir.path()), None, &mut data_none);
+        assert_eq!(data_none.len(), 3);
+
+        // 5. Test error cases (invalid SHA) - graceful handling, should not filter
+        let mut data_invalid = commits_data.clone();
+        filter_commits_by_reachability(
+            Some(temp_dir.path()),
+            Some("invalid_sha"),
+            &mut data_invalid,
+        );
+        assert_eq!(data_invalid.len(), 3);
     }
 }
