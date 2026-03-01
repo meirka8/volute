@@ -1,6 +1,5 @@
 import { useMemo } from "react";
 import { parseDiff, Diff, Hunk } from "react-diff-view";
-import "react-diff-view/style/index.css";
 
 interface DiffViewerProps {
   filename: string;
