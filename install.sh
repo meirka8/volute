@@ -4,7 +4,6 @@ set -e
 # Configuration
 REPO="helixthought/cvc2"
 INSTALL_DIR="$HOME/.cvc/bin"
-BINARY_NAME="cvc"
 
 echo "Installing CVC..."
 
@@ -25,6 +24,7 @@ case "$OS" in
         ;;
 esac
 
+case "$ARCH" in
     x86_64)
         ARCH_TAG="x86_64"
         ;;
@@ -35,6 +35,7 @@ esac
         echo "Unsupported Architecture: $ARCH"
         exit 1
         ;;
+esac
 
 ASSET_NAME="cvc-${ARCH_TAG}-${OS_TAG}.tar.gz"
 
@@ -44,24 +45,37 @@ echo "Target Asset: $ASSET_NAME"
 # Create install directory
 mkdir -p "$INSTALL_DIR"
 
-# Download latest release (Placeholder URL logic - this would need to query GitHub API for 'latest' tag in production)
-# For now, we'll assume a direct download link pattern or use a placeholder message if release implementation isn't live.
+# Download latest release
 DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$ASSET_NAME"
 
 echo "Downloading from $DOWNLOAD_URL..."
 # curl -L -o "/tmp/$ASSET_NAME" "$DOWNLOAD_URL"
 
-# Extract
+# Extract (release archive contains both cvc and cvc-mcp binaries)
 # tar -xzf "/tmp/$ASSET_NAME" -C "$INSTALL_DIR"
-# chmod +x "$INSTALL_DIR/$BINARY_NAME"
+# chmod +x "$INSTALL_DIR/cvc"
+# chmod +x "$INSTALL_DIR/cvc-mcp"
 
-# echo "Installed to $INSTALL_DIR/$BINARY_NAME"
-# echo "Please add $INSTALL_DIR to your PATH."
-
-# Since we don't have actual releases yet, we'll write a mock success message.
-echo "NOTE: specific release URL download is commented out until releases exist."
+# Since we don't have actual releases yet, simulate installation.
+echo "NOTE: release download is commented out until releases exist."
 echo "Simulating installation..."
-touch "$INSTALL_DIR/$BINARY_NAME"
-chmod +x "$INSTALL_DIR/$BINARY_NAME"
+touch "$INSTALL_DIR/cvc"
+chmod +x "$INSTALL_DIR/cvc"
+touch "$INSTALL_DIR/cvc-mcp"
+chmod +x "$INSTALL_DIR/cvc-mcp"
 
-echo "Success! CVC installed."
+echo ""
+echo "Success! CVC installed to $INSTALL_DIR"
+echo "  cvc       — CLI interface"
+echo "  cvc-mcp   — MCP server for coding agents"
+echo ""
+echo "Please add $INSTALL_DIR to your PATH:"
+echo "  export PATH=\"\$HOME/.cvc/bin:\$PATH\""
+echo ""
+
+# Optional: MCP client configuration
+echo "To use CVC with a coding agent (Claude, Cursor, Windsurf, etc.),"
+echo "add the following to your MCP client config:"
+echo ""
+echo "  {\"cvc\": {\"command\": \"$INSTALL_DIR/cvc-mcp\", \"args\": []}}"
+echo ""
