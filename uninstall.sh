@@ -24,7 +24,8 @@ $HOME/.cache/cvc
 "
 fi
 
-for p in $PATHS_TO_REMOVE; do
+echo "$PATHS_TO_REMOVE" | while IFS= read -r p; do
+    [ -z "$p" ] && continue
     if [ -d "$p" ]; then
         echo "Removing data directory: $p"
         rm -rf "$p"

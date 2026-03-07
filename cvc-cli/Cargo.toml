@@ -3,6 +3,10 @@ name = "cvc-cli"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "cvc"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
