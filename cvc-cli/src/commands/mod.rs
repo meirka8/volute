@@ -1,3 +1,5 @@
+pub mod auth;
+pub mod component;
 pub mod hook;
 pub mod init;
 pub mod log;

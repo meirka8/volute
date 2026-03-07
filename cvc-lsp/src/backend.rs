@@ -41,6 +41,25 @@ impl LanguageServer for Backend {
                         .await;
                 }
                 *self.state.store.lock().unwrap() = Some(s);
+
+                // Install hooks
+                // We do this here because it's a good time to ensure the environment is set up
+                // and we know we have a valid repo/DB context.
+                match cvc_core::hooks::install(&root_path) {
+                    Ok(_) => {
+                        self.client
+                            .log_message(MessageType::INFO, "CVC hooks installed/verified")
+                            .await;
+                    }
+                    Err(e) => {
+                        self.client
+                            .log_message(
+                                MessageType::WARNING,
+                                format!("Failed to install CVC hooks: {}", e),
+                            )
+                            .await;
+                    }
+                }
             }
             Err(e) => {
                 self.client

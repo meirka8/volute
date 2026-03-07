@@ -34,38 +34,44 @@ pub fn install(repo_root: &Path) -> Result<()> {
         ))?;
     }
 
-    let post_commit_path = hooks_dir.join("post-commit");
-    let hook_cmd = "\n# CVC Hook\ncvc hook post-commit\n";
+    let hooks = vec![
+        ("post-commit", "\n# CVC Hook\ncvc hook post-commit\n"),
+        ("pre-push", "\n# CVC Hook\ncvc push\n"),
+        ("post-merge", "\n# CVC Hook\ncvc pull\n"),
+    ];
 
-    if post_commit_path.exists() {
-        let content = fs::read_to_string(&post_commit_path)?;
-        if !content.contains("cvc hook post-commit") {
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(&post_commit_path)?;
-            file.write_all(hook_cmd.as_bytes())?;
-            println!(
-                "Appended CVC hook to existing post-commit at {:?}",
-                post_commit_path
-            );
+    for (hook_name, hook_cmd) in hooks {
+        let hook_path = hooks_dir.join(hook_name);
+
+        if hook_path.exists() {
+            let content = fs::read_to_string(&hook_path)?;
+            // Check if hook is already present (simple string match)
+            if !content.contains(hook_cmd.trim()) {
+                let mut file = fs::OpenOptions::new().append(true).open(&hook_path)?;
+                file.write_all(hook_cmd.as_bytes())?;
+                println!(
+                    "Appended CVC hook to existing {} at {:?}",
+                    hook_name, hook_path
+                );
+            } else {
+                println!(
+                    "CVC hook already present in {} at {:?}",
+                    hook_name, hook_path
+                );
+            }
         } else {
-            println!(
-                "CVC hook already present in post-commit at {:?}",
-                post_commit_path
-            );
+            let mut file = fs::File::create(&hook_path)?;
+            file.write_all(b"#!/bin/sh\n")?;
+            file.write_all(hook_cmd.as_bytes())?;
+            println!("Created new {} hook at {:?}", hook_name, hook_path);
         }
-    } else {
-        let mut file = fs::File::create(&post_commit_path)?;
-        file.write_all(b"#!/bin/sh\n")?;
-        file.write_all(hook_cmd.as_bytes())?;
-        println!("Created new post-commit hook at {:?}", post_commit_path);
-    }
 
-    #[cfg(unix)]
-    {
-        let mut perms = fs::metadata(&post_commit_path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&post_commit_path, perms)?;
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&hook_path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&hook_path, perms)?;
+        }
     }
 
     Ok(())

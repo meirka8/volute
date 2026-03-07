@@ -24,13 +24,33 @@ pub async fn push() -> Result<()> {
     sync::push_to_ref(&repo, &store, "refs/cvc/main")?;
     println!("Successfully pushed interactions.");
 
-    // Optional: push to origin
-    // This requires git credentials. For now we just update local ref.
-    // The user can run `git push origin refs/cvc/main` manually or we can try.
+    // Execute git push to sync the ref
     println!(
-        "Note: You may need to run 'git push {} refs/cvc/main' to sync with remote.",
+        "Syncing storage ref with remote '{}' (git push)...",
         remote_name
     );
+
+    // We use --no-verify to prevent the pre-push hook (which runs `cvc push`)
+    // from causing an infinite recursion loop.
+    let status = std::process::Command::new("git")
+        .arg("push")
+        .arg("--no-verify")
+        .arg(remote_name)
+        .arg("refs/cvc/main")
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("Successfully synced with remote.");
+        }
+        Ok(_) => {
+            eprintln!("Warning: Failed to push to remote. This might be due to missing credentials or network issues.");
+            eprintln!("Your interactions are saved locally in the shadow branch.");
+        }
+        Err(e) => {
+            eprintln!("Warning: Failed to execute git push: {}", e);
+        }
+    }
 
     Ok(())
 }

@@ -1,21 +1,21 @@
 {
-  "name": "volute-vc",
-  "displayName": "Volute VC",
+  "name": "cvc",
+  "displayName": "Volute CVC",
   "description": "Git, Augmented. Track the trajectory of intent alongside your code changes.",
   "version": "0.1.0",
-  "publisher": "helixthought",
-  "license": "MIT",
+  "publisher": "volute",
+  "license": "Proprietary",
   "icon": "resources/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/helixthought/volute-vc"
+    "url": "https://github.com/meirka8/cvc"
   },
-  "homepage": "https://volutevc.com",
+  "homepage": "https://cvc.dev",
   "engines": {
     "vscode": "^1.90.0"
   },
   "categories": [
-    "Machine Learning",
+    "AI",
     "Other"
   ],
   "keywords": [
@@ -35,7 +35,7 @@
   "main": "./dist/extension.js",
   "contributes": {
     "configuration": {
-      "title": "Volute VC",
+      "title": "Volute CVC",
       "properties": {
         "volute.lspPath": {
           "type": "string",
@@ -76,7 +76,7 @@
       "activitybar": [
         {
           "id": "volute-explorer",
-          "title": "Volute VC",
+          "title": "Volute CVC",
           "icon": "resources/activitybar-icon.svg"
         }
       ]
@@ -102,7 +102,7 @@
     "chatParticipants": [
       {
         "id": "volute.chat",
-        "fullName": "Volute VC",
+        "fullName": "Volute CVC",
         "name": "volute",
         "description": "Chat with AI while automatically logging your thought process",
         "isSticky": true
@@ -111,15 +111,15 @@
     "walkthroughs": [
       {
         "id": "volute.welcome",
-        "title": "Get Started with Volute VC",
+        "title": "Get Started with Volute CVC",
         "description": "Learn how to track your cognitive process alongside your code",
         "steps": [
           {
             "id": "volute.welcome.intro",
-            "title": "Welcome to Volute VC",
-            "description": "Volute VC augments Git by tracking the 'why' alongside the 'what'. Your AI conversations, reasoning, and context are preserved and linked to your commits.\n\n[Learn More](https://volutevc.com/docs)",
+            "title": "Welcome to Volute CVC",
+            "description": "Volute CVC augments Git by tracking the 'why' alongside the 'what'. Your AI conversations, reasoning, and context are preserved and linked to your commits.\n\n[Learn More](https://volutevc.com/docs)",
             "media": {
-              "markdown": "# Git, Augmented\n\nVolute creates a **Shadow DAG** - a parallel history of reasoning that accompanies your code changes."
+              "markdown": "# Git, Augmented\n\nVolute CVC creates a **Shadow DAG** - a parallel history of reasoning that accompanies your code changes."
             }
           },
           {
