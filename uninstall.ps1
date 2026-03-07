@@ -4,8 +4,8 @@ Write-Host "Uninstalling CVC..."
 
 $PathsToRemove = @(
     "$env:USERPROFILE\.cvc",
-    "$env:LOCALAPPDATA\helixthought\cvc",
-    "$env:APPDATA\helixthought\cvc"
+    "$env:LOCALAPPDATA\volute\cvc",
+    "$env:APPDATA\volute\cvc"
 )
 
 foreach ($p in $PathsToRemove) {

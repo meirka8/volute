@@ -2,7 +2,7 @@
 set -e
 
 # Configuration
-REPO="helixthought/cvc2"
+REPO="meirka8/cvc"
 INSTALL_DIR="$HOME/.cvc/bin"
 
 echo "Installing CVC..."

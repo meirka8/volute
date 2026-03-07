@@ -12,9 +12,9 @@ fi
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then
     PATHS_TO_REMOVE="
-$HOME/Library/Application Support/com.helixthought.cvc
-$HOME/Library/Caches/com.helixthought.cvc
-$HOME/Library/Preferences/com.helixthought.cvc
+$HOME/Library/Application Support/dev.volute.cvc
+$HOME/Library/Caches/dev.volute.cvc
+$HOME/Library/Preferences/dev.volute.cvc
 "
 else
     PATHS_TO_REMOVE="

@@ -20,7 +20,7 @@ struct Release {
 pub async fn list() -> Result<()> {
     println!("Fetching available components...");
     // Mocking the logic for now since we don't have a real release history yet.
-    // In production, this would hit: https://api.github.com/repos/helixthought/cvc2/releases/latest
+    // In production, this would hit: https://api.github.com/repos/meirka8/cvc/releases/latest
     println!("Available components (from latest release):");
     println!(" - cvc-mcp (Agent Protocol Server)");
     println!(" - cvc-lsp (Language Server)");
@@ -31,7 +31,7 @@ pub async fn install(name: &str) -> Result<()> {
     println!("Installing component: {}", name);
 
     // 1. Determine Install Path
-    let proj_dirs = ProjectDirs::from("com", "helixthought", "cvc")
+    let proj_dirs = ProjectDirs::from("dev", "volute", "cvc")
         .context("Could not determine config directory")?;
     let bin_dir = proj_dirs.data_local_dir().join("bin");
     fs::create_dir_all(&bin_dir)?;
@@ -43,7 +43,7 @@ pub async fn install(name: &str) -> Result<()> {
     println!("Looking for asset: {}", asset_name);
     // Placeholder URL - in real logic we'd fetch the release JSON and find the asset url
     let download_url = format!(
-        "https://github.com/helixthought/cvc2/releases/latest/download/{}",
+        "https://github.com/meirka8/cvc/releases/latest/download/{}",
         asset_name
     );
 

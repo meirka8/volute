@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Repo = "helixthought/cvc2"
+$Repo = "meirka8/cvc"
 $InstallDir = "$env:USERPROFILE\.cvc\bin"
 
 Write-Host "Installing CVC..."

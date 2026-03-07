@@ -14,7 +14,7 @@ struct TokenData {
 
 pub async fn login() -> Result<()> {
     println!("Initiating Device Authorization Flow...");
-    println!("Please visit: https://cvc.helixthought.com/activate");
+    println!("Please visit: https://cvc.dev/activate");
     println!("Enter code: ABCD-1234");
 
     println!("Waiting for authorization...");
