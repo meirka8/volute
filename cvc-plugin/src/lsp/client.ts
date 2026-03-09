@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import * as fs from "fs";
 import {
   LanguageClient,
   LanguageClientOptions,
@@ -19,6 +18,11 @@ import {
   InteractionGetParams,
   InteractionDetail,
 } from "./protocol";
+import {
+  expandPath,
+  isExecutable,
+  findBinary,
+} from "../setup/binaryUtils";
 
 /**
  * Volute VC Language Client - manages the connection to the volute-lsp server
@@ -276,7 +280,7 @@ export class VoluteLanguageClient {
    * 1. User-configured path (volute.lspPath setting)
    * 2. Bundled binary in extension
    * 3. Development build in workspace
-   * 4. System PATH
+   * 4. Well-known install dir (~/.cvc/bin/) and system PATH (via shared findBinary)
    */
   private async findServerBinary(): Promise<string | undefined> {
     // 1. Check user configuration
@@ -284,8 +288,8 @@ export class VoluteLanguageClient {
     const configuredPath = config.get<string>("lspPath");
 
     if (configuredPath && configuredPath.trim() !== "") {
-      const expandedPath = this.expandPath(configuredPath);
-      if (await this.isExecutable(expandedPath)) {
+      const expandedPath = expandPath(configuredPath);
+      if (await isExecutable(expandedPath)) {
         return expandedPath;
       }
       this.outputChannel.appendLine(
@@ -295,25 +299,20 @@ export class VoluteLanguageClient {
 
     // 2. Check bundled binary in extension
     const bundledPath = this.getBundledBinaryPath();
-    if (bundledPath && (await this.isExecutable(bundledPath))) {
+    if (bundledPath && (await isExecutable(bundledPath))) {
       return bundledPath;
     }
 
     // 3. Check development build in workspace (relative to extension)
     const devPaths = this.getDevBinaryPaths();
     for (const devPath of devPaths) {
-      if (await this.isExecutable(devPath)) {
+      if (await isExecutable(devPath)) {
         return devPath;
       }
     }
 
-    // 4. Check system PATH
-    const systemPath = await this.findInPath("cvc-lsp");
-    if (systemPath) {
-      return systemPath;
-    }
-
-    return undefined;
+    // 4. Check well-known install dir and system PATH
+    return findBinary("cvc-lsp");
   }
 
   /**
@@ -368,61 +367,5 @@ export class VoluteLanguageClient {
       path.join(extensionDir, "..", "cvc-lsp", "target", "debug", binaryName),
       path.join(extensionDir, "..", "cvc-lsp", "target", "release", binaryName),
     ];
-  }
-
-  /**
-   * Expand ~ and environment variables in path
-   */
-  private expandPath(inputPath: string): string {
-    let expanded = inputPath;
-
-    // Expand ~
-    if (expanded.startsWith("~")) {
-      const home = process.env.HOME || process.env.USERPROFILE || "";
-      expanded = path.join(home, expanded.slice(1));
-    }
-
-    // Expand environment variables ($VAR or ${VAR})
-    expanded = expanded.replace(/\$\{?(\w+)\}?/g, (_, varName) => {
-      return process.env[varName] || "";
-    });
-
-    return expanded;
-  }
-
-  /**
-   * Check if a file exists and is executable
-   */
-  private async isExecutable(filePath: string): Promise<boolean> {
-    try {
-      await fs.promises.access(filePath, fs.constants.X_OK);
-      const stats = await fs.promises.stat(filePath);
-      return stats.isFile();
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Find an executable in the system PATH
-   */
-  private async findInPath(executable: string): Promise<string | undefined> {
-    const pathEnv = process.env.PATH || "";
-    const pathSeparator = process.platform === "win32" ? ";" : ":";
-    const paths = pathEnv.split(pathSeparator);
-
-    const extensions =
-      process.platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
-
-    for (const dir of paths) {
-      for (const ext of extensions) {
-        const fullPath = path.join(dir, executable + ext);
-        if (await this.isExecutable(fullPath)) {
-          return fullPath;
-        }
-      }
-    }
-
-    return undefined;
   }
 }

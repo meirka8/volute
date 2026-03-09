@@ -161,7 +161,7 @@ The extension should feel invisible until needed.
 
 - **Native Look:** Use VS Code's native Tree View API and Webview UI Toolkit (`@vscode/webview-ui-toolkit`) to look exactly like built-in features.
 
-- **No Configuration:** It automatically finds the `cvc-lsp` binary (or downloads it) and connects.
+- **No Configuration:** It automatically finds the `cvc-lsp` binary (bundled → `~/.cvc/bin` → PATH) and connects. If not found, it prompts the user to install — it does **not** silently auto-download.
 
 - **Silent Operation:** The Chat Session Watcher operates entirely in the background with no user prompts or notifications unless errors occur.
 
