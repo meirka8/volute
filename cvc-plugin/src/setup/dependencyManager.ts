@@ -189,7 +189,7 @@ function promptInstall(
         openInstallTerminal();
       } else if (choice === "Learn More") {
         vscode.env.openExternal(vscode.Uri.parse(SETUP_PAGE_URL));
-      } else {
+      } else if (choice === "Not Now") {
         recordDismissal(context, dismissKey);
       }
     });
@@ -211,7 +211,7 @@ function promptOptional(
         openInstallTerminal();
       } else if (choice === "Learn More") {
         vscode.env.openExternal(vscode.Uri.parse(SETUP_PAGE_URL));
-      } else {
+      } else if (choice === "Not Now") {
         recordDismissal(context, dismissKey);
       }
     });
@@ -236,7 +236,7 @@ function promptInit(
         const terminal = vscode.window.createTerminal("CVC Init");
         terminal.show();
         terminal.sendText(`${cvcBinary} init`);
-      } else {
+      } else if (choice === "Not Now") {
         recordDismissal(context, DISMISS_KEY_INIT);
       }
     });
@@ -244,16 +244,21 @@ function promptInit(
 
 /**
  * Open a terminal with the appropriate install command for the current OS.
+ * For security reasons, the command is typed into the terminal but NOT 
+ * automatically executed (requires the user to press Enter).
  */
 function openInstallTerminal(): void {
   const terminal = vscode.window.createTerminal("CVC Install");
   terminal.show();
 
   if (process.platform === "win32") {
+    terminal.sendText("# Press Enter to run the CVC installation script");
     terminal.sendText(
       `powershell -ExecutionPolicy Bypass -Command "& {Invoke-WebRequest -Uri '${INSTALL_PS1_URL}' -OutFile cvc-install.ps1; .\\cvc-install.ps1; Remove-Item cvc-install.ps1}"`,
+      false // Do not auto-execute
     );
   } else {
-    terminal.sendText(`curl -fsSL '${INSTALL_SCRIPT_URL}' | sh`);
+    terminal.sendText("# Press Enter to run the CVC installation script");
+    terminal.sendText(`curl -fsSL '${INSTALL_SCRIPT_URL}' | sh`, false); // Do not auto-execute
   }
 }

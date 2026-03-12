@@ -28,9 +28,13 @@ export async function activate(
     outputChannel,
   );
 
-  if (!criticalReady) {
+  if (!status.cvcCli.found || !status.cvcLsp.found) {
+    const missing = [];
+    if (!status.cvcCli.found) missing.push("CVC CLI");
+    if (!status.cvcLsp.found) missing.push("CVC LSP");
+
     outputChannel.appendLine(
-      "Critical dependencies missing — running in degraded mode (no LSP)",
+      `Critical dependencies missing (${missing.join(", ")}) — running in degraded mode`,
     );
   }
 
