@@ -31,18 +31,20 @@ $DownloadUrl = "https://github.com/$Repo/releases/latest/download/$AssetName"
 Write-Host "Downloading from $DownloadUrl..."
 # Invoke-WebRequest -Uri $DownloadUrl -OutFile "$env:TEMP\$AssetName"
 
-# Extract (release archive contains both cvc.exe and cvc-mcp.exe)
+# Extract (release archive contains cvc.exe, cvc-mcp.exe, cvc-lsp.exe)
 # Expand-Archive -Path "$env:TEMP\$AssetName" -DestinationPath $InstallDir -Force
 
 Write-Host "NOTE: release download is commented out until releases exist."
 Write-Host "Simulating installation..."
 New-Item -ItemType File -Force -Path "$InstallDir\cvc.exe" | Out-Null
 New-Item -ItemType File -Force -Path "$InstallDir\cvc-mcp.exe" | Out-Null
+New-Item -ItemType File -Force -Path "$InstallDir\cvc-lsp.exe" | Out-Null
 
 Write-Host ""
 Write-Host "Success! CVC installed to $InstallDir"
 Write-Host "  cvc.exe       - CLI interface"
 Write-Host "  cvc-mcp.exe   - MCP server for coding agents"
+Write-Host "  cvc-lsp.exe   - Language server for the VSCode extension"
 Write-Host ""
 Write-Host "Please add $InstallDir to your User PATH."
 Write-Host ""

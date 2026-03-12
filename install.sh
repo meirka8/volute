@@ -51,10 +51,11 @@ DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$ASSET_NAME"
 echo "Downloading from $DOWNLOAD_URL..."
 # curl -L -o "/tmp/$ASSET_NAME" "$DOWNLOAD_URL"
 
-# Extract (release archive contains both cvc and cvc-mcp binaries)
+# Extract (release archive contains cvc, cvc-mcp, cvc-lsp binaries)
 # tar -xzf "/tmp/$ASSET_NAME" -C "$INSTALL_DIR"
 # chmod +x "$INSTALL_DIR/cvc"
 # chmod +x "$INSTALL_DIR/cvc-mcp"
+# chmod +x "$INSTALL_DIR/cvc-lsp"
 
 # Since we don't have actual releases yet, simulate installation.
 echo "NOTE: release download is commented out until releases exist."
@@ -63,11 +64,14 @@ touch "$INSTALL_DIR/cvc"
 chmod +x "$INSTALL_DIR/cvc"
 touch "$INSTALL_DIR/cvc-mcp"
 chmod +x "$INSTALL_DIR/cvc-mcp"
+touch "$INSTALL_DIR/cvc-lsp"
+chmod +x "$INSTALL_DIR/cvc-lsp"
 
 echo ""
 echo "Success! CVC installed to $INSTALL_DIR"
 echo "  cvc       — CLI interface"
 echo "  cvc-mcp   — MCP server for coding agents"
+echo "  cvc-lsp   — Language server for the VSCode extension"
 echo ""
 echo "Please add $INSTALL_DIR to your PATH:"
 echo "  export PATH=\"\$HOME/.cvc/bin:\$PATH\""

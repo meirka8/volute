@@ -42,6 +42,21 @@
           "default": "",
           "description": "Custom path to the volute-lsp binary. Leave empty to use the bundled or auto-downloaded binary."
         },
+        "volute.cvcCliPath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom path to the cvc CLI binary. Leave empty to auto-detect from ~/.cvc/bin or PATH."
+        },
+        "volute.cvcMcpPath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom path to the cvc-mcp binary. Leave empty to auto-detect from ~/.cvc/bin or PATH."
+        },
+        "volute.suppressSetupPrompts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Suppress all setup and installation prompts on activation."
+        },
         "volute.trace.server": {
           "type": "string",
           "enum": [
@@ -70,6 +85,12 @@
         "command": "volute.restartServer",
         "title": "Restart Language Server",
         "category": "Volute"
+      },
+      {
+        "command": "volute.checkSetup",
+        "title": "Check Setup",
+        "category": "Volute",
+        "icon": "$(checklist)"
       }
     ],
     "viewsContainers": {
@@ -114,6 +135,15 @@
         "title": "Get Started with Volute CVC",
         "description": "Learn how to track your cognitive process alongside your code",
         "steps": [
+          {
+            "id": "volute.welcome.setup",
+            "title": "Check Your Setup",
+            "description": "Volute CVC needs a few components to work. Let's make sure everything is installed.\n\n[Check Setup](command:volute.checkSetup)",
+            "media": {
+              "markdown": "## Components\n\n- **CVC CLI** (`cvc`) — Required for init, log, push/pull\n- **CVC Language Server** (`cvc-lsp`) — Powers the extension\n- **CVC MCP Server** (`cvc-mcp`) — Optional, for AI agent integration"
+            },
+            "completionEvents": ["onCommand:volute.checkSetup"]
+          },
           {
             "id": "volute.welcome.intro",
             "title": "Welcome to Volute CVC",

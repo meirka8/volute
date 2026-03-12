@@ -4,6 +4,10 @@ import { VoloteChatParticipant } from "./chat/participant";
 import { ChatSessionWatcher } from "./watcher/chatSessionWatcher";
 import { TimelineTreeProvider } from "./timeline/provider";
 import { ThoughtDetailPanel } from "./webview/thoughtDetailPanel";
+import {
+  detectDependencies,
+  promptForMissingDependencies,
+} from "./setup/dependencyManager";
 
 let client: VoluteLanguageClient | undefined;
 let chatParticipant: VoloteChatParticipant | undefined;
@@ -16,56 +20,82 @@ export async function activate(
   const outputChannel = vscode.window.createOutputChannel("Volute VC");
   outputChannel.appendLine("Activating Volute VC extension...");
 
-  // Initialize and start the LSP client
-  client = new VoluteLanguageClient(context, outputChannel);
+  // ── Dependency Check (greenfield entrypoint) ───────────────────────────
+  const status = await detectDependencies(outputChannel);
+  const criticalReady = await promptForMissingDependencies(
+    context,
+    status,
+    outputChannel,
+  );
 
-  try {
-    await client.start();
-    outputChannel.appendLine("Volute Language Server started successfully");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+  if (!status.cvcCli.found || !status.cvcLsp.found) {
+    const missing = [];
+    if (!status.cvcCli.found) missing.push("CVC CLI");
+    if (!status.cvcLsp.found) missing.push("CVC LSP");
+
     outputChannel.appendLine(
-      `Failed to start Volute Language Server: ${message}`,
+      `Critical dependencies missing (${missing.join(", ")}) — running in degraded mode`,
     );
-    vscode.window.showErrorMessage(
-      `Volute VC: Failed to start language server. ${message}`,
-    );
+  }
+
+  // ── Initialize and start the LSP client (only if LSP binary exists) ────
+  if (status.cvcLsp.found) {
+    client = new VoluteLanguageClient(context, outputChannel);
+
+    try {
+      await client.start();
+      outputChannel.appendLine("Volute Language Server started successfully");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      outputChannel.appendLine(
+        `Failed to start Volute Language Server: ${message}`,
+      );
+      vscode.window.showErrorMessage(
+        `Volute VC: Failed to start language server. ${message}`,
+      );
+    }
   }
 
   // Start the Chat Session Watcher (passive Copilot observation)
-  chatSessionWatcher = new ChatSessionWatcher(outputChannel, client);
-  try {
-    await chatSessionWatcher.start(context);
-    outputChannel.appendLine("Chat Session Watcher started successfully");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    outputChannel.appendLine(
-      `Failed to start Chat Session Watcher: ${message}`,
-    );
-    // Non-fatal - the extension can still work without passive observation
+  if (client) {
+    chatSessionWatcher = new ChatSessionWatcher(outputChannel, client);
+    try {
+      await chatSessionWatcher.start(context);
+      outputChannel.appendLine("Chat Session Watcher started successfully");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      outputChannel.appendLine(
+        `Failed to start Chat Session Watcher: ${message}`,
+      );
+      // Non-fatal - the extension can still work without passive observation
+    }
   }
 
   // Register the @volute chat participant (alternative explicit logging mode)
-  chatParticipant = new VoloteChatParticipant(outputChannel, client);
-  chatParticipant.register(context);
+  if (client) {
+    chatParticipant = new VoloteChatParticipant(outputChannel, client);
+    chatParticipant.register(context);
+  }
 
-  // Register the Cognitive Timeline tree view
-  timelineProvider = new TimelineTreeProvider(outputChannel, client);
-  const treeView = vscode.window.createTreeView("volute.timeline", {
-    treeDataProvider: timelineProvider,
-    showCollapseAll: true,
+  // Register the Cognitive Timeline tree view (only fully functional with LSP)
+  if (client) {
+    timelineProvider = new TimelineTreeProvider(outputChannel, client);
+    const treeView = vscode.window.createTreeView("volute.timeline", {
+      treeDataProvider: timelineProvider,
+      showCollapseAll: true,
   });
   context.subscriptions.push(treeView);
 
-  // Register for timeline refresh notifications from server
-  context.subscriptions.push(
-    client.onTimelineRefresh(() => {
-      timelineProvider?.refresh();
-    }),
-  );
+    // Register for timeline refresh notifications from server
+    context.subscriptions.push(
+      client.onTimelineRefresh(() => {
+        timelineProvider?.refresh();
+      }),
+    );
 
-  // Initial timeline load
-  timelineProvider.refresh();
+    // Initial timeline load
+    timelineProvider.refresh();
+  }
 
   // Register commands
   context.subscriptions.push(
@@ -104,6 +134,17 @@ export async function activate(
         }
       },
     ),
+
+    vscode.commands.registerCommand("volute.checkSetup", async () => {
+      const freshStatus = await detectDependencies(outputChannel);
+      await promptForMissingDependencies(context, freshStatus, outputChannel);
+
+      if (freshStatus.cvcCli.found && freshStatus.cvcLsp.found) {
+        vscode.window.showInformationMessage(
+          "Volute CVC: All required components are installed! ✓",
+        );
+      }
+    }),
   );
 
   // Add output channel to subscriptions for cleanup
