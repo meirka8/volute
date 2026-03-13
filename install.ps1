@@ -25,8 +25,8 @@ if (!(Test-Path -Path $InstallDir)) {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 }
 
-# Download logic (placeholder until releases exist)
-$DownloadUrl = "https://github.com/$Repo/releases/latest/download/$AssetName"
+# Download logic via the secure proxy
+$DownloadUrl = "https://cvc.dev/api/download/$AssetName"
 
 Write-Host "Downloading from $DownloadUrl..."
 Invoke-WebRequest -Uri $DownloadUrl -OutFile "$env:TEMP\$AssetName"

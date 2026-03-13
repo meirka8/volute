@@ -45,8 +45,8 @@ echo "Target Asset: $ASSET_NAME"
 # Create install directory
 mkdir -p "$INSTALL_DIR"
 
-# Download latest release
-DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$ASSET_NAME"
+# Download latest release via the secure proxy
+DOWNLOAD_URL="https://cvc.dev/api/download/$ASSET_NAME"
 
 echo "Downloading from $DOWNLOAD_URL..."
 curl -L -o "/tmp/$ASSET_NAME" "$DOWNLOAD_URL"
