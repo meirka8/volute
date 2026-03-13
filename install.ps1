@@ -29,16 +29,10 @@ if (!(Test-Path -Path $InstallDir)) {
 $DownloadUrl = "https://github.com/$Repo/releases/latest/download/$AssetName"
 
 Write-Host "Downloading from $DownloadUrl..."
-# Invoke-WebRequest -Uri $DownloadUrl -OutFile "$env:TEMP\$AssetName"
+Invoke-WebRequest -Uri $DownloadUrl -OutFile "$env:TEMP\$AssetName"
 
 # Extract (release archive contains cvc.exe, cvc-mcp.exe, cvc-lsp.exe)
-# Expand-Archive -Path "$env:TEMP\$AssetName" -DestinationPath $InstallDir -Force
-
-Write-Host "NOTE: release download is commented out until releases exist."
-Write-Host "Simulating installation..."
-New-Item -ItemType File -Force -Path "$InstallDir\cvc.exe" | Out-Null
-New-Item -ItemType File -Force -Path "$InstallDir\cvc-mcp.exe" | Out-Null
-New-Item -ItemType File -Force -Path "$InstallDir\cvc-lsp.exe" | Out-Null
+Expand-Archive -Path "$env:TEMP\$AssetName" -DestinationPath $InstallDir -Force
 
 Write-Host ""
 Write-Host "Success! CVC installed to $InstallDir"

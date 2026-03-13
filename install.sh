@@ -49,22 +49,12 @@ mkdir -p "$INSTALL_DIR"
 DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$ASSET_NAME"
 
 echo "Downloading from $DOWNLOAD_URL..."
-# curl -L -o "/tmp/$ASSET_NAME" "$DOWNLOAD_URL"
+curl -L -o "/tmp/$ASSET_NAME" "$DOWNLOAD_URL"
 
 # Extract (release archive contains cvc, cvc-mcp, cvc-lsp binaries)
-# tar -xzf "/tmp/$ASSET_NAME" -C "$INSTALL_DIR"
-# chmod +x "$INSTALL_DIR/cvc"
-# chmod +x "$INSTALL_DIR/cvc-mcp"
-# chmod +x "$INSTALL_DIR/cvc-lsp"
-
-# Since we don't have actual releases yet, simulate installation.
-echo "NOTE: release download is commented out until releases exist."
-echo "Simulating installation..."
-touch "$INSTALL_DIR/cvc"
+tar -xzf "/tmp/$ASSET_NAME" -C "$INSTALL_DIR"
 chmod +x "$INSTALL_DIR/cvc"
-touch "$INSTALL_DIR/cvc-mcp"
 chmod +x "$INSTALL_DIR/cvc-mcp"
-touch "$INSTALL_DIR/cvc-lsp"
 chmod +x "$INSTALL_DIR/cvc-lsp"
 
 echo ""
