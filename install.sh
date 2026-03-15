@@ -49,7 +49,7 @@ mkdir -p "$INSTALL_DIR"
 DOWNLOAD_URL="https://cvc.dev/api/download/$ASSET_NAME"
 
 echo "Downloading from $DOWNLOAD_URL..."
-curl -L -o "/tmp/$ASSET_NAME" "$DOWNLOAD_URL"
+curl -fSL -o "/tmp/$ASSET_NAME" "$DOWNLOAD_URL"
 
 # Extract (release archive contains cvc, cvc-mcp, cvc-lsp binaries)
 tar -xzf "/tmp/$ASSET_NAME" -C "$INSTALL_DIR"

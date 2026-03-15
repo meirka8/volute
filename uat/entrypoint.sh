@@ -14,10 +14,12 @@ websockify --web /usr/share/novnc 6080 localhost:5901 &
 if [ -d /workspace/extension ]; then
     cd /workspace/extension
     # Package and install it, or install from VSIX if pre-built
-    if [ -f *.vsix ]; then
-        code --user-data-dir /tmp/vscode-user --extensions-dir /tmp/vscode-ext \
-             --install-extension *.vsix --no-sandbox
-    fi
+    for vsix_file in *.vsix; do
+        if [ -f "$vsix_file" ]; then
+            code --user-data-dir /tmp/vscode-user --extensions-dir /tmp/vscode-ext \
+                 --install-extension "$vsix_file" --no-sandbox
+        fi
+    done
 fi
 
 echo "✅ Desktop ready at http://localhost:6080/vnc.html"

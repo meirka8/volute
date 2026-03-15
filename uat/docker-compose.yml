@@ -2,8 +2,8 @@ services:
   desktop:
     build: .
     ports:
-      - "6080:6080"       # noVNC web UI
-      - "5901:5901"   # VNC direct (Remmina)
+      - "127.0.0.1:6080:6080"       # noVNC web UI
+      - "127.0.0.1:5901:5901"       # VNC direct (Remmina)
     volumes:
       - ./extension:/workspace/extension:ro   # your ext source, read-only
     # Notably: NO volume for ~/.vscode or VS Code user data
