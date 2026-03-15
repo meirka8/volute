@@ -40,7 +40,25 @@ Write-Host "  cvc.exe       - CLI interface"
 Write-Host "  cvc-mcp.exe   - MCP server for coding agents"
 Write-Host "  cvc-lsp.exe   - Language server for the VSCode extension"
 Write-Host ""
-Write-Host "Please add $InstallDir to your User PATH."
+$addPath = Read-Host "Would you like to add CVC to your User PATH? [Y/n]"
+if ($addPath -eq 'n' -or $addPath -eq 'N') {
+    Write-Host "Skipping PATH configuration."
+    Write-Host "Please manually add $InstallDir to your User PATH."
+} else {
+    $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+    if ($userPath -like "*$InstallDir*") {
+        Write-Host "CVC is already in your PATH."
+    } else {
+        if ($userPath -and -not $userPath.EndsWith(";")) {
+            $newPath = $userPath + ";" + $InstallDir
+        } else {
+            $newPath = $userPath + $InstallDir
+        }
+        [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
+        Write-Host "✔ Added $InstallDir to your User PATH."
+        Write-Host "👉 Please restart your terminal for the new PATH to take effect."
+    }
+}
 Write-Host ""
 Write-Host "To use CVC with a coding agent (Claude, Cursor, Windsurf, etc.),"
 Write-Host "add the following to your MCP client config:"
