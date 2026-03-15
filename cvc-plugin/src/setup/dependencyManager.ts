@@ -6,10 +6,8 @@ import { findBinary } from "./binaryUtils";
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const SETUP_PAGE_URL = "https://cvc.dev/setup";
-const INSTALL_SCRIPT_URL =
-  "https://raw.githubusercontent.com/meirka8/cvc/main/install.sh";
-const INSTALL_PS1_URL =
-  "https://raw.githubusercontent.com/meirka8/cvc/main/install.ps1";
+const INSTALL_SCRIPT_URL = "https://cvc.dev/api/install.sh";
+const INSTALL_PS1_URL = "https://cvc.dev/api/install.ps1";
 
 /** How often (ms) to re-prompt after a "Not Now" dismissal — 7 days */
 const REMINDER_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
