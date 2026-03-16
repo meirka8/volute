@@ -64,15 +64,19 @@ echo "  cvc-mcp   — MCP server for coding agents"
 echo "  cvc-lsp   — Language server for the VSCode extension"
 echo ""
 echo "Please manually add $INSTALL_DIR to your PATH:"
-echo "  export PATH=\"\$INSTALL_DIR:\$PATH\""
+echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
 echo ""
 
-read -p "Would you like to automatically add CVC to your PATH? [Y/n] " ADD_PATH
+if [ -t 0 ] || [ -c /dev/tty ]; then
+    read -p "Would you like to automatically add CVC to your PATH? [Y/n] " ADD_PATH < /dev/tty
+else
+    ADD_PATH="n"
+fi
 case $ADD_PATH in
     [Nn]* )
         echo "Skipping PATH configuration."
         echo "You can add it manually later:"
-        echo "  export PATH=\"\$INSTALL_DIR:\$PATH\""
+        echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
         ;;
     * )
         SHELL_RC=""
@@ -96,7 +100,7 @@ case $ADD_PATH in
         else
             echo "Could not confidently detect default shell config file."
             echo "Please manually add $INSTALL_DIR to your PATH:"
-            echo "  export PATH=\"\$INSTALL_DIR:\$PATH\""
+            echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
         fi
         ;;
 esac

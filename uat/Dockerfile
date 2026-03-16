@@ -29,7 +29,10 @@ RUN mkdir -p ~/.vnc && \
     echo "password" | vncpasswd -f > ~/.vnc/passwd && \
     chmod 600 ~/.vnc/passwd
 
-COPY --chown=dev:dev entrypoint.sh /home/dev/entrypoint.sh
+RUN echo '#!/bin/bash\ncode --user-data-dir /tmp/vscode-user --extensions-dir /tmp/vscode-ext --no-sandbox "$@"' \
+    > /usr/local/bin/vscode-clean && chmod +x /usr/local/bin/vscode-clean
+
+COPY --chown=dev:dev entrypoint.sh /home/dev/entrypoint.sh    
 RUN chmod +x /home/dev/entrypoint.sh
 
 EXPOSE 6080
