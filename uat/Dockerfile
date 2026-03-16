@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -21,6 +21,10 @@ RUN wget -qO /tmp/vscode.deb \
 
 # Create a non-root user (VS Code is unhappy as root)
 RUN useradd -m -s /bin/bash dev && echo "dev:dev" | chpasswd && adduser dev sudo
+
+RUN echo '#!/bin/bash\ncode --user-data-dir /tmp/vscode-user --extensions-dir /tmp/vscode-ext --no-sandbox "$@"' \
+    > /usr/local/bin/vscode-clean && chmod +x /usr/local/bin/vscode-clean
+
 USER dev
 WORKDIR /home/dev
 
@@ -28,9 +32,6 @@ WORKDIR /home/dev
 RUN mkdir -p ~/.vnc && \
     echo "password" | vncpasswd -f > ~/.vnc/passwd && \
     chmod 600 ~/.vnc/passwd
-
-RUN echo '#!/bin/bash\ncode --user-data-dir /tmp/vscode-user --extensions-dir /tmp/vscode-ext --no-sandbox "$@"' \
-    > /usr/local/bin/vscode-clean && chmod +x /usr/local/bin/vscode-clean
 
 COPY --chown=dev:dev entrypoint.sh /home/dev/entrypoint.sh    
 RUN chmod +x /home/dev/entrypoint.sh
