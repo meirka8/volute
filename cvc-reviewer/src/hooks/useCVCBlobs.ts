@@ -21,13 +21,15 @@ async function fetchBlobJson<T>(url: string, token: string): Promise<T> {
 }
 
 export function useCVCBlobs(owner: string, repo: string) {
-  const { token } = useAuth();
+  const { isAuthenticated, acquireToken } = useAuth();
 
   return useQuery({
     queryKey: ["cvc-blobs", owner, repo],
     queryFn: async (): Promise<InteractionNode[]> => {
-      if (!token) throw new Error("No token");
-      const client = createGithubClient(token);
+      const currentToken = await acquireToken(owner, repo);
+      if (!currentToken) throw new Error("Could not acquire token");
+      
+      const client = createGithubClient(currentToken);
 
       try {
         // 1. Get the Tree for refs/cvc/main
@@ -63,7 +65,7 @@ export function useCVCBlobs(owner: string, repo: string) {
         for (let i = 0; i < blobs.length; i += BATCH_SIZE) {
           const batch = blobs.slice(i, i + BATCH_SIZE);
           const results = await Promise.all(
-            batch.map((blob) => fetchBlobJson<CVCBlobData>(blob.url!, token))
+            batch.map((blob) => fetchBlobJson<CVCBlobData>(blob.url!, currentToken))
           );
           blobDataList.push(...results);
         }
@@ -83,7 +85,7 @@ export function useCVCBlobs(owner: string, repo: string) {
         throw error;
       }
     },
-    enabled: !!token && !!owner && !!repo,
+    enabled: isAuthenticated && !!owner && !!repo,
     staleTime: 1000 * 60 * 5, // 5 minutes
   });
 }
