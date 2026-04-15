@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useRef } from 'react';
+import React, { createContext, useContext, useState, useRef, useEffect } from 'react';
 import { StorageService } from './StorageService';
 
 export class PaymentRequiredError extends Error {
@@ -35,6 +35,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     // Cache structure: repoKey -> { token, expiresAt, timeoutId, promise }
     const tokenCache = useRef<Map<string, { token: string, expiresAt: number, timeoutId?: number, promise?: Promise<string> }>>(new Map());
+
+    // Clear all scheduled refresh timeouts on unmount to prevent stale timers
+    // from firing after AuthProvider is removed (navigation, tests, hot reload).
+    useEffect(() => {
+        return () => {
+            tokenCache.current.forEach(cache => {
+                if (cache.timeoutId) window.clearTimeout(cache.timeoutId);
+            });
+            tokenCache.current.clear();
+        };
+    }, []);
 
     const acquireToken = async (owner?: string, repo?: string): Promise<string> => {
         if (!isHostedMode) {
@@ -86,15 +97,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
                 const data = await response.json();
                 const newToken = data.token;
-                const expiresAt = new Date(data.expiresAt).getTime();
+                const parsedExpiry = new Date(data.expiresAt).getTime();
 
                 // Clear existing timeout
                 if (cached?.timeoutId) {
                     window.clearTimeout(cached.timeoutId);
                 }
 
+                // Recompute now after the network round-trip for accurate scheduling
+                const nowAfterFetch = Date.now();
+
+                // Validate expiresAt — fall back to a conservative 5 min TTL if unusable
+                const expiresAt = Number.isFinite(parsedExpiry) && parsedExpiry > nowAfterFetch
+                    ? parsedExpiry
+                    : nowAfterFetch + 5 * 60 * 1000;
+
                 // Schedule auto-refresh 5 mins before expiry
-                const timeUntilRefresh = (expiresAt - now) - (5 * 60 * 1000);
+                const timeUntilRefresh = (expiresAt - nowAfterFetch) - (5 * 60 * 1000);
                 let newTimeoutId;
                 if (timeUntilRefresh > 0) {
                     newTimeoutId = window.setTimeout(() => {
