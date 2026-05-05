@@ -96,8 +96,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                 }
 
                 const data = await response.json();
-                const newToken = data.token;
+                
+                // Validate response shape
+                if (!data.token || typeof data.token !== 'string') {
+                    throw new Error("Invalid token response: token is missing or not a string");
+                }
+                
                 const parsedExpiry = new Date(data.expiresAt).getTime();
+                if (!data.expiresAt || !Number.isFinite(parsedExpiry)) {
+                    throw new Error("Invalid token response: expiresAt is missing or not parseable");
+                }
+                
+                const newToken = data.token;
 
                 // Clear existing timeout
                 if (cached?.timeoutId) {
@@ -108,7 +118,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                 const nowAfterFetch = Date.now();
 
                 // Validate expiresAt — fall back to a conservative 5 min TTL if unusable
-                const expiresAt = Number.isFinite(parsedExpiry) && parsedExpiry > nowAfterFetch
+                // (Though we just validated it above, we keep the check to ensure it's in the future)
+                const expiresAt = parsedExpiry > nowAfterFetch
                     ? parsedExpiry
                     : nowAfterFetch + 5 * 60 * 1000;
 
