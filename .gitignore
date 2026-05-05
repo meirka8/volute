@@ -18,3 +18,5 @@ node_modules
 
 # whole common_data folder
 common_data
+
+.env*

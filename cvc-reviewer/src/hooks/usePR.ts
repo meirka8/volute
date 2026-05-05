@@ -3,13 +3,15 @@ import { useAuth } from '../auth/AuthContext';
 import { createGithubClient } from '../api/github';
 
 export function usePR(owner: string, repo: string, pullNumber: number) {
-    const { token } = useAuth();
+    const { isAuthenticated, acquireToken } = useAuth();
 
     return useQuery({
         queryKey: ['pr', owner, repo, pullNumber],
         queryFn: async () => {
-            if (!token) throw new Error("No token");
-            const client = createGithubClient(token);
+            const currentToken = await acquireToken(owner, repo);
+            if (!currentToken) throw new Error("Could not acquire token");
+            
+            const client = createGithubClient(currentToken);
 
             const [pr, files] = await Promise.all([
                 client.getPullRequest(owner, repo, pullNumber),
@@ -18,6 +20,6 @@ export function usePR(owner: string, repo: string, pullNumber: number) {
 
             return { pr, files };
         },
-        enabled: !!token && !!owner && !!repo && !!pullNumber,
+        enabled: isAuthenticated && !!owner && !!repo && !!pullNumber,
     });
 }

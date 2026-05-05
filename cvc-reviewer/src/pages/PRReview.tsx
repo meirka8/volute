@@ -7,6 +7,7 @@ import { ThreePaneLayout } from "../components/ui/ThreePaneLayout";
 import { Sidebar, type FileItem } from "../components/sidebar/Sidebar";
 import { DiffViewer } from "../components/diff/DiffViewer";
 import { ShadowTimeline } from "../components/timeline/ShadowTimeline";
+import { Paywall } from "./Paywall";
 import {
   CommandPalette,
   useCommandPalette,
@@ -33,7 +34,7 @@ export function PRReviewPage() {
   const prNumber = parseInt(params.pr || "0", 10);
 
   // Auth
-  const { token, logout } = useAuth();
+  const { token, logout, acquireToken, isAuthenticated } = useAuth();
 
   // UI State
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
@@ -46,10 +47,10 @@ export function PRReviewPage() {
   const { isOpen: isPaletteOpen, close: closePalette } = useCommandPalette();
 
   // Fetch PR data
-  const { data: prData, isLoading: isPRLoading } = usePR(owner, repo, prNumber);
+  const { data: prData, isLoading: isPRLoading, error: prError } = usePR(owner, repo, prNumber);
 
   // Fetch CVC blobs
-  const { data: allInteractions, isLoading: isBlobsLoading } = useCVCBlobs(
+  const { data: allInteractions, isLoading: isBlobsLoading, error: blobsError } = useCVCBlobs(
     owner,
     repo,
   );
@@ -62,18 +63,22 @@ export function PRReviewPage() {
       repo,
       prNumber,
       allInteractions?.length,
+      isAuthenticated,
     ],
     queryFn: async (): Promise<InteractionNode[]> => {
-      if (!allInteractions || !token) return [];
+      if (!allInteractions || !isAuthenticated) return [];
 
-      const client = createGithubClient(token);
+      const activeToken = await acquireToken(owner, repo).catch(() => null);
+      if (!activeToken) return [];
+
+      const client = createGithubClient(activeToken);
       const ranger = new CommitRanger(client);
       const commits = await ranger.getCommitShas(owner, repo, prNumber);
 
       const mapper = new InteractionMapper(allInteractions);
       return mapper.getInteractionsForRange(commits);
     },
-    enabled: !!allInteractions && !!token && prNumber > 0,
+    enabled: !!allInteractions && isAuthenticated && prNumber > 0,
   });
 
   // Transform PR files to FileItem format
@@ -221,6 +226,14 @@ export function PRReviewPage() {
 
   // Loading state
   const isLoading = isPRLoading || isBlobsLoading || isJoinLoading;
+
+  // Extract errors from queries
+  const errorObj = prData === undefined ? prError : null; // React Query destructuring aliasing check, let's just use useQuery error directly below
+
+  // Check for Payment Required
+  if (prError?.name === 'PaymentRequiredError' || blobsError?.name === 'PaymentRequiredError' || errorObj?.name === 'PaymentRequiredError') {
+    return <Paywall />;
+  }
 
   // Error state - show if no valid params
   if (!owner || !repo || !prNumber) {
