@@ -1,0 +1,20 @@
+{
+  "name": "@volute/cvc-mcp",
+  "version": "0.1.0",
+  "description": "CVC Model Context Protocol Server",
+  "bin": {
+    "cvc-mcp": "./bin/cvc-mcp.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/meirka8/cvc.git"
+  },
+  "author": "Volute",
+  "license": "ISC",
+  "publishConfig": {
+    "access": "public"
+  }
+}
