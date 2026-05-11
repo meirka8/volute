@@ -29,12 +29,15 @@ export function CommandPalette({
   onSelectFile,
 }: CommandPaletteProps) {
   const [search, setSearch] = useState("");
+  const handleClose = useCallback(() => {
+    setSearch("");
+    onClose();
+  }, [onClose]);
 
-  // Close on escape
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        onClose();
+        handleClose();
       }
     };
 
@@ -42,14 +45,7 @@ export function CommandPalette({
       document.addEventListener("keydown", handleKeyDown);
       return () => document.removeEventListener("keydown", handleKeyDown);
     }
-  }, [isOpen, onClose]);
-
-  // Reset search when closing
-  useEffect(() => {
-    if (!isOpen) {
-      setSearch("");
-    }
-  }, [isOpen]);
+  }, [handleClose, isOpen]);
 
   // Group actions by their group property
   const groupedActions = actions.reduce(
@@ -72,8 +68,8 @@ export function CommandPalette({
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.1 }}
-            className="fixed inset-0 bg-black/60 z-50"
-            onClick={onClose}
+            className="fixed inset-0 z-50 bg-[rgba(90,74,65,0.18)] backdrop-blur-sm"
+            onClick={handleClose}
           />
 
           {/* Command Dialog */}
@@ -85,35 +81,32 @@ export function CommandPalette({
             className="fixed top-[20%] left-1/2 -translate-x-1/2 w-full max-w-xl z-50"
           >
             <Command
-              className="bg-[#0d0d0d] border border-[#262626] rounded-lg shadow-2xl overflow-hidden"
+              className="rr-panel overflow-hidden rounded-[1.75rem] shadow-2xl"
               loop
             >
-              {/* Search input */}
-              <div className="flex items-center gap-3 px-4 py-3 border-b border-[#1c1c1c]">
-                <Search size={18} className="text-[#555555]" />
+              <div className="flex items-center gap-3 border-b border-line/80 px-4 py-3">
+                <Search size={18} className="text-muted" />
                 <Command.Input
                   value={search}
                   onValueChange={setSearch}
                   placeholder="Type a command or search..."
-                  className="flex-1 bg-transparent text-[#ededed] placeholder-[#555555] outline-none text-sm"
+                  className="flex-1 bg-transparent text-sm text-ink placeholder:text-muted outline-none"
                   autoFocus
                 />
-                <kbd className="px-1.5 py-0.5 text-xs text-[#555555] bg-[#1c1c1c] rounded">
+                <kbd className="rounded-full bg-canvas/80 px-2 py-1 text-xs text-muted">
                   ESC
                 </kbd>
               </div>
 
-              {/* Results */}
               <Command.List className="max-h-80 overflow-y-auto p-2">
-                <Command.Empty className="py-6 text-center text-sm text-[#555555]">
+                <Command.Empty className="py-6 text-center text-sm text-muted">
                   No results found.
                 </Command.Empty>
 
-                {/* Files group */}
                 {files.length > 0 && (
                   <Command.Group
                     heading={
-                      <span className="text-xs text-[#555555] font-medium px-2">
+                      <span className="px-2 text-xs font-medium uppercase tracking-[0.18em] text-muted">
                         Files
                       </span>
                     }
@@ -124,33 +117,32 @@ export function CommandPalette({
                         value={`file ${file.filename}`}
                         onSelect={() => {
                           onSelectFile?.(file.filename);
-                          onClose();
+                          handleClose();
                         }}
                         className={clsx(
-                          "flex items-center gap-3 px-3 py-2 rounded cursor-pointer",
-                          "text-sm text-[#ededed]",
-                          "aria-selected:bg-[#5e6ad2]/20",
-                          "hover:bg-[#1c1c1c]",
+                          "flex cursor-pointer items-center gap-3 rounded-2xl px-3 py-2",
+                          "text-sm text-ink",
+                          "aria-selected:bg-action/10",
+                          "hover:bg-canvas/80",
                         )}
                       >
-                        <File size={14} className="text-[#888888]" />
+                        <File size={14} className="text-muted" />
                         <span className="flex-1 truncate font-mono text-xs">
                           {file.filename}
                         </span>
                         {file.isViewed && (
-                          <Check size={14} className="text-[#27a300]" />
+                          <Check size={14} className="text-success" />
                         )}
                       </Command.Item>
                     ))}
                   </Command.Group>
                 )}
 
-                {/* Action groups */}
                 {Object.entries(groupedActions).map(([group, groupActions]) => (
                   <Command.Group
                     key={group}
                     heading={
-                      <span className="text-xs text-[#555555] font-medium px-2">
+                      <span className="px-2 text-xs font-medium uppercase tracking-[0.18em] text-muted">
                         {group}
                       </span>
                     }
@@ -161,21 +153,21 @@ export function CommandPalette({
                         value={action.label}
                         onSelect={() => {
                           action.onSelect();
-                          onClose();
+                          handleClose();
                         }}
                         className={clsx(
-                          "flex items-center gap-3 px-3 py-2 rounded cursor-pointer",
-                          "text-sm text-[#ededed]",
-                          "aria-selected:bg-[#5e6ad2]/20",
-                          "hover:bg-[#1c1c1c]",
+                          "flex cursor-pointer items-center gap-3 rounded-2xl px-3 py-2",
+                          "text-sm text-ink",
+                          "aria-selected:bg-action/10",
+                          "hover:bg-canvas/80",
                         )}
                       >
                         {action.icon || (
-                          <Keyboard size={14} className="text-[#888888]" />
+                          <Keyboard size={14} className="text-muted" />
                         )}
                         <span className="flex-1">{action.label}</span>
                         {action.shortcut && (
-                          <kbd className="px-1.5 py-0.5 text-xs text-[#555555] bg-[#1c1c1c] rounded font-mono">
+                          <kbd className="rounded-full bg-canvas/80 px-2 py-1 text-xs font-mono text-muted">
                             {action.shortcut}
                           </kbd>
                         )}
@@ -190,28 +182,4 @@ export function CommandPalette({
       )}
     </AnimatePresence>
   );
-}
-
-// Hook to manage command palette state and keyboard shortcuts
-export function useCommandPalette() {
-  const [isOpen, setIsOpen] = useState(false);
-
-  const open = useCallback(() => setIsOpen(true), []);
-  const close = useCallback(() => setIsOpen(false), []);
-  const toggle = useCallback(() => setIsOpen((prev) => !prev), []);
-
-  // Global Cmd+K / Ctrl+K handler
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
-        e.preventDefault();
-        toggle();
-      }
-    };
-
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [toggle]);
-
-  return { isOpen, open, close, toggle };
 }

@@ -1,35 +1,30 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&family=Spectral:wght@400;500;600;700&display=swap");
 @import "tailwindcss";
 @import "react-diff-view/style/index.css";
 
-/* Tell Tailwind v4 where to find classes */
 @source "../index.html";
 @source "./**/*.{js,ts,jsx,tsx}";
 
+@theme {
+    --font-sans: "Inter", system-ui, sans-serif;
+    --font-serif: "Spectral", Georgia, serif;
+    --font-mono: "IBM Plex Mono", monospace;
+
+    --color-canvas: #f6f3eb;
+    --color-surface: #e6dbd4;
+    --color-surface-strong: #ddd0c8;
+    --color-thought: #efe3da;
+    --color-code: #fbf8f2;
+    --color-line: #dedac7;
+    --color-ink: #5a4a41;
+    --color-muted: #7c6d63;
+    --color-action: #10508d;
+    --color-success: #4caf50;
+    --color-warning: #f9a825;
+    --color-danger: #b00020;
+}
+
 :root {
-    /* CVC Design System - Linear-Grade Dark Theme */
-    --cvc-bg-primary: #080808;
-    --cvc-bg-secondary: #0d0d0d;
-    --cvc-bg-tertiary: #111111;
-    --cvc-border: #1c1c1c;
-    --cvc-border-subtle: #262626;
-
-    --cvc-text-primary: #ededed;
-    --cvc-text-secondary: #888888;
-    --cvc-text-muted: #555555;
-
-    --cvc-accent-ai: #5e6ad2;
-    --cvc-accent-ai-dim: #3d4494;
-    --cvc-accent-success: #27a300;
-    --cvc-accent-warning: #f59e0b;
-    --cvc-accent-error: #ef4444;
-
-    /* Typography */
-    font-family:
-        Inter,
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        sans-serif;
     line-height: 1.5;
     font-weight: 400;
     font-synthesis: none;
@@ -48,74 +43,91 @@ body,
     margin: 0;
     padding: 0;
     min-height: 100vh;
-    background-color: var(--cvc-bg-primary);
-    color: var(--cvc-text-primary);
+    background:
+        radial-gradient(circle at top, rgba(16, 80, 141, 0.08), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(249, 168, 37, 0.12), transparent 30%),
+        #f6f3eb;
+    color: #5a4a41;
+    font-family: "Inter", system-ui, sans-serif;
 }
 
-/* Monospace for code */
-.font-mono {
-    font-family: "SF Mono", "Fira Code", "JetBrains Mono", Consolas, monospace;
-}
-
-/* Scrollbar styling for dark theme */
 ::-webkit-scrollbar {
     width: 8px;
     height: 8px;
 }
 
 ::-webkit-scrollbar-track {
-    background: var(--cvc-bg-secondary);
+    background: rgba(230, 219, 212, 0.55);
 }
 
 ::-webkit-scrollbar-thumb {
-    background: var(--cvc-border-subtle);
+    background: rgba(124, 109, 99, 0.55);
     border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-    background: var(--cvc-text-muted);
+    background: rgba(90, 74, 65, 0.72);
 }
 
-/* Focus styles for keyboard navigation */
 :focus-visible {
-    outline: 2px solid var(--cvc-accent-ai);
+    outline: 2px solid rgba(16, 80, 141, 0.7);
     outline-offset: 2px;
 }
 
-/* Selection styling */
 ::selection {
-    background-color: var(--cvc-accent-ai-dim);
-    color: var(--cvc-text-primary);
+    background-color: rgba(16, 80, 141, 0.18);
+    color: #5a4a41;
 }
 
-/* react-diff-view theme overrides via CSS custom properties */
+.rr-panel {
+    border: 1px solid rgba(222, 218, 199, 0.92);
+    background: rgba(246, 243, 235, 0.78);
+    box-shadow: 0 4px 6px rgba(90, 74, 65, 0.1), 0 18px 38px rgba(90, 74, 65, 0.08);
+    backdrop-filter: blur(12px);
+}
+
+.rr-card {
+    border: 1px solid rgba(222, 218, 199, 0.92);
+    background: rgba(230, 219, 212, 0.74);
+    box-shadow: 0 4px 6px rgba(90, 74, 65, 0.1), 0 20px 40px rgba(90, 74, 65, 0.08);
+}
+
+.rr-code {
+    border: 1px solid rgba(222, 218, 199, 0.92);
+    background: rgba(251, 248, 242, 0.94);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
+}
+
+.rr-thought {
+    border: 1px solid rgba(222, 218, 199, 0.92);
+    background: rgba(239, 227, 218, 0.92);
+}
+
 :root {
-    --diff-background-color: var(--cvc-bg-primary);
-    --diff-text-color: var(--cvc-text-primary);
-    --diff-font-family:
-        "SF Mono", "Fira Code", "JetBrains Mono", Consolas, monospace;
-    --diff-selection-background-color: var(--cvc-accent-ai-dim);
-    --diff-selection-text-color: var(--cvc-text-primary);
-    --diff-gutter-insert-background-color: rgba(39, 163, 0, 0.25);
-    --diff-gutter-insert-text-color: var(--cvc-accent-success);
-    --diff-gutter-delete-background-color: rgba(239, 68, 68, 0.25);
-    --diff-gutter-delete-text-color: var(--cvc-accent-error);
-    --diff-gutter-selected-background-color: var(--cvc-border-subtle);
-    --diff-gutter-selected-text-color: var(--cvc-text-primary);
-    --diff-code-insert-background-color: rgba(39, 163, 0, 0.15);
-    --diff-code-insert-text-color: var(--cvc-text-primary);
-    --diff-code-delete-background-color: rgba(239, 68, 68, 0.15);
-    --diff-code-delete-text-color: var(--cvc-text-primary);
-    --diff-code-insert-edit-background-color: rgba(39, 163, 0, 0.35);
-    --diff-code-insert-edit-text-color: var(--cvc-text-primary);
-    --diff-code-delete-edit-background-color: rgba(239, 68, 68, 0.35);
-    --diff-code-delete-edit-text-color: var(--cvc-text-primary);
-    --diff-code-selected-background-color: var(--cvc-border-subtle);
-    --diff-code-selected-text-color: var(--cvc-text-primary);
-    --diff-omit-gutter-line-color: var(--cvc-accent-error);
+    --diff-background-color: rgba(251, 248, 242, 0.9);
+    --diff-text-color: #5a4a41;
+    --diff-font-family: "IBM Plex Mono", monospace;
+    --diff-selection-background-color: rgba(16, 80, 141, 0.12);
+    --diff-selection-text-color: #5a4a41;
+    --diff-gutter-insert-background-color: rgba(76, 175, 80, 0.16);
+    --diff-gutter-insert-text-color: #2f7f37;
+    --diff-gutter-delete-background-color: rgba(176, 0, 32, 0.12);
+    --diff-gutter-delete-text-color: #8f0e26;
+    --diff-gutter-selected-background-color: rgba(230, 219, 212, 0.7);
+    --diff-gutter-selected-text-color: #5a4a41;
+    --diff-code-insert-background-color: rgba(76, 175, 80, 0.1);
+    --diff-code-insert-text-color: #5a4a41;
+    --diff-code-delete-background-color: rgba(176, 0, 32, 0.08);
+    --diff-code-delete-text-color: #5a4a41;
+    --diff-code-insert-edit-background-color: rgba(76, 175, 80, 0.18);
+    --diff-code-insert-edit-text-color: #5a4a41;
+    --diff-code-delete-edit-background-color: rgba(176, 0, 32, 0.14);
+    --diff-code-delete-edit-text-color: #5a4a41;
+    --diff-code-selected-background-color: rgba(230, 219, 212, 0.7);
+    --diff-code-selected-text-color: #5a4a41;
+    --diff-omit-gutter-line-color: #b00020;
 }
 
-/* react-diff-view additional overrides */
 .diff-unified,
 .diff-split {
     font-size: 13px;
@@ -123,13 +135,13 @@ body,
 }
 
 .diff-gutter {
-    background: var(--cvc-bg-secondary);
-    color: var(--cvc-text-muted);
+    background: rgba(230, 219, 212, 0.55);
+    color: #7c6d63;
     padding: 0 8px;
 }
 
 .diff-gutter:hover {
-    background: var(--cvc-border-subtle);
+    background: rgba(221, 208, 200, 0.82);
 }
 
 .diff-code {
