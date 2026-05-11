@@ -4,6 +4,7 @@ import Login from "./pages/Login";
 import { PRReviewPage } from "./pages/PRReview";
 import { DebugView } from "./DebugView";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ThemeToggle } from "./components/ui/ThemeToggle";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -27,12 +28,15 @@ function Dashboard() {
             <div className="text-xs font-semibold uppercase tracking-[0.2em] text-action">Hosted Reviewer</div>
             <h1 className="mt-2 font-serif text-3xl font-semibold">CVC Reviewer</h1>
           </div>
-          <button
-            onClick={logout}
-            className="rr-panel rounded-full px-4 py-2 text-sm font-medium text-muted transition-colors hover:bg-surface hover:text-ink"
-          >
-            Logout
-          </button>
+          <div className="flex items-center gap-3">
+            <ThemeToggle compact />
+            <button
+              onClick={logout}
+              className="rr-panel rounded-full px-4 py-2 text-sm font-medium text-muted transition-colors hover:bg-surface hover:text-ink"
+            >
+              Logout
+            </button>
+          </div>
         </div>
 
         <div className="rr-panel rounded-[2rem] p-6">

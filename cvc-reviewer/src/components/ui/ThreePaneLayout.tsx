@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen } from 'lucide-react';
+import { ThemeToggle } from './ThemeToggle';
 
 interface ThreePaneLayoutProps {
   sidebar: ReactNode;
@@ -64,13 +65,16 @@ export function ThreePaneLayout({
           </div>
         </div>
 
-        <button
-          onClick={toggleRightPanel}
-          className="rounded-full p-2 text-muted transition-colors hover:bg-surface hover:text-ink"
-          aria-label={isRightPanelOpen ? 'Close timeline' : 'Open timeline'}
-        >
-          {isRightPanelOpen ? <PanelRightClose size={18} /> : <PanelRightOpen size={18} />}
-        </button>
+        <div className="flex items-center gap-2">
+          <ThemeToggle compact />
+          <button
+            onClick={toggleRightPanel}
+            className="rounded-full p-2 text-muted transition-colors hover:bg-surface hover:text-ink"
+            aria-label={isRightPanelOpen ? 'Close timeline' : 'Open timeline'}
+          >
+            {isRightPanelOpen ? <PanelRightClose size={18} /> : <PanelRightOpen size={18} />}
+          </button>
+        </div>
       </header>
 
       <div className="flex flex-1 overflow-hidden px-3 pb-3 sm:px-4 sm:pb-4">
@@ -86,7 +90,7 @@ export function ThreePaneLayout({
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
                   exit={{ opacity: 0 }}
-                  className="fixed inset-0 z-30 bg-[rgba(90,74,65,0.18)] backdrop-blur-sm"
+                  className="rr-overlay fixed inset-0 z-30 backdrop-blur-sm"
                   onClick={closePanels}
                 />
               )}

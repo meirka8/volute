@@ -63,7 +63,7 @@ ${patch}`;
 
   return (
     <div className="rr-panel h-full overflow-auto rounded-[1.5rem]">
-      <div className="sticky top-0 z-10 flex items-center justify-between border-b border-line/80 bg-[rgba(246,243,235,0.92)] px-4 py-3 backdrop-blur-xl">
+      <div className="rr-toolbar sticky top-0 z-10 flex items-center justify-between border-b border-line/80 px-4 py-3 backdrop-blur-xl">
         <span className="font-mono text-sm text-ink">{filename}</span>
         {highlightedLine && (
           <span className="text-xs text-action">

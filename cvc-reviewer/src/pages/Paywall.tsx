@@ -1,5 +1,6 @@
 import { Lock, CreditCard, ChevronRight } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext';
+import { ThemeToggle } from '../components/ui/ThemeToggle';
 
 export function Paywall() {
     const { isHostedMode } = useAuth();
@@ -8,7 +9,11 @@ export function Paywall() {
     const upgradeUrl = `${platformUrl}/dashboard/billing`;
 
     return (
-        <div className="flex min-h-screen flex-col items-center justify-center p-4 text-ink">
+        <div className="relative flex min-h-screen flex-col items-center justify-center p-4 text-ink">
+            <div className="fixed right-6 top-6 z-20">
+                <ThemeToggle compact />
+            </div>
+
             <div className="w-full max-w-lg space-y-8">
                 <div className="text-center">
                     <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl border border-line bg-canvas/80">

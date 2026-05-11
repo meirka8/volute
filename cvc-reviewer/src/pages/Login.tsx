@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useAuth } from '../auth/AuthContext';
 import { useLocation } from 'wouter';
 import { KeyRound, ShieldCheck } from 'lucide-react';
+import { ThemeToggle } from '../components/ui/ThemeToggle';
 
 export default function Login() {
     const { login } = useAuth();
@@ -50,7 +51,11 @@ export default function Login() {
     };
 
     return (
-        <div className="flex min-h-screen flex-col items-center justify-center p-4 text-ink">
+        <div className="relative flex min-h-screen flex-col items-center justify-center p-4 text-ink">
+            <div className="fixed right-6 top-6 z-20">
+                <ThemeToggle compact />
+            </div>
+
             <div className="w-full max-w-md space-y-8">
                 <div className="text-center">
                     <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-action/10">

@@ -68,7 +68,7 @@ export function CommandPalette({
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.1 }}
-            className="fixed inset-0 z-50 bg-[rgba(90,74,65,0.18)] backdrop-blur-sm"
+            className="rr-overlay fixed inset-0 z-50 backdrop-blur-sm"
             onClick={handleClose}
           />
 

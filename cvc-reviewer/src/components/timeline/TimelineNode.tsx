@@ -161,7 +161,7 @@ export function TimelineNode({
         className={clsx(
         'mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors',
         isSelected
-          ? 'border-action bg-action/10 shadow-[0_10px_28px_rgba(16,80,141,0.08)]'
+          ? 'rr-selected-card border-action bg-action/10'
           : 'border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70'
       )}
       onClick={onSelect}
