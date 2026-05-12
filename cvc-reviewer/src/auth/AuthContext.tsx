@@ -1,12 +1,7 @@
+/* eslint-disable react-refresh/only-export-components */
 import React, { createContext, useContext, useState, useRef, useEffect } from 'react';
 import { StorageService } from './StorageService';
-
-export class PaymentRequiredError extends Error {
-    constructor(message: string) {
-        super(message);
-        this.name = 'PaymentRequiredError';
-    }
-}
+import { PaymentRequiredError } from './errors';
 
 // Use strict types for the context
 interface AuthContextType {
@@ -39,11 +34,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // Clear all scheduled refresh timeouts on unmount to prevent stale timers
     // from firing after AuthProvider is removed (navigation, tests, hot reload).
     useEffect(() => {
+        const cache = tokenCache.current;
+
         return () => {
-            tokenCache.current.forEach(cache => {
-                if (cache.timeoutId) window.clearTimeout(cache.timeoutId);
+            cache.forEach(entry => {
+                if (entry.timeoutId) window.clearTimeout(entry.timeoutId);
             });
-            tokenCache.current.clear();
+            cache.clear();
         };
     }, []);
 

@@ -39,9 +39,9 @@ ${patch}`;
 
   if (!patch) {
     return (
-      <div className="h-full flex items-center justify-center text-[#555555]">
+      <div className="flex h-full items-center justify-center text-muted">
         <div className="text-center">
-          <p className="text-lg">No diff available</p>
+          <p className="font-serif text-2xl">No diff available</p>
           <p className="text-sm mt-1">This file might be binary or empty</p>
         </div>
       </div>
@@ -50,9 +50,9 @@ ${patch}`;
 
   if (files.length === 0) {
     return (
-      <div className="h-full flex items-center justify-center text-[#ef4444]">
+      <div className="flex h-full items-center justify-center text-danger">
         <div className="text-center">
-          <p className="text-lg">Failed to parse diff</p>
+          <p className="font-serif text-2xl">Failed to parse diff</p>
           <p className="text-sm mt-1">The patch format might be invalid</p>
         </div>
       </div>
@@ -62,12 +62,11 @@ ${patch}`;
   const file = files[0];
 
   return (
-    <div className="h-full overflow-auto bg-[#080808]">
-      {/* File header */}
-      <div className="sticky top-0 z-10 bg-[#0d0d0d] border-b border-[#1c1c1c] px-4 py-2 flex items-center justify-between">
-        <span className="font-mono text-sm text-[#ededed]">{filename}</span>
+    <div className="rr-panel h-full overflow-auto rounded-[1.5rem]">
+      <div className="rr-toolbar sticky top-0 z-10 flex items-center justify-between border-b border-line/80 px-4 py-3 backdrop-blur-xl">
+        <span className="font-mono text-sm text-ink">{filename}</span>
         {highlightedLine && (
-          <span className="text-xs text-[#5e6ad2]">
+          <span className="text-xs text-action">
             Line {highlightedLine} linked
           </span>
         )}
@@ -84,7 +83,7 @@ ${patch}`;
 
       {/* Empty state for no hunks */}
       {(!file.hunks || file.hunks.length === 0) && (
-        <div className="flex items-center justify-center h-40 text-[#555555] text-sm">
+        <div className="flex h-40 items-center justify-center text-sm text-muted">
           No changes in this file
         </div>
       )}

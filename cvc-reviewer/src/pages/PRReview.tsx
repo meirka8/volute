@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { useParams } from "wouter";
 import { useQuery } from "@tanstack/react-query";
 import { Eye, LogOut, GitPullRequest, ExternalLink } from "lucide-react";
@@ -10,15 +10,16 @@ import { ShadowTimeline } from "../components/timeline/ShadowTimeline";
 import { Paywall } from "./Paywall";
 import {
   CommandPalette,
-  useCommandPalette,
   type CommandAction,
 } from "../components/ui/CommandPalette";
+import { useCommandPalette } from "../components/ui/useCommandPalette";
 import {
   useKeyboardNavigation,
   useFileNavigation,
 } from "../hooks/useKeyboardNavigation";
 
 import { useAuth } from "../auth/AuthContext";
+import { PaymentRequiredError } from "../auth/errors";
 import { usePR } from "../hooks/usePR";
 import { useCVCBlobs } from "../hooks/useCVCBlobs";
 import { createGithubClient } from "../api/github";
@@ -34,7 +35,7 @@ export function PRReviewPage() {
   const prNumber = parseInt(params.pr || "0", 10);
 
   // Auth
-  const { token, logout, acquireToken, isAuthenticated } = useAuth();
+  const { logout, acquireToken, isAuthenticated } = useAuth();
 
   // UI State
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
@@ -81,34 +82,39 @@ export function PRReviewPage() {
     enabled: !!allInteractions && isAuthenticated && prNumber > 0,
   });
 
-  // Transform PR files to FileItem format
+  const sourceFiles = prData?.files;
   const files: FileItem[] = useMemo(() => {
-    if (!prData?.files) return [];
-    return prData.files.map((f) => ({
+    if (!sourceFiles) {
+      return [];
+    }
+
+    return sourceFiles.map((f) => ({
       filename: f.filename,
       status: f.status as FileItem["status"],
       additions: f.additions,
       deletions: f.deletions,
       patch: f.patch,
     }));
-  }, [prData?.files]);
+  }, [sourceFiles]);
 
-  // Get current file's patch
+  const activeSelectedFile = selectedFile ?? files[0]?.filename ?? null;
+
   const currentFile = useMemo(() => {
-    if (!selectedFile) return null;
-    return files.find((f) => f.filename === selectedFile) || null;
-  }, [selectedFile, files]);
+    if (!activeSelectedFile) return null;
+    return files.find((f) => f.filename === activeSelectedFile) || null;
+  }, [activeSelectedFile, files]);
 
   // File navigation
   const fileNames = useMemo(() => files.map((f) => f.filename), [files]);
+  const paletteFiles = useMemo(
+    () =>
+      files.map((f) => ({
+        filename: f.filename,
+        isViewed: viewedFiles.has(f.filename),
+      })),
+    [files, viewedFiles],
+  );
   const { getNextFile, getPreviousFile } = useFileNavigation(fileNames);
-
-  // Auto-select first file
-  useEffect(() => {
-    if (files.length > 0) {
-      setSelectedFile((curr) => curr || files[0].filename);
-    }
-  }, [files]);
 
   // Handlers
   const handleSelectFile = useCallback((filename: string) => {
@@ -128,14 +134,14 @@ export function PRReviewPage() {
   }, []);
 
   const handleNextFile = useCallback(() => {
-    const next = getNextFile(selectedFile);
+    const next = getNextFile(activeSelectedFile);
     if (next) setSelectedFile(next);
-  }, [getNextFile, selectedFile]);
+  }, [activeSelectedFile, getNextFile]);
 
   const handlePreviousFile = useCallback(() => {
-    const prev = getPreviousFile(selectedFile);
+    const prev = getPreviousFile(activeSelectedFile);
     if (prev) setSelectedFile(prev);
-  }, [getPreviousFile, selectedFile]);
+  }, [activeSelectedFile, getPreviousFile]);
 
   const handleExpandReasoning = useCallback(() => {
     // This would toggle the reasoning accordion on the selected interaction
@@ -144,10 +150,10 @@ export function PRReviewPage() {
   }, []);
 
   const handleMarkViewed = useCallback(() => {
-    if (selectedFile) {
-      handleToggleViewed(selectedFile);
+    if (activeSelectedFile) {
+      handleToggleViewed(activeSelectedFile);
     }
-  }, [selectedFile, handleToggleViewed]);
+  }, [activeSelectedFile, handleToggleViewed]);
 
   const handleLineClick = useCallback(
     (lineNumber: number, changeType: string) => {
@@ -173,7 +179,7 @@ export function PRReviewPage() {
         id: "next-file",
         label: "Go to next file",
         shortcut: "J",
-        icon: <GitPullRequest size={14} className="text-[#888888]" />,
+        icon: <GitPullRequest size={14} className="text-muted" />,
         onSelect: handleNextFile,
         group: "Navigation",
       },
@@ -181,7 +187,7 @@ export function PRReviewPage() {
         id: "prev-file",
         label: "Go to previous file",
         shortcut: "K",
-        icon: <GitPullRequest size={14} className="text-[#888888]" />,
+        icon: <GitPullRequest size={14} className="text-muted" />,
         onSelect: handlePreviousFile,
         group: "Navigation",
       },
@@ -189,14 +195,14 @@ export function PRReviewPage() {
         id: "mark-viewed",
         label: "Toggle file as viewed",
         shortcut: "Space",
-        icon: <Eye size={14} className="text-[#888888]" />,
+        icon: <Eye size={14} className="text-muted" />,
         onSelect: handleMarkViewed,
         group: "Actions",
       },
       {
         id: "open-github",
         label: "Open PR on GitHub",
-        icon: <ExternalLink size={14} className="text-[#888888]" />,
+        icon: <ExternalLink size={14} className="text-muted" />,
         onSelect: () => {
           window.open(
             `https://github.com/${owner}/${repo}/pull/${prNumber}`,
@@ -208,7 +214,7 @@ export function PRReviewPage() {
       {
         id: "logout",
         label: "Logout",
-        icon: <LogOut size={14} className="text-[#888888]" />,
+        icon: <LogOut size={14} className="text-muted" />,
         onSelect: logout,
         group: "Account",
       },
@@ -231,17 +237,17 @@ export function PRReviewPage() {
   const errorObj = prData === undefined ? prError : null; // React Query destructuring aliasing check, let's just use useQuery error directly below
 
   // Check for Payment Required
-  if (prError?.name === 'PaymentRequiredError' || blobsError?.name === 'PaymentRequiredError' || errorObj?.name === 'PaymentRequiredError') {
+  if (prError instanceof PaymentRequiredError || blobsError instanceof PaymentRequiredError || errorObj instanceof PaymentRequiredError) {
     return <Paywall />;
   }
 
   // Error state - show if no valid params
   if (!owner || !repo || !prNumber) {
     return (
-      <div className="h-screen flex items-center justify-center bg-[#080808] text-[#ededed]">
-        <div className="text-center">
-          <h1 className="text-xl font-medium mb-2">Invalid PR URL</h1>
-          <p className="text-[#888888]">
+      <div className="flex h-screen items-center justify-center p-4 text-ink">
+        <div className="rr-panel rounded-[2rem] px-8 py-10 text-center">
+          <h1 className="mb-2 font-serif text-2xl font-semibold">Invalid PR URL</h1>
+          <p className="text-muted">
             Please use the format: /pr/:owner/:repo/:number
           </p>
         </div>
@@ -255,7 +261,7 @@ export function PRReviewPage() {
         sidebar={
           <Sidebar
             files={files}
-            selectedFile={selectedFile}
+            selectedFile={activeSelectedFile}
             onSelectFile={handleSelectFile}
             viewedFiles={viewedFiles}
             onToggleViewed={handleToggleViewed}
@@ -264,7 +270,7 @@ export function PRReviewPage() {
         main={
           isLoading ? (
             <div className="h-full flex items-center justify-center">
-              <div className="text-center text-[#555555]">
+              <div className="text-center text-muted">
                 <div className="animate-pulse">
                   <GitPullRequest size={32} className="mx-auto mb-2" />
                   <p className="text-sm">Loading PR #{prNumber}...</p>
@@ -278,7 +284,7 @@ export function PRReviewPage() {
               onLineClick={handleLineClick}
             />
           ) : (
-            <div className="h-full flex items-center justify-center text-[#555555]">
+            <div className="flex h-full items-center justify-center text-muted">
               <p>Select a file to view</p>
             </div>
           )
@@ -298,10 +304,7 @@ export function PRReviewPage() {
         isOpen={isPaletteOpen}
         onClose={closePalette}
         actions={commandActions}
-        files={files.map((f) => ({
-          filename: f.filename,
-          isViewed: viewedFiles.has(f.filename),
-        }))}
+        files={paletteFiles}
         onSelectFile={handleSelectFile}
       />
     </>
