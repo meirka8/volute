@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   User,
@@ -128,10 +128,6 @@ function getSignal(interaction: InteractionNode) {
   };
 }
 
-function needsExpansion(text: string, maxLength: number): boolean {
-  return text.length > maxLength;
-}
-
 export function TimelineNode({
   interaction,
   isSelected = false,
@@ -140,6 +136,10 @@ export function TimelineNode({
   const [isReasoningExpanded, setIsReasoningExpanded] = useState(false);
   const [isThoughtExpanded, setIsThoughtExpanded] = useState(false);
   const [isObservationExpanded, setIsObservationExpanded] = useState(false);
+  const [thoughtElement, setThoughtElement] = useState<HTMLParagraphElement | null>(null);
+  const [observationElement, setObservationElement] = useState<HTMLParagraphElement | null>(null);
+  const [isThoughtTruncated, setIsThoughtTruncated] = useState(false);
+  const [isObservationTruncated, setIsObservationTruncated] = useState(false);
 
   const hasReasoning = hasContent(interaction.model_cot);
   const showWhyButton = interaction.author === 'agent';
@@ -148,8 +148,53 @@ export function TimelineNode({
   const actionLines = getActionLines(interaction);
   const signal = getSignal(interaction);
 
-  const canExpandThought = needsExpansion(thoughtText, 220);
-  const canExpandObservation = needsExpansion(observationText, 180);
+  const thoughtRef = useCallback((node: HTMLParagraphElement | null) => {
+    setThoughtElement(node);
+  }, []);
+
+  const observationRef = useCallback((node: HTMLParagraphElement | null) => {
+    setObservationElement(node);
+  }, []);
+
+  useEffect(() => {
+    if (!thoughtElement) {
+      return;
+    }
+
+    const checkTruncation = () => {
+      setIsThoughtTruncated(thoughtElement.scrollHeight > thoughtElement.clientHeight + 1);
+    };
+
+    const rafId = window.requestAnimationFrame(checkTruncation);
+    const observer = new ResizeObserver(checkTruncation);
+    observer.observe(thoughtElement);
+
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
+  }, [isThoughtExpanded, thoughtElement, thoughtText]);
+
+  useEffect(() => {
+    if (!observationElement) {
+      return;
+    }
+
+    const checkTruncation = () => {
+      setIsObservationTruncated(
+        observationElement.scrollHeight > observationElement.clientHeight + 1,
+      );
+    };
+
+    const rafId = window.requestAnimationFrame(checkTruncation);
+    const observer = new ResizeObserver(checkTruncation);
+    observer.observe(observationElement);
+
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
+  }, [isObservationExpanded, observationElement, observationText]);
 
   return (
     <motion.div
@@ -201,6 +246,7 @@ export function TimelineNode({
         <div className="rr-thought rounded-[1.25rem] p-4">
           <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-action">Thought</div>
           <p
+            ref={thoughtRef}
             className={clsx(
               'mt-2 whitespace-pre-wrap font-serif text-sm leading-relaxed text-ink',
               !isThoughtExpanded && 'line-clamp-4'
@@ -208,7 +254,7 @@ export function TimelineNode({
           >
             {thoughtText}
           </p>
-          {(canExpandThought || isThoughtExpanded) && (
+          {(isThoughtTruncated || isThoughtExpanded) && (
             <button
               onClick={(e) => {
                 e.stopPropagation();
@@ -224,8 +270,8 @@ export function TimelineNode({
         <div className="rr-code rounded-[1.25rem] p-4">
           <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-action">Action</div>
           <div className="mt-2 space-y-2">
-            {actionLines.map((line) => (
-              <div key={line} className="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink">
+            {actionLines.map((line, index) => (
+              <div key={`${index}-${line}`} className="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink">
                 {line}
               </div>
             ))}
@@ -249,6 +295,7 @@ export function TimelineNode({
             )}
           </div>
           <p
+            ref={observationRef}
             className={clsx(
               'mt-2 whitespace-pre-wrap font-mono text-xs leading-relaxed text-ink',
               !isObservationExpanded && 'line-clamp-4'
@@ -256,7 +303,7 @@ export function TimelineNode({
           >
             {observationText}
           </p>
-          {(canExpandObservation || isObservationExpanded) && (
+          {(isObservationTruncated || isObservationExpanded) && (
             <button
               onClick={(e) => {
                 e.stopPropagation();

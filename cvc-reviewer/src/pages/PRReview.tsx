@@ -82,14 +82,20 @@ export function PRReviewPage() {
     enabled: !!allInteractions && isAuthenticated && prNumber > 0,
   });
 
-  const sourceFiles = prData?.files ?? [];
-  const files: FileItem[] = sourceFiles.map((f) => ({
+  const sourceFiles = prData?.files;
+  const files: FileItem[] = useMemo(() => {
+    if (!sourceFiles) {
+      return [];
+    }
+
+    return sourceFiles.map((f) => ({
       filename: f.filename,
       status: f.status as FileItem["status"],
       additions: f.additions,
       deletions: f.deletions,
       patch: f.patch,
     }));
+  }, [sourceFiles]);
 
   const activeSelectedFile = selectedFile ?? files[0]?.filename ?? null;
 
@@ -100,6 +106,14 @@ export function PRReviewPage() {
 
   // File navigation
   const fileNames = useMemo(() => files.map((f) => f.filename), [files]);
+  const paletteFiles = useMemo(
+    () =>
+      files.map((f) => ({
+        filename: f.filename,
+        isViewed: viewedFiles.has(f.filename),
+      })),
+    [files, viewedFiles],
+  );
   const { getNextFile, getPreviousFile } = useFileNavigation(fileNames);
 
   // Handlers
@@ -290,10 +304,7 @@ export function PRReviewPage() {
         isOpen={isPaletteOpen}
         onClose={closePalette}
         actions={commandActions}
-        files={files.map((f) => ({
-          filename: f.filename,
-          isViewed: viewedFiles.has(f.filename),
-        }))}
+        files={paletteFiles}
         onSelectFile={handleSelectFile}
       />
     </>
