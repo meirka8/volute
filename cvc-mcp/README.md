@@ -30,7 +30,7 @@ Add the following entry to the `mcpServers` object:
   "mcpServers": {
     "cvc": {
       "command": "npx",
-      "args": ["-y", "@volute/cvc-mcp"],
+      "args": ["-y", "@volute_cvc/cvc-mcp"],
       "env": {
         "RUST_LOG": "info"
       }

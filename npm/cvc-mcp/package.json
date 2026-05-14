@@ -1,5 +1,5 @@
 {
-  "name": "@volute/cvc-mcp",
+  "name": "@volute_cvc/cvc-mcp",
   "version": "0.1.0",
   "description": "CVC Model Context Protocol Server",
   "bin": {
