@@ -13,7 +13,7 @@
     "url": "git+https://github.com/meirka8/cvc.git"
   },
   "author": "Volute",
-  "license": "ISC",
+  "license": "UNLICENSED",
   "publishConfig": {
     "access": "public"
   }
