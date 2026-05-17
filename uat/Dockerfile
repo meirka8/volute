@@ -13,6 +13,14 @@ RUN apt-get update && apt-get install -y \
     libatspi2.0-0 libdrm2 libgbm1 libxcb-dri3-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Node.js & npm (v20)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install AI CLI Agents
+RUN npm install -g @anthropic-ai/claude-code @google/gemini-cli opencode-ai
+
 # Install VS Code
 RUN wget -qO /tmp/vscode.deb \
     "https://code.visualstudio.com/sha/download?build=stable&os=linux-deb-x64" \
