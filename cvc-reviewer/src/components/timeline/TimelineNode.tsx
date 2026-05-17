@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, type DependencyList } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   User,
@@ -21,15 +21,15 @@ interface TimelineNodeProps {
 function getAuthorIcon(author: InteractionNode['author']) {
   switch (author) {
     case 'human':
-      return <User size={16} className="text-[#ededed]" />;
+      return <User size={16} className="text-ink" />;
     case 'agent':
-      return <Bot size={16} className="text-[#5e6ad2]" />;
+      return <Bot size={16} className="text-action" />;
     case 'system':
-      return <Terminal size={16} className="text-[#f59e0b]" />;
+      return <Terminal size={16} className="text-warning" />;
     case 'external':
-      return <ExternalLink size={16} className="text-[#888888]" />;
+      return <ExternalLink size={16} className="text-muted" />;
     default:
-      return <User size={16} className="text-[#888888]" />;
+      return <User size={16} className="text-muted" />;
   }
 }
 
@@ -67,38 +67,65 @@ function hasContent(text: string | null | undefined): boolean {
   return cleaned.length > 0;
 }
 
-/**
- * Hook that detects whether an element's text is being truncated by CSS line-clamp.
- */
-function useIsTruncated(deps: DependencyList) {
-  const ref = useRef<HTMLParagraphElement>(null);
-  const [isTruncated, setIsTruncated] = useState(false);
+function getThoughtText(interaction: InteractionNode): string {
+  return (
+    interaction.user_prompt ||
+    interaction.model_cot ||
+    interaction.model_response ||
+    'No explicit thought was recorded for this step.'
+  );
+}
 
-  const check = useCallback(() => {
-    const el = ref.current;
-    if (el) {
-      setIsTruncated(el.scrollHeight > el.clientHeight + 1);
-    }
-  }, []);
-
-  useEffect(() => {
-    check();
-
-    const el = ref.current;
-    if (!el) return;
-
-    const observer = new ResizeObserver(() => {
-      check();
+function getActionLines(interaction: InteractionNode): string[] {
+  if (interaction.tool_executions.length > 0) {
+    return interaction.tool_executions.map((tool) => {
+      const args = tool.arguments?.trim();
+      return args ? `${tool.tool_name} ${args}` : tool.tool_name;
     });
+  }
 
-    observer.observe(el);
+  if (interaction.artifact_links.length > 0) {
+    return interaction.artifact_links.map(
+      (link) => `${link.link_type} ${link.git_commit_hash.substring(0, 7)}`,
+    );
+  }
 
-    return () => {
-      observer.disconnect();
+  return ['No recorded tool execution.'];
+}
+
+function getObservationText(interaction: InteractionNode): string {
+  if (hasContent(interaction.model_response)) {
+    return interaction.model_response!;
+  }
+
+  if (interaction.tool_executions.length > 0) {
+    return interaction.tool_executions
+      .map((tool) => `${tool.status === 'success' ? 'pass' : 'fail'} ${tool.tool_name}`)
+      .join('\n');
+  }
+
+  return 'No recorded observation.';
+}
+
+function getSignal(interaction: InteractionNode) {
+  if (interaction.tool_executions.some((tool) => tool.status === 'failure')) {
+    return {
+      label: 'Critical alert',
+      className: 'border border-danger/20 bg-danger/10 text-danger',
     };
-  }, [check, ...deps]);
+  }
 
-  return { ref, isTruncated };
+  if (interaction.author === 'agent' && interaction.tool_executions.length === 0) {
+    return {
+      label: 'Review required',
+      className: 'border border-warning/20 bg-warning/10 text-warning',
+    };
+  }
+
+  return {
+    label: 'Green check',
+    className: 'border border-success/20 bg-success/10 text-success',
+  };
 }
 
 export function TimelineNode({
@@ -107,15 +134,67 @@ export function TimelineNode({
   onSelect,
 }: TimelineNodeProps) {
   const [isReasoningExpanded, setIsReasoningExpanded] = useState(false);
-  const [isPromptExpanded, setIsPromptExpanded] = useState(false);
-  const [isResponseExpanded, setIsResponseExpanded] = useState(false);
+  const [isThoughtExpanded, setIsThoughtExpanded] = useState(false);
+  const [isObservationExpanded, setIsObservationExpanded] = useState(false);
+  const [thoughtElement, setThoughtElement] = useState<HTMLParagraphElement | null>(null);
+  const [observationElement, setObservationElement] = useState<HTMLParagraphElement | null>(null);
+  const [isThoughtTruncated, setIsThoughtTruncated] = useState(false);
+  const [isObservationTruncated, setIsObservationTruncated] = useState(false);
 
-  const hasPrompt = hasContent(interaction.user_prompt);
   const hasReasoning = hasContent(interaction.model_cot);
-  const hasResponse = hasContent(interaction.model_response);
+  const showWhyButton = interaction.author === 'agent';
+  const thoughtText = getThoughtText(interaction);
+  const observationText = getObservationText(interaction);
+  const actionLines = getActionLines(interaction);
+  const signal = getSignal(interaction);
 
-  const promptTruncation = useIsTruncated([interaction.user_prompt, isPromptExpanded]);
-  const responseTruncation = useIsTruncated([interaction.model_response, isResponseExpanded]);
+  const thoughtRef = useCallback((node: HTMLParagraphElement | null) => {
+    setThoughtElement(node);
+  }, []);
+
+  const observationRef = useCallback((node: HTMLParagraphElement | null) => {
+    setObservationElement(node);
+  }, []);
+
+  useEffect(() => {
+    if (!thoughtElement) {
+      return;
+    }
+
+    const checkTruncation = () => {
+      setIsThoughtTruncated(thoughtElement.scrollHeight > thoughtElement.clientHeight + 1);
+    };
+
+    const rafId = window.requestAnimationFrame(checkTruncation);
+    const observer = new ResizeObserver(checkTruncation);
+    observer.observe(thoughtElement);
+
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
+  }, [isThoughtExpanded, thoughtElement, thoughtText]);
+
+  useEffect(() => {
+    if (!observationElement) {
+      return;
+    }
+
+    const checkTruncation = () => {
+      setIsObservationTruncated(
+        observationElement.scrollHeight > observationElement.clientHeight + 1,
+      );
+    };
+
+    const rafId = window.requestAnimationFrame(checkTruncation);
+    const observer = new ResizeObserver(checkTruncation);
+    observer.observe(observationElement);
+
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
+  }, [isObservationExpanded, observationElement, observationText]);
 
   return (
     <motion.div
@@ -124,11 +203,11 @@ export function TimelineNode({
       animate={{ opacity: 1, x: 0 }}
       exit={{ opacity: 0, x: -20 }}
       transition={{ duration: 0.15 }}
-      className={clsx(
-        'border-l-2 pl-4 py-3 cursor-pointer transition-colors',
+        className={clsx(
+        'mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors',
         isSelected
-          ? 'border-[#5e6ad2] bg-[#5e6ad2]/10'
-          : 'border-[#262626] hover:border-[#555555] hover:bg-[#111111]'
+          ? 'rr-selected-card border-action bg-action/10'
+          : 'border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70'
       )}
       onClick={onSelect}
       tabIndex={0}
@@ -139,95 +218,105 @@ export function TimelineNode({
         }
       }}
     >
-      {/* Header: Author + Timestamp */}
-      <div className="flex items-center gap-2 mb-2">
-        <div className="w-7 h-7 rounded-full bg-[#1c1c1c] flex items-center justify-center">
+      <div className="mb-4 flex items-start gap-3">
+        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-canvas/80">
           {getAuthorIcon(interaction.author)}
         </div>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-[#ededed]">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-medium text-ink">
               {getAuthorLabel(interaction.author)}
             </span>
-            <span className="text-xs text-[#555555]">
+            <span className={clsx('rounded-full px-2.5 py-1 text-[11px] font-medium', signal.className)}>
+              {signal.label}
+            </span>
+            <span className="text-xs text-muted">
               {formatTimestamp(interaction.timestamp)}
             </span>
           </div>
+          {interaction.model_name && (
+            <div className="mt-1 text-xs uppercase tracking-[0.16em] text-muted">
+              {interaction.model_name}
+            </div>
+          )}
         </div>
       </div>
 
-      {/* User Prompt */}
-      {hasPrompt && (
-        <div className="mb-2">
+      <div className="space-y-3">
+        <div className="rr-thought rounded-[1.25rem] p-4">
+          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-action">Thought</div>
           <p
-            ref={promptTruncation.ref}
+            ref={thoughtRef}
             className={clsx(
-              'text-sm text-[#ededed] whitespace-pre-wrap',
-              !isPromptExpanded && 'line-clamp-3'
+              'mt-2 whitespace-pre-wrap font-serif text-sm leading-relaxed text-ink',
+              !isThoughtExpanded && 'line-clamp-4'
             )}
           >
-            {interaction.user_prompt}
+            {thoughtText}
           </p>
-          {(promptTruncation.isTruncated || isPromptExpanded) && (
+          {(isThoughtTruncated || isThoughtExpanded) && (
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                setIsPromptExpanded(!isPromptExpanded);
+                setIsThoughtExpanded(!isThoughtExpanded);
               }}
-              className="mt-1 text-xs text-[#5e6ad2] hover:text-[#7c86e2] transition-colors"
+              className="mt-2 text-xs text-action transition-colors hover:opacity-80"
             >
-              {isPromptExpanded ? 'Show less' : 'Show more'}
+              {isThoughtExpanded ? 'Show less' : 'Show more'}
             </button>
           )}
         </div>
-      )}
 
-      {/* Model Response Preview */}
-      {hasResponse && (
-        <div className="mb-2 pl-3 border-l border-[#5e6ad2]/50">
+        <div className="rr-code rounded-[1.25rem] p-4">
+          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-action">Action</div>
+          <div className="mt-2 space-y-2">
+            {actionLines.map((line, index) => (
+              <div key={`${index}-${line}`} className="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink">
+                {line}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="rr-code rounded-[1.25rem] p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-success">Observation</div>
+            {showWhyButton && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setIsReasoningExpanded(!isReasoningExpanded);
+                }}
+                className="flex items-center gap-1.5 rounded-full border border-line bg-canvas/80 px-3 py-1 text-[11px] font-medium text-action transition-colors hover:bg-surface"
+              >
+                {isReasoningExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                <span>Why?</span>
+              </button>
+            )}
+          </div>
           <p
-            ref={responseTruncation.ref}
+            ref={observationRef}
             className={clsx(
-              'text-sm text-[#888888] whitespace-pre-wrap',
-              !isResponseExpanded && 'line-clamp-2'
+              'mt-2 whitespace-pre-wrap font-mono text-xs leading-relaxed text-ink',
+              !isObservationExpanded && 'line-clamp-4'
             )}
           >
-            {interaction.model_response}
+            {observationText}
           </p>
-          {(responseTruncation.isTruncated || isResponseExpanded) && (
+          {(isObservationTruncated || isObservationExpanded) && (
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                setIsResponseExpanded(!isResponseExpanded);
+                setIsObservationExpanded(!isObservationExpanded);
               }}
-              className="mt-1 text-xs text-[#5e6ad2] hover:text-[#7c86e2] transition-colors"
+              className="mt-2 text-xs text-action transition-colors hover:opacity-80"
             >
-              {isResponseExpanded ? 'Show less' : 'Show more'}
+              {isObservationExpanded ? 'Show less' : 'Show more'}
             </button>
           )}
-        </div>
-      )}
-
-      {/* Chain of Thought (Reasoning) Accordion */}
-      {hasReasoning && (
-        <div className="mt-3">
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              setIsReasoningExpanded(!isReasoningExpanded);
-            }}
-            className="flex items-center gap-1.5 text-xs text-[#5e6ad2] hover:text-[#7c86e2] transition-colors"
-          >
-            {isReasoningExpanded ? (
-              <ChevronDown size={14} />
-            ) : (
-              <ChevronRight size={14} />
-            )}
-            <span>View reasoning</span>
-          </button>
 
           <AnimatePresence>
-            {isReasoningExpanded && (
+            {showWhyButton && isReasoningExpanded && (
               <motion.div
                 initial={{ height: 0, opacity: 0 }}
                 animate={{ height: 'auto', opacity: 1 }}
@@ -235,32 +324,34 @@ export function TimelineNode({
                 transition={{ duration: 0.15, ease: 'easeInOut' }}
                 className="overflow-hidden"
               >
-                <div className="mt-2 p-3 bg-[#0d0d0d] rounded border border-[#262626]">
-                  <pre className="text-xs text-[#888888] whitespace-pre-wrap font-mono overflow-x-auto">
-                    {interaction.model_cot}
+                <div className="rr-thought mt-3 rounded-[1.25rem] p-3">
+                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-action">
+                    Decision Factors
+                  </div>
+                  <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-muted">
+                    {hasReasoning ? interaction.model_cot : 'No recorded decision factors for this AI step.'}
                   </pre>
                 </div>
               </motion.div>
             )}
           </AnimatePresence>
         </div>
-      )}
 
-      {/* Artifact Links */}
-      {interaction.artifact_links && interaction.artifact_links.length > 0 && (
-        <div className="mt-3 flex flex-wrap gap-1.5">
+        {interaction.artifact_links && interaction.artifact_links.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
           {interaction.artifact_links.map((link) => (
             <span
               key={`${link.git_commit_hash}-${link.link_type}`}
-              className="inline-flex items-center gap-1 px-2 py-0.5 bg-[#1c1c1c] rounded text-xs text-[#888888]"
+              className="inline-flex items-center gap-1 rounded-full bg-canvas/80 px-3 py-1 text-xs text-muted"
             >
               <GitCommit size={10} />
               <span className="font-mono">{link.git_commit_hash.substring(0, 7)}</span>
-              <span className="text-[#555555]">({link.link_type})</span>
+              <span className="text-muted/80">({link.link_type})</span>
             </span>
           ))}
-        </div>
-      )}
+          </div>
+        )}
+      </div>
     </motion.div>
   );
 }

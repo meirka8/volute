@@ -48,14 +48,14 @@ function groupFilesByDirectory(files: FileItem[]): Map<string, FileItem[]> {
 function getFileIcon(status: FileItem["status"]) {
   switch (status) {
     case "added":
-      return <FilePlus size={14} className="text-[#27a300]" />;
+      return <FilePlus size={14} className="text-success" />;
     case "removed":
-      return <FileMinus size={14} className="text-[#ef4444]" />;
+      return <FileMinus size={14} className="text-danger" />;
     case "modified":
     case "renamed":
-      return <FileEdit size={14} className="text-[#f59e0b]" />;
+      return <FileEdit size={14} className="text-warning" />;
     default:
-      return <File size={14} className="text-[#888888]" />;
+      return <File size={14} className="text-muted" />;
   }
 }
 
@@ -77,51 +77,47 @@ function FileRow({
   return (
     <div
       className={clsx(
-        "group flex items-center gap-2 px-3 py-1.5 cursor-pointer transition-colors",
+        "group flex cursor-pointer items-center gap-2 rounded-r-2xl px-3 py-2 transition-colors",
         isSelected
-          ? "bg-[#5e6ad2]/20 border-l-2 border-[#5e6ad2]"
-          : "hover:bg-[#1c1c1c] border-l-2 border-transparent",
+          ? "border-l-2 border-action bg-action/10"
+          : "border-l-2 border-transparent hover:bg-canvas/70",
       )}
       onClick={onSelect}
     >
-      {/* Viewed checkbox */}
       <button
         onClick={(e) => {
           e.stopPropagation();
           onToggleViewed();
         }}
         className={clsx(
-          "w-4 h-4 rounded border flex items-center justify-center transition-colors flex-shrink-0",
+          "flex h-4 w-4 flex-shrink-0 items-center justify-center rounded border transition-colors",
           isViewed
-            ? "bg-[#27a300] border-[#27a300]"
-            : "border-[#555555] hover:border-[#888888] group-hover:border-[#888888]",
+            ? "border-success bg-success"
+            : "border-muted/60 hover:border-action group-hover:border-action",
         )}
         aria-label={isViewed ? "Mark as unviewed" : "Mark as viewed"}
       >
         {isViewed && <Check size={10} className="text-white" />}
       </button>
 
-      {/* File icon */}
       {getFileIcon(file.status)}
 
-      {/* File name */}
       <span
         className={clsx(
           "flex-1 truncate text-sm",
-          isViewed ? "text-[#555555]" : "text-[#ededed]",
+          isViewed ? "text-muted/70" : "text-ink",
         )}
         title={file.filename}
       >
         {fileName}
       </span>
 
-      {/* Change stats */}
       <div className="flex gap-1 text-xs font-mono opacity-0 group-hover:opacity-100 transition-opacity">
         {file.additions > 0 && (
-          <span className="text-[#27a300]">+{file.additions}</span>
+          <span className="text-success">+{file.additions}</span>
         )}
         {file.deletions > 0 && (
-          <span className="text-[#ef4444]">-{file.deletions}</span>
+          <span className="text-danger">-{file.deletions}</span>
         )}
       </div>
     </div>
@@ -167,12 +163,12 @@ function DirectoryGroup({
     <div>
       <button
         onClick={() => setIsExpanded(!isExpanded)}
-        className="w-full flex items-center gap-1 px-3 py-1.5 text-[#888888] hover:text-[#ededed] hover:bg-[#1c1c1c] transition-colors"
+        className="flex w-full items-center gap-1 rounded-2xl px-3 py-2 text-muted transition-colors hover:bg-canvas/70 hover:text-ink"
       >
         {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         <FileCode size={14} />
         <span className="text-sm truncate">{directory}</span>
-        <span className="text-xs text-[#555555] ml-auto">{files.length}</span>
+        <span className="ml-auto text-xs text-muted">{files.length}</span>
       </button>
 
       {isExpanded && (
@@ -214,18 +210,16 @@ export function Sidebar({
 
   return (
     <div className="h-full flex flex-col">
-      {/* Header */}
-      <div className="px-4 py-3 border-b border-[#1c1c1c]">
+      <div className="border-b border-line/80 px-4 py-4">
         <div className="flex items-center justify-between">
-          <span className="text-sm font-medium text-[#ededed]">Files</span>
-          <span className="text-xs text-[#888888]">
+          <span className="font-serif text-lg font-semibold text-ink">Files</span>
+          <span className="text-xs text-muted">
             {viewedCount}/{totalCount} viewed
           </span>
         </div>
-        {/* Progress bar */}
-        <div className="mt-2 h-1 bg-[#1c1c1c] rounded-full overflow-hidden">
+        <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-surface-strong/60">
           <div
-            className="h-full bg-[#27a300] transition-all duration-300"
+            className="h-full bg-success transition-all duration-300"
             style={{
               width: `${totalCount > 0 ? (viewedCount / totalCount) * 100 : 0}%`,
             }}
@@ -233,7 +227,6 @@ export function Sidebar({
         </div>
       </div>
 
-      {/* File list */}
       <div className="flex-1 overflow-y-auto py-2">
         {sortedDirs.map((dir) => (
           <DirectoryGroup
@@ -248,7 +241,7 @@ export function Sidebar({
         ))}
 
         {files.length === 0 && (
-          <div className="px-4 py-8 text-center text-[#555555] text-sm">
+          <div className="px-4 py-8 text-center text-sm text-muted">
             No files in this PR
           </div>
         )}

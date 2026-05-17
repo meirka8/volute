@@ -29,9 +29,9 @@ export function ShadowTimeline({
       <div className="h-full flex flex-col">
         <TimelineHeader prTitle={prTitle} count={0} />
         <div className="flex-1 flex items-center justify-center">
-          <div className="text-center text-[#555555]">
+          <div className="text-center text-muted">
             <div className="animate-pulse">
-              <Brain size={32} className="mx-auto mb-2 text-[#5e6ad2]" />
+              <Brain size={32} className="mx-auto mb-2 text-action" />
               <p className="text-sm">Loading cognitive history...</p>
             </div>
           </div>
@@ -45,7 +45,7 @@ export function ShadowTimeline({
       <div className="h-full flex flex-col">
         <TimelineHeader prTitle={prTitle} count={0} />
         <div className="flex-1 flex items-center justify-center p-4">
-          <div className="text-center text-[#555555]">
+          <div className="text-center text-muted">
             <Brain size={32} className="mx-auto mb-3 opacity-50" />
             <p className="text-sm font-medium">No cognitive history</p>
             <p className="text-xs mt-1">
@@ -79,20 +79,20 @@ export function ShadowTimeline({
 
 function TimelineHeader({ prTitle, count }: { prTitle?: string; count: number }) {
   return (
-    <div className="px-4 py-3 border-b border-[#1c1c1c] bg-[#0d0d0d]">
+    <div className="border-b border-line/80 px-4 py-4">
       <div className="flex items-center gap-2 mb-1">
-        <Brain size={16} className="text-[#5e6ad2]" />
-        <span className="text-sm font-medium text-[#ededed]">Shadow Timeline</span>
+        <Brain size={16} className="text-action" />
+        <span className="font-serif text-lg font-semibold text-ink">Shadow Gallery</span>
       </div>
 
       {prTitle && (
-        <div className="flex items-center gap-1.5 text-xs text-[#888888] mt-1">
+        <div className="mt-1 flex items-center gap-1.5 text-xs text-muted">
           <GitPullRequest size={12} />
           <span className="truncate">{prTitle}</span>
         </div>
       )}
 
-      <div className="text-xs text-[#555555] mt-2">
+      <div className="mt-2 text-xs text-muted">
         {count} interaction{count !== 1 ? 's' : ''} linked to this PR
       </div>
     </div>
