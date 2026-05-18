@@ -1,6 +1,6 @@
 {
   "name": "@volute_cvc/cvc-mcp",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "CVC Model Context Protocol Server",
   "bin": {
     "cvc-mcp": "./bin/cvc-mcp.js",
