@@ -44,7 +44,7 @@ function download(url, dest) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
     https.get(url, (response) => {
-      if (response.statusCode === 301 || response.statusCode === 302) {
+      if ([301, 302, 307, 308].includes(response.statusCode)) {
         return download(response.headers.location, dest).then(resolve).catch(reject);
       }
       if (response.statusCode !== 200) {
