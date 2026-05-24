@@ -15,7 +15,7 @@ The binary will be located at:
 
 ## 2. Configuration for IDEs and Claude Desktop
 
-You need to add the server configuration to your MCP config file. The easiest and recommended way is to use `npx` which will automatically download and run the correct MCP binary for your system.
+You need to add the server configuration to your MCP config file. Before configuring your client, ensure you have installed the server globally via npm: `npm install -g @volute_cvc/cvc-mcp`.
 
 **Config File Locations:**
 - **VS Code (Antigravity/Forks):** Typically inside `.vscode/mcp.json` or user settings. Check your specific extension documentation.
@@ -29,8 +29,8 @@ Add the following entry to the `mcpServers` object:
 {
   "mcpServers": {
     "cvc": {
-      "command": "npx",
-      "args": ["-y", "@volute_cvc/cvc-mcp"],
+      "command": "cvc-mcp",
+      "args": [],
       "env": {
         "RUST_LOG": "info"
       }
