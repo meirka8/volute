@@ -17,7 +17,9 @@ struct JsonRpcRequest {
 #[derive(Serialize, Deserialize, Debug)]
 struct JsonRpcResponse {
     jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<JsonRpcError>,
     id: Option<Value>,
 }
@@ -66,11 +68,15 @@ pub async fn run() -> Result<()> {
             }
         };
 
+        let is_notification = request.id.is_none();
         let response = handle_request(request, store.clone()).await;
-        let response_json = serde_json::to_string(&response)?;
-        writer.write_all(response_json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        
+        if !is_notification {
+            let response_json = serde_json::to_string(&response)?;
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+        }
     }
 
     Ok(())
