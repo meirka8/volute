@@ -10,25 +10,25 @@ pub fn list_tools() -> Value {
         "tools": [
             {
                 "name": "commit_thought",
-                "description": "Log a reasoning step, task, and response into CVC. Call this after completing a reasoning step or task.",
+                "description": "Save a concise task record and important reasoning to CVC. Use it when a key plan, decision, or result is worth preserving for later context. Keep entries focused rather than exhaustive.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "task": {
                             "type": "string",
-                            "description": "The task or prompt you were asked to complete (what the user requested)"
+                            "description": "The task, request, or subtask being worked on"
                         },
                         "reasoning": {
                             "type": "string",
-                            "description": "Your internal reasoning, chain of thought, or plan for how to approach the task"
+                            "description": "Concise rationale, decision notes, or important reasoning worth retaining"
                         },
                         "response": {
                             "type": "string",
-                            "description": "Your response or the action you took to complete the task"
+                            "description": "Optional result, response, or action taken"
                         },
                         "context_summary": {
                             "type": "string",
-                            "description": "Optional summary of relevant file context or state"
+                            "description": "Optional summary of the relevant code or repo state"
                         }
                     },
                     "required": ["task", "reasoning"]
@@ -36,31 +36,42 @@ pub fn list_tools() -> Value {
             },
             {
                 "name": "read_history",
-                "description": "Read recent interaction history.",
+                "description": "Read recent saved CVC history. Use it to recover prior task context or decisions. Results are limited to recent entries only.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "limit": { "type": "integer" }
+                        "limit": {
+                            "type": "integer",
+                            "description": "Optional number of recent entries to return"
+                        }
                     }
                 }
             },
             {
                 "name": "get_context",
-                "description": "Get the file context (clean or dirty state).",
+                "description": "Inspect git-backed context for one file. Use it before summarizing or recording file state. It reports one file per call.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "file_path": { "type": "string" }
+                        "file_path": {
+                            "type": "string",
+                            "description": "Repository-relative path for the file to inspect"
+                        }
                     },
                     "required": ["file_path"]
                 }
             },
             {
                 "name": "setup_cvc",
-                "description": "Initialize CVC in the current directory if missing.",
+                "description": "Initialize CVC storage and hooks for the current repository. Use it during first-time setup or when CVC is not yet installed. It only works inside a git repository.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {}
+                    "properties": {
+                        "cwd": {
+                            "type": "string",
+                            "description": "Optional working directory to initialize, mainly for tests or explicit repo targeting"
+                        }
+                    }
                 }
             }
         ]

@@ -41,11 +41,11 @@ Add the following entry to the `mcpServers` object:
 
 ## 3. Verification
 
-After configuring, restart your IDE or Claude Desktop. You should see the CVC tools available:
-- `commit_thought`
-- `read_history`
-- `get_context`
-- `setup_cvc`
+After configuring, restart your IDE or Claude Desktop. Confirm these CVC tools appear:
+- `commit_thought` — Save a concise task record, key reasoning, and optional result.
+- `read_history` — Read recent saved CVC history for prior context or decisions.
+- `get_context` — Inspect git-backed context for one file before summarizing or recording it.
+- `setup_cvc` — Initialize CVC storage and hooks for the current repository.
 
 ## 4. Troubleshooting
 
