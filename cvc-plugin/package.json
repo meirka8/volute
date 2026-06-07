@@ -125,8 +125,8 @@
         "id": "volute.chat",
         "fullName": "Volute CVC",
         "name": "volute",
-        "description": "Chat with AI while automatically logging your thought process",
-        "isSticky": true
+        "description": "Background status and history for the Volute CVC watcher. Use GitHub Copilot Chat normally without addressing this participant.",
+        "isSticky": false
       }
     ],
     "walkthroughs": [
@@ -140,40 +140,40 @@
             "title": "Check Your Setup",
             "description": "Volute CVC needs a few components to work. Let's make sure everything is installed.\n\n[Check Setup](command:volute.checkSetup)",
             "media": {
-              "markdown": "## Components\n\n- **CVC CLI** (`cvc`) — Required for init, log, push/pull\n- **CVC Language Server** (`cvc-lsp`) — Powers the extension\n- **CVC MCP Server** (`cvc-mcp`) — Optional, for AI agent integration"
+              "markdown": "## Components\n\n- **CVC CLI** (`cvc`) — Handles local repo setup, commit linking, and optional terminal history checks\n- **CVC Language Server** (`cvc-lsp`) — Powers the extension\n- **CVC MCP Server** (`cvc-mcp`) — Not needed for this VS Code workflow. Required only for non-VS-Code AI clients."
             },
             "completionEvents": ["onCommand:volute.checkSetup"]
           },
           {
             "id": "volute.welcome.intro",
             "title": "Welcome to Volute CVC",
-            "description": "Volute CVC augments Git by tracking the 'why' alongside the 'what'. Your AI conversations, reasoning, and context are preserved and linked to your commits.\n\n[Learn More](https://volutevc.com/docs)",
+            "description": "Volute CVC keeps the reasoning behind your AI-assisted changes next to the code. In VS Code, the watcher follows GitHub Copilot chats automatically and links them to your commits.\n\n[Learn More](https://volutevc.com/docs)",
             "media": {
-              "markdown": "# Git, Augmented\n\nVolute CVC creates a **Shadow DAG** - a parallel history of reasoning that accompanies your code changes."
+              "markdown": "# Git, Augmented\n\nUse GitHub Copilot in VS Code the way you normally do. Volute CVC records the reasoning in the background and shows it in the timeline panel."
             }
           },
           {
             "id": "volute.welcome.chat",
-            "title": "Use the @volute Chat Participant",
-            "description": "Type `@volute` in the GitHub Copilot Chat to automatically log your AI conversations.\n\n[Open Chat](command:workbench.action.chat.open)",
+            "title": "Open a New Copilot Chat",
+            "description": "Open GitHub Copilot Chat, start a new conversation, and work normally. The watcher records Copilot chats automatically - there is nothing extra to invoke.\n\n[Open Chat](command:workbench.action.chat.open)",
             "media": {
-              "markdown": "## The Native Delegate\n\nThe `@volute` participant intercepts your prompts, delegates to your existing LLM, and logs everything to the cognitive timeline."
+              "markdown": "## Watcher-Based Workflow\n\nThe VS Code watcher is built for GitHub Copilot's chat storage format. It does not rely on a separate CVC chat participant."
             }
           },
           {
             "id": "volute.welcome.timeline",
-            "title": "View Your Cognitive Timeline",
-            "description": "Open the Volute panel in the Activity Bar to see your pending thoughts and historical context.\n\n[Open Timeline](command:volute.timeline.focus)",
+            "title": "Open the Volute Panel",
+            "description": "Open the Volute panel in the Activity Bar after a Copilot exchange. You should see captured thoughts appear in the timeline automatically.\n\n[Open Timeline](command:volute.timeline.focus)",
             "media": {
-              "markdown": "## Pending Thoughts\n\nSee your floating thoughts before committing. They'll be automatically linked to your next `git commit`."
+              "markdown": "## Pending Thoughts\n\nThoughts first appear as pending. After you commit, they move into commit-linked history for that unit of work."
             }
           },
           {
             "id": "volute.welcome.commit",
-            "title": "Commit Your Code",
-            "description": "When you run `git commit`, all pending thoughts are automatically linked to that commit. The 'why' is now permanently bound to the 'what'.",
+            "title": "Commit, Push, and Review",
+            "description": "When you run `git commit`, pending thoughts attach to that commit. After you push and open a PR, the same history appears in hosted review as the shadow timeline.",
             "media": {
-              "markdown": "## Late Binding\n\nVolute uses an **Immediate Persistence, Late Binding** model. Thoughts are saved immediately, but linked to commits only when you commit."
+              "markdown": "## From Local Thoughts to Hosted Review\n\nThe flow is simple: chat in Copilot, see thoughts in the panel, commit to attach them, then push and open a PR to review the same history beside the diff."
             }
           }
         ]

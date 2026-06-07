@@ -21,7 +21,9 @@
     - [x] **Deliverable:** Extension starts and successfully launches the Rust binary.
         
 
-## 2. Feature: Native Chat Participant (`@cvc`)
+## 2. Feature: Native Chat Participant (`@cvc`) - Legacy / Background Capability
+
+> **Note:** This feature exists, but it is not the recommended getting-started path. The primary VS Code workflow is the passive watcher for VS Code + GitHub Copilot.
 
 - [x] **Task 2.1: Participant Registration**
     
@@ -107,6 +109,9 @@
 ---
 
 ## Notes
+
+### Current Onboarding Direction
+The intended primary VS Code workflow is now the passive watcher for **VS Code + GitHub Copilot**. The separate chat participant remains legacy behavior and should not be treated as the recommended getting-started path in user-facing guides.
 
 ### Branding Update
 The extension has been rebranded from "CVC" to **Volute VC** as per the branding guidelines in `/branding_and_design/`. Key changes:
