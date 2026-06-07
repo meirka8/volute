@@ -68,12 +68,19 @@ function hasContent(text: string | null | undefined): boolean {
 }
 
 function getThoughtText(interaction: InteractionNode): string {
-  return (
-    interaction.user_prompt ||
-    interaction.model_cot ||
-    interaction.model_response ||
-    'No explicit thought was recorded for this step.'
-  );
+  if (hasContent(interaction.user_prompt)) {
+    return interaction.user_prompt!;
+  }
+
+  if (!hasContent(interaction.model_cot) && hasContent(interaction.model_response)) {
+    return interaction.model_response!;
+  }
+
+  if (hasContent(interaction.model_cot)) {
+    return 'No primary prompt was recorded for this AI step.';
+  }
+
+  return 'No explicit thought was recorded for this step.';
 }
 
 function getActionLines(interaction: InteractionNode): string[] {
@@ -142,7 +149,7 @@ export function TimelineNode({
   const [isObservationTruncated, setIsObservationTruncated] = useState(false);
 
   const hasReasoning = hasContent(interaction.model_cot);
-  const showWhyButton = interaction.author === 'agent';
+  const showWhyButton = interaction.author === 'agent' && hasReasoning;
   const thoughtText = getThoughtText(interaction);
   const observationText = getObservationText(interaction);
   const actionLines = getActionLines(interaction);
