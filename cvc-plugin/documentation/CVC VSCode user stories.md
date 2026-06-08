@@ -7,30 +7,30 @@
 - **Sarah (The Lead):** Reviews code but also codes. Uses the timeline to self-review before committing.
     
 
-## 2. Epic: The Native Chat Workflow
+## 2. Epic: The Copilot Watcher Workflow
 
 ### Story 2.1: The Seamless Log
 
-> As Devin, I want to ask the AI for help using my standard Chat UI, but have it automatically recorded, so I don't have to switch tools or copy-paste logs.
+> As Devin, I want to use GitHub Copilot Chat in VS Code the way I normally do, but have it recorded automatically, so I don't have to switch tools or copy-paste logs.
 
 - **Scenario:** Devin is stuck on a Rust borrow checker error.
     
-- **Action:** He opens the Chat Sidebar and types `@cvc How do I fix this lifetime issue?`.
+- **Action:** He opens a new GitHub Copilot Chat and asks, `How do I fix this lifetime issue?`.
     
-- **System:** The extension delegates to Copilot GPT-4. The answer appears instantly.
+- **System:** The watcher sees the Copilot chat session update and records the exchange automatically.
     
-- **Verification:** Devin glances at the "Cognitive Timeline" panel and sees a new "Pending Thought" appear with his question.
+- **Verification:** Devin glances at the Volute timeline panel and sees a new pending thought appear with his question.
     
 
-### Story 2.2: The Context Carrier
+### Story 2.2: The Copilot-Specific Watcher
 
-> As Devin, I want the `@cvc` participant to see the file I'm looking at, so I don't have to manually copy-paste code context.
+> As Devin, I want the VS Code workflow to work specifically with GitHub Copilot chat, so I know exactly which conversations Volute is watching.
 
-- **Scenario:** Devin has `main.rs` open.
+- **Scenario:** Devin uses GitHub Copilot in VS Code and also has other agent tools installed.
     
-- **Action:** He asks `@cvc refactor this function`.
+- **Action:** He continues working in GitHub Copilot Chat as normal.
     
-- **System:** The extension detects the active editor and passes the file reference to the language model and the CVC logger.
+- **System:** The watcher follows GitHub Copilot's local chat storage format and records that conversation path without asking Devin to invoke a separate participant.
     
 
 ## 3. Epic: The Cognitive Timeline (Side Panel)
@@ -46,6 +46,16 @@
 - **Action:** She realizes one thought was a random question about lunch (unrelated). She right-clicks and selects "Delete Thought" to exclude it from the permanent record.
     
 - **Result:** She commits the code, and the remaining 4 thoughts are automatically bound.
+
+### Story 3.4: The PR Shadow Timeline
+
+> As Sarah, after a branch is pushed and a pull request is opened, I want to see the same captured thought history beside the diff, so hosted review keeps the full reasoning trail visible.
+
+- **Scenario:** Devin pushes his branch and opens a PR.
+
+- **Action:** Sarah opens the hosted reviewer.
+
+- **Result:** She sees the shadow timeline beside the diff and can follow why the code changed, not just what changed.
     
 
 ### Story 3.2: The "After Lunch" Context Refresh
