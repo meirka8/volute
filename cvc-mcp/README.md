@@ -1,6 +1,6 @@
 # CVC MCP Server Setup
 
-This guide provides instructions on how to build the `cvc-mcp` server and configure it for use with IDEs like VS Code, Cursor, or Antigravity, as well as Claude Desktop.
+This guide explains how to build the `cvc-mcp` server and configure it for MCP-compatible clients such as VS Code, Cursor, and Claude Desktop.
 
 ## 1. Building the Server
 
@@ -15,10 +15,10 @@ The binary will be located at:
 
 ## 2. Configuration for IDEs and Claude Desktop
 
-You need to add the server configuration to your MCP config file. Before configuring your client, ensure you have installed the server globally via npm: `npm install -g @volute_cvc/cvc-mcp`.
+You need to add the server configuration to your MCP client config file. If you want to launch `cvc-mcp` from your PATH, install it globally via npm first: `npm install -g @volute_cvc/cvc-mcp`. If you prefer to use the binary you built above, point your client config at its absolute path instead.
 
 **Config File Locations:**
-- **VS Code (Antigravity/Forks):** Typically inside `.vscode/mcp.json` or user settings. Check your specific extension documentation.
+- **VS Code / Cursor:** Typically in workspace `.vscode/mcp.json` or in client settings. Check your specific client documentation.
 - **Claude Desktop:** `~/config/Claude/claude_desktop_config.json` (Linux) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS).
 
 **Configuration JSON:**

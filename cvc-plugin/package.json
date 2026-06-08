@@ -147,7 +147,7 @@
           {
             "id": "volute.welcome.intro",
             "title": "Welcome to Volute CVC",
-            "description": "Volute CVC keeps the reasoning behind your AI-assisted changes next to the code. In VS Code, the watcher follows GitHub Copilot chats automatically and links them to your commits.\n\n[Learn More](https://volutevc.com/docs)",
+            "description": "Volute CVC keeps the reasoning behind your AI-assisted changes next to the code. In VS Code, the watcher follows GitHub Copilot chats automatically and links them to your commits.\n\n[Learn More](https://cvc.dev)",
             "media": {
               "markdown": "# Git, Augmented\n\nUse GitHub Copilot in VS Code the way you normally do. Volute CVC records the reasoning in the background and shows it in the timeline panel."
             }

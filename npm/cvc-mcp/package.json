@@ -1,7 +1,7 @@
 {
   "name": "@volute_cvc/cvc-mcp",
   "version": "0.3.6",
-  "description": "NPM distributor for CVC MCP Server",
+  "description": "MCP server for CVC (Cognitive Version Control) for saving and reading git-linked AI work history",
   "bin": {
     "cvc-mcp": "./bin/cvc-mcp.js",
     "cvc": "./bin/cvc.js"
