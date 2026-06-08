@@ -1,6 +1,6 @@
 {
   "name": "@volute_cvc/cvc-mcp",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "MCP server for CVC (Cognitive Version Control) for saving and reading git-linked AI work history",
   "bin": {
     "cvc-mcp": "./bin/cvc-mcp.js",

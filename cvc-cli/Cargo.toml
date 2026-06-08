@@ -1,6 +1,6 @@
 [package]
 name = "cvc-cli"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 
 [[bin]]
@@ -24,5 +24,4 @@ directories = "5.0"
 flate2 = "1.0"
 tar = "0.4"
 zip = "0.6"
-
 
