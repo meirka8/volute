@@ -9,7 +9,7 @@ The web-based review interface for Cognitive Version Control.
 - A GitHub Personal Access Token (PAT)
 
 ### Authentication
-This application uses the **Alcatraz Protocol**: it is a client-side-only application that communicates directly with GitHub. Your token is stored in memory (obfuscated in Session Storage) and never sent to any backend other than `api.github.com`.
+This application uses the **Alcatraz Protocol**: it runs in the browser and is designed to communicate directly with GitHub. During a session, the GitHub PAT is kept in the browser for that session, including session storage used by the app. In the current implementation, the token is used for requests to `api.github.com`.
 
 #### Required PAT Permissions
 If using a **Fine-grained Personal Access Token**, you must grant the following permissions for the target repository:

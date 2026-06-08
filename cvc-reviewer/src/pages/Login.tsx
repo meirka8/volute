@@ -63,7 +63,7 @@ export default function Login() {
                     </div>
                     <h2 className="mt-6 font-serif text-4xl font-semibold tracking-tight">CVC Reviewer</h2>
                     <p className="mt-2 text-sm text-muted">
-                        The Zero-Trust Cognitive Review Interface
+                        Review captured coding context alongside the diff
                     </p>
                 </div>
 
@@ -108,7 +108,7 @@ export default function Login() {
                         <div className="mt-4 border-t border-line/80 pt-4 text-center text-xs text-muted">
                             <p className="flex items-center justify-center gap-2">
                                 <ShieldCheck className="w-3 h-3" />
-                                Client-Side Only. Tokens are never sent to our servers.
+                                In local mode, your token stays in this browser session and is used for direct GitHub API requests from the client.
                             </p>
                         </div>
                     </form>

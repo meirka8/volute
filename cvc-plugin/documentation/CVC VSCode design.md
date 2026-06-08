@@ -1,10 +1,10 @@
-# Project Design: Volute VC VS Code Extension
+# Project Design: Volute CVC VS Code Extension
 
 ## 1. Executive Summary
 
-The **Volute VC VS Code Extension** is the primary "Head" of the system for developers using VS Code, Cursor, or Windsurf (where extensions are supported). It serves two critical functions:
+The **Volute CVC VS Code Extension** is the primary "Head" of the system for developers using VS Code, Cursor, or Windsurf (where extensions are supported). It serves two critical functions:
 
-1. **Input (The Passive Observer):** Silently observes GitHub Copilot Chat conversations by monitoring VS Code's chat session storage files, capturing prompts, responses, and chain-of-thought without interfering with the user's workflow.
+1. **Input (The Passive Observer):** Reads GitHub Copilot Chat session storage files that VS Code stores locally, capturing prompts, responses, and available reasoning/context for this workflow without changing the user's normal Copilot flow.
 
 2. **Visualization (The Cognitive Timeline):** Provides a real-time Side Panel view of the "Shadow Graph," showing both **Pending Thoughts** (uncommitted reasoning) and **Historical Context** (thoughts linked to previous commits).
 
@@ -45,7 +45,7 @@ To support the UI features, we extend the standard LSP with custom methods:
 
 ### 3.1 Feature A: The Chat Session Watcher (Primary - Passive Observer)
 
-**The Invisible Stenographer** - Silently monitors GitHub Copilot Chat without any user intervention.
+**The Invisible Stenographer** - Reads GitHub Copilot Chat session files in the background without any extra user action.
 
 - **Mechanism:**
 
@@ -60,7 +60,7 @@ To support the UI features, we extend the standard LSP with custom methods:
         - Full model responses (including multiple parts)
         - Tool invocations (MCP, local tools) and their outputs
         - Code edits (TextEditGroups)
-        - Chain of Thought (Thinking blocks)
+        - Thinking or reasoning blocks when present in the locally stored session data
 
 - **Data Extracted:**
 
@@ -84,9 +84,9 @@ To support the UI features, we extend the standard LSP with custom methods:
 - **Benefits:**
 
     - Zero interference with Copilot's capabilities (RAG, tools, workspace indexing)
-    - Captures full chain-of-thought from models that expose it
+    - Captures locally stored reasoning/context from models and tools when that data is present in the VS Code session files
     - Works with any model the user selects
-    - Completely invisible to the user
+    - Should be clearly disclosed in user-facing docs because it depends on local VS Code chat session storage
 
 
 ### 3.2 Feature B: The Native Chat Participant (`@volute`) - Alternative/Explicit Mode

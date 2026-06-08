@@ -111,19 +111,19 @@
 ## Notes
 
 ### Current Onboarding Direction
-The intended primary VS Code workflow is now the passive watcher for **VS Code + GitHub Copilot**. The separate chat participant remains legacy behavior and should not be treated as the recommended getting-started path in user-facing guides.
+The intended primary VS Code workflow is now the passive watcher for **VS Code + GitHub Copilot**. For this workflow, the extension reads GitHub Copilot chat session files stored locally by VS Code. The separate chat participant remains legacy behavior and should not be treated as the recommended getting-started path in user-facing guides.
 
 ### Branding Update
-The extension has been rebranded from "CVC" to **Volute VC** as per the branding guidelines in `/branding_and_design/`. Key changes:
+The extension has been rebranded from "CVC" to **Volute CVC**. Key changes:
 
 - Extension name: `volute-vc`
-- Display name: `Volute VC`
+- Display name: `Volute CVC`
 - Chat participant: `@volute`
 - Command prefix: `volute.*`
 - Settings prefix: `volute.*`
 
 ### Brand Colors Applied
-The Volute VC brand colors have been applied to the webview:
+The Volute CVC brand colors have been applied to the webview:
 - **Git Orange** (`#F05032`) - Response section accent, errors
 - **Electric Teal** (`#64FFDA`) - Prompt section accent, buttons, links
 - **Cognitive Navy** (`#0A192F`) - Backgrounds

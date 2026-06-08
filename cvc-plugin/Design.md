@@ -74,7 +74,7 @@ To balance performance with query capability, we utilize a hybrid approach:
 
 ## 5. User Stories
 
-### Story A: The "Hallucination Rollback"
+### Story A: Prompt Recovery
 
 **Scenario:** A developer asks the AI to refactor a class. The AI hallucinates a method that doesn't exist. The developer spends 20 minutes trying to fix the generated code before realizing the approach was fundamentally flawed.
 

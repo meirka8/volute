@@ -6,7 +6,7 @@ The **CVC Reviewer** is a visualization layer for Pull Requests that overlays th
 
 **Primary Mandates:**
 
-1. **Alcatraz Security:** Zero-Trust architecture. The application must operate without an intermediary backend storing source code or tokens. It communicates directly from the Client (Browser) to the Git Host (GitHub/GitLab).
+1. **Alcatraz Security:** Direct-connection architecture. The application must operate without an intermediary backend storing source code or tokens. It communicates directly from the Client (Browser) to the Git Host (GitHub/GitLab).
     
 2. **Linear-Grade UX:** A "Tool-First" design philosophy focusing on keyboard centricity, sub-100ms latency perception, and information density without clutter.
     

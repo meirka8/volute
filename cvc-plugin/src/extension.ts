@@ -17,8 +17,8 @@ let timelineProvider: TimelineTreeProvider | undefined;
 export async function activate(
   context: vscode.ExtensionContext,
 ): Promise<void> {
-  const outputChannel = vscode.window.createOutputChannel("Volute VC");
-  outputChannel.appendLine("Activating Volute VC extension...");
+  const outputChannel = vscode.window.createOutputChannel("Volute CVC");
+  outputChannel.appendLine("Activating Volute CVC extension...");
 
   // ── Dependency Check (greenfield entrypoint) ───────────────────────────
   const status = await detectDependencies(outputChannel);
@@ -51,7 +51,7 @@ export async function activate(
         `Failed to start Volute Language Server: ${message}`,
       );
       vscode.window.showErrorMessage(
-        `Volute VC: Failed to start language server. ${message}`,
+        `Volute CVC: Failed to start language server. ${message}`,
       );
     }
   }
