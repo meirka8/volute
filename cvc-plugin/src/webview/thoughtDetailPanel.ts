@@ -4,7 +4,7 @@ import { InteractionDetail } from "../lsp/protocol";
 import { marked } from "marked";
 
 /**
- * Volute VC Brand Colors
+ * Volute CVC Brand Colors
  * These are used as accents alongside VS Code's native theming
  */
 const BRAND = {
@@ -283,7 +283,7 @@ export class ThoughtDetailPanel {
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
     <title>Thought Detail</title>
     <style>
-        /* Volute VC Brand Colors */
+        /* Volute CVC Brand Colors */
         :root {
             --volute-git-orange: ${BRAND.gitOrange};
             --volute-cognitive-navy: ${BRAND.cognitiveNavy};
@@ -717,7 +717,7 @@ export class ThoughtDetailPanel {
         }
 
         <div class="footer">
-            Tracked by <span class="brand">Volute VC</span>
+            Tracked by <span class="brand">Volute CVC</span>
         </div>
     </div>
 

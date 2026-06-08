@@ -13,15 +13,15 @@
 
 **Goal:** Establish trust immediately. The user must feel confident that their credentials and code remain local/direct.
 
-### Story 2.1: The Zero-Trust Login (Bob)
+### Story 2.1: The Direct GitHub Login (Bob)
 
-> As a security-conscious reviewer, I want to authenticate directly with GitHub without passing my credentials through a CVC backend, so that I know my repository access is never compromised.
+> As a security-conscious reviewer, I want to authenticate directly with GitHub without routing my credentials through a CVC backend, so that I can better understand where my repository access is being used.
 
 - **Scenario:** Bob opens `reviewer.cvc.dev`. He sees a "Paste PAT" input field and a prominent "Client-Side Only" badge.
     
 - **Action:** He disconnects his WiFi and pastes a fake token. The UI attempts a `fetch` and fails locally. He reconnects and pastes his real PAT.
     
-- **Success:** The dashboard loads instantly. He checks the Network tab and confirms calls go _only_ to `api.github.com`.
+- **Success:** The dashboard loads promptly. He checks the Network tab and verifies the current implementation is making GitHub API calls to `api.github.com`.
     
 
 ### Story 2.2: The Local Proxy Bypass (Enterprise Alice)
@@ -47,7 +47,7 @@
     
 - **Action:** She glances at the **Right Pane (Shadow Timeline)** aligned with that file. She sees a node: _"User: Make the email validation RFC 5322 compliant but ignore comments."_
     
-- **Result:** She immediately understands the complexity is intentional, not accidental. She approves the file.
+- **Result:** She quickly understands the complexity is intentional, not accidental. She approves the file.
     
 
 ### Story 3.2: The "Reverse Blame" Discovery (Charlie)

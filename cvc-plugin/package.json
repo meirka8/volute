@@ -1,7 +1,7 @@
 {
   "name": "cvc",
   "displayName": "Volute CVC",
-  "description": "Git, Augmented. Track the trajectory of intent alongside your code changes.",
+  "description": "Track AI-assisted coding context alongside code changes. For the VS Code workflow, the extension reads GitHub Copilot chat session files stored locally by VS Code.",
   "version": "0.1.0",
   "publisher": "volute",
   "license": "Proprietary",
@@ -147,17 +147,17 @@
           {
             "id": "volute.welcome.intro",
             "title": "Welcome to Volute CVC",
-            "description": "Volute CVC keeps the reasoning behind your AI-assisted changes next to the code. In VS Code, the watcher follows GitHub Copilot chats automatically and links them to your commits.\n\n[Learn More](https://cvc.dev)",
+            "description": "Volute CVC keeps the reasoning behind your AI-assisted changes next to the code. In VS Code, the watcher reads GitHub Copilot chat session files stored locally by VS Code and links captured context to your commits.\n\n[Learn More](https://cvc.dev)",
             "media": {
-              "markdown": "# Git, Augmented\n\nUse GitHub Copilot in VS Code the way you normally do. Volute CVC records the reasoning in the background and shows it in the timeline panel."
+              "markdown": "# Git, Augmented\n\nUse GitHub Copilot in VS Code the way you normally do. Volute CVC reads GitHub Copilot chat session files stored locally by VS Code for this workflow, then shows the captured context in the timeline panel."
             }
           },
           {
             "id": "volute.welcome.chat",
             "title": "Open a New Copilot Chat",
-            "description": "Open GitHub Copilot Chat, start a new conversation, and work normally. The watcher records Copilot chats automatically - there is nothing extra to invoke.\n\n[Open Chat](command:workbench.action.chat.open)",
+            "description": "Open GitHub Copilot Chat, start a new conversation, and work normally. The watcher reads Copilot chat session files stored locally by VS Code automatically - there is nothing extra to invoke.\n\n[Open Chat](command:workbench.action.chat.open)",
             "media": {
-              "markdown": "## Watcher-Based Workflow\n\nThe VS Code watcher is built for GitHub Copilot's chat storage format. It does not rely on a separate CVC chat participant."
+              "markdown": "## Watcher-Based Workflow\n\nThe VS Code watcher is built for GitHub Copilot's chat storage format and reads the local `chatSessions` files that VS Code maintains for Copilot Chat. It does not rely on a separate CVC chat participant."
             }
           },
           {

@@ -33,7 +33,7 @@ export function Paywall() {
                             </div>
                             <div>
                                 <h3 className="font-serif text-2xl font-semibold text-ink">Upgrade your team</h3>
-                                <p className="mt-1 text-xs text-muted">Unlock zero-trust private repository integration instantly.</p>
+                                <p className="mt-1 text-xs text-muted">Unlock hosted private repository access for eligible review workflows.</p>
                             </div>
                         </div>
 
