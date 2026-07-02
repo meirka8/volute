@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use cvc_core::db::CvcStore;
-use cvc_core::hooks;
+use cvc_core::hooks::{self, HookAction};
 use std::env;
 use std::fs;
 
@@ -26,7 +26,23 @@ pub async fn run() -> Result<()> {
         .context("Failed to initialize database schema")?;
 
     println!("Installing CVC hooks...");
-    hooks::install(&current_dir).context("Failed to install hooks")?;
+    let outcomes = hooks::install(&current_dir).context("Failed to install hooks")?;
+    for outcome in outcomes {
+        match outcome.action {
+            HookAction::Created => println!(
+                "Created new {} hook at {:?}",
+                outcome.hook_name, outcome.hook_path
+            ),
+            HookAction::Appended => println!(
+                "Appended CVC hook to existing {} at {:?}",
+                outcome.hook_name, outcome.hook_path
+            ),
+            HookAction::AlreadyPresent => println!(
+                "CVC hook already present in {} at {:?}",
+                outcome.hook_name, outcome.hook_path
+            ),
+        }
+    }
 
     println!("CVC Initialized successfully!");
     Ok(())
