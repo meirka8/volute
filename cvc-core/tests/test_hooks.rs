@@ -1,4 +1,4 @@
-use cvc_core::hooks;
+use cvc_core::hooks::{self, HookAction};
 use git2::Repository;
 use std::fs;
 use tempfile::TempDir;
@@ -13,7 +13,15 @@ fn setup_repo() -> (TempDir, Repository) {
 #[test]
 fn test_install_creates_hooks() -> anyhow::Result<()> {
     let (tmp, _repo) = setup_repo();
-    hooks::install(tmp.path())?;
+    let outcomes = hooks::install(tmp.path())?;
+
+    // install() must report outcomes to the caller rather than print/log
+    // directly -- it's shared by cvc-lsp and cvc-mcp, both stdio JSON-RPC
+    // servers where unframed stdout output corrupts the protocol stream.
+    assert_eq!(outcomes.len(), 3);
+    for outcome in &outcomes {
+        assert_eq!(outcome.action, HookAction::Created);
+    }
 
     let hooks_dir = tmp.path().join(".git").join("hooks");
     for name in &["post-commit", "pre-push", "post-merge"] {
@@ -52,7 +60,11 @@ fn test_install_idempotency() -> anyhow::Result<()> {
 
     // Install twice
     hooks::install(tmp.path())?;
-    hooks::install(tmp.path())?;
+    let outcomes = hooks::install(tmp.path())?;
+
+    for outcome in &outcomes {
+        assert_eq!(outcome.action, HookAction::AlreadyPresent);
+    }
 
     let hooks_dir = tmp.path().join(".git").join("hooks");
     for name in &["post-commit", "pre-push", "post-merge"] {
@@ -79,7 +91,13 @@ fn test_install_appends_to_existing() -> anyhow::Result<()> {
     let existing_content = "#!/bin/sh\necho \"existing hook\"\n";
     fs::write(hooks_dir.join("post-commit"), existing_content)?;
 
-    hooks::install(tmp.path())?;
+    let outcomes = hooks::install(tmp.path())?;
+
+    let post_commit_outcome = outcomes
+        .iter()
+        .find(|o| o.hook_name == "post-commit")
+        .expect("post-commit outcome should be reported");
+    assert_eq!(post_commit_outcome.action, HookAction::Appended);
 
     let content = fs::read_to_string(hooks_dir.join("post-commit"))?;
     assert!(
