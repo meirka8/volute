@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "cvc-cli"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "cvc-core"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "cvc-lsp"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "cvc-mcp"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "chrono",
