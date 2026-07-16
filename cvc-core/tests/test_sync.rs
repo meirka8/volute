@@ -372,6 +372,85 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_fetch_and_pull_from_fresh_clone() -> anyhow::Result<()> {
+    // Simulates HEL-57's continuation-of-work scenario: work started on one machine
+    // (repo_a) is pushed to a shared remote, then a second machine (repo_b, a fresh
+    // clone with an empty CVC cache) catches up via `fetch_and_pull` alone -- the
+    // same primitive the cvc-mcp `sync_history` tool calls.
+    let temp_dir = TempDir::new()?;
+    let remote_path = temp_dir.path().join("remote");
+    let _remote_repo = Repository::init_bare(&remote_path)?;
+
+    // Machine A: records a thought and pushes it to the shared remote.
+    let local_a_path = temp_dir.path().join("local_a");
+    let repo_a = Repository::clone(remote_path.to_str().expect("Path not UTF-8"), &local_a_path)?;
+    let mut config_a = repo_a.config()?;
+    config_a.set_str("user.name", "User A")?;
+    config_a.set_str("user.email", "a@example.com")?;
+
+    let store_a = CvcStore::open(local_a_path.join(".git/cvc/index.db"))?;
+    store_a.init()?;
+    store_a.create_conversation(&Conversation {
+        id: "conv-a".to_string(),
+        title: "Conv A".to_string(),
+        created_at: Utc::now(),
+    })?;
+    let inter_a = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "conv-a".to_string(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "Thought from machine A".to_string(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store_a.create_interaction(&inter_a)?;
+    sync::push_to_ref(&repo_a, &store_a, "refs/cvc/main")?;
+
+    let mut push_callbacks = git2::RemoteCallbacks::new();
+    push_callbacks.credentials(|_, _, _| git2::Cred::default());
+    let mut push_opts = git2::PushOptions::new();
+    push_opts.remote_callbacks(push_callbacks);
+    repo_a
+        .find_remote("origin")?
+        .push(&["refs/cvc/main:refs/cvc/main"], Some(&mut push_opts))?;
+
+    // Machine B: a fresh clone that never ran `commit_thought` locally.
+    let local_b_path = temp_dir.path().join("local_b");
+    let repo_b = Repository::clone(remote_path.to_str().expect("Path not UTF-8"), &local_b_path)?;
+    let store_b = CvcStore::open(local_b_path.join(".git/cvc/index.db"))?;
+    store_b.init()?;
+
+    assert!(
+        store_b.get_interaction(&inter_a.id)?.is_none(),
+        "sanity check: machine B shouldn't have A's thought yet"
+    );
+
+    // `git fetch` needs a resolvable remote URL; the bare repo is a local path here,
+    // which the system `git` CLI (fetch_and_pull's first attempt) handles fine.
+    let new_count = sync::fetch_and_pull(&repo_b, &store_b, "origin")?;
+
+    assert_eq!(new_count, 1, "should report exactly one newly ingested interaction");
+    let fetched = store_b.get_interaction(&inter_a.id)?;
+    assert!(fetched.is_some(), "machine B should now have A's thought");
+    assert_eq!(fetched.unwrap().user_prompt, "Thought from machine A");
+
+    // The local shadow ref should now be fast-forwarded to what was fetched.
+    let local_ref = repo_b.find_reference("refs/cvc/main")?;
+    let remote_ref = repo_b.find_reference("refs/remotes/origin/cvc/main")?;
+    assert_eq!(local_ref.target(), remote_ref.target());
+
+    // Calling again with nothing new on the remote should be a no-op.
+    let second_count = sync::fetch_and_pull(&repo_b, &store_b, "origin")?;
+    assert_eq!(second_count, 0, "should report zero on a repeat sync");
+
+    Ok(())
+}
+
+#[test]
 fn test_sync_cycle_detection() -> anyhow::Result<()> {
     // 1. Setup Repo and DB
     let temp_dir = TempDir::new()?;

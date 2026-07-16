@@ -10,7 +10,7 @@ pub fn list_tools() -> Value {
         "tools": [
             {
                 "name": "commit_thought",
-                "description": "Save a concise task record and important reasoning to CVC. Use it when a key plan, decision, or result is worth preserving for later context. Keep entries focused rather than exhaustive.",
+                "description": "You MUST call this after every meaningful step: forming a plan, making a non-trivial decision, rejecting an approach, or finishing a subtask -- not only once at the very end. This is the only durable record of your reasoning. If you skip it, the plan, the rationale, and the paths you considered and rejected are gone the moment this session ends, unrecoverable by you or by anyone (including you, on another machine, via another harness) picking up this work later. Log liberally rather than sparingly; keep each entry concise and focused, not exhaustive.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -44,20 +44,37 @@ pub fn list_tools() -> Value {
             },
             {
                 "name": "read_history",
-                "description": "Read recent saved CVC history. Use it to recover prior task context or decisions. Results are limited to recent entries only.",
+                "description": "You MUST call this at the start of a task, before assuming you are starting from a blank slate. It recovers the reasoning and decisions already recorded for this repository, including from earlier sessions and other machines -- not just this conversation. If the repository was cloned, pulled, or checked out somewhere new since the history you need was recorded, call sync_history first so this tool has something to find.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "limit": {
                             "type": "integer",
-                            "description": "Optional number of recent entries to return"
+                            "description": "Optional number of recent entries to return. Ignored if 'commit' is set."
+                        },
+                        "commit": {
+                            "type": "string",
+                            "description": "Optional commit SHA. If set, returns the interactions that led to that specific commit instead of recent history -- use this to resume work at a known commit, e.g. after cloning or checking out on a different machine."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "sync_history",
+                "description": "Call this before read_history whenever you cannot be sure the local CVC history cache is current: a fresh clone, a repository you have not worked in during this session, a different machine than the one that recorded prior thoughts, or a long-idle checkout. It fetches CVC history pushed to the git remote by other sessions or teammates and ingests it locally so read_history can actually find it. It never pushes local thoughts anywhere -- syncing outward happens automatically on git push, not through this tool.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cwd": {
+                            "type": "string",
+                            "description": "Optional working directory to sync, mainly for tests or explicit repo targeting"
                         }
                     }
                 }
             },
             {
                 "name": "get_context",
-                "description": "Inspect git-backed context for one file. Use it before summarizing or recording file state. It reports one file per call.",
+                "description": "Inspect git-backed context for one file. Call this before summarizing or recording a file's state in a thought -- do not guess whether a file is clean or has uncommitted changes. It reports one file per call.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -71,7 +88,7 @@ pub fn list_tools() -> Value {
             },
             {
                 "name": "setup_cvc",
-                "description": "Initialize CVC storage and hooks for the current repository. Use it during first-time setup or when CVC is not yet installed. It only works inside a git repository.",
+                "description": "Call this proactively, without asking for confirmation, the first time another CVC tool fails because storage or hooks are missing for the current repository. It only initializes a local SQLite cache and local git hooks -- nothing leaves the machine. It only works inside a git repository.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -101,6 +118,7 @@ pub async fn call_tool(params: Value, state: Arc<AppState>) -> Result<Value, Jso
     match name {
         "commit_thought" => commit_thought(args, state).await,
         "read_history" => read_history(args, state).await,
+        "sync_history" => sync_history(args, state).await,
         "get_context" => get_context(args).await,
         "setup_cvc" => setup_cvc(args).await,
         _ => Err(JsonRpcError {
@@ -218,6 +236,10 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
 
 async fn read_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRpcError> {
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let commit = args
+        .get("commit")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let conversation_id = state.conversation_id.lock().unwrap().clone();
 
     let store = state.store.clone();
@@ -226,25 +248,34 @@ async fn read_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRp
             .lock()
             .map_err(|_| anyhow::anyhow!("Failed to lock store"))?;
 
-        // Recent interactions for the current session's conversation first, then fill
-        // the rest with recent repo-wide interactions, regardless of link status --
-        // agent memory should survive a commit, not go blank the moment one lands.
-        let mut interactions = match &conversation_id {
-            Some(conv_id) => store.get_recent_interactions_for_conversation(conv_id, limit)?,
-            None => Vec::new(),
-        };
+        let interactions = if let Some(commit_sha) = commit {
+            // Resuming at a known commit: return exactly what led to it, not a mix
+            // diluted with unrelated recent chatter.
+            store.get_interactions_for_commit(&cvc_core::models::CommitSha::new(commit_sha))?
+        } else {
+            // Recent interactions for the current session's conversation first, then
+            // fill the rest with recent repo-wide interactions, regardless of link
+            // status -- agent memory should survive a commit, not go blank the moment
+            // one lands.
+            let mut recent = match &conversation_id {
+                Some(conv_id) => store.get_recent_interactions_for_conversation(conv_id, limit)?,
+                None => Vec::new(),
+            };
 
-        if interactions.len() < limit {
-            let seen: HashSet<_> = interactions.iter().map(|i| i.id.clone()).collect();
-            for interaction in store.get_recent_interactions(limit)? {
-                if interactions.len() >= limit {
-                    break;
-                }
-                if !seen.contains(&interaction.id) {
-                    interactions.push(interaction);
+            if recent.len() < limit {
+                let seen: HashSet<_> = recent.iter().map(|i| i.id.clone()).collect();
+                for interaction in store.get_recent_interactions(limit)? {
+                    if recent.len() >= limit {
+                        break;
+                    }
+                    if !seen.contains(&interaction.id) {
+                        recent.push(interaction);
+                    }
                 }
             }
-        }
+
+            recent
+        };
 
         Ok::<_, anyhow::Error>(interactions)
     })
@@ -273,6 +304,66 @@ async fn read_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRp
         Err(e) => Err(JsonRpcError {
             code: -32603,
             message: format!("DB Error: {}", e),
+            data: None,
+        }),
+    }
+}
+
+async fn sync_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRpcError> {
+    let current_dir = if let Some(cwd) = args.get("cwd").and_then(|v| v.as_str()) {
+        std::path::PathBuf::from(cwd)
+    } else {
+        std::env::current_dir().map_err(|e| JsonRpcError {
+            code: -32603,
+            message: format!("Failed to get current directory: {}", e),
+            data: None,
+        })?
+    };
+
+    let store = state.store.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let repo = cvc_core::git::open_repo(&current_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to open repo: {}", e))?;
+
+        let remotes = repo.remotes()?;
+        let remote_name = if remotes.iter().any(|r| r == Some("origin")) {
+            "origin".to_string()
+        } else {
+            remotes
+                .iter()
+                .flatten()
+                .next()
+                .map(|s| s.to_string())
+                .ok_or_else(|| anyhow::anyhow!("No git remotes configured for this repository"))?
+        };
+
+        let store = store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock store"))?;
+
+        let new_count = cvc_core::sync::fetch_and_pull(&repo, &store, &remote_name)?;
+        Ok::<_, anyhow::Error>((remote_name, new_count))
+    })
+    .await
+    .map_err(|e| JsonRpcError {
+        code: -32603,
+        message: format!("Internal Error: {}", e),
+        data: None,
+    })?;
+
+    match res {
+        Ok((remote_name, new_count)) => Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "Synced with remote '{}'. Pulled {} new interaction(s) into local history.",
+                    remote_name, new_count
+                )
+            }]
+        })),
+        Err(e) => Err(JsonRpcError {
+            code: -32603,
+            message: format!("Sync Error: {}", e),
             data: None,
         }),
     }
