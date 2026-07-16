@@ -1,10 +1,15 @@
 use crate::db::CvcStore;
 use crate::models::{ArtifactLink, ContextItem, Interaction, ToolExecution};
-use git2::{FileMode, ObjectType, Repository};
+use git2::{FileMode, ObjectType, Repository, Tree, TreeBuilder};
 use serde::de::Error as SerdeError;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
+
+/// Tree layout version written by `push_to_ref`. Stored at the ref tree's root as a
+/// blob named `FORMAT`. See `push_to_ref` for the layout this describes.
+const SYNC_FORMAT_VERSION: &[u8] = b"2";
 
 #[derive(Error, Debug)]
 pub enum SyncError {
@@ -42,50 +47,110 @@ pub fn validate_ref_name(ref_name: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_')
 }
 
+/// First two hex characters of an interaction ID, used as its `nodes/` shard.
+/// Mirrors `.git/objects`' own fan-out scheme so individual tree listings stay small
+/// as history grows, instead of one giant flat directory.
+fn shard_prefix(id: &str) -> &str {
+    &id[0..2]
+}
+
+/// Resolves `name` as a child tree of `parent` (if `parent` is set and has such a
+/// child), swallowing lookup errors as "not found" -- a ref that's supposed to be
+/// append-only should never have a corrupt child, but if it somehow did, treating it
+/// as absent and rebuilding that shard fresh is a safe, self-healing fallback.
+fn child_tree<'repo>(repo: &'repo Repository, parent: Option<&Tree>, name: &str) -> Option<Tree<'repo>> {
+    parent
+        .and_then(|t| t.get_name(name))
+        .filter(|e| e.kind() == Some(ObjectType::Tree))
+        .and_then(|e| repo.find_tree(e.id()).ok())
+}
+
+/// A `TreeBuilder` seeded from `parent`'s child tree named `name`, or empty if there
+/// isn't one yet.
+fn child_treebuilder<'repo>(
+    repo: &'repo Repository,
+    parent: Option<&Tree>,
+    name: &str,
+) -> Result<TreeBuilder<'repo>> {
+    Ok(repo.treebuilder(child_tree(repo, parent, name).as_ref())?)
+}
+
+/// Writes the tree layout for `refs/cvc/main` (or any other CVC shadow ref):
+///
+/// ```text
+/// FORMAT                              # version marker, currently "2"
+/// nodes/<id[0..2]>/<interaction-id>.json   # sharded interaction blobs (immutable once written)
+/// by-commit/<commit-sha>/<interaction-id>  # zero-byte pointer entries, a pure index
+/// ```
+///
+/// Legacy repos may still have interactions stored as flat `<id>.json` files at the
+/// root from before this layout existed -- those are left untouched (never rewritten,
+/// per the "immutable blobs" rule) and `pull_from_ref` keeps reading them. New pushes
+/// always write the new layout, so a repo naturally converges on it over time without
+/// a disruptive one-time migration.
 pub fn push_to_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<()> {
     if !validate_ref_name(ref_name) {
         return Err(SyncError::Ref(format!("Invalid ref name: {}", ref_name)));
     }
 
-    // 1. Get all interaction IDs from DB
     let all_ids = db.get_all_interaction_ids()?;
 
-    // 2. Load TreeBuilder from current ref
-    let mut tree_builder = repo.treebuilder(None)?;
+    let mut root_builder = repo.treebuilder(None)?;
     let mut parent_commit = None;
+    let mut existing_root_tree: Option<Tree> = None;
 
-    // Check if ref exists and points to a tree or commit
     if let Ok(reference) = repo.find_reference(ref_name) {
-        // Try peeling to commit first (normal case after migration)
         if let Ok(commit) = reference.peel_to_commit() {
             let tree = commit.tree()?;
-            tree_builder = repo.treebuilder(Some(&tree))?;
+            root_builder = repo.treebuilder(Some(&tree))?;
+            existing_root_tree = Some(tree);
             parent_commit = Some(commit);
         } else if let Ok(obj) = reference.peel(ObjectType::Tree) {
-            // Legacy case: ref points directly to tree
             if let Some(tree) = obj.as_tree() {
-                tree_builder = repo.treebuilder(Some(tree))?;
+                root_builder = repo.treebuilder(Some(tree))?;
+                existing_root_tree = Some(repo.find_tree(tree.id())?);
             }
-            // No parent commit in this case, we start a fresh history or valid parent is missing
         }
     }
 
-    // 3. Iterate IDs, check existence, add if missing
-    for id in all_ids {
-        let filename = format!("{}.json", id.as_str());
+    let existing_nodes_tree = child_tree(repo, existing_root_tree.as_ref(), "nodes");
+    let existing_by_commit_tree = child_tree(repo, existing_root_tree.as_ref(), "by-commit");
 
-        // internal git2 optimization: get returns Entry which has oid
-        if tree_builder.get(&filename)?.is_some() {
-            continue; // Already synced
+    // --- nodes/<prefix>/<id>.json ---
+    let mut prefix_builders: HashMap<String, TreeBuilder> = HashMap::new();
+
+    for id in &all_ids {
+        let legacy_filename = format!("{}.json", id.as_str());
+        if root_builder.get(&legacy_filename)?.is_some() {
+            continue; // already synced under the pre-v2 flat layout; leave it alone
         }
 
-        // Construct SyncNode
-        let interaction = db.get_interaction(&id)?.ok_or_else(|| {
+        let id_str = id.as_str();
+        let prefix = shard_prefix(&id_str);
+        let already_sharded = child_tree(repo, existing_nodes_tree.as_ref(), prefix)
+            .map(|sub| sub.get_name(&legacy_filename).is_some())
+            .unwrap_or(false);
+        if already_sharded {
+            continue;
+        }
+
+        let builder = match prefix_builders.entry(prefix.to_string()) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                let b = child_treebuilder(repo, existing_nodes_tree.as_ref(), prefix)?;
+                e.insert(b)
+            }
+        };
+        if builder.get(&legacy_filename)?.is_some() {
+            continue;
+        }
+
+        let interaction = db.get_interaction(id)?.ok_or_else(|| {
             SyncError::Db(crate::db::DbError::Migration("Interaction missing".into()))
         })?;
-        let context_items = db.get_context_items(&id)?;
-        let tool_executions = db.get_tool_executions(&id)?;
-        let artifact_links = db.get_artifact_links(&id)?;
+        let context_items = db.get_context_items(id)?;
+        let tool_executions = db.get_tool_executions(id)?;
+        let artifact_links = db.get_artifact_links(id)?;
 
         let node = SyncNode {
             interaction,
@@ -94,16 +159,69 @@ pub fn push_to_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<(
             artifact_links,
         };
 
-        // Serialize and Write Blob
         let json = serde_json::to_string_pretty(&node)?;
         let blob_oid = repo.blob(json.as_bytes())?;
-
-        // Add to Tree
-        tree_builder.insert(&filename, blob_oid, FileMode::Blob.into())?;
+        builder.insert(&legacy_filename, blob_oid, FileMode::Blob.into())?;
     }
 
-    // 4. Write Tree
-    let new_tree_oid = tree_builder.write()?;
+    if !prefix_builders.is_empty() {
+        let mut nodes_builder = child_treebuilder(repo, existing_root_tree.as_ref(), "nodes")?;
+        for (prefix, builder) in &prefix_builders {
+            let oid = builder.write()?;
+            nodes_builder.insert(prefix, oid, FileMode::Tree.into())?;
+        }
+        let nodes_oid = nodes_builder.write()?;
+        root_builder.insert("nodes", nodes_oid, FileMode::Tree.into())?;
+    }
+
+    // --- by-commit/<sha>/<id>: written/updated whenever artifact links exist ---
+    let mut commit_builders: HashMap<String, TreeBuilder> = HashMap::new();
+
+    for id in &all_ids {
+        for link in db.get_artifact_links(id)? {
+            let commit_sha = link.git_commit_hash.as_str().to_string();
+            let pointer_name = id.as_str();
+
+            let already_indexed = child_tree(repo, existing_by_commit_tree.as_ref(), &commit_sha)
+                .map(|sub| sub.get_name(&pointer_name).is_some())
+                .unwrap_or(false);
+            if already_indexed {
+                continue;
+            }
+
+            let builder = match commit_builders.entry(commit_sha.clone()) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => {
+                    let b = child_treebuilder(repo, existing_by_commit_tree.as_ref(), &commit_sha)?;
+                    e.insert(b)
+                }
+            };
+            if builder.get(&pointer_name)?.is_none() {
+                // Zero-byte pointer: by-commit/ is a pure index, the content lives in nodes/.
+                let empty_oid = repo.blob(b"")?;
+                builder.insert(&pointer_name, empty_oid, FileMode::Blob.into())?;
+            }
+        }
+    }
+
+    if !commit_builders.is_empty() {
+        let mut by_commit_builder = child_treebuilder(repo, existing_root_tree.as_ref(), "by-commit")?;
+        for (commit_sha, builder) in &commit_builders {
+            let oid = builder.write()?;
+            by_commit_builder.insert(commit_sha, oid, FileMode::Tree.into())?;
+        }
+        let by_commit_oid = by_commit_builder.write()?;
+        root_builder.insert("by-commit", by_commit_oid, FileMode::Tree.into())?;
+    }
+
+    // --- FORMAT marker: written once, never touched again ---
+    if root_builder.get("FORMAT")?.is_none() {
+        let format_oid = repo.blob(SYNC_FORMAT_VERSION)?;
+        root_builder.insert("FORMAT", format_oid, FileMode::Blob.into())?;
+    }
+
+    // Write Tree
+    let new_tree_oid = root_builder.write()?;
 
     // Optimization: Skip commit if tree hasn't changed
     if let Some(parent) = &parent_commit {
@@ -139,6 +257,38 @@ pub fn push_to_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<(
     Ok(())
 }
 
+/// Recursively collects `(interaction_id, blob_oid)` pairs for every `<id>.json` blob
+/// in `tree`, up to `max_depth` levels below it. Used to read both the legacy flat
+/// layout (depth 0) and the v2 `nodes/<prefix>/<id>.json` layout (depth 2) in one pass.
+/// Explicitly skips `by-commit/` -- its entries never end in `.json` and it can be
+/// large, so there's no reason to even open it here.
+fn collect_interaction_blobs(
+    repo: &Repository,
+    tree: &Tree,
+    max_depth: usize,
+    out: &mut Vec<(String, git2::Oid)>,
+) -> Result<()> {
+    for entry in tree.iter() {
+        let name = entry.name().unwrap_or_default();
+        match entry.kind() {
+            Some(ObjectType::Blob) => {
+                if let Some(id_str) = name.strip_suffix(".json") {
+                    out.push((id_str.to_string(), entry.id()));
+                }
+            }
+            Some(ObjectType::Tree) if max_depth > 0 => {
+                if name == "by-commit" {
+                    continue;
+                }
+                let sub = repo.find_tree(entry.id())?;
+                collect_interaction_blobs(repo, &sub, max_depth - 1, out)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<()> {
     if !validate_ref_name(ref_name) {
         return Err(SyncError::Ref(format!("Invalid ref name: {}", ref_name)));
@@ -155,7 +305,14 @@ pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result
         .as_tree()
         .ok_or_else(|| SyncError::Ref("Ref is not a tree".into()))?;
 
-    // 2. Iterate Tree
+    // 2. Collect (interaction-id, blob-oid) pairs from BOTH layouts this ref might
+    // contain: legacy flat `<id>.json` files at the root, and/or the v2 sharded
+    // `nodes/<prefix>/<id>.json` layout. `by-commit/` is skipped entirely -- it's a
+    // pure index for the Reviewer's PR-scoped fetch path, not a source of truth; every
+    // interaction's own blob already carries its `artifact_links`.
+    let mut blob_refs: Vec<(String, git2::Oid)> = Vec::new();
+    collect_interaction_blobs(repo, tree, 2, &mut blob_refs)?;
+
     // We want to verify existing IDs in DB to skip reading blobs
     let existing_ids_vec = db.get_all_interaction_ids()?;
     let existing_ids: HashSet<String> = existing_ids_vec
@@ -165,34 +322,25 @@ pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result
 
     let mut nodes_to_insert = Vec::new();
 
-    for entry in tree.iter() {
-        let name = entry.name().unwrap_or_default();
-        if !name.ends_with(".json") {
+    for (id_str, blob_oid) in blob_refs {
+        if existing_ids.contains(&id_str) {
             continue;
         }
 
-        let id_str = name.trim_end_matches(".json");
-        if existing_ids.contains(id_str) {
-            continue;
-        }
-
-        // 3. Read Blob
-        let object = entry.to_object(repo)?;
-        let blob = object
-            .as_blob()
-            .ok_or_else(|| SyncError::Ref("Entry is not a blob".into()))?;
+        let blob = repo.find_blob(blob_oid)?;
         let content = std::str::from_utf8(blob.content())
             .map_err(|e| SyncError::Serde(serde_json::Error::custom(e.to_string())))?;
 
-        // 4. Parse SyncNode
         let node: SyncNode = serde_json::from_str(content)?;
         nodes_to_insert.push(node);
     }
 
     // 5. Robust Topological Sort (DFS)
     // We need to ensure that if B depends on A (B.parent_id = A.id), A is inserted first.
+    // (Duplicate ids across the two layouts -- e.g. a pre-upgrade repo re-pushed after
+    // upgrading -- resolve harmlessly here: last write wins into node_map, and content
+    // is identical either way since interaction ids are content-addressed.)
 
-    use std::collections::HashMap;
     let mut node_map: HashMap<String, SyncNode> = HashMap::new();
     for node in nodes_to_insert {
         node_map.insert(node.interaction.id.to_string(), node);

@@ -451,6 +451,234 @@ fn test_fetch_and_pull_from_fresh_clone() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_sync_v2_round_trip() -> anyhow::Result<()> {
+    // HEL-65 acceptance criterion: push v2 layout, pull into a fresh clone, DBs equal.
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let signature = Signature::now("Test User", "test@example.com")?;
+    let tree_oid = repo.index()?.write_tree()?;
+    let tree = repo.find_tree(tree_oid)?;
+    let commit_oid = repo.commit(Some("HEAD"), &signature, &signature, "Init", &tree, &[])?;
+    let commit_sha = CommitSha::new(commit_oid.to_string());
+
+    let store = CvcStore::open(temp_dir.path().join("cvc.db"))?;
+    store.init()?;
+    store.create_conversation(&Conversation {
+        id: "conv-1".to_string(),
+        title: "Round Trip".to_string(),
+        created_at: Utc::now(),
+    })?;
+
+    // A linked interaction (will end up indexed under by-commit/) ...
+    let linked = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "conv-1".to_string(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "Linked thought".to_string(),
+        model_name: None,
+        model_cot: Some("reasoning".to_string()),
+        model_response: Some("response".to_string()),
+        source_request_id: None,
+    };
+    store.create_interaction(&linked)?;
+    store.link_interaction(&linked.id, &commit_sha, "generated")?;
+    store.add_context_item(&ContextItem {
+        id: None,
+        interaction_id: linked.id.clone(),
+        file_path: "src/lib.rs".to_string(),
+        git_blob_sha: Some("deadbeef".to_string()),
+        dirty_patch: None,
+        start_line: None,
+        end_line: None,
+    })?;
+
+    // ... and a floating one (nodes/ only, no by-commit/ entry).
+    let floating = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "conv-1".to_string(),
+        parent_id: Some(linked.id.clone()),
+        timestamp: Utc::now(),
+        author: Author::Agent,
+        user_prompt: "Floating thought".to_string(),
+        model_name: Some("agent".to_string()),
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&floating)?;
+
+    let ref_name = "refs/cvc/main";
+    sync::push_to_ref(&repo, &store, ref_name)?;
+
+    // Verify the v2 layout actually landed: FORMAT marker, sharded nodes/, by-commit/ index.
+    let pushed_tree = repo.find_reference(ref_name)?.peel_to_commit()?.tree()?;
+    let format_entry = pushed_tree
+        .get_name("FORMAT")
+        .expect("FORMAT marker should be written");
+    let format_blob = repo.find_blob(format_entry.id())?;
+    assert_eq!(format_blob.content(), b"2");
+
+    let nodes_tree = pushed_tree
+        .get_name("nodes")
+        .expect("nodes/ should exist")
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    let linked_prefix = &linked.id.as_str()[0..2];
+    let shard_tree = nodes_tree
+        .get_name(linked_prefix)
+        .unwrap_or_else(|| panic!("nodes/{} shard should exist", linked_prefix))
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    assert!(shard_tree
+        .get_name(&format!("{}.json", linked.id))
+        .is_some());
+
+    let by_commit_tree = pushed_tree
+        .get_name("by-commit")
+        .expect("by-commit/ should exist")
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    let commit_index = by_commit_tree
+        .get_name(commit_sha.as_str())
+        .expect("by-commit/<sha> should exist for the linked commit")
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    assert!(commit_index.get_name(&linked.id.to_string()).is_some());
+    // The floating interaction was never linked, so it must not appear in the index.
+    assert!(commit_index.get_name(&floating.id.to_string()).is_none());
+
+    // Pull into a fresh clone/DB and compare.
+    let store_2 = CvcStore::open(temp_dir.path().join("cvc_2.db"))?;
+    store_2.init()?;
+    sync::pull_from_ref(&repo, &store_2, ref_name)?;
+
+    for original in [&linked, &floating] {
+        let fetched = store_2
+            .get_interaction(&original.id)?
+            .unwrap_or_else(|| panic!("interaction {} missing after pull", original.id));
+        assert_eq!(fetched.user_prompt, original.user_prompt);
+        assert_eq!(fetched.conversation_id, original.conversation_id);
+        assert_eq!(fetched.parent_id, original.parent_id);
+        assert_eq!(fetched.author, original.author);
+        assert_eq!(fetched.model_cot, original.model_cot);
+        assert_eq!(fetched.model_response, original.model_response);
+    }
+
+    let fetched_links = store_2.get_artifact_links(&linked.id)?;
+    assert_eq!(fetched_links.len(), 1);
+    assert_eq!(fetched_links[0].git_commit_hash, commit_sha);
+
+    let fetched_context = store_2.get_context_items(&linked.id)?;
+    assert_eq!(fetched_context.len(), 1);
+    assert_eq!(fetched_context[0].file_path, "src/lib.rs");
+
+    assert!(store_2.get_artifact_links(&floating.id)?.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn test_pull_from_ref_reads_legacy_v1_layout() -> anyhow::Result<()> {
+    // Repos synced before HEL-65 have a flat `<id>.json` tree with no nodes/,
+    // by-commit/, or FORMAT entries at all. pull_from_ref must still read them.
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let signature = Signature::now("Test User", "test@example.com")?;
+
+    let id = InteractionId::new();
+    let node = SyncNode {
+        interaction: Interaction {
+            id: id.clone(),
+            conversation_id: "conv-legacy".to_string(),
+            parent_id: None,
+            timestamp: Utc::now(),
+            author: Author::Human,
+            user_prompt: "Legacy thought".to_string(),
+            model_name: None,
+            model_cot: None,
+            model_response: None,
+            source_request_id: None,
+        },
+        context_items: vec![],
+        tool_executions: vec![],
+        artifact_links: vec![],
+    };
+
+    let mut tree_builder = repo.treebuilder(None)?;
+    let json = serde_json::to_string_pretty(&node)?;
+    let blob_oid = repo.blob(json.as_bytes())?;
+    tree_builder.insert(format!("{}.json", id), blob_oid, FileMode::Blob.into())?;
+    let tree_oid = tree_builder.write()?;
+    let tree = repo.find_tree(tree_oid)?;
+    repo.commit(
+        Some("refs/cvc/main"),
+        &signature,
+        &signature,
+        "Legacy v1 sync",
+        &tree,
+        &[],
+    )?;
+
+    let store = CvcStore::open(temp_dir.path().join("cvc.db"))?;
+    store.init()?;
+    sync::pull_from_ref(&repo, &store, "refs/cvc/main")?;
+
+    let fetched = store.get_interaction(&id)?;
+    assert!(fetched.is_some(), "legacy v1 interaction should be ingested");
+    assert_eq!(fetched.unwrap().user_prompt, "Legacy thought");
+
+    // A push against this legacy tree should leave the old entry alone and start
+    // writing new interactions under the v2 layout -- no disruptive migration.
+    // (conv-legacy already exists: pull_from_ref auto-created it while ingesting the
+    // legacy interaction above.)
+    let new_id = InteractionId::new();
+    store.create_interaction(&Interaction {
+        id: new_id.clone(),
+        conversation_id: "conv-legacy".to_string(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Agent,
+        user_prompt: "Post-upgrade thought".to_string(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    })?;
+    sync::push_to_ref(&repo, &store, "refs/cvc/main")?;
+
+    let updated_tree = repo
+        .find_reference("refs/cvc/main")?
+        .peel_to_commit()?
+        .tree()?;
+    // The old flat entry is untouched (immutable blobs rule).
+    assert!(updated_tree.get_name(&format!("{}.json", id)).is_some());
+    // The new interaction lands in the sharded layout instead.
+    let prefix = &new_id.as_str()[0..2];
+    let nodes_tree = updated_tree
+        .get_name("nodes")
+        .expect("nodes/ should now exist")
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    let shard = nodes_tree
+        .get_name(prefix)
+        .expect("shard should exist")
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    assert!(shard.get_name(&format!("{}.json", new_id)).is_some());
+
+    // And a pull against this mixed tree picks up both.
+    let store_2 = CvcStore::open(temp_dir.path().join("cvc_2.db"))?;
+    store_2.init()?;
+    sync::pull_from_ref(&repo, &store_2, "refs/cvc/main")?;
+    assert!(store_2.get_interaction(&id)?.is_some());
+    assert!(store_2.get_interaction(&new_id)?.is_some());
+
+    Ok(())
+}
+
+#[test]
 fn test_sync_cycle_detection() -> anyhow::Result<()> {
     // 1. Setup Repo and DB
     let temp_dir = TempDir::new()?;
