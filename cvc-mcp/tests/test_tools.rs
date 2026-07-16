@@ -1,7 +1,9 @@
+use chrono::Utc;
 use cvc_core::db::CvcStore;
-use cvc_core::models::CommitSha;
+use cvc_core::models::{Author, CommitSha, Conversation, Interaction, InteractionId};
 use cvc_mcp::server::{start_session, AppState};
 use cvc_mcp::tools::{call_tool, list_tools};
+use git2::Repository;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tempfile::{tempdir, TempDir};
@@ -193,4 +195,79 @@ async fn test_distinct_sessions_get_distinct_conversations() {
     // Both conversations live in the same shared repo DB.
     let conversation_b_from_a = store_a.get_conversation(&conv_b).unwrap();
     assert!(conversation_b_from_a.is_some());
+}
+
+#[tokio::test]
+async fn test_sync_history_pulls_from_remote() {
+    // HEL-57 continuation-of-work scenario: a thought recorded and pushed from one
+    // machine/harness should be pullable via the sync_history MCP tool alone, by a
+    // second machine that never called commit_thought locally.
+    let temp_dir = tempdir().unwrap();
+    let remote_path = temp_dir.path().join("remote");
+    Repository::init_bare(&remote_path).unwrap();
+
+    // Machine A: records a thought and pushes it to the shared remote.
+    let local_a_path = temp_dir.path().join("local_a");
+    let repo_a = Repository::clone(remote_path.to_str().unwrap(), &local_a_path).unwrap();
+    {
+        let mut config_a = repo_a.config().unwrap();
+        config_a.set_str("user.name", "User A").unwrap();
+        config_a.set_str("user.email", "a@example.com").unwrap();
+    }
+    let store_a = CvcStore::open(local_a_path.join(".git/cvc/index.db")).unwrap();
+    store_a.init().unwrap();
+    store_a
+        .create_conversation(&Conversation {
+            id: "conv-a".to_string(),
+            title: "Conv A".to_string(),
+            created_at: Utc::now(),
+        })
+        .unwrap();
+    let inter_a = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "conv-a".to_string(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "Thought from machine A".to_string(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store_a.create_interaction(&inter_a).unwrap();
+    cvc_core::sync::push_to_ref(&repo_a, &store_a, "refs/cvc/main").unwrap();
+
+    let mut callbacks = git2::RemoteCallbacks::new();
+    callbacks.credentials(|_, _, _| git2::Cred::default());
+    let mut push_opts = git2::PushOptions::new();
+    push_opts.remote_callbacks(callbacks);
+    repo_a
+        .find_remote("origin")
+        .unwrap()
+        .push(&["refs/cvc/main:refs/cvc/main"], Some(&mut push_opts))
+        .unwrap();
+
+    // Machine B: a fresh clone; the MCP server's state points at its own local DB.
+    let local_b_path = temp_dir.path().join("local_b");
+    Repository::clone(remote_path.to_str().unwrap(), &local_b_path).unwrap();
+    let store_b = CvcStore::open(local_b_path.join(".git/cvc/index.db")).unwrap();
+    store_b.init().unwrap();
+    let state = Arc::new(AppState::new(Arc::new(Mutex::new(store_b))));
+
+    let args = json!({
+        "name": "sync_history",
+        "arguments": { "cwd": local_b_path.to_str().unwrap() }
+    });
+    let res = call_tool(args, state.clone()).await.unwrap();
+    let text = res["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("Pulled 1 new interaction"),
+        "unexpected sync_history response: {text}"
+    );
+
+    let store = state.store.lock().unwrap();
+    let fetched = store.get_interaction(&inter_a.id).unwrap();
+    assert!(fetched.is_some(), "machine B should now have A's thought");
+    assert_eq!(fetched.unwrap().user_prompt, "Thought from machine A");
 }

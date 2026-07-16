@@ -246,6 +246,56 @@ pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result
     Ok(())
 }
 
+/// Fetches `refs/cvc/main` from `remote_name` (via the system `git` CLI, falling back
+/// to libgit2 with SSH-agent auth if that fails) and ingests any new interactions into
+/// `db`, then fast-forwards the local shadow ref to match what was fetched.
+///
+/// This is the piece that lets a fresh checkout -- a new clone, a different machine, a
+/// different agentic harness -- catch up on history pushed from elsewhere before doing
+/// its own work. Returns the number of newly ingested interactions.
+pub fn fetch_and_pull(repo: &Repository, db: &CvcStore, remote_name: &str) -> Result<usize> {
+    let ref_name = "refs/cvc/main";
+    let remote_tracking_ref = format!("refs/remotes/{}/cvc/main", remote_name);
+    let refspec = format!("{}:{}", ref_name, remote_tracking_ref);
+
+    // Bare repos have no workdir; run `git fetch` from the repo path itself in that
+    // case. Without pinning this explicitly, the subprocess inherits *our* cwd, which
+    // may well be a different repository entirely.
+    let git_cli_success = std::process::Command::new("git")
+        .arg("fetch")
+        .arg(remote_name)
+        .arg(&refspec)
+        .current_dir(repo.workdir().unwrap_or_else(|| repo.path()))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !git_cli_success {
+        let mut remote = repo.find_remote(remote_name)?;
+        let mut callbacks = git2::RemoteCallbacks::new();
+        callbacks.credentials(|_url, username_from_url, _allowed_types| {
+            git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
+        });
+        let mut fetch_opts = git2::FetchOptions::new();
+        fetch_opts.remote_callbacks(callbacks);
+        remote.fetch(&[&refspec], Some(&mut fetch_opts), None)?;
+    }
+
+    if repo.find_reference(&remote_tracking_ref).is_err() {
+        return Ok(0);
+    }
+
+    let before_count = db.get_all_interaction_ids()?.len();
+    pull_from_ref(repo, db, &remote_tracking_ref)?;
+    let new_count = db.get_all_interaction_ids()?.len().saturating_sub(before_count);
+
+    if let Some(oid) = repo.find_reference(&remote_tracking_ref)?.target() {
+        repo.reference(ref_name, oid, true, "cvc sync: pull")?;
+    }
+
+    Ok(new_count)
+}
+
 fn topo_visit(
     id: &str,
     node_map: &mut std::collections::HashMap<String, SyncNode>,
