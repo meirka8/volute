@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { AnimatePresence } from 'framer-motion';
-import { Brain, GitPullRequest } from 'lucide-react';
+import { AlertTriangle, Brain, GitPullRequest } from 'lucide-react';
 import { TimelineNode } from './TimelineNode';
 import type { InteractionNode } from '../../types/cvc';
 
@@ -10,6 +10,8 @@ interface ShadowTimelineProps {
   onSelectInteraction?: (id: string) => void;
   prTitle?: string;
   isLoading?: boolean;
+  /** Shown as a small warning banner, e.g. when history was capped for an older repo. */
+  notice?: string;
 }
 
 export function ShadowTimeline({
@@ -18,6 +20,7 @@ export function ShadowTimeline({
   onSelectInteraction,
   prTitle,
   isLoading = false,
+  notice,
 }: ShadowTimelineProps) {
   // Sort interactions by timestamp (newest first for review flow)
   const sortedInteractions = useMemo(() => {
@@ -27,7 +30,7 @@ export function ShadowTimeline({
   if (isLoading) {
     return (
       <div className="h-full flex flex-col">
-        <TimelineHeader prTitle={prTitle} count={0} />
+        <TimelineHeader prTitle={prTitle} count={0} notice={notice} />
         <div className="flex-1 flex items-center justify-center">
           <div className="text-center text-muted">
             <div className="animate-pulse">
@@ -43,7 +46,7 @@ export function ShadowTimeline({
   if (interactions.length === 0) {
     return (
       <div className="h-full flex flex-col">
-        <TimelineHeader prTitle={prTitle} count={0} />
+        <TimelineHeader prTitle={prTitle} count={0} notice={notice} />
         <div className="flex-1 flex items-center justify-center p-4">
           <div className="text-center text-muted">
             <Brain size={32} className="mx-auto mb-3 opacity-50" />
@@ -59,7 +62,7 @@ export function ShadowTimeline({
 
   return (
     <div className="h-full flex flex-col">
-      <TimelineHeader prTitle={prTitle} count={interactions.length} />
+      <TimelineHeader prTitle={prTitle} count={interactions.length} notice={notice} />
 
       <div className="flex-1 overflow-y-auto">
         <AnimatePresence mode="popLayout">
@@ -77,7 +80,15 @@ export function ShadowTimeline({
   );
 }
 
-function TimelineHeader({ prTitle, count }: { prTitle?: string; count: number }) {
+function TimelineHeader({
+  prTitle,
+  count,
+  notice,
+}: {
+  prTitle?: string;
+  count: number;
+  notice?: string;
+}) {
   return (
     <div className="border-b border-line/80 px-4 py-4">
       <div className="flex items-center gap-2 mb-1">
@@ -95,6 +106,13 @@ function TimelineHeader({ prTitle, count }: { prTitle?: string; count: number })
       <div className="mt-2 text-xs text-muted">
         {count} interaction{count !== 1 ? 's' : ''} linked to this PR
       </div>
+
+      {notice && (
+        <div className="mt-2 flex items-start gap-1.5 rounded-lg bg-amber-500/10 px-2 py-1.5 text-xs text-amber-600 dark:text-amber-400">
+          <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+          <span>{notice}</span>
+        </div>
+      )}
     </div>
   );
 }

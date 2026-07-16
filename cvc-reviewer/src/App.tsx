@@ -3,7 +3,10 @@ import { AuthProvider, useAuth } from "./auth/AuthContext";
 import Login from "./pages/Login";
 import { PRReviewPage } from "./pages/PRReview";
 import { DebugView } from "./DebugView";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient } from "@tanstack/react-query";
+import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
+import { createAsyncStoragePersister } from "@tanstack/query-async-storage-persister";
+import { get as idbGet, set as idbSet, del as idbDel } from "idb-keyval";
 import { ThemeToggle } from "./components/ui/ThemeToggle";
 
 const queryClient = new QueryClient({
@@ -15,6 +18,33 @@ const queryClient = new QueryClient({
     },
   },
 });
+
+// CVC interaction blobs and by-commit index entries are content-addressed and
+// immutable once written (see cvc_core::sync's "immutable blobs" rule) -- they're
+// cached with staleTime: Infinity in usePRInteractions, and persisting them in
+// IndexedDB means a returning visitor's PR view can render from cache instantly
+// instead of re-fetching history it already has.
+const persister = createAsyncStoragePersister({
+  key: "cvc-reviewer-query-cache",
+  storage: {
+    getItem: async (key: string) => (await idbGet(key)) ?? null,
+    setItem: (key: string, value: string) => idbSet(key, value),
+    removeItem: (key: string) => idbDel(key),
+  },
+});
+
+const persistOptions = {
+  persister,
+  maxAge: 1000 * 60 * 60 * 24 * 30, // 30 days
+  dehydrateOptions: {
+    // Only the immutable, content-addressed queries are worth persisting across
+    // reloads -- PR metadata and file diffs change too often to be worth it.
+    shouldDehydrateQuery: (query: { queryKey: readonly unknown[] }) => {
+      const [key] = query.queryKey;
+      return key === "cvc-node" || key === "cvc-by-commit";
+    },
+  },
+};
 
 // Simple landing/dashboard to select a PR
 function Dashboard() {
@@ -120,11 +150,11 @@ function Routes() {
 
 function App() {
   return (
-    <QueryClientProvider client={queryClient}>
+    <PersistQueryClientProvider client={queryClient} persistOptions={persistOptions}>
       <AuthProvider>
         <Routes />
       </AuthProvider>
-    </QueryClientProvider>
+    </PersistQueryClientProvider>
   );
 }
 

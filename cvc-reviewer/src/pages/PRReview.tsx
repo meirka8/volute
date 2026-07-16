@@ -1,6 +1,5 @@
 import { useState, useCallback, useMemo } from "react";
 import { useParams } from "wouter";
-import { useQuery } from "@tanstack/react-query";
 import { Eye, LogOut, GitPullRequest, ExternalLink } from "lucide-react";
 
 import { ThreePaneLayout } from "../components/ui/ThreePaneLayout";
@@ -21,11 +20,7 @@ import {
 import { useAuth } from "../auth/AuthContext";
 import { PaymentRequiredError } from "../auth/errors";
 import { usePR } from "../hooks/usePR";
-import { useCVCBlobs } from "../hooks/useCVCBlobs";
-import { createGithubClient } from "../api/github";
-import { CommitRanger } from "../lib/CommitRanger";
-import { InteractionMapper } from "../lib/InteractionMapper";
-import type { InteractionNode } from "../types/cvc";
+import { usePRInteractions } from "../hooks/usePRInteractions";
 
 export function PRReviewPage() {
   // URL params
@@ -35,7 +30,7 @@ export function PRReviewPage() {
   const prNumber = parseInt(params.pr || "0", 10);
 
   // Auth
-  const { logout, acquireToken, isAuthenticated } = useAuth();
+  const { logout } = useAuth();
 
   // UI State
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
@@ -50,37 +45,14 @@ export function PRReviewPage() {
   // Fetch PR data
   const { data: prData, isLoading: isPRLoading, error: prError } = usePR(owner, repo, prNumber);
 
-  // Fetch CVC blobs
-  const { data: allInteractions, isLoading: isBlobsLoading, error: blobsError } = useCVCBlobs(
-    owner,
-    repo,
-  );
-
-  // Join interactions to PR commits
-  const { data: prInteractions, isLoading: isJoinLoading } = useQuery({
-    queryKey: [
-      "pr-interactions",
-      owner,
-      repo,
-      prNumber,
-      allInteractions?.length,
-      isAuthenticated,
-    ],
-    queryFn: async (): Promise<InteractionNode[]> => {
-      if (!allInteractions || !isAuthenticated) return [];
-
-      const activeToken = await acquireToken(owner, repo).catch(() => null);
-      if (!activeToken) return [];
-
-      const client = createGithubClient(activeToken);
-      const ranger = new CommitRanger(client);
-      const commits = await ranger.getCommitShas(owner, repo, prNumber);
-
-      const mapper = new InteractionMapper(allInteractions);
-      return mapper.getInteractionsForRange(commits);
-    },
-    enabled: !!allInteractions && isAuthenticated && prNumber > 0,
-  });
+  // Fetch CVC history scoped to this PR's commits (HEL-65: previously downloaded the
+  // entire cognitive history on every PR view and filtered client-side).
+  const {
+    data: prInteractionsResult,
+    isLoading: isInteractionsLoading,
+    error: blobsError,
+  } = usePRInteractions(owner, repo, prNumber);
+  const prInteractions = prInteractionsResult?.interactions;
 
   const sourceFiles = prData?.files;
   const files: FileItem[] = useMemo(() => {
@@ -231,7 +203,7 @@ export function PRReviewPage() {
   );
 
   // Loading state
-  const isLoading = isPRLoading || isBlobsLoading || isJoinLoading;
+  const isLoading = isPRLoading || isInteractionsLoading;
 
   // Extract errors from queries
   const errorObj = prData === undefined ? prError : null; // React Query destructuring aliasing check, let's just use useQuery error directly below
@@ -296,6 +268,11 @@ export function PRReviewPage() {
             onSelectInteraction={setSelectedInteractionId}
             prTitle={prData?.pr?.title}
             isLoading={isLoading}
+            notice={
+              prInteractionsResult?.truncated
+                ? "Showing partial history: this repository predates PR-scoped sync (HEL-65). Push again with an updated cvc-core to restore full, fast history."
+                : undefined
+            }
           />
         }
       />
