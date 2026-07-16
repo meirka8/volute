@@ -1,9 +1,9 @@
-use crate::server::JsonRpcError;
+use crate::server::{AppState, JsonRpcError};
 use chrono::Utc;
-use cvc_core::db::CvcStore;
-use cvc_core::models::{Author, Interaction, InteractionId};
+use cvc_core::models::{Author, Conversation, Interaction, InteractionId};
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 pub fn list_tools() -> Value {
     json!({
@@ -29,6 +29,14 @@ pub fn list_tools() -> Value {
                         "context_summary": {
                             "type": "string",
                             "description": "Optional summary of the relevant code or repo state"
+                        },
+                        "conversation_id": {
+                            "type": "string",
+                            "description": "Optional conversation ID for clients/harnesses that manage their own sessions instead of using the server's default per-process session. Created if it doesn't already exist."
+                        },
+                        "parent_id": {
+                            "type": "string",
+                            "description": "Optional explicit parent interaction ID, for branching instead of continuing the default linear per-session chain."
                         }
                     },
                     "required": ["task", "reasoning"]
@@ -78,7 +86,7 @@ pub fn list_tools() -> Value {
     })
 }
 
-pub async fn call_tool(params: Value, store: Arc<Mutex<CvcStore>>) -> Result<Value, JsonRpcError> {
+pub async fn call_tool(params: Value, state: Arc<AppState>) -> Result<Value, JsonRpcError> {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
@@ -91,8 +99,8 @@ pub async fn call_tool(params: Value, store: Arc<Mutex<CvcStore>>) -> Result<Val
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     match name {
-        "commit_thought" => commit_thought(args, store).await,
-        "read_history" => read_history(args, store).await,
+        "commit_thought" => commit_thought(args, state).await,
+        "read_history" => read_history(args, state).await,
         "get_context" => get_context(args).await,
         "setup_cvc" => setup_cvc(args).await,
         _ => Err(JsonRpcError {
@@ -103,7 +111,7 @@ pub async fn call_tool(params: Value, store: Arc<Mutex<CvcStore>>) -> Result<Val
     }
 }
 
-async fn commit_thought(args: Value, store: Arc<Mutex<CvcStore>>) -> Result<Value, JsonRpcError> {
+async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, JsonRpcError> {
     // New schema fields
     let task = args
         .get("task")
@@ -131,50 +139,49 @@ async fn commit_thought(args: Value, store: Arc<Mutex<CvcStore>>) -> Result<Valu
         reasoning
     };
 
-    // Create a new Conversation ID for this session if we don't have one?
-    // The spec says "Conversation maps 1:1 with a VS Code Chat Session ID".
-    // For MCP, we might not have a session ID provided by the client easily.
-    // For MVP, lets just use a fixed UUID or generate one per run?
-    // Better: Generate a specialized "Agent Session" conversation on first call?
-    // But we are stateless between tool calls unless we store state in `main.rs`.
-    // Let's create a new conversation for EACH tool call? No that's bad.
-    // Let's create one conversation ID for the LIFETIME of the MCP server process.
-    // But we are inside `call_tool`.
-    // Let's just create a random one for now is probably wrong.
-    // Ideally we should receive conversation_id in args.
-    // But the tool definition in Design.md didn't specify it.
-    // Let's just hardcode a placeholder or generate a fresh one for each thought for now (creates many 1-item conversations),
-    // OR: Assume a "Global Agent Conversation" with a known ID?
-    // Let's use a "Default Agent Conversation".
+    // Clients/harnesses that manage their own sessions can override the server's
+    // default per-process session and chaining behavior.
+    let explicit_conversation_id = args
+        .get("conversation_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-    let conversation_id = "agent-session-default".to_string(); // TODO: Manage sessions properly
+    let explicit_parent_id = match args.get("parent_id").and_then(|v| v.as_str()) {
+        Some(s) => Some(s.parse::<InteractionId>().map_err(|e| JsonRpcError {
+            code: -32602,
+            message: format!("Invalid 'parent_id': {}", e),
+            data: None,
+        })?),
+        None => None,
+    };
 
-    // Ensure conversation exists
-    let store_clone = store.clone();
-    let conv_id_clone = conversation_id.clone();
+    let session_conversation_id = state.conversation_id.lock().unwrap().clone();
+    let session_parent_id = state.last_interaction_id.lock().unwrap().clone();
 
-    // We need to run blocking DB ops in spawn_blocking usually, but `rusqlite` is blocking.
-    // Since we are in async fn, we should use spawn_blocking.
-
+    let store = state.store.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let store = store_clone
+        let store = store
             .lock()
             .map_err(|_| anyhow::anyhow!("Failed to lock store"))?;
 
-        // Upsert conversation (ignore if exists)
-        // CvcStore check?
-        if store.get_conversation(&conv_id_clone)?.is_none() {
-            store.create_conversation(&cvc_core::models::Conversation {
-                id: conv_id_clone.clone(),
-                title: "Agent Session".to_string(),
+        let conversation_id = explicit_conversation_id
+            .or(session_conversation_id)
+            .unwrap_or_else(|| "agent-session-default".to_string());
+
+        // Covers both a client-supplied conversation_id we haven't seen before and
+        // the fallback default when no MCP `initialize` handshake set up a session.
+        if store.get_conversation(&conversation_id)?.is_none() {
+            store.create_conversation(&Conversation {
+                id: conversation_id.clone(),
+                title: format!("Session {}", conversation_id),
                 created_at: Utc::now(),
             })?;
         }
 
         let interaction = Interaction {
             id: InteractionId::new(),
-            conversation_id: conv_id_clone,
-            parent_id: None, // We don't track parent in this simple tool yet (need history)
+            conversation_id,
+            parent_id: explicit_parent_id.or(session_parent_id),
             timestamp: Utc::now(),
             author: Author::Agent,
             user_prompt: task, // The task/prompt the agent was asked to complete
@@ -195,9 +202,12 @@ async fn commit_thought(args: Value, store: Arc<Mutex<CvcStore>>) -> Result<Valu
     })?;
 
     match res {
-        Ok(id) => Ok(json!({
-            "content": [{ "type": "text", "text": format!("Thought recorded. ID: {}", id) }]
-        })),
+        Ok(id) => {
+            *state.last_interaction_id.lock().unwrap() = Some(id.clone());
+            Ok(json!({
+                "content": [{ "type": "text", "text": format!("Thought recorded. ID: {}", id) }]
+            }))
+        }
         Err(e) => Err(JsonRpcError {
             code: -32603,
             message: format!("DB Error: {}", e),
@@ -206,22 +216,37 @@ async fn commit_thought(args: Value, store: Arc<Mutex<CvcStore>>) -> Result<Valu
     }
 }
 
-async fn read_history(args: Value, store: Arc<Mutex<CvcStore>>) -> Result<Value, JsonRpcError> {
+async fn read_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRpcError> {
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let conversation_id = state.conversation_id.lock().unwrap().clone();
 
+    let store = state.store.clone();
     let res = tokio::task::spawn_blocking(move || {
         let store = store
             .lock()
             .map_err(|_| anyhow::anyhow!("Failed to lock store"))?;
-        let interactions = store.get_floating_interactions()?;
-        // Sort by timestamp desc? `get_floating_interactions` order is explicit in SQL? No order clause.
-        // Let's just take last N.
-        let mut recent = interactions;
-        // Ideally we sort by timestamp.
-        recent.sort_by_key(|i| i.timestamp);
-        recent.reverse();
-        recent.truncate(limit);
-        Ok::<_, anyhow::Error>(recent)
+
+        // Recent interactions for the current session's conversation first, then fill
+        // the rest with recent repo-wide interactions, regardless of link status --
+        // agent memory should survive a commit, not go blank the moment one lands.
+        let mut interactions = match &conversation_id {
+            Some(conv_id) => store.get_recent_interactions_for_conversation(conv_id, limit)?,
+            None => Vec::new(),
+        };
+
+        if interactions.len() < limit {
+            let seen: HashSet<_> = interactions.iter().map(|i| i.id.clone()).collect();
+            for interaction in store.get_recent_interactions(limit)? {
+                if interactions.len() >= limit {
+                    break;
+                }
+                if !seen.contains(&interaction.id) {
+                    interactions.push(interaction);
+                }
+            }
+        }
+
+        Ok::<_, anyhow::Error>(interactions)
     })
     .await
     .map_err(|e| JsonRpcError {
