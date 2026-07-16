@@ -3,7 +3,7 @@ use crate::models::{
     ToolExecution, ToolStatus,
 };
 use chrono::{TimeZone, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::path::Path;
 use thiserror::Error;
 
@@ -20,6 +20,45 @@ pub enum DbError {
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
+
+/// Maps a row selected as
+/// `id, conversation_id, parent_id, timestamp, author, user_prompt,
+///  model_name, model_cot, model_response, source_request_id`
+/// (in that column order) into an `Interaction`.
+fn map_interaction_row(row: &Row) -> rusqlite::Result<Interaction> {
+    let parent_id_str: Option<String> = row.get(2)?;
+    let timestamp: i64 = row.get(3)?;
+    let author_str: String = row.get(4)?;
+    let author = match author_str.as_str() {
+        "human" => Author::Human,
+        "agent" => Author::Agent,
+        "system" => Author::System,
+        _ => Author::External,
+    };
+
+    let dt = Utc.timestamp_opt(timestamp, 0).single().ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Integer,
+            Box::new(DbError::Timestamp(timestamp)),
+        )
+    })?;
+
+    Ok(Interaction {
+        id: row.get::<_, String>(0)?.parse().map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        conversation_id: row.get(1)?,
+        parent_id: parent_id_str.map(|s| s.parse().unwrap_or_default()),
+        timestamp: dt,
+        author,
+        user_prompt: row.get(5)?,
+        model_name: row.get(6)?,
+        model_cot: row.get(7)?,
+        model_response: row.get(8)?,
+        source_request_id: row.get(9)?,
+    })
+}
 
 pub struct CvcStore {
     conn: Connection,
@@ -275,6 +314,47 @@ impl CvcStore {
         let mut interactions = Vec::new();
         for person in rows {
             interactions.push(person?);
+        }
+        Ok(interactions)
+    }
+
+    /// Most recent interactions in a single conversation, newest first, regardless of
+    /// whether they've been linked to a commit yet.
+    pub fn get_recent_interactions_for_conversation(
+        &self,
+        conversation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Interaction>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, conversation_id, parent_id, timestamp, author, user_prompt,
+                    model_name, model_cot, model_response, source_request_id
+             FROM interactions
+             WHERE conversation_id = ?1
+             ORDER BY timestamp DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![conversation_id, limit as i64], map_interaction_row)?;
+        let mut interactions = Vec::new();
+        for row in rows {
+            interactions.push(row?);
+        }
+        Ok(interactions)
+    }
+
+    /// Most recent interactions across the whole repo, newest first, regardless of
+    /// conversation or link status.
+    pub fn get_recent_interactions(&self, limit: usize) -> Result<Vec<Interaction>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, conversation_id, parent_id, timestamp, author, user_prompt,
+                    model_name, model_cot, model_response, source_request_id
+             FROM interactions
+             ORDER BY timestamp DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], map_interaction_row)?;
+        let mut interactions = Vec::new();
+        for row in rows {
+            interactions.push(row?);
         }
         Ok(interactions)
     }

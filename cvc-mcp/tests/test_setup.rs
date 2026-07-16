@@ -28,13 +28,14 @@ async fn test_setup_cvc_integration() {
     let store = std::sync::Arc::new(std::sync::Mutex::new(
         cvc_core::db::CvcStore::open(&dummy_db).unwrap(),
     ));
+    let state = std::sync::Arc::new(cvc_mcp::server::AppState::new(store));
 
     let res = tools::call_tool(
         json!({
             "name": "setup_cvc",
             "arguments": args
         }),
-        store,
+        state,
     )
     .await;
 
