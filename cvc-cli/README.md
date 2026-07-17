@@ -67,6 +67,16 @@ cvc log
 
 This lists all interactions stored in the local database.
 
+### Automatic-link window
+
+The post-commit linker considers only recent eligible floating interactions. Configure its window in seconds per repository:
+
+```bash
+git config cvc.linkWindow <seconds>
+```
+
+Valid values are `0..=2592000` seconds (30 days); the default is `86400` (24 hours). `0` disables automatic linking. Missing, malformed, negative, overflowing, or over-max values safely fall back to the default, and linker failures never block a Git commit.
+
 ### `push` / `pull`
 
 Synchronize thoughts with the Git Remote.

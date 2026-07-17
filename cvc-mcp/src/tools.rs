@@ -464,7 +464,7 @@ async fn setup_cvc(args: Value) -> Result<Value, JsonRpcError> {
         }
 
         // Open store and init schema
-        let store = cvc_core::db::CvcStore::open(&db_path)
+        let store = cvc_core::db::CvcStore::open_initialized(&db_path)
             .map_err(|e| anyhow::anyhow!("Failed to open DB: {}", e))?;
         store
             .init()

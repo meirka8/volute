@@ -158,7 +158,7 @@ CREATE TABLE conversations (
 
 -- The primary nodes in the graph
 CREATE TABLE interactions (
-    id TEXT PRIMARY KEY, -- SHA-256 of content
+    id TEXT PRIMARY KEY, -- UUID interaction ID (not a Git content address)
     conversation_id TEXT, -- The logic container
     parent_id TEXT,      -- Pointer to previous thought (DAG structure)
     timestamp INTEGER,
@@ -220,9 +220,10 @@ CREATE TABLE tool_executions (
 -- Mapping thoughts to code
 -- Supports Many-to-One: Multiple interaction nodes can link to a single Git commit.
 CREATE TABLE artifact_links (
-    interaction_id TEXT,
+    interaction_id TEXT, -- UUID referring to interactions.id
     git_commit_hash TEXT,
-    link_type TEXT, -- e.g., 'generated', 'verified', 'refactored'
+    link_type TEXT NOT NULL DEFAULT 'generated', -- automatic: 'generated' or low-confidence 'temporal'
+    linked_by TEXT, -- configured repository signature email; linking-identity attribution
     PRIMARY KEY (interaction_id, git_commit_hash)
 );
 ```
@@ -421,21 +422,12 @@ To ensure data integrity without disrupting the developer's flow, CVC employs an
 
 ### 11.2 The "Late Binding" of Artifacts
 
-The connection between the Cognitive Graph and the Git Graph is solidified only when the code is actually committed.
+The connection between the Cognitive Graph and Git Graph is considered only after a standard `git commit`, normally through the `post-commit` hook. The hook is fail-safe: a linker error is reported as a warning and never fails the Git commit.
 
-- **Trigger:** A standard `git commit` event.
-    
-    - _Mechanism:_ A `post-commit` hook or an IDE event listener.
-        
-- **The Binding Logic:**
-    
-    1. CVC queries the `interactions` table for all **Floating Nodes** (unlinked).
-        
-    2. It filters for nodes created by the **current user** within the **current repository**.
-        
-    3. It creates entries in the `artifact_links` table, associating these interaction IDs with the new Git Commit SHA.
-        
-- **Edge Case (The "Abandoned Thought"):** If a user has a conversation but never commits code (e.g., "How do I center a div?"), those nodes remain Floating forever (or until garbage collection). This is a feature, not a bug; it preserves the research history even if no artifact resulted.
+- **Policy and eligibility:** `LinkPolicy` considers floating nodes only when their timestamp is strictly after `max(first-parent commit time, now - link window)`. The first-parent time prevents a later commit from claiming earlier work; when there is no parent, the window bound is used. `cvc.linkWindow` accepts `0..=2592000` seconds (30 days), defaulting to `86400`; missing, malformed, negative, overflowing, or over-max values safely fall back to the default. `0` deliberately disables automatic linking. Nodes more than five minutes in the future are excluded; a first-parent timestamp beyond that skew fails closed and produces no automatic links.
+- **Changed paths:** The linker compares the commit tree with its first parent (or an empty tree for a root commit), considering both old and new paths so renames and deletions can overlap. A node with explicit file context qualifies only when a normalized context path overlaps a changed path.
+- **Binding:** One eligible overlapping node qualifies its conversation, and all eligible nodes in that conversation receive a `generated` link. An eligible node with no explicit context items can receive a lower-confidence `temporal` link instead. The complete automatic decision is persisted atomically, so a failure cannot half-bind a conversation. `linked_by` records the configured repository signature email as linking-identity attribution; it is not an author-based eligibility filter. Conflicting automatic link type or provenance fails rather than silently overwriting an existing record.
+- **No forced association:** Stale nodes, nodes with explicit but disjoint context, and abandoned conversations remain floating. This conservatism is intentional: mislinked provenance is worse than no link.
     
 
 ### 11.3 VS Code Context persistence
@@ -460,13 +452,23 @@ To enable collaboration without requiring a dedicated database server, CVC utili
 
 ### 12.2 The Sync Mechanism
 
+Sync format v3 stores a `FORMAT` marker and this append-only layout:
+
+```text
+nodes/<id[0..2]>/<interaction-id>.json   # immutable interaction node
+by-commit/<commit-sha>/<interaction-id>  # zero-byte lookup index
+links/<interaction-id>/<commit-sha>.json # immutable automatic-link event
+```
+
+Interaction IDs are UUIDs; the JSON blobs are Git objects and therefore content-addressed separately. The `links/` event stream preserves node immutability: an interaction first pushed while floating can acquire an automatic link in a later push. A push upgrades a v2 `FORMAT` marker to v3 without rewriting existing nodes.
+
 **1. The Push Flow (Hydration):**
 
 - **Trigger:** User runs `git cvc push` (or hooked into `git push`).
     
 - **Scan:** CVC identifies new, un-synced Interaction Nodes in the local SQLite DB.
     
-- **Serialize:** Each node is serialized into a deterministic JSON format.
+- **Serialize:** Each new node is serialized into an immutable JSON blob; later automatic links are serialized as separate immutable `links/` events.
     
 - **Write:** These JSONs are written as Git Blobs (Objects) into a custom Tree.
     
@@ -481,20 +483,20 @@ To enable collaboration without requiring a dedicated database server, CVC utili
     
 - **Fetch:** CVC fetches the remote `refs/cvc/main`.
     
-- **Diff:** It detects new Blobs in the remote tree that are missing locally.
+- **Diff:** It detects new node blobs and link events in the remote tree that are missing locally.
     
-- **Ingest:** It reads the JSON blobs and inserts them into the local SQLite `interactions` table.
+- **Ingest:** It inserts new node blobs into the local SQLite cache and merges link events, including events for nodes already present locally.
     
 - **Result:** The local "Cache" is now consistent with the distributed "Truth."
     
 
 ### 12.3 Conflict Resolution
 
-- **Architecture:** Because Interaction Nodes are **Content-Addressable** (ID = Hash) and **Immutable** (Append-Only), true merge conflicts are impossible.
+- **Architecture:** Interaction IDs are UUIDs, while immutable node and link-event blobs are Git-content-addressed. Independent entries union cleanly in the append-only tree.
     
 - **Scenario:** Alice and Bob both push new thoughts.
     
-- **Result:** The `refs/cvc/main` tree simply becomes the union of Alice's blobs and Bob's blobs. Git handles the deduplication of identical objects automatically.
+- **Result:** The `refs/cvc/main` tree can union independent blobs. If two automatic records name the same interaction and commit but disagree on link type or `linked_by`, ingestion fails rather than silently replacing provenance.
     
 
 ## 13. Future Considerations & Open Questions

@@ -9,7 +9,7 @@ use thiserror::Error;
 
 /// Tree layout version written by `push_to_ref`. Stored at the ref tree's root as a
 /// blob named `FORMAT`. See `push_to_ref` for the layout this describes.
-const SYNC_FORMAT_VERSION: &[u8] = b"2";
+const SYNC_FORMAT_VERSION: &[u8] = b"3";
 
 #[derive(Error, Debug)]
 pub enum SyncError {
@@ -31,6 +31,25 @@ pub struct SyncNode {
     pub context_items: Vec<ContextItem>,
     pub tool_executions: Vec<ToolExecution>,
     pub artifact_links: Vec<ArtifactLink>,
+}
+
+/// Immutable post-node link event. Node blobs remain immutable, so links made
+/// after a floating node was first pushed are represented here instead.
+#[derive(Serialize, Deserialize, Debug)]
+struct SyncLinkRecord {
+    interaction_id: String,
+    git_commit_hash: String,
+    link_type: String,
+    #[serde(default)]
+    linked_by: Option<String>,
+}
+
+fn is_safe_commit_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_automatic_link_type(value: &str) -> bool {
+    matches!(value, "generated" | "temporal")
 }
 
 pub fn validate_ref_name(ref_name: &str) -> bool {
@@ -58,7 +77,11 @@ fn shard_prefix(id: &str) -> &str {
 /// child), swallowing lookup errors as "not found" -- a ref that's supposed to be
 /// append-only should never have a corrupt child, but if it somehow did, treating it
 /// as absent and rebuilding that shard fresh is a safe, self-healing fallback.
-fn child_tree<'repo>(repo: &'repo Repository, parent: Option<&Tree>, name: &str) -> Option<Tree<'repo>> {
+fn child_tree<'repo>(
+    repo: &'repo Repository,
+    parent: Option<&Tree>,
+    name: &str,
+) -> Option<Tree<'repo>> {
     parent
         .and_then(|t| t.get_name(name))
         .filter(|e| e.kind() == Some(ObjectType::Tree))
@@ -78,9 +101,10 @@ fn child_treebuilder<'repo>(
 /// Writes the tree layout for `refs/cvc/main` (or any other CVC shadow ref):
 ///
 /// ```text
-/// FORMAT                              # version marker, currently "2"
+/// FORMAT                              # version marker, currently "3"
 /// nodes/<id[0..2]>/<interaction-id>.json   # sharded interaction blobs (immutable once written)
 /// by-commit/<commit-sha>/<interaction-id>  # zero-byte pointer entries, a pure index
+/// links/<interaction-id>/<commit-sha>.json # immutable post-node automatic link event
 /// ```
 ///
 /// Legacy repos may still have interactions stored as flat `<id>.json` files at the
@@ -115,6 +139,7 @@ pub fn push_to_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<(
 
     let existing_nodes_tree = child_tree(repo, existing_root_tree.as_ref(), "nodes");
     let existing_by_commit_tree = child_tree(repo, existing_root_tree.as_ref(), "by-commit");
+    let existing_links_tree = child_tree(repo, existing_root_tree.as_ref(), "links");
 
     // --- nodes/<prefix>/<id>.json ---
     let mut prefix_builders: HashMap<String, TreeBuilder> = HashMap::new();
@@ -205,7 +230,8 @@ pub fn push_to_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<(
     }
 
     if !commit_builders.is_empty() {
-        let mut by_commit_builder = child_treebuilder(repo, existing_root_tree.as_ref(), "by-commit")?;
+        let mut by_commit_builder =
+            child_treebuilder(repo, existing_root_tree.as_ref(), "by-commit")?;
         for (commit_sha, builder) in &commit_builders {
             let oid = builder.write()?;
             by_commit_builder.insert(commit_sha, oid, FileMode::Tree.into())?;
@@ -214,8 +240,80 @@ pub fn push_to_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<(
         root_builder.insert("by-commit", by_commit_oid, FileMode::Tree.into())?;
     }
 
-    // --- FORMAT marker: written once, never touched again ---
-    if root_builder.get("FORMAT")?.is_none() {
+    // --- links/<interaction-id>/<commit-sha>.json ---
+    // Only automatic links need this append-only side channel. Historical
+    // custom link types remain available in their legacy node blobs.
+    let mut link_builders: HashMap<String, TreeBuilder> = HashMap::new();
+    for id in &all_ids {
+        let id_string = id.as_str();
+        for link in db.get_artifact_links(id)? {
+            if !is_automatic_link_type(&link.link_type)
+                || !is_safe_commit_sha(link.git_commit_hash.as_str())
+            {
+                continue;
+            }
+            let filename = format!("{}.json", link.git_commit_hash.as_str());
+            let exists = child_tree(repo, existing_links_tree.as_ref(), &id_string)
+                .map(|tree| tree.get_name(&filename).is_some())
+                .unwrap_or(false);
+            if exists {
+                let entry = child_tree(repo, existing_links_tree.as_ref(), &id_string)
+                    .and_then(|tree| tree.get_name(&filename).map(|entry| entry.id()))
+                    .ok_or_else(|| SyncError::Ref("missing existing link record".into()))?;
+                let existing: SyncLinkRecord =
+                    serde_json::from_slice(repo.find_blob(entry)?.content())?;
+                let intended = SyncLinkRecord {
+                    interaction_id: id_string.clone(),
+                    git_commit_hash: link.git_commit_hash.as_str().to_owned(),
+                    link_type: link.link_type.clone(),
+                    linked_by: link.linked_by.clone(),
+                };
+                if !link_record_equal(&existing, &intended) {
+                    return Err(SyncError::Ref(
+                        "immutable link record conflicts with local link".into(),
+                    ));
+                }
+                continue;
+            }
+            let builder = match link_builders.entry(id_string.clone()) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(child_treebuilder(
+                    repo,
+                    existing_links_tree.as_ref(),
+                    &id_string,
+                )?),
+            };
+            if builder.get(&filename)?.is_none() {
+                let record = SyncLinkRecord {
+                    interaction_id: id_string.clone(),
+                    git_commit_hash: link.git_commit_hash.as_str().to_owned(),
+                    link_type: link.link_type,
+                    linked_by: link.linked_by,
+                };
+                let blob_oid = repo.blob(serde_json::to_vec(&record)?.as_slice())?;
+                builder.insert(&filename, blob_oid, FileMode::Blob.into())?;
+            }
+        }
+    }
+    if !link_builders.is_empty() {
+        let mut links_builder = child_treebuilder(repo, existing_root_tree.as_ref(), "links")?;
+        for (interaction_id, builder) in &link_builders {
+            links_builder.insert(interaction_id, builder.write()?, FileMode::Tree.into())?;
+        }
+        root_builder.insert("links", links_builder.write()?, FileMode::Tree.into())?;
+    }
+
+    // --- FORMAT marker: upgrade known numeric predecessors, never downgrade ---
+    let existing_format = existing_root_tree
+        .as_ref()
+        .and_then(|tree| tree.get_name("FORMAT"))
+        .and_then(|entry| repo.find_blob(entry.id()).ok())
+        .and_then(|blob| {
+            std::str::from_utf8(blob.content())
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        });
+    if existing_format.is_none_or(|version| version < 3) {
         let format_oid = repo.blob(SYNC_FORMAT_VERSION)?;
         root_builder.insert("FORMAT", format_oid, FileMode::Blob.into())?;
     }
@@ -277,7 +375,7 @@ fn collect_interaction_blobs(
                 }
             }
             Some(ObjectType::Tree) if max_depth > 0 => {
-                if name == "by-commit" {
+                if name == "by-commit" || name == "links" {
                     continue;
                 }
                 let sub = repo.find_tree(entry.id())?;
@@ -308,8 +406,8 @@ pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result
     // 2. Collect (interaction-id, blob-oid) pairs from BOTH layouts this ref might
     // contain: legacy flat `<id>.json` files at the root, and/or the v2 sharded
     // `nodes/<prefix>/<id>.json` layout. `by-commit/` is skipped entirely -- it's a
-    // pure index for the Reviewer's PR-scoped fetch path, not a source of truth; every
-    // interaction's own blob already carries its `artifact_links`.
+    // pure index for the Reviewer's PR-scoped fetch path. `links/` is read
+    // separately because it contains post-node append-only events.
     let mut blob_refs: Vec<(String, git2::Oid)> = Vec::new();
     collect_interaction_blobs(repo, tree, 2, &mut blob_refs)?;
 
@@ -323,17 +421,30 @@ pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result
     let mut nodes_to_insert = Vec::new();
 
     for (id_str, blob_oid) in blob_refs {
-        if existing_ids.contains(&id_str) {
-            continue;
-        }
-
         let blob = repo.find_blob(blob_oid)?;
         let content = std::str::from_utf8(blob.content())
             .map_err(|e| SyncError::Serde(serde_json::Error::custom(e.to_string())))?;
 
         let node: SyncNode = serde_json::from_str(content)?;
-        nodes_to_insert.push(node);
+        if node.interaction.id.to_string() != id_str {
+            return Err(SyncError::Ref(
+                "interaction blob filename/id mismatch".into(),
+            ));
+        }
+        validate_legacy_links(&node)?;
+        if !existing_ids.contains(&id_str) {
+            nodes_to_insert.push(node);
+        }
     }
+
+    let records = collect_link_records(repo, tree)?;
+    let mut known_interactions = existing_ids;
+    known_interactions.extend(
+        nodes_to_insert
+            .iter()
+            .map(|node| node.interaction.id.to_string()),
+    );
+    validate_records_against_store(db, &records, &known_interactions, &nodes_to_insert)?;
 
     // 5. Robust Topological Sort (DFS)
     // We need to ensure that if B depends on A (B.parent_id = A.id), A is inserted first.
@@ -387,11 +498,140 @@ pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result
             db.create_tool_execution(exe)?;
         }
         for link in &node.artifact_links {
-            db.link_interaction(&link.interaction_id, &link.git_commit_hash, &link.link_type)?;
+            db.import_artifact_link(
+                &link.interaction_id,
+                &link.git_commit_hash,
+                &link.link_type,
+                link.linked_by.as_deref(),
+            )?;
         }
     }
 
+    for record in records {
+        let interaction_id: crate::models::InteractionId = record
+            .interaction_id
+            .parse()
+            .map_err(|_| SyncError::Ref("invalid link interaction id".into()))?;
+        if db.get_interaction(&interaction_id)?.is_none() {
+            return Err(SyncError::Ref(
+                "link record references missing interaction".into(),
+            ));
+        }
+        let commit_sha = crate::models::CommitSha::new(record.git_commit_hash);
+        db.link_automatic_interactions(
+            &[interaction_id],
+            &commit_sha,
+            &record.link_type,
+            record.linked_by.as_deref(),
+        )?;
+    }
+
     Ok(())
+}
+
+fn link_record_equal(left: &SyncLinkRecord, right: &SyncLinkRecord) -> bool {
+    left.interaction_id == right.interaction_id
+        && left.git_commit_hash == right.git_commit_hash
+        && left.link_type == right.link_type
+        && left.linked_by == right.linked_by
+}
+
+fn validate_legacy_links(node: &SyncNode) -> Result<()> {
+    for link in &node.artifact_links {
+        if link.interaction_id != node.interaction.id
+            || git2::Oid::from_str(link.git_commit_hash.as_str()).is_err()
+            || link.link_type.trim().is_empty()
+            || link
+                .linked_by
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(SyncError::Ref("invalid embedded artifact link".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_records_against_store(
+    db: &CvcStore,
+    records: &[SyncLinkRecord],
+    known_interactions: &HashSet<String>,
+    incoming_nodes: &[SyncNode],
+) -> Result<()> {
+    for record in records {
+        let interaction_id: crate::models::InteractionId = record
+            .interaction_id
+            .parse()
+            .map_err(|_| SyncError::Ref("invalid link interaction id".into()))?;
+        if !known_interactions.contains(&record.interaction_id) {
+            return Err(SyncError::Ref(
+                "link record references missing interaction".into(),
+            ));
+        }
+        let existing = db.get_artifact_links(&interaction_id)?;
+        for link in existing
+            .into_iter()
+            .filter(|link| link.git_commit_hash.as_str() == record.git_commit_hash)
+        {
+            if link.link_type != record.link_type
+                || matches!((&link.linked_by, &record.linked_by), (Some(left), Some(right)) if left != right)
+            {
+                return Err(SyncError::Ref(
+                    "link record conflicts with local provenance".into(),
+                ));
+            }
+        }
+        if let Some(node) = incoming_nodes
+            .iter()
+            .find(|node| node.interaction.id == interaction_id)
+        {
+            for link in node
+                .artifact_links
+                .iter()
+                .filter(|link| link.git_commit_hash.as_str() == record.git_commit_hash)
+            {
+                if link.link_type != record.link_type
+                    || matches!((&link.linked_by, &record.linked_by), (Some(left), Some(right)) if left != right)
+                {
+                    return Err(SyncError::Ref(
+                        "link record conflicts with embedded provenance".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_link_records(repo: &Repository, root: &Tree) -> Result<Vec<SyncLinkRecord>> {
+    let Some(links_tree) = child_tree(repo, Some(root), "links") else {
+        return Ok(Vec::new());
+    };
+    let mut records = Vec::new();
+    for interaction_entry in links_tree.iter() {
+        let interaction_id = interaction_entry.name().unwrap_or_default();
+        interaction_id
+            .parse::<crate::models::InteractionId>()
+            .map_err(|_| SyncError::Ref("invalid links path interaction id".into()))?;
+        let interaction_tree = repo.find_tree(interaction_entry.id())?;
+        for record_entry in interaction_tree.iter() {
+            let filename = record_entry.name().unwrap_or_default();
+            let commit = filename
+                .strip_suffix(".json")
+                .filter(|value| is_safe_commit_sha(value))
+                .ok_or_else(|| SyncError::Ref("invalid links path commit SHA".into()))?;
+            let blob = repo.find_blob(record_entry.id())?;
+            let record: SyncLinkRecord = serde_json::from_slice(blob.content())?;
+            if record.interaction_id != interaction_id
+                || record.git_commit_hash != commit
+                || !is_automatic_link_type(&record.link_type)
+            {
+                return Err(SyncError::Ref("inconsistent link record".into()));
+            }
+            records.push(record);
+        }
+    }
+    Ok(records)
 }
 
 /// Fetches `refs/cvc/main` from `remote_name` (via the system `git` CLI, falling back
@@ -435,7 +675,10 @@ pub fn fetch_and_pull(repo: &Repository, db: &CvcStore, remote_name: &str) -> Re
 
     let before_count = db.get_all_interaction_ids()?.len();
     pull_from_ref(repo, db, &remote_tracking_ref)?;
-    let new_count = db.get_all_interaction_ids()?.len().saturating_sub(before_count);
+    let new_count = db
+        .get_all_interaction_ids()?
+        .len()
+        .saturating_sub(before_count);
 
     if let Some(oid) = repo.find_reference(&remote_tracking_ref)?.target() {
         repo.reference(ref_name, oid, true, "cvc sync: pull")?;

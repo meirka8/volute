@@ -93,7 +93,8 @@ function getActionLines(interaction: InteractionNode): string[] {
 
   if (interaction.artifact_links.length > 0) {
     return interaction.artifact_links.map(
-      (link) => `${link.link_type} ${link.git_commit_hash.substring(0, 7)}`,
+      (link) =>
+        `${link.link_type === 'temporal' ? 'low-confidence temporal link' : link.link_type} ${link.git_commit_hash.substring(0, 7)}`,
     );
   }
 
@@ -348,12 +349,27 @@ export function TimelineNode({
           <div className="flex flex-wrap gap-1.5">
           {interaction.artifact_links.map((link) => (
             <span
-              key={`${link.git_commit_hash}-${link.link_type}`}
-              className="inline-flex items-center gap-1 rounded-full bg-canvas/80 px-3 py-1 text-xs text-muted"
+              key={`${link.git_commit_hash}-${link.link_type}-${link.linked_by ?? ''}`}
+              className={clsx(
+                'inline-flex items-center gap-1 rounded-full bg-canvas/80 px-3 py-1 text-xs text-muted',
+                link.link_type === 'temporal' && 'border border-dashed border-line',
+              )}
+              aria-label={
+                link.link_type === 'temporal'
+                  ? `Temporal link to commit ${link.git_commit_hash.substring(0, 7)}; lower confidence`
+                  : `${link.link_type} link to commit ${link.git_commit_hash.substring(0, 7)}`
+              }
+              title={
+                link.link_type === 'temporal'
+                  ? 'Temporal link: inferred by timing rather than matching file context.'
+                  : undefined
+              }
             >
               <GitCommit size={10} />
               <span className="font-mono">{link.git_commit_hash.substring(0, 7)}</span>
-              <span className="text-muted/80">({link.link_type})</span>
+              <span className="text-muted/80">
+                {link.link_type === 'temporal' ? '(temporal, lower confidence)' : `(${link.link_type})`}
+              </span>
             </span>
           ))}
           </div>

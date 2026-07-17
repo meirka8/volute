@@ -36,3 +36,11 @@ npm run dev
 ```bash
 npm run build
 ```
+
+## CVC sync compatibility
+
+The reviewer reads legacy node-embedded artifact links and sync format v3's
+append-only `links/<interaction-id>/<commit-sha>.json` records. Temporal links are
+shown as **lower confidence** because they are inferred from timing rather than file
+context. Linking-identity attribution (the configured repository signature email) is
+retained for data compatibility but is not shown as a public timeline badge.

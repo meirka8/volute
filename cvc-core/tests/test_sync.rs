@@ -3,7 +3,255 @@ use cvc_core::db::CvcStore;
 use cvc_core::models::*;
 use cvc_core::sync::{self, SyncNode};
 use git2::{FileMode, Repository, Signature};
+use rusqlite::Connection;
 use tempfile::TempDir;
+
+#[test]
+fn post_node_link_records_reach_fresh_and_existing_pulls() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let source = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let conversation = Conversation {
+        id: "late-link".into(),
+        title: "late-link".into(),
+        created_at: Utc::now(),
+    };
+    source.create_conversation(&conversation)?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: conversation.id.clone(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "floating first".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&interaction)?;
+    let ref_name = "refs/cvc/late-link";
+    sync::push_to_ref(&repo, &source, ref_name)?;
+
+    let existing = CvcStore::open(temp_dir.path().join("existing.db"))?;
+    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    assert!(existing.get_artifact_links(&interaction.id)?.is_empty());
+
+    let sha = CommitSha::new("a".repeat(40));
+    source.link_automatic_interactions(
+        std::slice::from_ref(&interaction.id),
+        &sha,
+        "generated",
+        Some("linker@example.com"),
+    )?;
+    sync::push_to_ref(&repo, &source, ref_name)?;
+
+    let fresh = CvcStore::open(temp_dir.path().join("fresh.db"))?;
+    sync::pull_from_ref(&repo, &fresh, ref_name)?;
+    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    for store in [&fresh, &existing] {
+        let links = store.get_artifact_links(&interaction.id)?;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].link_type, "generated");
+        assert_eq!(links[0].linked_by.as_deref(), Some("linker@example.com"));
+    }
+    Ok(())
+}
+
+#[test]
+fn push_upgrades_v2_format_without_downgrading_data() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let source = CvcStore::open(temp_dir.path().join("source.db"))?;
+    source.create_conversation(&Conversation {
+        id: "upgrade".into(),
+        title: "upgrade".into(),
+        created_at: Utc::now(),
+    })?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "upgrade".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "preserve me".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&interaction)?;
+    let ref_name = "refs/cvc/upgrade";
+    sync::push_to_ref(&repo, &source, ref_name)?;
+
+    let previous = repo.find_reference(ref_name)?.peel_to_commit()?;
+    let mut builder = repo.treebuilder(Some(&previous.tree()?))?;
+    builder.insert("FORMAT", repo.blob(b"2")?, FileMode::Blob.into())?;
+    let tree = repo.find_tree(builder.write()?)?;
+    let signature = Signature::now("Test User", "test@example.com")?;
+    repo.commit(
+        Some(ref_name),
+        &signature,
+        &signature,
+        "v2 marker",
+        &tree,
+        &[&previous],
+    )?;
+
+    let existing = CvcStore::open(temp_dir.path().join("existing.db"))?;
+    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    sync::push_to_ref(&repo, &source, ref_name)?;
+    let upgraded_tree = repo.find_reference(ref_name)?.peel_to_commit()?.tree()?;
+    let marker = repo.find_blob(upgraded_tree.get_name("FORMAT").unwrap().id())?;
+    assert_eq!(marker.content(), b"3");
+
+    let fresh = CvcStore::open(temp_dir.path().join("fresh.db"))?;
+    sync::pull_from_ref(&repo, &fresh, ref_name)?;
+    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    assert!(fresh.get_interaction(&interaction.id)?.is_some());
+    assert!(existing.get_interaction(&interaction.id)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn v3_pull_surfaces_conflicting_link_attribution() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let source = CvcStore::open(temp_dir.path().join("source.db"))?;
+    source.create_conversation(&Conversation {
+        id: "conflict".into(),
+        title: "conflict".into(),
+        created_at: Utc::now(),
+    })?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "conflict".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "conflict".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&interaction)?;
+    let ref_name = "refs/cvc/conflict";
+    sync::push_to_ref(&repo, &source, ref_name)?;
+    let target = CvcStore::open(temp_dir.path().join("target.db"))?;
+    sync::pull_from_ref(&repo, &target, ref_name)?;
+    let sha = CommitSha::new("c".repeat(40));
+    target.link_automatic_interactions(
+        std::slice::from_ref(&interaction.id),
+        &sha,
+        "generated",
+        Some("local@example.com"),
+    )?;
+    source.link_automatic_interactions(
+        std::slice::from_ref(&interaction.id),
+        &sha,
+        "generated",
+        Some("remote@example.com"),
+    )?;
+    sync::push_to_ref(&repo, &source, ref_name)?;
+    assert!(sync::pull_from_ref(&repo, &target, ref_name).is_err());
+    Ok(())
+}
+
+#[test]
+fn push_rejects_existing_immutable_link_record_mismatch() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let db_path = temp_dir.path().join("source.db");
+    let source = CvcStore::open(&db_path)?;
+    source.create_conversation(&Conversation {
+        id: "push-conflict".into(),
+        title: "push-conflict".into(),
+        created_at: Utc::now(),
+    })?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "push-conflict".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "push".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&interaction)?;
+    let sha = CommitSha::new("d".repeat(40));
+    source.link_automatic_interactions(
+        std::slice::from_ref(&interaction.id),
+        &sha,
+        "generated",
+        Some("first@example.com"),
+    )?;
+    let ref_name = "refs/cvc/push-conflict";
+    sync::push_to_ref(&repo, &source, ref_name)?;
+    // Exact replay is the immutable-record no-op case.
+    sync::push_to_ref(&repo, &source, ref_name)?;
+
+    let raw = Connection::open(&db_path)?;
+    raw.execute(
+        "UPDATE artifact_links SET linked_by = 'second@example.com'",
+        [],
+    )?;
+    drop(raw);
+    assert!(sync::push_to_ref(&repo, &source, ref_name).is_err());
+    Ok(())
+}
+
+#[test]
+fn pull_rejects_malformed_legacy_embedded_link() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let signature = Signature::now("Test User", "test@example.com")?;
+    let node_id = InteractionId::new();
+    let node = SyncNode {
+        interaction: Interaction {
+            id: node_id.clone(),
+            conversation_id: "bad".into(),
+            parent_id: None,
+            timestamp: Utc::now(),
+            author: Author::Human,
+            user_prompt: "bad".into(),
+            model_name: None,
+            model_cot: None,
+            model_response: None,
+            source_request_id: None,
+        },
+        context_items: vec![],
+        tool_executions: vec![],
+        artifact_links: vec![ArtifactLink {
+            interaction_id: InteractionId::new(),
+            git_commit_hash: CommitSha::new("not-an-oid"),
+            link_type: "verified".into(),
+            linked_by: None,
+        }],
+    };
+    let mut builder = repo.treebuilder(None)?;
+    builder.insert(
+        format!("{}.json", node_id),
+        repo.blob(serde_json::to_vec(&node)?.as_slice())?,
+        FileMode::Blob.into(),
+    )?;
+    let tree = repo.find_tree(builder.write()?)?;
+    repo.commit(
+        Some("refs/cvc/bad"),
+        &signature,
+        &signature,
+        "bad",
+        &tree,
+        &[],
+    )?;
+    let store = CvcStore::open(temp_dir.path().join("target.db"))?;
+    assert!(sync::pull_from_ref(&repo, &store, "refs/cvc/bad").is_err());
+    assert!(store.get_all_interaction_ids()?.is_empty());
+    Ok(())
+}
 
 #[test]
 fn test_sync_push_pull() -> anyhow::Result<()> {
@@ -433,7 +681,10 @@ fn test_fetch_and_pull_from_fresh_clone() -> anyhow::Result<()> {
     // which the system `git` CLI (fetch_and_pull's first attempt) handles fine.
     let new_count = sync::fetch_and_pull(&repo_b, &store_b, "origin")?;
 
-    assert_eq!(new_count, 1, "should report exactly one newly ingested interaction");
+    assert_eq!(
+        new_count, 1,
+        "should report exactly one newly ingested interaction"
+    );
     let fetched = store_b.get_interaction(&inter_a.id)?;
     assert!(fetched.is_some(), "machine B should now have A's thought");
     assert_eq!(fetched.unwrap().user_prompt, "Thought from machine A");
@@ -483,7 +734,12 @@ fn test_sync_v2_round_trip() -> anyhow::Result<()> {
         source_request_id: None,
     };
     store.create_interaction(&linked)?;
-    store.link_interaction(&linked.id, &commit_sha, "generated")?;
+    store.link_interaction_with_metadata(
+        &linked.id,
+        &commit_sha,
+        "generated",
+        Some("author@example.com"),
+    )?;
     store.add_context_item(&ContextItem {
         id: None,
         interaction_id: linked.id.clone(),
@@ -518,7 +774,7 @@ fn test_sync_v2_round_trip() -> anyhow::Result<()> {
         .get_name("FORMAT")
         .expect("FORMAT marker should be written");
     let format_blob = repo.find_blob(format_entry.id())?;
-    assert_eq!(format_blob.content(), b"2");
+    assert_eq!(format_blob.content(), b"3");
 
     let nodes_tree = pushed_tree
         .get_name("nodes")
@@ -569,6 +825,10 @@ fn test_sync_v2_round_trip() -> anyhow::Result<()> {
     let fetched_links = store_2.get_artifact_links(&linked.id)?;
     assert_eq!(fetched_links.len(), 1);
     assert_eq!(fetched_links[0].git_commit_hash, commit_sha);
+    assert_eq!(
+        fetched_links[0].linked_by.as_deref(),
+        Some("author@example.com")
+    );
 
     let fetched_context = store_2.get_context_items(&linked.id)?;
     assert_eq!(fetched_context.len(), 1);
@@ -626,7 +886,10 @@ fn test_pull_from_ref_reads_legacy_v1_layout() -> anyhow::Result<()> {
     sync::pull_from_ref(&repo, &store, "refs/cvc/main")?;
 
     let fetched = store.get_interaction(&id)?;
-    assert!(fetched.is_some(), "legacy v1 interaction should be ingested");
+    assert!(
+        fetched.is_some(),
+        "legacy v1 interaction should be ingested"
+    );
     assert_eq!(fetched.unwrap().user_prompt, "Legacy thought");
 
     // A push against this legacy tree should leave the old entry alone and start

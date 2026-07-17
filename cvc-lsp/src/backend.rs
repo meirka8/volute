@@ -28,7 +28,7 @@ impl LanguageServer for Backend {
             .await;
 
         // Try to open the DB
-        let store = CvcStore::open(&db_path);
+        let store = CvcStore::open_initialized(&db_path);
         match store {
             Ok(s) => {
                 // Ensure schema is init

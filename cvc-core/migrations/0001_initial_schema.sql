@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS tool_executions (
 CREATE TABLE IF NOT EXISTS artifact_links (
     interaction_id TEXT,
     git_commit_hash TEXT,
-    link_type TEXT, -- e.g., 'generated', 'verified', 'refactored'
+    link_type TEXT NOT NULL DEFAULT 'generated', -- 'generated' or 'temporal' for automatic links
+    linked_by TEXT, -- Git commit author email responsible for automatic binding
     PRIMARY KEY (interaction_id, git_commit_hash)
 );
 

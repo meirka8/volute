@@ -3,7 +3,7 @@ use crate::models::{
     ToolExecution, ToolStatus,
 };
 use chrono::{TimeZone, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{ffi, params, Connection, ErrorCode, OptionalExtension, Row};
 use std::path::Path;
 use thiserror::Error;
 
@@ -17,9 +17,25 @@ pub enum DbError {
     Timestamp(i64),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Invalid automatic link: {0}")]
+    InvalidLink(String),
+    #[error("Artifact link integrity conflict: {0}")]
+    LinkConflict(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
+
+fn is_safe_commit_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_unique_constraint(error: &rusqlite::ffi::Error) -> bool {
+    error.code == ErrorCode::ConstraintViolation
+        && matches!(
+            error.extended_code,
+            ffi::SQLITE_CONSTRAINT_PRIMARYKEY | ffi::SQLITE_CONSTRAINT_UNIQUE
+        )
+}
 
 /// Maps a row selected as
 /// `id, conversation_id, parent_id, timestamp, author, user_prompt,
@@ -66,6 +82,12 @@ pub struct CvcStore {
 
 impl CvcStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_initialized(path)
+    }
+
+    /// Open a store and apply every idempotent schema migration before it can
+    /// be read or written. `open` delegates here for legacy callers.
+    pub fn open_initialized<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -75,7 +97,9 @@ impl CvcStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        Ok(Self { conn })
+        let store = Self { conn };
+        store.init()?;
+        Ok(store)
     }
 
     pub fn init(&self) -> Result<()> {
@@ -95,6 +119,61 @@ impl CvcStore {
                 .execute_batch(include_str!("../migrations/0002_add_source_request_id.sql"))?;
         }
 
+        self.normalize_artifact_links_schema()?;
+
+        Ok(())
+    }
+
+    fn normalize_artifact_links_schema(&self) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let columns: Vec<(String, String, bool, Option<String>)> = transaction
+            .prepare("PRAGMA table_info(artifact_links)")?
+            .query_map([], |row| {
+                Ok((
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let linked_by_present = columns.iter().any(|(name, _, _, _)| name == "linked_by");
+        let link_type_converged = columns.iter().any(|(name, ty, not_null, default)| {
+            name == "link_type"
+                && ty.eq_ignore_ascii_case("TEXT")
+                && *not_null
+                && default
+                    .as_deref()
+                    .is_some_and(|value| value.contains("generated"))
+        });
+        if !linked_by_present || !link_type_converged {
+            transaction.execute_batch(
+                "CREATE TABLE artifact_links_normalized (
+                    interaction_id TEXT,
+                    git_commit_hash TEXT,
+                    link_type TEXT NOT NULL DEFAULT 'generated',
+                    linked_by TEXT,
+                    PRIMARY KEY (interaction_id, git_commit_hash)
+                );",
+            )?;
+            let linked_by = if linked_by_present {
+                "linked_by"
+            } else {
+                "NULL"
+            };
+            transaction.execute_batch(&format!(
+                "INSERT INTO artifact_links_normalized (interaction_id, git_commit_hash, link_type, linked_by)
+                 SELECT interaction_id, git_commit_hash, COALESCE(link_type, 'generated'), {linked_by}
+                 FROM artifact_links;
+                 DROP TABLE artifact_links;
+                 ALTER TABLE artifact_links_normalized RENAME TO artifact_links;"
+            ))?;
+        }
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_artifact_links_commit_hash
+             ON artifact_links(git_commit_hash);",
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -217,9 +296,9 @@ impl CvcStore {
     pub fn delete_interactions_by_source_request_id(&self, source_request_id: &str) -> Result<()> {
         // First collect the interaction IDs to cascade-delete related rows
         let ids: Vec<String> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id FROM interactions WHERE source_request_id = ?1",
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM interactions WHERE source_request_id = ?1")?;
             let rows = stmt.query_map(params![source_request_id], |row| row.get(0))?;
             rows.collect::<std::result::Result<Vec<String>, _>>()?
         };
@@ -229,9 +308,18 @@ impl CvcStore {
         }
 
         for id in &ids {
-            self.conn.execute("DELETE FROM context_items WHERE interaction_id = ?1", params![id])?;
-            self.conn.execute("DELETE FROM tool_executions WHERE interaction_id = ?1", params![id])?;
-            self.conn.execute("DELETE FROM artifact_links WHERE interaction_id = ?1", params![id])?;
+            self.conn.execute(
+                "DELETE FROM context_items WHERE interaction_id = ?1",
+                params![id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM tool_executions WHERE interaction_id = ?1",
+                params![id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM artifact_links WHERE interaction_id = ?1",
+                params![id],
+            )?;
         }
 
         self.conn.execute(
@@ -367,15 +455,191 @@ impl CvcStore {
         commit_sha: &CommitSha,
         link_type: &str,
     ) -> Result<()> {
+        self.link_interaction_with_metadata(interaction_id, commit_sha, link_type, None)
+    }
+
+    /// Add an immutable artifact link. `linked_by` records the author identity
+    /// from the commit which triggered an automatic link, when available.
+    pub fn link_interaction_with_metadata(
+        &self,
+        interaction_id: &InteractionId,
+        commit_sha: &CommitSha,
+        link_type: &str,
+        linked_by: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO artifact_links (interaction_id, git_commit_hash, link_type) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO artifact_links (interaction_id, git_commit_hash, link_type, linked_by) VALUES (?1, ?2, ?3, ?4)",
             params![
                 interaction_id.to_string(),
                 commit_sha.as_str(),
-                link_type
+                link_type,
+                linked_by,
             ]
         )?;
         Ok(())
+    }
+
+    /// Atomically create automatic links selected by the linker. Conflicts do
+    /// not count as inserts; an existing row only receives attribution when it
+    /// has the same type and currently lacks it.
+    pub fn link_automatic_interactions(
+        &self,
+        interaction_ids: &[InteractionId],
+        commit_sha: &CommitSha,
+        link_type: &str,
+        linked_by: Option<&str>,
+    ) -> Result<usize> {
+        let links: Vec<(&InteractionId, &str)> = interaction_ids
+            .iter()
+            .map(|interaction_id| (interaction_id, link_type))
+            .collect();
+        self.link_automatic_interaction_batch(&links, commit_sha, linked_by)
+    }
+
+    /// Import a link from sync with explicit conflict checks. Historical link
+    /// types remain valid, while automatic types use the stricter batch path.
+    pub fn import_artifact_link(
+        &self,
+        interaction_id: &InteractionId,
+        commit_sha: &CommitSha,
+        link_type: &str,
+        linked_by: Option<&str>,
+    ) -> Result<()> {
+        if matches!(link_type, "generated" | "temporal") {
+            self.link_automatic_interactions(
+                std::slice::from_ref(interaction_id),
+                commit_sha,
+                link_type,
+                linked_by,
+            )?;
+            return Ok(());
+        }
+        if !is_safe_commit_sha(commit_sha.as_str()) || link_type.trim().is_empty() {
+            return Err(DbError::InvalidLink("invalid imported link".into()));
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        match transaction.execute(
+            "INSERT INTO artifact_links (interaction_id, git_commit_hash, link_type, linked_by)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                interaction_id.to_string(),
+                commit_sha.as_str(),
+                link_type,
+                linked_by
+            ],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, _)) if is_unique_constraint(&error) => {
+                let existing: (String, Option<String>) = transaction.query_row(
+                    "SELECT link_type, linked_by FROM artifact_links
+                     WHERE interaction_id = ?1 AND git_commit_hash = ?2",
+                    params![interaction_id.to_string(), commit_sha.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                if existing.0 != link_type
+                    || matches!((existing.1.as_deref(), linked_by), (Some(left), Some(right)) if left != right)
+                {
+                    return Err(DbError::LinkConflict(
+                        "imported link differs from existing provenance".into(),
+                    ));
+                }
+                if existing.1.is_none() && linked_by.is_some() {
+                    transaction.execute(
+                        "UPDATE artifact_links SET linked_by = ?4
+                         WHERE interaction_id = ?1 AND git_commit_hash = ?2
+                           AND link_type = ?3 AND linked_by IS NULL",
+                        params![
+                            interaction_id.to_string(),
+                            commit_sha.as_str(),
+                            link_type,
+                            linked_by
+                        ],
+                    )?;
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically persist a complete linker decision, including generated and
+    /// temporal rows, so an error never leaves a conversation only half bound.
+    pub fn link_automatic_interaction_batch(
+        &self,
+        links: &[(&InteractionId, &str)],
+        commit_sha: &CommitSha,
+        linked_by: Option<&str>,
+    ) -> Result<usize> {
+        if let Some((_, link_type)) = links
+            .iter()
+            .find(|(_, link_type)| !matches!(*link_type, "generated" | "temporal"))
+        {
+            return Err(DbError::InvalidLink((*link_type).to_owned()));
+        }
+        if !is_safe_commit_sha(commit_sha.as_str()) {
+            return Err(DbError::InvalidLink("invalid commit SHA".into()));
+        }
+
+        let transaction = self.conn.unchecked_transaction()?;
+        let mut inserts = 0;
+        for (interaction_id, link_type) in links {
+            match transaction.execute(
+                "INSERT INTO artifact_links (interaction_id, git_commit_hash, link_type, linked_by)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    interaction_id.to_string(),
+                    commit_sha.as_str(),
+                    link_type,
+                    linked_by
+                ],
+            ) {
+                Ok(_) => inserts += 1,
+                Err(rusqlite::Error::SqliteFailure(error, _)) if is_unique_constraint(&error) => {
+                    let existing: (String, Option<String>) = transaction.query_row(
+                        "SELECT link_type, linked_by FROM artifact_links
+                         WHERE interaction_id = ?1 AND git_commit_hash = ?2",
+                        params![interaction_id.to_string(), commit_sha.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    if existing.0 != *link_type {
+                        return Err(DbError::LinkConflict(format!(
+                            "link type differs for {}@{}",
+                            interaction_id,
+                            commit_sha.as_str()
+                        )));
+                    }
+                    match (existing.1.as_deref(), linked_by) {
+                        (Some(current), Some(incoming)) if current != incoming => {
+                            return Err(DbError::LinkConflict(format!(
+                                "linked_by differs for {}@{}",
+                                interaction_id,
+                                commit_sha.as_str()
+                            )));
+                        }
+                        (None, Some(_)) => {
+                            transaction.execute(
+                                "UPDATE artifact_links SET linked_by = ?4
+                             WHERE interaction_id = ?1 AND git_commit_hash = ?2
+                               AND link_type = ?3 AND linked_by IS NULL",
+                                params![
+                                    interaction_id.to_string(),
+                                    commit_sha.as_str(),
+                                    link_type,
+                                    linked_by
+                                ],
+                            )?;
+                        }
+                        // Missing incoming attribution makes no claim and cannot
+                        // downgrade a known value; exact duplicates are no-ops.
+                        _ => {}
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        transaction.commit()?;
+        Ok(inserts)
     }
 
     pub fn create_tool_execution(&self, exe: &ToolExecution) -> Result<()> {
@@ -479,7 +743,7 @@ impl CvcStore {
     }
 
     pub fn get_artifact_links(&self, interaction_id: &InteractionId) -> Result<Vec<ArtifactLink>> {
-        let mut stmt = self.conn.prepare("SELECT interaction_id, git_commit_hash, link_type FROM artifact_links WHERE interaction_id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT interaction_id, git_commit_hash, link_type, linked_by FROM artifact_links WHERE interaction_id = ?1")?;
 
         let rows = stmt.query_map(params![interaction_id.to_string()], |row| {
             Ok(ArtifactLink {
@@ -492,6 +756,7 @@ impl CvcStore {
                 })?,
                 git_commit_hash: CommitSha::new(row.get::<_, String>(1)?),
                 link_type: row.get(2)?,
+                linked_by: row.get(3)?,
             })
         })?;
         let mut items = Vec::new();

@@ -37,8 +37,16 @@ export interface ToolExecution {
 export interface ArtifactLinkData {
   interaction_id: string;
   git_commit_hash: string;
-  link_type: "generated" | "verified" | "refactored";
+  link_type: ArtifactLinkType;
+  /** Commit author attribution when the automatic link was created. */
+  linked_by?: string | null;
 }
+
+/** Link types emitted by current automatic linking and supported legacy blobs. */
+export type ArtifactLinkType = "generated" | "temporal" | "verified" | "refactored";
+
+/** The append-only `links/<interaction-id>/<commit-sha>.json` record in sync format v3. */
+export type CVCLinkRecord = ArtifactLinkData;
 
 // Normalized InteractionNode for UI use (flattened structure)
 export interface InteractionNode {
@@ -84,6 +92,29 @@ export function normalizeInteraction(blob: CVCBlobData): InteractionNode {
     tool_executions: tool_executions || [],
     artifact_links: artifact_links || [],
   };
+}
+
+/**
+ * Adds append-only v3 link records to an immutable node blob. A node may have been
+ * pushed while floating, so its original `artifact_links` array cannot be rewritten.
+ * Existing legacy links are retained; a matching v3 record fills in newer metadata.
+ */
+export function mergeArtifactLinks(
+  interaction: InteractionNode,
+  linkRecords: CVCLinkRecord[],
+): InteractionNode {
+  if (linkRecords.length === 0) return interaction;
+
+  const links = new Map<string, ArtifactLinkData>();
+  for (const link of interaction.artifact_links) {
+    links.set(`${link.git_commit_hash}:${link.link_type}`, link);
+  }
+  for (const link of linkRecords) {
+    const key = `${link.git_commit_hash}:${link.link_type}`;
+    links.set(key, { ...links.get(key), ...link });
+  }
+
+  return { ...interaction, artifact_links: Array.from(links.values()) };
 }
 
 export interface CVCTreeItem {

@@ -68,7 +68,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
 
     if let Some(_repo) = repo_opt {
         // Warn if we can't open store but CVC dir exists
-        match CvcStore::open(&db_path) {
+        match CvcStore::open_initialized(&db_path) {
             Ok(store) => {
                 let interaction_id = InteractionId::new();
 

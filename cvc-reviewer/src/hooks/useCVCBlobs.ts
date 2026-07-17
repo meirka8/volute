@@ -53,8 +53,16 @@ export function useCVCBlobs(owner: string, repo: string) {
           recursive: "true",
         });
 
-        // 2. Filter for Blobs (files)
-        const blobs = treeData.tree.filter((item) => item.type === "blob");
+        // 2. Only node blobs are interaction documents. Format-v3 also contains
+        // FORMAT, by-commit pointers, and append-only links/* records; parsing any
+        // of those as a node would corrupt this diagnostic view.
+        const blobs = treeData.tree.filter(
+          (item) =>
+            item.type === "blob" &&
+            !!item.path &&
+            (item.path.startsWith("nodes/") ||
+              (!item.path.includes("/") && item.path.endsWith(".json"))),
+        );
 
         // 3. Fetch all blobs in parallel and normalize them
         // In a real app with thousands of nodes, we would paginate or lazy load.

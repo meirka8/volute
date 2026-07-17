@@ -24,7 +24,7 @@ fn run_post_commit_logic(current_dir: &std::path::Path) -> Result<()> {
 
     let repo = Repository::open(current_dir).context("Failed to open git repository")?;
     let db_path = cvc_dir.join("index.db");
-    let store = CvcStore::open(&db_path)?; // No context here to keep error clean if fails
+    let store = CvcStore::open_initialized(&db_path)?; // Hook caller still swallows all errors.
 
     let count = linker::link_current_commit_to_floating_nodes(&repo, &store)?;
 

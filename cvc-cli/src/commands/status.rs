@@ -12,7 +12,7 @@ pub async fn run() -> Result<()> {
     }
 
     let db_path = cvc_dir.join("index.db");
-    let store = CvcStore::open(&db_path).context("Failed to open CVC database")?;
+    let store = CvcStore::open_initialized(&db_path).context("Failed to open CVC database")?;
 
     let all_ids = store.get_all_interaction_ids()?;
     let floating = store.get_floating_interactions()?;

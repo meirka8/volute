@@ -30,6 +30,10 @@ vi.mock("../api/github", () => ({
 }));
 
 const CVC_MAIN_SHA = "cvcmain0000000000000000000000000000000";
+const ID_ONE = "11111111-1111-1111-1111-111111111111";
+const ID_TWO = "22222222-2222-2222-2222-222222222222";
+const ID_THREE = "33333333-3333-3333-3333-333333333333";
+const TEMPORAL_COMMIT_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 function notFoundError() {
   const error = new Error("Not Found") as Error & { status: number };
@@ -67,6 +71,33 @@ function renderWithClient(owner: string, repo: string, prNumber: number) {
   return renderHook(() => usePRInteractions(owner, repo, prNumber), { wrapper });
 }
 
+function setupV3LinkEvent(payload: unknown) {
+  mockGetRef.mockResolvedValue({ data: { object: { sha: CVC_MAIN_SHA } } });
+  mockListCommits.mockResolvedValue({ data: [{ sha: TEMPORAL_COMMIT_SHA }] });
+  mockGetTree.mockResolvedValue({
+    data: {
+      tree: [
+        { path: "by-commit", type: "tree" },
+        { path: "nodes", type: "tree" },
+        { path: "links", type: "tree" },
+      ],
+    },
+  });
+  mockGetContent.mockResolvedValue({ data: [{ name: ID_TWO }] });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockImplementation((url: string) => {
+      if (url.includes(`links/${ID_TWO}/${TEMPORAL_COMMIT_SHA}.json`)) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(payload) });
+      }
+      return Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify(rawInteractionBlob(ID_TWO))),
+      });
+    }),
+  );
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   mockAcquireToken.mockResolvedValue("fake-token");
@@ -89,7 +120,7 @@ describe("usePRInteractions", () => {
     expect(mockListCommits).not.toHaveBeenCalled();
   });
 
-  it("v2 path: looks up by-commit/<sha> per PR commit and fetches only the referenced blobs", async () => {
+  it("v2 path: preserves legacy node links without linked_by", async () => {
     mockGetRef.mockResolvedValue({ data: { object: { sha: CVC_MAIN_SHA } } });
     mockListCommits.mockResolvedValue({ data: [{ sha: "commit-a" }, { sha: "commit-b" }] });
     mockGetTree.mockResolvedValue({
@@ -97,7 +128,7 @@ describe("usePRInteractions", () => {
     });
     mockGetContent.mockImplementation(({ path }: { path: string }) => {
       if (path === "by-commit/commit-a") {
-        return Promise.resolve({ data: [{ name: "id-1" }] });
+        return Promise.resolve({ data: [{ name: ID_ONE }] });
       }
       if (path === "by-commit/commit-b") {
         // No thoughts recorded for this commit -- the common case.
@@ -108,7 +139,7 @@ describe("usePRInteractions", () => {
 
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      text: () => Promise.resolve(JSON.stringify(rawInteractionBlob("id-1", ["commit-a"]))),
+      text: () => Promise.resolve(JSON.stringify(rawInteractionBlob(ID_ONE, ["commit-a"]))),
     });
     vi.stubGlobal("fetch", fetchMock);
 
@@ -118,16 +149,115 @@ describe("usePRInteractions", () => {
     expect(result.current.data?.hasHistory).toBe(true);
     expect(result.current.data?.truncated).toBe(false);
     expect(result.current.data?.interactions).toHaveLength(1);
-    expect(result.current.data?.interactions[0].id).toBe("id-1");
+    expect(result.current.data?.interactions[0].id).toBe(ID_ONE);
+    expect(result.current.data?.interactions[0].artifact_links[0].link_type).toBe("generated");
+    expect(result.current.data?.interactions[0].artifact_links[0].linked_by).toBeUndefined();
 
     // Exactly one by-commit lookup per PR commit, and only one blob fetched
     // (the tree walk / whole-history path must never be touched here).
     expect(mockGetContent).toHaveBeenCalledTimes(2);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][0]).toContain("nodes/id/id-1.json");
+    expect(fetchMock.mock.calls[0][0]).toContain(`nodes/${ID_ONE.slice(0, 2)}/${ID_ONE}.json`);
     expect(mockGetTree).toHaveBeenCalledWith(
       expect.objectContaining({ recursive: "false" }),
     );
+  });
+
+  it("v3 path: merges append-only temporal link metadata into a floating node", async () => {
+    mockGetRef.mockResolvedValue({ data: { object: { sha: CVC_MAIN_SHA } } });
+    mockListCommits.mockResolvedValue({ data: [{ sha: TEMPORAL_COMMIT_SHA }] });
+    mockGetTree.mockResolvedValue({
+      data: {
+        tree: [
+          { path: "by-commit", type: "tree" },
+          { path: "nodes", type: "tree" },
+          { path: "links", type: "tree" },
+          { path: "FORMAT", type: "blob" },
+        ],
+      },
+    });
+    mockGetContent.mockResolvedValue({ data: [{ name: ID_TWO }] });
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.includes(`links/${ID_TWO}/${TEMPORAL_COMMIT_SHA}.json`)) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            interaction_id: ID_TWO,
+            git_commit_hash: TEMPORAL_COMMIT_SHA,
+            link_type: "temporal",
+            linked_by: "Ada Example <ada@example.test>",
+          }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify(rawInteractionBlob(ID_TWO))),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result } = renderWithClient("owner", "repo", 3);
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.interactions).toHaveLength(1);
+    expect(result.current.data?.interactions[0].artifact_links).toEqual([
+      {
+        interaction_id: ID_TWO,
+        git_commit_hash: TEMPORAL_COMMIT_SHA,
+        link_type: "temporal",
+        linked_by: "Ada Example <ada@example.test>",
+      },
+    ]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed when a by-commit index entry is not an interaction UUID", async () => {
+    mockGetRef.mockResolvedValue({ data: { object: { sha: CVC_MAIN_SHA } } });
+    mockListCommits.mockResolvedValue({ data: [{ sha: "commit-a" }] });
+    mockGetTree.mockResolvedValue({ data: { tree: [{ path: "by-commit", type: "tree" }] } });
+    mockGetContent.mockResolvedValue({ data: [{ name: "not-a-uuid" }] });
+
+    const { result } = renderWithClient("owner", "repo", 4);
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a v3 event payload does not match its indexed path", async () => {
+    setupV3LinkEvent({
+      interaction_id: ID_THREE,
+      git_commit_hash: TEMPORAL_COMMIT_SHA,
+      link_type: "temporal",
+    });
+
+    const { result } = renderWithClient("owner", "repo", 5);
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+  });
+
+  it("fails closed when a v3 event has an unsupported link type", async () => {
+    setupV3LinkEvent({
+      interaction_id: ID_TWO,
+      git_commit_hash: TEMPORAL_COMMIT_SHA,
+      link_type: "verified",
+    });
+
+    const { result } = renderWithClient("owner", "repo", 6);
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+  });
+
+  it("fails closed when a v3 event has an invalid commit SHA", async () => {
+    setupV3LinkEvent({
+      interaction_id: ID_TWO,
+      git_commit_hash: "not-a-sha",
+      link_type: "temporal",
+    });
+
+    const { result } = renderWithClient("owner", "repo", 7);
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
   });
 
   it("deduplicates an interaction referenced by multiple PR commits into a single blob fetch", async () => {
@@ -137,13 +267,13 @@ describe("usePRInteractions", () => {
       data: { tree: [{ path: "by-commit", type: "tree" }] },
     });
     // Same interaction id shows up under both commits' by-commit index.
-    mockGetContent.mockResolvedValue({ data: [{ name: "shared-id" }] });
+    mockGetContent.mockResolvedValue({ data: [{ name: ID_THREE }] });
 
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       text: () =>
         Promise.resolve(
-          JSON.stringify(rawInteractionBlob("shared-id", ["commit-a", "commit-b"])),
+            JSON.stringify(rawInteractionBlob(ID_THREE, ["commit-a", "commit-b"])),
         ),
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -204,11 +334,11 @@ describe("usePRInteractions", () => {
     mockGetRef.mockResolvedValue({ data: { object: { sha: CVC_MAIN_SHA } } });
     mockGetTree.mockResolvedValue({ data: { tree: [{ path: "by-commit", type: "tree" }] } });
     mockListCommits.mockResolvedValue({ data: [{ sha: "commit-a" }] });
-    mockGetContent.mockResolvedValue({ data: [{ name: "id-1" }] });
+    mockGetContent.mockResolvedValue({ data: [{ name: ID_ONE }] });
 
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      text: () => Promise.resolve(JSON.stringify(rawInteractionBlob("id-1", ["commit-a"]))),
+      text: () => Promise.resolve(JSON.stringify(rawInteractionBlob(ID_ONE, ["commit-a"]))),
     });
     vi.stubGlobal("fetch", fetchMock);
 
@@ -228,5 +358,31 @@ describe("usePRInteractions", () => {
     expect(mockGetContent).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(second.result.current.data?.interactions).toHaveLength(1);
+  });
+
+  it("refreshes a by-commit directory when refs/cvc/main advances for a late link", async () => {
+    mockGetRef
+      .mockResolvedValueOnce({ data: { object: { sha: "cvc-before" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "cvc-after" } } });
+    mockListCommits.mockResolvedValue({ data: [{ sha: "commit-a" }] });
+    mockGetTree.mockResolvedValue({ data: { tree: [{ path: "by-commit", type: "tree" }] } });
+    mockGetContent
+      .mockResolvedValueOnce({ data: [{ name: ID_ONE }] })
+      .mockResolvedValueOnce({ data: [{ name: ID_TWO }] });
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      const id = url.includes(ID_TWO) ? ID_TWO : ID_ONE;
+      return Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify(rawInteractionBlob(id, ["commit-a"]))),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result } = renderWithClient("owner", "repo", 1);
+    await waitFor(() => expect(result.current.data?.interactions[0]?.id).toBe(ID_ONE));
+
+    await result.current.refetch();
+    await waitFor(() => expect(result.current.data?.interactions[0]?.id).toBe(ID_TWO));
+    expect(mockGetContent).toHaveBeenCalledTimes(2);
   });
 });

@@ -8,7 +8,7 @@ pub async fn push() -> Result<()> {
     let current_dir = env::current_dir()?;
     let repo = Repository::open(&current_dir).context("Failed to open git repository")?;
     let db_path = current_dir.join(".git").join("cvc").join("index.db");
-    let store = CvcStore::open(&db_path).context("Failed to open CVC database")?;
+    let store = CvcStore::open_initialized(&db_path).context("Failed to open CVC database")?;
 
     let remotes = repo.remotes()?;
     let remote_name = if remotes.iter().any(|r| r == Some("origin")) {
@@ -59,7 +59,7 @@ pub async fn pull() -> Result<()> {
     let current_dir = env::current_dir()?;
     let repo = Repository::open(&current_dir).context("Failed to open git repository")?;
     let db_path = current_dir.join(".git").join("cvc").join("index.db");
-    let store = CvcStore::open(&db_path).context("Failed to open CVC database")?;
+    let store = CvcStore::open_initialized(&db_path).context("Failed to open CVC database")?;
 
     let remotes = repo.remotes()?;
     let remote_name = if remotes.iter().any(|r| r == Some("origin")) {

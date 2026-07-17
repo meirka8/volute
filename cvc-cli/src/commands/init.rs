@@ -20,10 +20,7 @@ pub async fn run() -> Result<()> {
     let db_path = cvc_dir.join("index.db");
 
     println!("Initializing CVC database at {:?}", db_path);
-    let store = CvcStore::open(&db_path).context("Failed to open CVC database")?;
-    store
-        .init()
-        .context("Failed to initialize database schema")?;
+    let _store = CvcStore::open_initialized(&db_path).context("Failed to open CVC database")?;
 
     println!("Installing CVC hooks...");
     let outcomes = hooks::install(&current_dir).context("Failed to install hooks")?;

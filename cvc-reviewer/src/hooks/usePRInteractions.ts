@@ -5,7 +5,9 @@ import { CommitRanger } from "../lib/CommitRanger";
 import { InteractionMapper } from "../lib/InteractionMapper";
 import {
   normalizeInteraction,
+  mergeArtifactLinks,
   type CVCBlobData,
+  type CVCLinkRecord,
   type InteractionNode,
 } from "../types/cvc";
 
@@ -17,6 +19,8 @@ const CVC_REF = "cvc/main";
 const LEGACY_FETCH_CAP = 200;
 
 const BATCH_SIZE = 10;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/i;
 
 export interface PRInteractionsResult {
   interactions: InteractionNode[];
@@ -40,6 +44,47 @@ function idFromBlobPath(path: string): string {
   return base.endsWith(".json") ? base.slice(0, -".json".length) : base;
 }
 
+function encodeGithubPath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
+function githubContentsUrl(owner: string, repo: string, path: string, ref: string): string {
+  return `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodeGithubPath(path)}?ref=${encodeURIComponent(ref)}`;
+}
+
+function isInteractionId(value: string): boolean {
+  return UUID_PATTERN.test(value);
+}
+
+function assertInteractionId(value: string): asserts value is string {
+  if (!isInteractionId(value)) {
+    throw new Error("Invalid interaction ID in CVC by-commit index");
+  }
+}
+
+function isV3LinkRecord(
+  value: unknown,
+  interactionId: string,
+  commitSha: string,
+): value is CVCLinkRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const formatKeys = ["format", "version", "format_version"];
+  if (formatKeys.some((key) => key in record && record[key] !== 3 && record[key] !== "3")) {
+    return false;
+  }
+  return (
+    typeof record.interaction_id === "string" &&
+    isInteractionId(record.interaction_id) &&
+    record.interaction_id === interactionId &&
+    typeof record.git_commit_hash === "string" &&
+    COMMIT_SHA_PATTERN.test(record.git_commit_hash) &&
+    record.git_commit_hash === commitSha &&
+    (record.link_type === "generated" || record.link_type === "temporal") &&
+    (record.linked_by === undefined || record.linked_by === null || typeof record.linked_by === "string")
+  );
+}
+
 async function fetchRawFile(
   owner: string,
   repo: string,
@@ -47,7 +92,7 @@ async function fetchRawFile(
   ref: string,
   token: string,
 ): Promise<string> {
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${ref}`;
+  const url = githubContentsUrl(owner, repo, path, ref);
   const response = await fetch(url, {
     headers: {
       Authorization: `token ${token}`,
@@ -71,6 +116,29 @@ async function fetchBlobJson<T>(url: string, token: string): Promise<T> {
     throw new Error(`Failed to fetch blob: ${response.statusText}`);
   }
   return response.json();
+}
+
+/** Reads a v3 append-only link record. Missing records are normal for legacy links. */
+async function fetchLinkRecord(
+  owner: string,
+  repo: string,
+  interactionId: string,
+  commitSha: string,
+  ref: string,
+  token: string,
+): Promise<CVCLinkRecord | null> {
+  const path = `links/${interactionId}/${commitSha}.json`;
+  const url = githubContentsUrl(owner, repo, path, ref);
+  const response = await fetch(url, {
+    headers: { Authorization: `token ${token}`, Accept: "application/vnd.github.v3.raw" },
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Failed to fetch ${path}: ${response.statusText}`);
+  const payload: unknown = await response.json();
+  if (!isV3LinkRecord(payload, interactionId, commitSha)) {
+    throw new Error(`Invalid v3 CVC link record at ${path}`);
+  }
+  return payload;
 }
 
 // Path-based directory listing: resolves server-side in one request regardless of
@@ -97,9 +165,9 @@ async function fetchDirectoryListing(
   }
 }
 
-// by-commit/<sha> is only ever written to once a commit is created and its floating
-// thoughts get linked (see linker::link_current_commit_to_floating_nodes) -- nothing
-// later adds more entries to an already-processed commit. Safe to cache forever.
+// A v3 late-link event can add a by-commit pointer after the node itself was first
+// pushed. The directory is immutable for a particular CVC ref, so scope the cache
+// key to that ref's commit instead of caching it across ref advances.
 function fetchByCommitCached(
   queryClient: QueryClient,
   client: GithubClient,
@@ -109,9 +177,15 @@ function fetchByCommitCached(
   cvcMainSha: string,
 ): Promise<{ name: string }[]> {
   return queryClient.fetchQuery({
-    queryKey: ["cvc-by-commit", owner, repo, commitSha],
+    queryKey: ["cvc-by-commit", owner, repo, cvcMainSha, commitSha],
     queryFn: () =>
-      fetchDirectoryListing(client, owner, repo, `by-commit/${commitSha}`, cvcMainSha),
+      fetchDirectoryListing(
+        client,
+        owner,
+        repo,
+        `by-commit/${encodeURIComponent(commitSha)}`,
+        cvcMainSha,
+      ),
     staleTime: Infinity,
   });
 }
@@ -143,6 +217,21 @@ async function fetchNodesInBatches<T>(
     nodes.push(...(await Promise.all(batch.map(fetchOne))));
   }
   return nodes;
+}
+
+async function fetchLinkRecordsInBatches(
+  references: { interactionId: string; commitSha: string }[],
+  fetchOne: (
+    reference: { interactionId: string; commitSha: string },
+  ) => Promise<CVCLinkRecord | null>,
+): Promise<CVCLinkRecord[]> {
+  const records: CVCLinkRecord[] = [];
+  for (let i = 0; i < references.length; i += BATCH_SIZE) {
+    const batch = references.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(batch.map(fetchOne));
+    records.push(...results.filter((record): record is CVCLinkRecord => record !== null));
+  }
+  return records;
 }
 
 // Format-v1 fallback: no by-commit/ index exists, so there's no cheap way to find just
@@ -226,11 +315,17 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
         tree_sha: cvcMainSha,
         recursive: "false",
       });
-      const isV2 = rootTree.tree.some(
+      const hasByCommitIndex = rootTree.tree.some(
         (entry) => entry.path === "by-commit" && entry.type === "tree",
       );
+      // Format v3 adds append-only link records under links/. The directory is absent
+      // until an automatic link exists, so its presence (not FORMAT alone) determines
+      // whether there are records to request.
+      const hasV3LinkRecords = rootTree.tree.some(
+        (entry) => entry.path === "links" && entry.type === "tree",
+      );
 
-      if (!isV2) {
+      if (!hasByCommitIndex) {
         return fetchLegacyCapped(
           queryClient,
           client,
@@ -249,9 +344,12 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
       );
 
       const ids = new Set<string>();
-      for (const entries of perCommitEntries) {
+      const linkReferences: { interactionId: string; commitSha: string }[] = [];
+      for (const [index, entries] of perCommitEntries.entries()) {
         for (const entry of entries) {
+          assertInteractionId(entry.name);
           ids.add(entry.name);
+          linkReferences.push({ interactionId: entry.name, commitSha: commitShas[index] });
         }
       }
 
@@ -263,7 +361,25 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
         }),
       );
 
-      return { interactions, truncated: false, hasHistory: true };
+      const linkRecords = hasV3LinkRecords
+        ? await fetchLinkRecordsInBatches(linkReferences, ({ interactionId, commitSha }) =>
+            fetchLinkRecord(owner, repo, interactionId, commitSha, cvcMainSha, token),
+          )
+        : [];
+      const recordsByInteraction = new Map<string, CVCLinkRecord[]>();
+      for (const record of linkRecords) {
+        const records = recordsByInteraction.get(record.interaction_id) ?? [];
+        records.push(record);
+        recordsByInteraction.set(record.interaction_id, records);
+      }
+
+      return {
+        interactions: interactions.map((interaction) =>
+          mergeArtifactLinks(interaction, recordsByInteraction.get(interaction.id) ?? []),
+        ),
+        truncated: false,
+        hasHistory: true,
+      };
     },
     enabled: isAuthenticated && !!owner && !!repo && prNumber > 0,
     // refs/cvc/main advances as new thoughts are pushed; re-check periodically. The

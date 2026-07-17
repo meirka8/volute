@@ -99,7 +99,7 @@ pub async fn run() -> Result<()> {
         std::fs::create_dir_all(parent).context("Failed to create cvc directory")?;
     }
 
-    let store = CvcStore::open(db_path).context("Failed to open CVC database")?;
+    let store = CvcStore::open_initialized(db_path).context("Failed to open CVC database")?;
     store.init().context("Failed to run migrations")?;
     let state = Arc::new(AppState::new(Arc::new(Mutex::new(store))));
 

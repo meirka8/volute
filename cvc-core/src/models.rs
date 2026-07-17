@@ -124,4 +124,8 @@ pub struct ArtifactLink {
     pub interaction_id: InteractionId,
     pub git_commit_hash: CommitSha,
     pub link_type: String, // 'generated', 'verified', etc.
+    /// Git author email from the commit that caused an automatic link.
+    /// Absent for links created before this metadata was introduced.
+    #[serde(default)]
+    pub linked_by: Option<String>,
 }
