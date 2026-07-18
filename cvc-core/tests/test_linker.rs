@@ -2,6 +2,7 @@ use chrono::{Duration, Utc};
 use cvc_core::db::CvcStore;
 use cvc_core::linker;
 use cvc_core::models::*;
+use cvc_core::privacy::{McpCapture, PreparedPolicy};
 use git2::{Repository, Signature, Status, Time};
 use std::fs;
 use std::path::Path;
@@ -72,15 +73,8 @@ fn add_interaction(
     timestamp: chrono::DateTime<Utc>,
     context_path: Option<&str>,
 ) -> anyhow::Result<InteractionId> {
-    if store.get_conversation(conversation_id)?.is_none() {
-        store.create_conversation(&Conversation {
-            id: conversation_id.to_owned(),
-            title: conversation_id.to_owned(),
-            created_at: timestamp,
-        })?;
-    }
     let id = InteractionId::new();
-    store.create_interaction(&Interaction {
+    let interaction = Interaction {
         id: id.clone(),
         conversation_id: conversation_id.to_owned(),
         parent_id: None,
@@ -91,18 +85,31 @@ fn add_interaction(
         model_cot: None,
         model_response: None,
         source_request_id: None,
-    })?;
-    if let Some(file_path) = context_path {
-        store.add_context_item(&ContextItem {
-            id: None,
-            interaction_id: id.clone(),
-            file_path: file_path.to_owned(),
-            git_blob_sha: None,
-            dirty_patch: None,
-            start_line: None,
-            end_line: None,
-        })?;
-    }
+    };
+    let context_items = context_path
+        .map(|file_path| {
+            vec![ContextItem {
+                id: None,
+                interaction_id: id.clone(),
+                file_path: file_path.to_owned(),
+                git_blob_sha: None,
+                dirty_patch: None,
+                start_line: None,
+                end_line: None,
+            }]
+        })
+        .unwrap_or_default();
+    store.capture_mcp(McpCapture::new(
+        Conversation {
+            id: conversation_id.to_owned(),
+            title: conversation_id.to_owned(),
+            created_at: timestamp,
+        },
+        interaction,
+        context_items,
+        Vec::new(),
+        PreparedPolicy::built_ins_only(),
+    ))?;
     Ok(id)
 }
 

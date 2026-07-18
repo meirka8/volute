@@ -1,9 +1,34 @@
 use chrono::Utc;
 use cvc_core::db::CvcStore;
 use cvc_core::models::*;
+use cvc_core::privacy::{McpCapture, PreparedPolicy};
 use rusqlite::Connection;
 use std::str::FromStr;
 use tempfile::TempDir;
+
+trait CaptureFixture {
+    fn create_conversation(&self, _: &Conversation) -> cvc_core::db::Result<()>;
+    fn create_interaction(&self, interaction: &Interaction) -> cvc_core::db::Result<()>;
+}
+impl CaptureFixture for CvcStore {
+    fn create_conversation(&self, _: &Conversation) -> cvc_core::db::Result<()> {
+        Ok(())
+    }
+    fn create_interaction(&self, interaction: &Interaction) -> cvc_core::db::Result<()> {
+        self.capture_mcp(McpCapture::new(
+            Conversation {
+                id: interaction.conversation_id.clone(),
+                title: "fixture".into(),
+                created_at: interaction.timestamp,
+            },
+            interaction.clone(),
+            Vec::new(),
+            Vec::new(),
+            PreparedPolicy::built_ins_only(),
+        ))
+        .map(|_| ())
+    }
+}
 
 #[test]
 fn test_db_workflow() -> anyhow::Result<()> {
@@ -19,10 +44,6 @@ fn test_db_workflow() -> anyhow::Result<()> {
         created_at: Utc::now(),
     };
     store.create_conversation(&conv)?;
-
-    let fetched_conv = store.get_conversation(conv_id)?;
-    assert!(fetched_conv.is_some());
-    assert_eq!(fetched_conv.unwrap().title, "Test Conversation");
 
     // 3. Create Interaction
     let inter_id = InteractionId::from_str("550e8400-e29b-41d4-a716-446655440000")?;
@@ -40,6 +61,9 @@ fn test_db_workflow() -> anyhow::Result<()> {
     };
     store.create_interaction(&interaction)?;
 
+    let fetched_conv = store.get_conversation(conv_id)?;
+    assert!(fetched_conv.is_some());
+
     let fetched_inter = store.get_interaction(&inter_id)?;
     assert!(fetched_inter.is_some());
     assert_eq!(fetched_inter.unwrap().user_prompt, "Hello World");
@@ -50,20 +74,65 @@ fn test_db_workflow() -> anyhow::Result<()> {
     assert_eq!(floating[0].id, inter_id);
 
     // 5. Link Artifact
-    let commit_sha = CommitSha::new("abc1234567890abcdef1234567890abcdef12");
+    let commit_sha = CommitSha::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     store.link_interaction(&inter_id, &commit_sha, "generated")?;
 
     let links = store.get_artifact_links(&inter_id)?;
     assert_eq!(links.len(), 1);
     assert_eq!(
         links[0].git_commit_hash.as_str(),
-        "abc1234567890abcdef1234567890abcdef12"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     );
 
     // 6. Test Floating Nodes Empty
     let floating_after = store.get_floating_interactions()?;
     assert_eq!(floating_after.len(), 0);
 
+    Ok(())
+}
+
+#[test]
+fn remote_redaction_requires_exact_authority_and_is_idempotent() -> anyhow::Result<()> {
+    let store = CvcStore::open(":memory:")?;
+    let id = InteractionId::new();
+    let interaction = Interaction {
+        id: id.clone(),
+        conversation_id: "redact-authority".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "secret".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&interaction)?;
+    assert!(store
+        .authorize_and_tombstone_remote(&id, "destination-a", TombstoneReasonCode::Security)
+        .is_err());
+    assert!(store.get_interaction(&id)?.is_some());
+    store.share_conversation_for_remote(
+        "redact-authority",
+        "destination-a",
+        FutureSharePolicy::Private,
+    )?;
+    let first = store.authorize_and_tombstone_remote(
+        &id,
+        "destination-a",
+        TombstoneReasonCode::Security,
+    )?;
+    assert!(store.get_interaction(&id)?.is_none());
+    let retry = store.authorize_and_tombstone_remote(
+        &id,
+        "destination-a",
+        TombstoneReasonCode::Security,
+    )?;
+    assert_eq!(first, retry);
+    assert_eq!(store.tombstones_for_projection("destination-a")?.len(), 1);
+    assert!(store
+        .authorize_and_tombstone_remote(&id, "destination-a", TombstoneReasonCode::Retention)
+        .is_err());
     Ok(())
 }
 

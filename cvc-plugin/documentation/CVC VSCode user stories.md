@@ -11,13 +11,13 @@
 
 ### Story 2.1: The Seamless Log
 
-> As Devin, I want to use GitHub Copilot Chat in VS Code the way I normally do, but have it recorded automatically, so I don't have to switch tools or copy-paste logs.
+> As Devin, after I acknowledge local capture, I want to use GitHub Copilot Chat in this workspace normally while CVC records available chat data privately, so I do not have to switch tools or copy-paste logs.
 
 - **Scenario:** Devin is stuck on a Rust borrow checker error.
     
 - **Action:** He opens a new GitHub Copilot Chat and asks, `How do I fix this lifetime issue?`.
     
-- **System:** The watcher sees the Copilot chat session update and records the exchange automatically.
+- **System:** The watcher, already gated by acknowledgement and mapped to this exact workspace only, sees the Copilot session update and records available prompts, responses, exposed reasoning, tool metadata, and context patches privately.
     
 - **Verification:** Devin glances at the Volute timeline panel and sees a new pending thought appear with his question.
     
@@ -30,7 +30,13 @@
     
 - **Action:** He continues working in GitHub Copilot Chat as normal.
     
-- **System:** The watcher follows GitHub Copilot's local chat storage format and records that conversation path without asking Devin to invoke a separate participant.
+- **System:** The watcher follows GitHub Copilot's local chat storage format only after acknowledgement and only when its workspace metadata exactly matches the open workspace. It does not inspect a recent or neighboring workspace's storage.
+
+### Story 2.3: Consent revocation stops observation
+
+> As Devin, when local capture consent is no longer available, I want the watcher to stop immediately so it cannot continue reading chat storage on stale permission.
+
+- **System:** On a privacy-status refresh that reports revoked, unavailable, or unconfirmed passive-capture consent, CVC stops and discards the active watcher before prompting. It starts a new watcher only after a later positive acknowledgement status.
     
 
 ## 3. Epic: The Cognitive Timeline (Side Panel)

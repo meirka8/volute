@@ -48,6 +48,29 @@ export type ArtifactLinkType = "generated" | "temporal" | "verified" | "refactor
 /** The append-only `links/<interaction-id>/<commit-sha>.json` record in sync format v3. */
 export type CVCLinkRecord = ArtifactLinkData;
 
+export interface CVCTombstone {
+  format: "cvc.tombstone/v1";
+  version: 1;
+  interaction_id: string;
+  deleted_at: string;
+  reason_code: "user_requested" | "security" | "retention";
+  previous_node_oid?: string | null;
+}
+
+export function validTombstone(value: unknown, pathId: string): value is CVCTombstone {
+  if (!value || typeof value !== "object") return false;
+  const t = value as Record<string, unknown>;
+  const allowed = new Set(["format", "version", "interaction_id", "deleted_at", "reason_code", "previous_node_oid"]);
+  if (Object.keys(t).some((key) => !allowed.has(key))) return false;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const oid = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
+  return t.format === "cvc.tombstone/v1" && t.version === 1 &&
+    typeof t.interaction_id === "string" && t.interaction_id === pathId && uuid.test(pathId) &&
+    typeof t.deleted_at === "string" && !Number.isNaN(Date.parse(t.deleted_at)) &&
+    (t.reason_code === "user_requested" || t.reason_code === "security" || t.reason_code === "retention") &&
+    (t.previous_node_oid == null || (typeof t.previous_node_oid === "string" && oid.test(t.previous_node_oid)));
+}
+
 // Normalized InteractionNode for UI use (flattened structure)
 export interface InteractionNode {
   id: string;

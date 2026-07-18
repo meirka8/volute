@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-**Cognitive Version Control (CVC)** is a system designed to augment standard Git version control by tracking the "trajectory of intent" alongside the "history of artifacts." While Git captures **what** changed (diffs) and **when**, CVC captures **why** (prompts, context, and AI Chain-of-Thought).
+**Cognitive Version Control (CVC)** augments Git with a private-by-default record of development intent. Git captures **what** changed and **when**; CVC may retain prompts, context, tool metadata, model-visible reasoning, and responses when a capture source exposes them. CVC does **not** guarantee access to, capture of, or publication of a model's hidden chain-of-thought.
 
 The system operates as a "Shadow DAG" (Directed Acyclic Graph), creating a parallel history of reasoning that is tightly coupled with, but distinct from, the Git commit graph.
 
@@ -42,7 +42,7 @@ A Node consists of:
         
     - _Dynamic Context:_ Files read or discovered by the agent during execution (e.g., via tool use).
         
-- **The Derivation:** The AI's hidden "Chain of Thought" (CoT) and final response.
+- **The Derivation:** A model response and any reasoning content the integration actually exposes. Hidden chain-of-thought is neither assumed nor guaranteed.
     
 - **The Outcome:** A linkage to the resulting Git Commit SHA.
     
@@ -170,7 +170,7 @@ CREATE TABLE interactions (
     user_prompt TEXT,    -- The chat message, ticket body, or tool output
     
     model_name TEXT,
-    model_cot TEXT,      -- Chain of Thought (Hidden reasoning)
+    model_cot TEXT,      -- optional exposed reasoning; hidden CoT is not guaranteed
     model_response TEXT, -- Final visible response
     
     FOREIGN KEY(conversation_id) REFERENCES conversations(id),
@@ -227,6 +227,12 @@ CREATE TABLE artifact_links (
     PRIMARY KEY (interaction_id, git_commit_hash)
 );
 ```
+
+### 7.1 Current privacy and publication schema
+
+The implemented schema adds `interactions.visibility` (`private` by default), `capture_source`, and `scrubber_version`. Conversation and interaction share records are keyed by a destination fingerprint; publication is independently tracked as `pending`, `published`, or `unknown` for that exact destination. This prevents a consent, share, or observed publication at one URL from authorizing another URL, including a changed push URL.
+
+`tombstones` are local-only or destination-scoped for remote suppression. Their immutable wire form is `cvc.tombstone/v1` and contains an interaction UUID, timestamp, small reason code, and optional prior node object ID—never prompt or path text. Tombstones take precedence over every node, link, and index representation during import and projection.
 
 ## 8. Software Architecture
 
@@ -313,7 +319,7 @@ This is the heartbeat of the system.
     
     - _Trigger:_ Model finishes streaming response.
         
-    - _Payload:_ `{ "response": "I fixed it.", "chain_of_thought": "...", "model": "gpt-4" }`
+    - _Payload:_ `{ "response": "I fixed it.", "model": "gpt-4" }` plus optional reasoning only when the provider exposes it.
         
 
 ### 9.3 Artifact Linking
@@ -415,7 +421,7 @@ To ensure data integrity without disrupting the developer's flow, CVC employs an
 
 - **Logic:** Interactions are committed to the SQLite database immediately upon the completion of a turn (`$/cvc/turn/end`).
     
-- **Rationale:** We cannot rely on memory buffers. IDE crashes, window reloads, or power failures would result in the loss of the "Chain of Thought."
+- **Rationale:** We cannot rely on memory buffers. IDE crashes, window reloads, or power failures would otherwise lose the locally available interaction record.
     
 - **State:** At this stage, interactions are considered **"Floating"**. They exist, they are searchable, but they are not yet attached to a permanent Git artifact (Commit SHA).
     
@@ -452,19 +458,20 @@ To enable collaboration without requiring a dedicated database server, CVC utili
 
 ### 12.2 The Sync Mechanism
 
-Sync format v3 stores a `FORMAT` marker and this append-only layout:
+The reader is compatible with sync formats **v1 through v4**. New outbound projections write format **v4**. V4 retains legacy-compatible node and link forms and adds tombstones:
 
 ```text
 nodes/<id[0..2]>/<interaction-id>.json   # immutable interaction node
 by-commit/<commit-sha>/<interaction-id>  # zero-byte lookup index
 links/<interaction-id>/<commit-sha>.json # immutable automatic-link event
+tombstones/<id[0..2]>/<interaction-id>.json # immutable suppression record
 ```
 
-Interaction IDs are UUIDs; the JSON blobs are Git objects and therefore content-addressed separately. The `links/` event stream preserves node immutability: an interaction first pushed while floating can acquire an automatic link in a later push. A push upgrades a v2 `FORMAT` marker to v3 without rewriting existing nodes.
+Interaction IDs are UUIDs; they are not Git content addresses. The JSON blobs are content-addressed Git objects separately. The `links/` event stream preserves node immutability: an interaction first pushed while floating can acquire an automatic link later. Tombstones are applied before nodes and suppress all legacy and sharded representations of their target. They are suppression records, not proof of physical object deletion.
 
 **1. The Push Flow (Hydration):**
 
-- **Trigger:** User runs `git cvc push` (or hooked into `git push`).
+- **Trigger:** A user explicitly shares a conversation for a destination and then runs `cvc push --manual --remote <name>`, or enables destination-specific auto-push after separate acknowledgement. A bare `cvc push` is auto-consent-gated.
     
 - **Scan:** CVC identifies new, un-synced Interaction Nodes in the local SQLite DB.
     
@@ -474,7 +481,11 @@ Interaction IDs are UUIDs; the JSON blobs are Git objects and therefore content-
     
 - **Update Ref:** The `refs/cvc/main` ref is updated to point to this new Tree.
     
-- **Transport:** The custom ref is pushed to the remote (`git push origin refs/cvc/main`).
+- **Transport:** The custom ref is pushed only after destination consent and the required manual TTY acknowledgement (unless that destination has acknowledged auto-push).
+
+**3. Redaction and local cleanup:** `cvc redact` confirms an authorized interaction and creates a pending, destination-scoped tombstone. The required next command is `cvc push --manual --remote <name>`, which projects that tombstone. A later `redact` may build a `RedactionPlan` only after the fetched v4 baseline contains the tombstone; `--apply-local` changes only the local current CVC ref. `cvc delete-local` is local suppression and never propagates.
+
+Tombstones are suppression, not physical erasure. SQLite uses `secure_delete` and attempts `wal_checkpoint(TRUNCATE)` followed by `VACUUM` after logical deletion, but those best-effort operations cannot guarantee removal from filesystem layers, SSD wear leveling, snapshots, backups, failed-operation WAL remnants, or immutable Git objects. Rotate exposed credentials first. Remote hard rewrite is unsupported pending an atomic force-with-lease design; no blind force-push procedure is supported.
     
 
 **2. The Pull Flow (Ingestion):**
@@ -503,13 +514,14 @@ Interaction IDs are UUIDs; the JSON blobs are Git objects and therefore content-
 
 While the Core Architecture is defined, the following areas represent edge cases and complex features deferred for future refinement.
 
-### 13.1 Security & Secret Sanitization
+### 13.1 Implemented privacy, secret detection, and retention caveats
 
 - **The Risk:** Since interactions are synced to the remote, accidental pasting of API keys in chat could lead to permanent leaks in the Git Object DB.
     
-- **Potential Solution:** An active scrubber/filter running in the Proxy/LSP layer that masks patterns matching common keys (`sk-...`, `AWS...`) before writing to SQLite.
-    
-- **Mechanism:** Implementation of a `.thoughtignore` file for pattern matching.
+- **Implemented boundary:** Aggregate capture is sanitized before any capture transaction. Built-in bounded detectors cover several high-confidence credential forms and credential-bearing JSON keys; a repository `.thoughtignore` can add path exclusions and literal/regex masks. Detection is defense in depth, not a guarantee: novel encodings, secrets not matching a detector, and data already copied elsewhere may remain. Never put secrets in `.thoughtignore` itself.
+- **Retention:** `cvc delete-local` creates local suppression and never propagates. `cvc redact` creates a pending destination tombstone; project it next with `cvc push --manual --remote <name>`. A remote tombstone hides the target from future CVC projections for that destination, but does not erase already reachable Git objects. SQLite `secure_delete`, WAL checkpoint/truncation, and `VACUUM` are best-effort local cleanup only. Rotate exposed credentials first. Host support/removal requests are best effort; clones, forks, reflogs, caches, backups, filesystem layers, SSD wear leveling, and snapshots may preserve data.
+- **Protected rewrite:** `RedactionPlan` is a 0600 local plan built against a freshly fetched v4 baseline. `--apply-local` switches only local `refs/cvc/main`; it does not guarantee deletion. Remote hard rewrite is **not implemented** until an atomic force-with-lease transport exists. No blind force command is a supported recovery procedure.
+- **Reference:** See [Privacy.md](../Privacy.md) for the exact implemented `.thoughtignore` syntax, bounds, validation, and fail-closed behavior.
     
 
 ### 13.2 Garbage Collection (The "Floating Node" Buildup)
@@ -530,7 +542,7 @@ While the Core Architecture is defined, the following areas represent edge cases
 
 - **The Need:** A user may want to commit the code publicly but keep the conversation private (e.g., "Explain this basic concept to me").
     
-- **Potential Solution:** A `private` flag in the `interactions` table. The "Push" mechanism filters these out, ensuring they remain local-only.
+- **Implemented:** Interactions are private by default. Sharing records an exact current conversation snapshot for one remote; `--future` separately opts future turns into sharing for that remote. Consent is a separate, destination-fingerprinted acknowledgement, and auto-push is off until separately acknowledged.
     
 
 ### 13.5 Large Context Blobs

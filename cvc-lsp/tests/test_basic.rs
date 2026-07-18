@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,11 +38,26 @@ fn send(stdin: &mut ChildStdin, msg: &Value) {
     stdin.flush().unwrap();
 }
 
+/// Tests must reap the LSP even when an assertion panics; `kill` alone leaves
+/// a zombie until the test process exits.
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Block until a message matching `pred` arrives, draining (and discarding)
 /// any other notifications in between. Panics on timeout or a closed channel
 /// rather than hanging, so a broken protocol fails the test instead of
 /// stalling CI.
-fn wait_for(rx: &mpsc::Receiver<Value>, timeout: Duration, mut pred: impl FnMut(&Value) -> bool) -> Value {
+fn wait_for(
+    rx: &mpsc::Receiver<Value>,
+    timeout: Duration,
+    mut pred: impl FnMut(&Value) -> bool,
+) -> Value {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -59,15 +74,17 @@ fn wait_for(rx: &mpsc::Receiver<Value>, timeout: Duration, mut pred: impl FnMut(
 
 #[test]
 fn test_lsp_turn_lifecycle() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cvc-lsp"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn cvc-lsp");
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_cvc-lsp"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn cvc-lsp"),
+    );
 
-    let mut stdin = child.stdin.take().expect("Failed to open stdin");
-    let stdout = child.stdout.take().expect("Failed to open stdout");
+    let mut stdin = child.0.stdin.take().expect("Failed to open stdin");
+    let stdout = child.0.stdout.take().expect("Failed to open stdout");
 
     // Continuously drain and parse framed messages on a background thread so
     // the child's stdout pipe never backs up. cvc-lsp emits several
@@ -100,12 +117,35 @@ fn test_lsp_turn_lifecycle() {
         }),
     );
 
-    let init_response = wait_for(&rx, Duration::from_secs(5), |m| m.get("id") == Some(&json!(1)));
+    let init_response = wait_for(&rx, Duration::from_secs(5), |m| {
+        m.get("id") == Some(&json!(1))
+    });
     assert!(
         init_response["result"]["capabilities"].is_object(),
         "unexpected initialize response: {:?}",
         init_response
     );
+
+    // Privacy status is a read-only request: it returns policy metadata only
+    // and does not acknowledge capture or accept an acknowledgement parameter.
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "cvc/privacy/status",
+            "params": {}
+        }),
+    );
+    let privacy_response = wait_for(&rx, Duration::from_secs(5), |m| {
+        m.get("id") == Some(&json!(2))
+    });
+    assert_eq!(privacy_response["result"]["privateByDefault"], true);
+    assert_eq!(
+        privacy_response["result"]["passiveCaptureAllowed"],
+        privacy_response["result"]["captureAcknowledged"]
+    );
+    assert!(privacy_response["result"].get("prompt").is_none());
 
     // 2. Initialized
     send(
@@ -163,7 +203,4 @@ fn test_lsp_turn_lifecycle() {
         "turn/end did not save the interaction: {:?}",
         completion["params"]["message"]
     );
-
-    // Cleanup
-    child.kill().unwrap();
 }

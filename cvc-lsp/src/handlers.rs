@@ -2,12 +2,65 @@ use crate::protocol::*;
 use crate::state::AppState;
 use chrono::Utc;
 use cvc_core::models::{Author, Conversation, Interaction, InteractionId};
+use cvc_core::privacy::{LspExplicitCapture, LspPassiveCapture, PreparedPolicy};
 use cvc_core::vscode::ChatRequest;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::task;
 use tower_lsp::lsp_types::MessageType;
 use tower_lsp::Client;
+
+const CAPTURE_NOTICE_VERSION: u32 = 1;
+
+/// Return policy metadata only. Acknowledgement remains a CLI operation so an
+/// LSP client cannot silently grant capture consent.
+pub async fn handle_privacy_status(state: Arc<AppState>) -> PrivacyStatusResponse {
+    task::spawn_blocking(move || {
+        let root = state.root_path.lock().ok().and_then(|path| path.clone());
+        let acknowledged = root
+            .as_deref()
+            .and_then(|path| git2::Repository::open(path).ok())
+            .and_then(|repo| cvc_core::privacy::capture_acknowledged(&repo).ok())
+            .unwrap_or(false);
+
+        let (sharing_summary, auto_push_enabled) = root
+            .as_deref()
+            .and_then(|path| git2::Repository::open(path).ok())
+            .and_then(|repo| cvc_core::privacy::privacy_status(&repo, "origin").ok())
+            .map(|status| {
+                if status.sharing_consented {
+                    if status.auto_push {
+                        ("Sharing to the configured remote is consented; automatic push is enabled.".to_string(), true)
+                    } else {
+                        ("Sharing to the configured remote is consented; automatic push is disabled.".to_string(), false)
+                    }
+                } else {
+                    ("No remote sharing consent is configured; automatic push is disabled.".to_string(), false)
+                }
+            })
+            .unwrap_or_else(|| ("No remote sharing consent is configured; automatic push is disabled.".to_string(), false));
+
+        PrivacyStatusResponse {
+            capture_acknowledged: acknowledged,
+            capture_notice_version: CAPTURE_NOTICE_VERSION,
+            passive_capture_allowed: acknowledged,
+            private_by_default: true,
+            private_default_statement: "Captured interactions are private by default.".to_string(),
+            sharing_summary,
+            auto_push_enabled,
+        }
+    })
+    .await
+    .unwrap_or_else(|_| PrivacyStatusResponse {
+        capture_acknowledged: false,
+        capture_notice_version: CAPTURE_NOTICE_VERSION,
+        passive_capture_allowed: false,
+        private_by_default: true,
+        private_default_statement: "Captured interactions are private by default.".to_string(),
+        sharing_summary: "Privacy status is unavailable; no passive capture is allowed.".to_string(),
+        auto_push_enabled: false,
+    })
+}
 
 pub async fn handle_session_start(
     client: &Client,
@@ -17,24 +70,13 @@ pub async fn handle_session_start(
     client
         .log_message(
             MessageType::INFO,
-            format!(
-                "Session started: {} (TS: {:?})",
-                params.title, params.timestamp
-            ),
+            format!("Session started (TS: {:?})", params.timestamp),
         )
         .await;
 }
 
 pub async fn handle_turn_start(client: &Client, state: Arc<AppState>, params: TurnStartParams) {
-    client
-        .log_message(
-            MessageType::INFO,
-            format!(
-                "Turn started (ID: {}). Prompt: {}",
-                params.id, params.prompt
-            ),
-        )
-        .await;
+    client.log_message(MessageType::INFO, "Turn started").await;
 
     // Concurrent insert
     state.pending_turns.insert(params.id, params.prompt);
@@ -70,7 +112,7 @@ pub async fn handle_turn_end(client: &Client, state: Arc<AppState>, params: Turn
         user_prompt: prompt,
         model_name: params.model,
         model_cot: params.chain_of_thought,
-        model_response: model_response,
+        model_response,
         source_request_id: None,
     };
 
@@ -80,17 +122,26 @@ pub async fn handle_turn_end(client: &Client, state: Arc<AppState>, params: Turn
         let store_guard = state_clone.store.lock().expect("CVC Store mutex poisoned");
 
         if let Some(store) = store_guard.as_ref() {
-            // Ensure conversation exists before creating interaction (FK constraint)
-            let conv_id = &interaction.conversation_id;
-            if store.get_conversation(conv_id)?.is_none() {
-                store.create_conversation(&Conversation {
-                    id: conv_id.clone(),
-                    title: "Copilot Chat Session".to_string(),
+            let policy = state_clone
+                .root_path
+                .lock()
+                .ok()
+                .and_then(|p| p.clone())
+                .map(|root| PreparedPolicy::load(&root))
+                .transpose()
+                .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?
+                .unwrap_or_else(PreparedPolicy::built_ins_only);
+            store.capture_lsp_explicit(LspExplicitCapture::new(
+                Conversation {
+                    id: interaction.conversation_id.clone(),
+                    title: "Copilot Chat Session".into(),
                     created_at: Utc::now(),
-                })?;
-            }
-
-            store.create_interaction(&interaction)
+                },
+                interaction,
+                Vec::new(),
+                Vec::new(),
+                policy,
+            ))
         } else {
             Err(cvc_core::db::DbError::Migration("DB not open".to_string()))
         }
@@ -129,33 +180,35 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
     client
         .log_message(
             MessageType::INFO,
-            format!(
-                "Turn batch (source: {}, session: {}, segments: {})",
-                params.source_request_id, params.session_id, segment_count
-            ),
+            format!("Turn batch received (segments: {})", segment_count),
         )
         .await;
 
     let state_clone = state.clone();
     let client_clone = client.clone();
-    let source_id_for_log = params.source_request_id.clone();
 
     let result = task::spawn_blocking(move || {
         let store_guard = state_clone.store.lock().expect("CVC Store mutex poisoned");
 
         if let Some(store) = store_guard.as_ref() {
-            // Ensure conversation exists
-            if store.get_conversation(&params.session_id)?.is_none() {
-                store.create_conversation(&Conversation {
-                    id: params.session_id.clone(),
-                    title: "Copilot Chat Session".to_string(),
-                    created_at: Utc::now(),
-                })?;
+            let root = state_clone.root_path.lock().ok().and_then(|p| p.clone());
+            let repo_root = root.as_deref().ok_or_else(|| {
+                cvc_core::db::DbError::Migration(
+                    "consent-required: repository is unavailable".into(),
+                )
+            })?;
+            let repo = git2::Repository::open(repo_root).map_err(|_| {
+                cvc_core::db::DbError::Migration(
+                    "consent-required: repository is unavailable".into(),
+                )
+            })?;
+            if !cvc_core::privacy::capture_acknowledged(&repo)
+                .map_err(|e| cvc_core::db::DbError::Migration(format!("consent-required: {e}")))?
+            {
+                return Err(cvc_core::db::DbError::Migration(
+                    "consent-required: acknowledge capture before passive collection".into(),
+                ));
             }
-
-            // Delete previous interactions from this source request (deduplication)
-            store.delete_interactions_by_source_request_id(&params.source_request_id)?;
-
             // Insert new segmented interactions with parent chaining.
             // Use a base timestamp with per-segment offset to guarantee unique,
             // ordered timestamps. Without this, all segments in a batch land on
@@ -165,16 +218,18 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
             let base_timestamp = Utc::now()
                 - chrono::Duration::seconds(params.interactions.len().saturating_sub(1) as i64);
             let mut previous_id: Option<InteractionId> = None;
+            let policy = root
+                .as_deref()
+                .map(PreparedPolicy::load)
+                .transpose()
+                .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?
+                .unwrap_or_else(PreparedPolicy::built_ins_only);
+            let mut captures = Vec::with_capacity(params.interactions.len());
 
             for (i, segment) in params.interactions.iter().enumerate() {
                 let id = InteractionId::new();
 
-                let author = match segment.author {
-                    Author::Human => Author::Human,
-                    Author::Agent => Author::Agent,
-                    Author::System => Author::System,
-                    Author::External => Author::External,
-                };
+                let author = segment.author.clone();
 
                 let interaction = Interaction {
                     id: id.clone(),
@@ -189,11 +244,20 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
                     source_request_id: Some(params.source_request_id.clone()),
                 };
 
-                store.create_interaction(&interaction)?;
+                captures.push(LspPassiveCapture::new(
+                    Conversation {
+                        id: interaction.conversation_id.clone(),
+                        title: "Copilot Chat Session".into(),
+                        created_at: Utc::now(),
+                    },
+                    interaction,
+                    Vec::new(),
+                    Vec::new(),
+                    policy.clone(),
+                ));
                 previous_id = Some(id);
             }
-
-            Ok(())
+            store.replace_lsp_passive_capture_batch(&params.source_request_id, captures)
         } else {
             Err(cvc_core::db::DbError::Migration("DB not open".to_string()))
         }
@@ -205,10 +269,7 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
             client_clone
                 .log_message(
                     MessageType::INFO,
-                    format!(
-                        "Batch saved: {} segments for source {}",
-                        segment_count, source_id_for_log
-                    ),
+                    format!("Batch saved: {} segments", segment_count),
                 )
                 .await;
         }
@@ -348,8 +409,7 @@ pub async fn handle_timeline_get(
                 .into_iter()
                 .take(max_items)
                 .map(|(sha, interactions)| {
-                    let (message, timestamp) =
-                        get_commit_info(&sha.as_str(), root_path.as_ref().map(|p| p.as_path()));
+                    let (message, timestamp) = get_commit_info(sha.as_str(), root_path.as_deref());
 
                     CommitWithThoughts {
                         sha: sha.as_str().to_string(),

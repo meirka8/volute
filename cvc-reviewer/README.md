@@ -37,10 +37,26 @@ npm run dev
 npm run build
 ```
 
-## CVC sync compatibility
+## CVC sync compatibility and retention
 
-The reviewer reads legacy node-embedded artifact links and sync format v3's
-append-only `links/<interaction-id>/<commit-sha>.json` records. Temporal links are
-shown as **lower confidence** because they are inferred from timing rather than file
-context. Linking-identity attribution (the configured repository signature email) is
-retained for data compatibility but is not shown as a public timeline badge.
+The reviewer reads CVC sync formats v1–v4, including legacy node-embedded links and
+append-only `links/<interaction-id>/<commit-sha>.json` records. Format v4 adds
+destination-scoped tombstones. Tombstones are loaded before nodes and win over every
+legacy or sharded node representation, so tombstoned interactions are not rendered.
+The reviewer evicts the corresponding `cvc-node` query-cache entry when it observes a
+tombstone; it refuses malformed/truncated tombstone trees rather than showing an
+incomplete timeline. Immutable cognitive entries may be retained in this browser's
+IndexedDB query cache for up to 30 days. Tombstones drive eviction from both memory and
+that persisted projection; logout and account/PAT transitions clear all reviewer
+React Query and IndexedDB caches.
+
+A tombstone is CVC projection suppression, **not** proof that the underlying Git
+object was physically erased. Browser query cache eviction only removes this app's
+in-memory/query-cache view; it cannot remove data retained by GitHub, a browser
+session, developer tools, downloaded responses, clones, forks, reflogs, caches, or
+backups. The PAT is retained in browser session storage in the current implementation;
+use a private browser context and clear its session data when appropriate.
+
+Temporal links are shown as **lower confidence** because they are inferred from timing
+rather than file context. Interaction IDs are UUIDs, not Git content addresses.
+Linking-identity attribution is retained for compatibility but is not a public badge.

@@ -1,6 +1,7 @@
 use crate::server::{AppState, JsonRpcError};
 use chrono::Utc;
 use cvc_core::models::{Author, Conversation, Interaction, InteractionId};
+use cvc_core::privacy::{McpCapture, PreparedPolicy};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -186,16 +187,6 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
             .or(session_conversation_id)
             .unwrap_or_else(|| "agent-session-default".to_string());
 
-        // Covers both a client-supplied conversation_id we haven't seen before and
-        // the fallback default when no MCP `initialize` handshake set up a session.
-        if store.get_conversation(&conversation_id)?.is_none() {
-            store.create_conversation(&Conversation {
-                id: conversation_id.clone(),
-                title: format!("Session {}", conversation_id),
-                created_at: Utc::now(),
-            })?;
-        }
-
         let interaction = Interaction {
             id: InteractionId::new(),
             conversation_id,
@@ -209,7 +200,18 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
             source_request_id: None,
         };
 
-        store.create_interaction(&interaction)?;
+        let policy = PreparedPolicy::load(&std::env::current_dir()?)?;
+        store.capture_mcp(McpCapture::new(
+            Conversation {
+                id: interaction.conversation_id.clone(),
+                title: format!("Session {}", interaction.conversation_id),
+                created_at: Utc::now(),
+            },
+            interaction.clone(),
+            Vec::new(),
+            Vec::new(),
+            policy,
+        ))?;
         Ok::<_, anyhow::Error>(interaction.id)
     })
     .await
@@ -341,7 +343,12 @@ async fn sync_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRp
             .lock()
             .map_err(|_| anyhow::anyhow!("Failed to lock store"))?;
 
-        let new_count = cvc_core::sync::fetch_and_pull(&repo, &store, &remote_name)?;
+        let destination = cvc_core::privacy::remote_destination(&repo, &remote_name)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let _operation_lock =
+            cvc_core::privacy::destination_operation_lock(&repo, &destination.fingerprint)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let new_count = cvc_core::sync::fetch_and_pull_destination(&repo, &store, &destination)?;
         Ok::<_, anyhow::Error>((remote_name, new_count))
     })
     .await

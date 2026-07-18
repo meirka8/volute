@@ -46,11 +46,24 @@ fn test_install_creates_hooks() -> anyhow::Result<()> {
     assert!(post_commit.contains("cvc hook post-commit"));
 
     let pre_push = fs::read_to_string(hooks_dir.join("pre-push"))?;
-    assert!(pre_push.contains("cvc push"));
+    assert!(pre_push.contains("cvc hook pre-push"));
 
     let post_merge = fs::read_to_string(hooks_dir.join("post-merge"))?;
     assert!(post_merge.contains("cvc pull"));
 
+    Ok(())
+}
+
+#[test]
+fn test_install_upgrades_legacy_pre_push_without_duplication() -> anyhow::Result<()> {
+    let (tmp, _) = setup_repo();
+    let hook = tmp.path().join(".git/hooks/pre-push");
+    fs::write(&hook, "#!/bin/sh\n# CVC Hook\ncvc push\n")?;
+    hooks::install(tmp.path())?;
+    let content = fs::read_to_string(hook)?;
+    assert!(content.contains("cvc hook pre-push"));
+    assert!(!content.contains("\ncvc push\n"));
+    assert_eq!(content.matches("# CVC Hook").count(), 1);
     Ok(())
 }
 

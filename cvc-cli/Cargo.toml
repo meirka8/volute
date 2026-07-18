@@ -24,4 +24,5 @@ directories = "5.0"
 flate2 = "1.0"
 tar = "0.4"
 zip = "0.6"
-
+sha2 = "0.10"
+hex = "0.4"

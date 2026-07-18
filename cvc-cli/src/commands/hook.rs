@@ -15,14 +15,23 @@ pub async fn post_commit() -> Result<()> {
     Ok(()) // Explicitly return Ok to ensure we don't fail the hook script
 }
 
+/// Pre-push is intentionally advisory: CVC failure must never block a code push.
+pub async fn pre_push() -> Result<()> {
+    let cwd = env::current_dir()?;
+    if let Err(error) = crate::commands::sync::auto_push(&cwd).await {
+        eprintln!("CVC: sync skipped ({error})");
+    }
+    Ok(())
+}
+
 fn run_post_commit_logic(current_dir: &std::path::Path) -> Result<()> {
-    let cvc_dir = current_dir.join(".git").join("cvc");
+    let repo = Repository::open(current_dir).context("Failed to open git repository")?;
+    let cvc_dir = cvc_core::privacy::common_git_dir(&repo).join("cvc");
     if !cvc_dir.exists() {
         // Not initialized, do nothing
         return Ok(());
     }
 
-    let repo = Repository::open(current_dir).context("Failed to open git repository")?;
     let db_path = cvc_dir.join("index.db");
     let store = CvcStore::open_initialized(&db_path)?; // Hook caller still swallows all errors.
 

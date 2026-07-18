@@ -3,6 +3,7 @@ use chrono::Utc;
 use cvc_core::db::CvcStore;
 use cvc_core::git::{self, open_repo};
 use cvc_core::models::{Author, Interaction, InteractionId};
+use cvc_core::privacy::{CliRunCapture, PreparedPolicy};
 use std::env;
 use std::process::{Command, Stdio};
 use uuid::Uuid;
@@ -14,6 +15,14 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     let current_dir = env::current_dir()?;
     let cvc_dir = current_dir.join(".git").join("cvc");
     let db_path = cvc_dir.join("index.db");
+    // Load once before opening the repository or inspecting status/diffs. This
+    // exact policy snapshot is later handed to persistence.
+    let policy = if cvc_dir.exists() {
+        PreparedPolicy::load(&current_dir)
+            .map_err(|error| anyhow::anyhow!("CVC capture blocked by .thoughtignore: {error}"))?
+    } else {
+        PreparedPolicy::built_ins_only()
+    };
 
     // 1. Snapshot Context (Git State)
     let mut context_items = Vec::new();
@@ -22,6 +31,10 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     if cvc_dir.exists() {
         if let Ok(repo) = open_repo(&current_dir) {
             if let Ok(dirty_files) = git::get_dirty_files(&repo) {
+                let dirty_files: Vec<String> = dirty_files
+                    .into_iter()
+                    .filter(|path| !policy.ignores_path(path))
+                    .collect();
                 // Generate temporary ID to associate context
                 let temp_id = InteractionId::new();
 
@@ -77,17 +90,6 @@ pub async fn run(args: Vec<String>) -> Result<()> {
                 // For now, unique per run as requested.
                 let session_id = format!("run-{}", Uuid::new_v4());
 
-                // Ensure session exists
-                if let Err(e) = store.create_conversation(&cvc_core::models::Conversation {
-                    id: session_id.clone(),
-                    title: format!("Run: {}", cmd_name),
-                    created_at: Utc::now(),
-                }) {
-                    // Optimization: create_conversation might fail if ID exists? unique so unlikely.
-                    // But if db error, log it.
-                    eprintln!("CVC Warning: Failed to create conversation: {}", e);
-                }
-
                 // Update context items with real ID
                 let final_context_items: Vec<_> = context_items
                     .into_iter()
@@ -110,14 +112,18 @@ pub async fn run(args: Vec<String>) -> Result<()> {
                     source_request_id: None,
                 };
 
-                if let Err(e) = store.create_interaction(&interaction) {
+                if let Err(e) = store.capture_cli_run(CliRunCapture::new(
+                    cvc_core::models::Conversation {
+                        id: interaction.conversation_id.clone(),
+                        title: format!("Run: {cmd_name}"),
+                        created_at: Utc::now(),
+                    },
+                    interaction,
+                    final_context_items,
+                    Vec::new(),
+                    policy,
+                )) {
                     eprintln!("CVC Warning: Failed to save interaction: {}", e);
-                } else {
-                    for item in final_context_items {
-                        if let Err(e) = store.add_context_item(&item) {
-                            eprintln!("CVC Warning: Failed to save context item: {}", e);
-                        }
-                    }
                 }
             }
             Err(e) => {

@@ -1,6 +1,8 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "../auth/AuthContext";
 import { createGithubClient } from "../api/github";
+import { fetchCanonicalTombstones } from "./usePRInteractions";
+import { purgeCognitiveCache } from "../lib/cognitiveCache";
 import {
   normalizeInteraction,
   type CVCBlobData,
@@ -22,6 +24,7 @@ async function fetchBlobJson<T>(url: string, token: string): Promise<T> {
 
 export function useCVCBlobs(owner: string, repo: string) {
   const { isAuthenticated, acquireToken } = useAuth();
+  const queryClient = useQueryClient();
 
   return useQuery({
     queryKey: ["cvc-blobs", owner, repo],
@@ -46,14 +49,57 @@ export function useCVCBlobs(owner: string, repo: string) {
 
         const treeSha = refData.object.sha;
 
+        const { data: rootTree } = await client.octokit.rest.git.getTree({
+          owner, repo, tree_sha: treeSha, recursive: "false",
+        });
+        if (rootTree.truncated) {
+          purgeCognitiveCache(queryClient, owner, repo);
+          throw new Error("CVC root tree is truncated; refusing incomplete history");
+        }
+        const tombstoneRoot = rootTree.tree.find((item) => item.path === "tombstones");
+        if (tombstoneRoot && tombstoneRoot.type !== "tree") {
+          purgeCognitiveCache(queryClient, owner, repo);
+          throw new Error("CVC tombstones root must be a tree");
+        }
+        const format = rootTree.tree.find((item) => item.path === "FORMAT");
+        if (format) {
+          if (format.type !== "blob") {
+            purgeCognitiveCache(queryClient, owner, repo);
+            throw new Error("CVC FORMAT must be a blob");
+          }
+          const response = await fetch(format.url!, { headers: { Authorization: `token ${currentToken}`, Accept: "application/vnd.github.v3.raw" } });
+          if (!response.ok || !/^[1-4]\s*$/.test(await response.text())) {
+            purgeCognitiveCache(queryClient, owner, repo);
+            throw new Error("Unsupported or malformed CVC FORMAT");
+          }
+        }
+        // 2. Fetch and validate v4 tombstones first. They suppress legacy and
+        // sharded nodes alike, regardless of tree order.
+        let tombstoned = new Set<string>();
+        if (tombstoneRoot) {
+          if (!tombstoneRoot.sha) {
+            purgeCognitiveCache(queryClient, owner, repo);
+            throw new Error("CVC tombstones root is missing its tree SHA");
+          }
+          try {
+            tombstoned = await fetchCanonicalTombstones(client, owner, repo, tombstoneRoot.sha, currentToken);
+          } catch (error) {
+            purgeCognitiveCache(queryClient, owner, repo);
+            throw error;
+          }
+        }
+        for (const id of tombstoned) queryClient.removeQueries({ queryKey: ["cvc-node", owner, repo, id], exact: true });
         const { data: treeData } = await client.octokit.rest.git.getTree({
           owner,
           repo,
           tree_sha: treeSha,
           recursive: "true",
         });
-
-        // 2. Only node blobs are interaction documents. Format-v3 also contains
+        if (treeData.truncated) {
+          purgeCognitiveCache(queryClient, owner, repo);
+          throw new Error("CVC history tree is truncated; refusing incomplete history");
+        }
+        // Only node blobs are interaction documents. Format-v3 also contains
         // FORMAT, by-commit pointers, and append-only links/* records; parsing any
         // of those as a node would corrupt this diagnostic view.
         const blobs = treeData.tree.filter(
@@ -61,7 +107,8 @@ export function useCVCBlobs(owner: string, repo: string) {
             item.type === "blob" &&
             !!item.path &&
             (item.path.startsWith("nodes/") ||
-              (!item.path.includes("/") && item.path.endsWith(".json"))),
+              (!item.path.includes("/") && item.path.endsWith(".json"))) &&
+            !tombstoned.has(item.path.split("/").pop()!.replace(/\.json$/, "")),
         );
 
         // 3. Fetch all blobs in parallel and normalize them

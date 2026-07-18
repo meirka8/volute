@@ -3,9 +3,11 @@ import { useAuth } from "../auth/AuthContext";
 import { createGithubClient, type GithubClient } from "../api/github";
 import { CommitRanger } from "../lib/CommitRanger";
 import { InteractionMapper } from "../lib/InteractionMapper";
+import { purgeCognitiveCache } from "../lib/cognitiveCache";
 import {
   normalizeInteraction,
   mergeArtifactLinks,
+  validTombstone,
   type CVCBlobData,
   type CVCLinkRecord,
   type InteractionNode,
@@ -19,6 +21,8 @@ const CVC_REF = "cvc/main";
 const LEGACY_FETCH_CAP = 200;
 
 const BATCH_SIZE = 10;
+const TOMBSTONE_MAX_COUNT = 10_000;
+const TOMBSTONE_MAX_BYTES = 16 * 1024 * 1024;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/i;
 
@@ -42,6 +46,93 @@ function isNotFound(error: unknown): boolean {
 function idFromBlobPath(path: string): string {
   const base = path.split("/").pop() ?? path;
   return base.endsWith(".json") ? base.slice(0, -".json".length) : base;
+}
+
+/** Only historical node locations participate in legacy traversal. */
+function isLegacyNodePath(path: string): boolean {
+  const parts = path.split("/");
+  if (!path.endsWith(".json")) return false;
+  // v1 had no UUID/path protocol; accept a flat JSON node but explicitly
+  // exclude known protocol metadata rather than accidentally parsing it.
+  if (parts.length === 1) return !["FORMAT.json", "metadata.json", "tombstone.json"].includes(path);
+  return parts.length === 3 && parts[0] === "nodes" && parts[1] === idFromBlobPath(path).slice(0, 2) && isInteractionId(idFromBlobPath(path));
+}
+
+type GitTreeEntry = { path?: string; type?: string; url?: string; sha?: string; size?: number };
+
+const CANONICAL_TOMBSTONE_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/**
+ * Validate the *entire* reserved tombstones namespace before reading a payload.
+ *
+ * This deliberately does not merely filter valid-looking blobs: accepting a valid
+ * sibling while ignoring an unexpected entry makes a malformed security namespace
+ * look trustworthy. Git's recursive tree response includes both shard trees and
+ * blobs, which lets us reject files, commits, or nested directories at every level.
+ */
+export function validateTombstoneTree(entries: GitTreeEntry[]): { id: string; url: string }[] {
+  const shards = new Set<string>();
+  const blobs: { id: string; shard: string; url: string }[] = [];
+  const paths = new Set<string>();
+  const ids = new Set<string>();
+
+  for (const entry of entries) {
+    const path = entry.path;
+    if (!path || path === "tombstones" || !path.startsWith("tombstones/")) continue;
+    if (paths.has(path)) throw new Error(`Duplicate CVC tombstone tree entry: ${path}`);
+    paths.add(path);
+
+    const parts = path.split("/");
+    if (parts.length === 2) {
+      if (entry.type !== "tree" || !/^[0-9a-f]{2}$/.test(parts[1])) {
+        throw new Error(`Invalid CVC tombstone shard: ${path}`);
+      }
+      shards.add(parts[1]);
+      continue;
+    }
+
+    if (parts.length !== 3 || entry.type !== "blob") {
+      throw new Error(`Invalid CVC tombstone tree entry: ${path}`);
+    }
+    const shard = parts[1];
+    const filename = parts[2];
+    const id = filename.endsWith(".json") ? filename.slice(0, -".json".length) : "";
+    if (
+      !/^[0-9a-f]{2}$/.test(shard) ||
+      !CANONICAL_TOMBSTONE_UUID.test(id) ||
+      filename !== `${id}.json` ||
+      shard !== id.slice(0, 2) ||
+      !entry.url
+    ) {
+      throw new Error(`Invalid CVC tombstone path: ${path}`);
+    }
+    if (ids.has(id)) throw new Error(`Duplicate CVC tombstone ID: ${id}`);
+    ids.add(id);
+    blobs.push({ id, shard, url: entry.url });
+  }
+
+  for (const blob of blobs) {
+    if (!shards.has(blob.shard)) {
+      throw new Error(`CVC tombstone blob has no shard tree: ${blob.id}`);
+    }
+  }
+  return blobs;
+}
+
+function assertTombstoneBounds(entries: GitTreeEntry[]) {
+  if (entries.length > TOMBSTONE_MAX_COUNT) {
+    throw new Error("CVC tombstone enumeration exceeds the safe entry limit");
+  }
+  let declaredBytes = 0;
+  for (const entry of entries) {
+    if (entry.size === undefined) continue; // Older GitHub mocks/API variants omit it; decoded bytes remain bounded below.
+    if (!Number.isSafeInteger(entry.size) || entry.size < 0) throw new Error("Invalid CVC tombstone declared size");
+    declaredBytes += entry.size;
+    if (declaredBytes > TOMBSTONE_MAX_BYTES) {
+      throw new Error("CVC tombstones exceed the safe declared-byte limit");
+    }
+  }
 }
 
 function encodeGithubPath(path: string): string {
@@ -118,6 +209,19 @@ async function fetchBlobJson<T>(url: string, token: string): Promise<T> {
   return response.json();
 }
 
+async function fetchBoundedTombstone(url: string, token: string, remainingBytes: number): Promise<{ payload: unknown; bytes: number }> {
+  const response = await fetch(url, { headers: { Authorization: `token ${token}`, Accept: "application/vnd.github.v3.raw" } });
+  if (!response.ok) throw new Error(`Failed to fetch tombstone blob: ${response.statusText}`);
+  const raw = await response.text();
+  const bytes = new TextEncoder().encode(raw).byteLength;
+  if (bytes > remainingBytes) throw new Error("CVC tombstones exceed the safe decoded-byte limit");
+  try {
+    return { payload: JSON.parse(raw), bytes };
+  } catch {
+    throw new Error("Invalid CVC tombstone JSON");
+  }
+}
+
 /** Reads a v3 append-only link record. Missing records are normal for legacy links. */
 async function fetchLinkRecord(
   owner: string,
@@ -139,6 +243,70 @@ async function fetchLinkRecord(
     throw new Error(`Invalid v3 CVC link record at ${path}`);
   }
   return payload;
+}
+
+/** Enumerate every v4 tombstone at this ref, independent of projected node IDs. */
+/**
+ * Read the reserved namespace one directory at a time. GitHub truncates large
+ * recursive tree responses, and a partial tombstone list is unsafe: it could make
+ * a cached deleted node visible. Every listing is therefore checked for truncation.
+ */
+export async function fetchCanonicalTombstones(
+  client: GithubClient,
+  owner: string,
+  repo: string,
+  tombstonesTreeSha: string,
+  token: string,
+): Promise<Set<string>> {
+  const { data: tombstoneRoot } = await client.octokit.rest.git.getTree({
+    owner,
+    repo,
+    tree_sha: tombstonesTreeSha,
+    recursive: "false",
+  });
+  if (tombstoneRoot.truncated) {
+    throw new Error("CVC tombstones tree is truncated; refusing incomplete suppression data");
+  }
+  // Check the server response before descending into any shard. This prevents an
+  // oversized root listing from amplifying into thousands of follow-up requests.
+  assertTombstoneBounds(tombstoneRoot.tree);
+
+  const normalizedEntries: GitTreeEntry[] = [];
+  for (const shard of tombstoneRoot.tree) {
+    const shardPath = shard.path ?? "";
+    // Include it in structural validation before reading it, so a blob, commit, or
+    // malformed directory can never be skipped.
+    normalizedEntries.push({ ...shard, path: `tombstones/${shardPath}` });
+    assertTombstoneBounds(normalizedEntries);
+    if (shard.type !== "tree" || !/^[0-9a-f]{2}$/.test(shardPath)) continue;
+    if (!shard.sha) throw new Error(`CVC tombstone shard ${shardPath} is missing its tree SHA`);
+
+    const { data: shardTree } = await client.octokit.rest.git.getTree({
+      owner,
+      repo,
+      tree_sha: shard.sha,
+      recursive: "false",
+    });
+    if (shardTree.truncated) {
+      throw new Error(`CVC tombstone shard ${shardPath} is truncated; refusing incomplete suppression data`);
+    }
+    normalizedEntries.push(
+      ...shardTree.tree.map((entry) => ({ ...entry, path: `tombstones/${shardPath}/${entry.path ?? ""}` })),
+    );
+    assertTombstoneBounds(normalizedEntries);
+  }
+
+  const blobs = validateTombstoneTree(normalizedEntries);
+  if (blobs.length > TOMBSTONE_MAX_COUNT) throw new Error("CVC tombstone count exceeds the safe limit");
+  const tombstoned = new Set<string>();
+  let decodedBytes = 0;
+  for (const { id, url } of blobs) {
+    const { payload, bytes } = await fetchBoundedTombstone(url, token, TOMBSTONE_MAX_BYTES - decodedBytes);
+    decodedBytes += bytes;
+    if (!validTombstone(payload, id)) throw new Error(`Invalid CVC tombstone at ${id}`);
+    tombstoned.add(id);
+  }
+  return tombstoned;
 }
 
 // Path-based directory listing: resolves server-side in one request regardless of
@@ -207,6 +375,13 @@ function fetchNodeCached(
   });
 }
 
+function evictTombstonedNodes(queryClient: QueryClient, owner: string, repo: string, ids: Iterable<string>) {
+  for (const id of ids) {
+    // removeQueries updates the persisted dehydrated cache as well as memory.
+    queryClient.removeQueries({ queryKey: ["cvc-node", owner, repo, id], exact: true });
+  }
+}
+
 async function fetchNodesInBatches<T>(
   items: T[],
   fetchOne: (item: T) => Promise<InteractionNode>,
@@ -245,6 +420,7 @@ async function fetchLegacyCapped(
   treeSha: string,
   commitShas: string[],
   token: string,
+  tombstoned: Set<string>,
 ): Promise<PRInteractionsResult> {
   const { data: treeData } = await client.octokit.rest.git.getTree({
     owner,
@@ -252,9 +428,16 @@ async function fetchLegacyCapped(
     tree_sha: treeSha,
     recursive: "true",
   });
+  if (treeData.truncated) throw new Error("CVC legacy tree is truncated; refusing incomplete history");
 
   const blobs = treeData.tree.filter(
-    (item) => item.type === "blob" && item.path?.endsWith(".json"),
+    (item) =>
+      item.type === "blob" &&
+      item.path?.endsWith(".json") &&
+      !item.path.startsWith("tombstones/") &&
+      !item.path.startsWith("links/") &&
+      isLegacyNodePath(item.path) &&
+      !tombstoned.has(idFromBlobPath(item.path)),
   );
   const truncated = blobs.length > LEGACY_FETCH_CAP;
   const capped = blobs.slice(0, LEGACY_FETCH_CAP);
@@ -287,6 +470,7 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
   return useQuery<PRInteractionsResult>({
     queryKey: ["pr-interactions", owner, repo, prNumber],
     queryFn: async (): Promise<PRInteractionsResult> => {
+      const failClosed = () => purgeCognitiveCache(queryClient, owner, repo, prNumber);
       const token = await acquireToken(owner, repo);
       if (!token) throw new Error("Could not acquire token");
       const client = createGithubClient(token);
@@ -309,12 +493,16 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
       const ranger = new CommitRanger(client);
       const commitShas = await ranger.getCommitShas(owner, repo, prNumber);
 
-      const { data: rootTree } = await client.octokit.rest.git.getTree({
+       const { data: rootTree } = await client.octokit.rest.git.getTree({
         owner,
         repo,
         tree_sha: cvcMainSha,
-        recursive: "false",
-      });
+         recursive: "false",
+       });
+        if (rootTree.truncated) {
+          failClosed();
+         throw new Error("CVC root tree is truncated; refusing incomplete suppression data");
+       }
       const hasByCommitIndex = rootTree.tree.some(
         (entry) => entry.path === "by-commit" && entry.type === "tree",
       );
@@ -324,17 +512,60 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
       const hasV3LinkRecords = rootTree.tree.some(
         (entry) => entry.path === "links" && entry.type === "tree",
       );
+       const tombstonesEntry = rootTree.tree.find((entry) => entry.path === "tombstones");
+        if (tombstonesEntry && tombstonesEntry.type !== "tree") {
+          failClosed();
+         throw new Error("CVC tombstones root must be a tree");
+       }
+      const rawFormatEntry = rootTree.tree.find((entry) => entry.path === "FORMAT");
+       if (rawFormatEntry && rawFormatEntry.type !== "blob") {
+         failClosed();
+         throw new Error("CVC FORMAT must be a blob");
+       }
+       const formatEntry = rawFormatEntry;
+       if (formatEntry) {
+         let raw: string;
+         try {
+           raw = await fetchRawFile(owner, repo, "FORMAT", cvcMainSha, token);
+         } catch (error) {
+           failClosed();
+           throw error;
+         }
+          if (!/^[1-4]\s*$/.test(raw)) {
+            failClosed();
+            throw new Error("Unsupported or malformed CVC FORMAT");
+          }
+       }
 
-      if (!hasByCommitIndex) {
-        return fetchLegacyCapped(
+       // Projected by-commit directories intentionally omit deleted interactions,
+       // so they cannot be used to discover tombstones. Enumerate the complete
+       // reserved namespace on every ref tip before consulting any node cache.
+       let tombstonedIds = new Set<string>();
+       if (tombstonesEntry) {
+          if (!tombstonesEntry.sha) {
+            failClosed();
+           throw new Error("CVC tombstones root is missing its tree SHA");
+         }
+         try {
+           tombstonedIds = await fetchCanonicalTombstones(client, owner, repo, tombstonesEntry.sha, token);
+          } catch (error) {
+            failClosed();
+           throw error;
+         }
+       }
+       evictTombstonedNodes(queryClient, owner, repo, tombstonedIds);
+
+       if (!hasByCommitIndex) {
+         return fetchLegacyCapped(
           queryClient,
           client,
           owner,
           repo,
-          cvcMainSha,
-          commitShas,
-          token,
-        );
+           cvcMainSha,
+           commitShas,
+           token,
+           tombstonedIds,
+         );
       }
 
       const perCommitEntries = await Promise.all(
@@ -353,7 +584,9 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
         }
       }
 
-      const interactions = await fetchNodesInBatches(Array.from(ids), (id) =>
+       const visibleIds = new Set(Array.from(ids).filter((id) => !tombstonedIds.has(id)));
+
+      const interactions = await fetchNodesInBatches(Array.from(visibleIds), (id) =>
         fetchNodeCached(queryClient, owner, repo, id, async () => {
           const path = `nodes/${id.slice(0, 2)}/${id}.json`;
           const raw = await fetchRawFile(owner, repo, path, cvcMainSha, token);
@@ -363,7 +596,9 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
 
       const linkRecords = hasV3LinkRecords
         ? await fetchLinkRecordsInBatches(linkReferences, ({ interactionId, commitSha }) =>
-            fetchLinkRecord(owner, repo, interactionId, commitSha, cvcMainSha, token),
+            visibleIds.has(interactionId)
+              ? fetchLinkRecord(owner, repo, interactionId, commitSha, cvcMainSha, token)
+              : Promise.resolve(null),
           )
         : [];
       const recordsByInteraction = new Map<string, CVCLinkRecord[]>();

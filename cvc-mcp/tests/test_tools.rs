@@ -1,12 +1,47 @@
 use chrono::Utc;
 use cvc_core::db::CvcStore;
 use cvc_core::models::{Author, CommitSha, Conversation, Interaction, InteractionId};
+use cvc_core::privacy::{McpCapture, PreparedPolicy};
 use cvc_mcp::server::{start_session, AppState};
 use cvc_mcp::tools::{call_tool, list_tools};
 use git2::Repository;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tempfile::{tempdir, TempDir};
+
+trait CaptureFixture {
+    fn create_conversation(&self, _: &Conversation) -> cvc_core::db::Result<()>;
+    fn create_interaction(&self, interaction: &Interaction) -> cvc_core::db::Result<()>;
+}
+impl CaptureFixture for CvcStore {
+    fn create_conversation(&self, _: &Conversation) -> cvc_core::db::Result<()> {
+        Ok(())
+    }
+    fn create_interaction(&self, interaction: &Interaction) -> cvc_core::db::Result<()> {
+        self.capture_mcp(McpCapture::new(
+            Conversation {
+                id: interaction.conversation_id.clone(),
+                title: "fixture".into(),
+                created_at: interaction.timestamp,
+            },
+            interaction.clone(),
+            Vec::new(),
+            Vec::new(),
+            PreparedPolicy::built_ins_only(),
+        ))
+        .map(|_| ())
+    }
+}
+
+fn project_fixture_to_ref(repo: &Repository, store: &CvcStore, ref_name: &str, destination: &str) {
+    let projection = cvc_core::sync::push_projection_to_ref(repo, store, "", destination).unwrap();
+    let cvc_core::sync::ProjectionResult::Candidate { oid, candidate, .. } = projection else {
+        panic!("fixture expected projection candidate");
+    };
+    repo.reference(ref_name, oid, true, "fixture: remote accepted candidate")
+        .unwrap();
+    drop(candidate);
+}
 
 /// Builds a fresh, isolated store + `AppState`. The returned `TempDir` must be kept
 /// alive for as long as `AppState` is used, since dropping it deletes the DB file.
@@ -109,7 +144,7 @@ async fn test_read_history_includes_linked_interactions() {
         let interactions = store.get_floating_interactions().unwrap();
         let interaction_id = &interactions[0].id;
         store
-            .link_interaction(interaction_id, &CommitSha::new("deadbeef"), "generated")
+            .link_interaction(interaction_id, &CommitSha::new("d".repeat(40)), "generated")
             .unwrap();
     }
 
@@ -188,13 +223,8 @@ async fn test_distinct_sessions_get_distinct_conversations() {
 
     assert_ne!(conv_a, conv_b);
 
-    let store_a = state_a.store.lock().unwrap();
-    let conversation_a = store_a.get_conversation(&conv_a).unwrap().unwrap();
-    assert!(conversation_a.title.starts_with("client-a session"));
-
-    // Both conversations live in the same shared repo DB.
-    let conversation_b_from_a = store_a.get_conversation(&conv_b).unwrap();
-    assert!(conversation_b_from_a.is_some());
+    // Sessions are materialized atomically with their first captured thought;
+    // start_session itself performs no row-level persistence.
 }
 
 #[tokio::test]
@@ -236,7 +266,19 @@ async fn test_sync_history_pulls_from_remote() {
         source_request_id: None,
     };
     store_a.create_interaction(&inter_a).unwrap();
-    cvc_core::sync::push_to_ref(&repo_a, &store_a, "refs/cvc/main").unwrap();
+    // Capture is private by default; this fixture models the explicit user action
+    // required before a thought may enter the outbound projection.
+    let destination = cvc_core::privacy::remote_destination(&repo_a, "origin")
+        .unwrap()
+        .fingerprint;
+    store_a
+        .share_conversation_for_remote(
+            "conv-a",
+            &destination,
+            cvc_core::models::FutureSharePolicy::Private,
+        )
+        .unwrap();
+    project_fixture_to_ref(&repo_a, &store_a, "refs/cvc/main", &destination);
 
     let mut callbacks = git2::RemoteCallbacks::new();
     callbacks.credentials(|_, _, _| git2::Cred::default());
