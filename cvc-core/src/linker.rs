@@ -138,7 +138,7 @@ pub fn link_current_commit_with_policy(
         .map(|id| (id, GENERATED_LINK_TYPE))
         .chain(temporal.iter().map(|id| (id, TEMPORAL_LINK_TYPE)))
         .collect();
-    Ok(db.link_automatic_interaction_batch(&links, &commit_sha, linked_by.as_deref())?)
+    Ok(db.link_automatic_interaction_batch_trusted(&links, &commit_sha, linked_by.as_deref())?)
 }
 
 fn eligibility_lower_bound(

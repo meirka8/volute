@@ -1,8 +1,296 @@
 use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
+
+pub const MAX_RANGE_COMMITS: usize = 2048;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeObservationOrigin {
+    Explicit,
+    PrePush,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RangeMember {
+    pub commit_oid: CommitSha,
+}
+
+/// Immutable anchored proof that one ordered commit range has a particular net
+/// tree transition. Trust, destination authority, timestamps and source-ref
+/// names are observations stored beside this body and are not part of its ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RangeEvidence {
+    pub range_id: String,
+    pub format: String,
+    pub version: u8,
+    pub repository_identity: String,
+    pub object_format: String,
+    pub base_oid: CommitSha,
+    pub tip_oid: CommitSha,
+    pub base_tree_oid: String,
+    pub result_tree_oid: String,
+    pub commits: Vec<RangeMember>,
+    pub changeset_algorithm: String,
+    pub changeset_digest: String,
+}
+
+/// Local-only source material captured with a range. Never serialized under
+/// `ranges/` and always scoped to exactly one interaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeSourceSnapshot {
+    pub interaction_id: InteractionId,
+    pub source_id: String,
+    pub snapshot: SourceSnapshot,
+}
+
+impl RangeEvidence {
+    pub fn canonical_id(&self) -> String {
+        let mut h = Sha256::new();
+        h.update(b"cvc.range-evidence/canonical/v1\0");
+        fn put(h: &mut Sha256, tag: u8, bytes: &[u8]) {
+            h.update([tag]);
+            h.update((bytes.len() as u64).to_be_bytes());
+            h.update(bytes);
+        }
+        for (tag, value) in [
+            (1, self.format.as_str()),
+            (2, &self.version.to_string()),
+            (3, self.repository_identity.as_str()),
+            (4, self.object_format.as_str()),
+            (5, self.base_oid.as_str()),
+            (6, self.tip_oid.as_str()),
+            (7, self.base_tree_oid.as_str()),
+            (8, self.result_tree_oid.as_str()),
+            (9, self.changeset_algorithm.as_str()),
+            (10, self.changeset_digest.as_str()),
+        ] {
+            put(&mut h, tag, value.as_bytes());
+        }
+        h.update([11]);
+        h.update((self.commits.len() as u64).to_be_bytes());
+        for member in &self.commits {
+            put(&mut h, 12, member.commit_oid.as_str().as_bytes());
+        }
+        hex::encode(h.finalize())
+    }
+    pub fn verify_id(&self) -> bool {
+        fn oid(value: &str) -> bool {
+            value.len() == 40
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        }
+        let mut commits = std::collections::HashSet::new();
+        self.range_id == self.canonical_id()
+            && self.range_id.len() == 64
+            && self
+                .range_id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            && self.format == "cvc.range-evidence/v1"
+            && self.version == 1
+            && self.object_format == "sha1"
+            && self.repository_identity.len() == 64
+            && self
+                .repository_identity
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            && oid(self.base_oid.as_str())
+            && oid(self.tip_oid.as_str())
+            && oid(&self.base_tree_oid)
+            && oid(&self.result_tree_oid)
+            && !self.commits.is_empty()
+            && self.commits.len() <= MAX_RANGE_COMMITS
+            && self
+                .commits
+                .iter()
+                .all(|m| oid(m.commit_oid.as_str()) && commits.insert(m.commit_oid.as_str()))
+            && self.changeset_algorithm == "cvc.changeset/v1"
+            && self.changeset_digest.len() == 64
+            && self
+                .changeset_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    }
+}
+
+/// Closed relation vocabulary.  New relation kinds require a format change, not
+/// an arbitrary string supplied by a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DerivationRelation {
+    Generated,
+    Temporal,
+    Verified,
+    RewriteExact,
+    SquashExact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    LocallyObserved,
+    ImportedLegacy,
+    RemoteAssertion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Evidence {
+    pub version: u8,
+    pub kind: EvidenceKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DerivationOrigin {
+    LocalHook,
+    LocalLinker,
+    RemoteAssertion,
+    LegacyImport,
+}
+
+/// Immutable, content-addressed explanation of why an interaction is related
+/// to an artifact.  `event_id` is deliberately independent of wall time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivationEvent {
+    pub event_id: String,
+    pub interaction_id: InteractionId,
+    pub target_commit: CommitSha,
+    pub relation: DerivationRelation,
+    pub evidence: Evidence,
+    pub origin: DerivationOrigin,
+    #[serde(default)]
+    pub source_event_ids: Vec<String>,
+    #[serde(default)]
+    pub old_oid: Option<CommitSha>,
+    #[serde(default)]
+    pub new_oid: Option<CommitSha>,
+    #[serde(default)]
+    pub range_id: Option<String>,
+    #[serde(default)]
+    pub linked_by: Option<String>,
+}
+
+/// Immutable preflight input to a rewrite.  It is deliberately a value object:
+/// the write phase re-reads it under BEGIN IMMEDIATE and requires byte-for-byte
+/// equality before it can append any derived event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceSnapshot {
+    Legacy {
+        interaction: String,
+        commit: String,
+        link_type: String,
+        linked_by: Option<String>,
+        authorization_rows: Vec<SourceAuthorizationRow>,
+    },
+    Event {
+        event_id: String,
+        canonical_payload: String,
+        canonical_payload_digest: String,
+        trusted_local_observations: Vec<SourceObservationRow>,
+        authorization_rows: Vec<SourceAuthorizationRow>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceObservationRow {
+    pub source_fingerprint: Option<String>,
+    pub source_key: String,
+    pub origin: String,
+    pub trusted_local: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceAuthorizationRow {
+    pub remote_fingerprint: String,
+    pub source_event_id: String,
+}
+
+impl DerivationEvent {
+    pub fn sources_are_canonical(&self) -> bool {
+        self.source_event_ids
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    }
+    /// Domain separated, unambiguous length-prefixed canonical payload.
+    pub fn canonical_id(&self) -> String {
+        let mut h = Sha256::new();
+        h.update(b"cvc.derivation-event/canonical/v2\0");
+        // Every field is tagged and every optional value has a discriminator:
+        // no concatenation/empty value ambiguity is possible.
+        fn put(h: &mut Sha256, tag: u8, value: &str) {
+            h.update([tag]);
+            h.update((value.len() as u64).to_be_bytes());
+            h.update(value.as_bytes());
+        }
+        put(&mut h, 1, &self.interaction_id.to_string());
+        put(&mut h, 2, self.target_commit.as_str());
+        put(
+            &mut h,
+            3,
+            match self.relation {
+                DerivationRelation::Generated => "generated",
+                DerivationRelation::Temporal => "temporal",
+                DerivationRelation::Verified => "verified",
+                DerivationRelation::RewriteExact => "rewrite_exact",
+                DerivationRelation::SquashExact => "squash_exact",
+            },
+        );
+        put(&mut h, 4, &self.evidence.version.to_string());
+        put(
+            &mut h,
+            5,
+            match self.evidence.kind {
+                EvidenceKind::LocallyObserved => "locally_observed",
+                EvidenceKind::ImportedLegacy => "imported_legacy",
+                EvidenceKind::RemoteAssertion => "remote_assertion",
+            },
+        );
+        put(
+            &mut h,
+            6,
+            match self.origin {
+                DerivationOrigin::LocalHook => "local_hook",
+                DerivationOrigin::LocalLinker => "local_linker",
+                DerivationOrigin::RemoteAssertion => "remote_assertion",
+                DerivationOrigin::LegacyImport => "legacy_import",
+            },
+        );
+        let mut sources = self.source_event_ids.clone();
+        sources.sort();
+        sources.dedup();
+        h.update([7]);
+        h.update((sources.len() as u64).to_be_bytes());
+        for id in &sources {
+            put(&mut h, 8, id);
+        }
+        for (tag, value) in [
+            (9, self.old_oid.as_ref().map(CommitSha::as_str)),
+            (10, self.new_oid.as_ref().map(CommitSha::as_str)),
+            (11, self.range_id.as_deref()),
+            (12, self.linked_by.as_deref()),
+        ] {
+            h.update([tag, value.is_some() as u8]);
+            if let Some(v) = value {
+                put(&mut h, tag, v);
+            }
+        }
+        format!("{:x}", h.finalize())
+    }
+    pub fn verify_id(&self) -> bool {
+        self.event_id == self.canonical_id()
+    }
+}
 
 /// The intentionally small, non-free-text reason vocabulary used in sync tombstones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

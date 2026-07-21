@@ -18,7 +18,28 @@ cvc run -- <command> [args...]
 cvc pull
 ```
 
-`init` creates the local SQLite cache and hooks. `run` records its command and output as a private floating interaction. The post-commit linker may associate recent eligible interactions with a commit, but it does not share them. Configure its conservative window with `git config cvc.linkWindow <seconds>` (`0..=2592000`, default `86400`; `0` disables automatic linking).
+`init` creates the local SQLite cache and installs advisory `post-commit`, `pre-push`, `post-merge`, and `post-rewrite` hooks (respecting `core.hooksPath`). `run` records its command and output as a private floating interaction. The post-commit linker may associate recent eligible interactions with a commit, but it does not share them. Configure its conservative window with `git config cvc.linkWindow <seconds>` (`0..=2592000`, default `86400`; `0` disables automatic linking). Automatic linking uses only the documented time/file-context policy—not author, message, or file-set similarity heuristics; `CVC-Session` trailers are not implemented.
+
+The optional pre-push range observer requires an explicit local target branch; it does not guess from a remote HEAD:
+
+```bash
+git config cvc.targetBranch refs/heads/main
+```
+
+It observes a single pushed local branch against that branch and may record exact range evidence within its advisory hook budget. The budget is cooperative: bounded traversal checks occur between operations, but one libgit2 call can exceed the nominal five seconds. Current exact evidence is SHA-1-only; unsupported object formats fail closed without creating a link.
+
+## Exact derivation evidence and hooks
+
+Record a range explicitly (Git revisions are resolved locally):
+
+```bash
+cvc relink observe-range <BASE> <TIP>
+cvc relink observe-range <BASE> <TIP> --remote origin
+```
+
+With `--remote`, the command requires the displayed `I AUTHORIZE RANGE <base> <tip> <fingerprint>` TTY acknowledgement; this authorizes that range's source snapshots only for that destination, not sharing. A valid range has a unique merge base equal to `BASE`, `BASE` as a strict ancestor of `TIP`, at most 2,048 ordered members, and a canonical `cvc.changeset/v1` digest of the base-tree→tip-tree transition.
+
+`post-rewrite` accepts only Git's exact `amend` (one old/new pair) and `rebase` pair stream. It validates and writes recoverable input to `.git/cvc/rewrite-inbox` before replaying it; permanent malformed entries are quarantined and retryable entries remain for later replay. It derives only from locally observed source provenance—never author/message/file-set heuristics—and does not guarantee a relink if the range, source evidence, or required Git objects are absent. `post-commit` scans its branch cursor; `post-merge` and `cvc pull` pull first and then run a longer pending squash scan. All hook failures are warnings and never fail the Git operation.
 
 ## Privacy acknowledgement and destination consent
 
@@ -95,7 +116,7 @@ This creates local suppression; it does not erase Git objects, remote history, o
 cvc push --manual --remote <name>
 ```
 
-That manual, destination-consented push projects the tombstone. Fetching on a later `redact` invocation must observe that tombstone in the v4 baseline before the command can build a protected hard-redaction plan:
+That manual, destination-consented push projects the tombstone. Fetching on a later `redact` invocation must observe that tombstone in the v5 baseline before the command can build a protected hard-redaction plan:
 
 ```bash
 cvc redact <interaction-uuid> --remote origin --rewrite-plan ./redaction-plan.json

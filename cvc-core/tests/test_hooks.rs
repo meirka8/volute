@@ -1,6 +1,8 @@
 use cvc_core::hooks::{self, HookAction};
 use git2::Repository;
 use std::fs;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 /// Helper: create a bare-minimum git repo for hook tests.
@@ -24,7 +26,7 @@ fn test_install_creates_hooks() -> anyhow::Result<()> {
     }
 
     let hooks_dir = tmp.path().join(".git").join("hooks");
-    for name in &["post-commit", "pre-push", "post-merge"] {
+    for name in &["post-commit", "pre-push", "post-merge", "post-rewrite"] {
         let hook = hooks_dir.join(name);
         assert!(hook.exists(), "hook {} should exist", name);
 
@@ -39,6 +41,7 @@ fn test_install_creates_hooks() -> anyhow::Result<()> {
             "{} should contain CVC marker",
             name
         );
+        assert!(content.contains("|| :"), "{name} must be advisory");
     }
 
     // Verify specific commands
@@ -49,8 +52,72 @@ fn test_install_creates_hooks() -> anyhow::Result<()> {
     assert!(pre_push.contains("cvc hook pre-push"));
 
     let post_merge = fs::read_to_string(hooks_dir.join("post-merge"))?;
-    assert!(post_merge.contains("cvc pull"));
+    assert!(post_merge.contains("cvc hook post-merge"));
 
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_hooks_never_block_when_cvc_is_missing_or_nonzero() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, _) = setup_repo();
+    hooks::install(tmp.path())?;
+    let hooks_dir = tmp.path().join(".git/hooks");
+    for (name, args) in [
+        ("post-commit", vec![]),
+        ("pre-push", vec!["origin", "file:///remote"]),
+        ("post-merge", vec!["1"]),
+        ("post-rewrite", vec!["rebase"]),
+    ] {
+        let status = Command::new(hooks_dir.join(name))
+            .args(&args)
+            .env("PATH", "/definitely/missing")
+            .stdin(Stdio::null())
+            .status()?;
+        assert!(status.success(), "missing cvc blocked {name}");
+    }
+
+    let bin = tmp.path().join("bin");
+    fs::create_dir(&bin)?;
+    let stub = bin.join("cvc");
+    fs::write(
+        &stub,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CVC_ARGS\"\nIFS= read -r line || :\nprintf '%s\\n' \"$line\" >> \"$CVC_STDIN\"\nexit 42\n",
+    )?;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))?;
+    let args_log = tmp.path().join("args.log");
+    let stdin_log = tmp.path().join("stdin.log");
+    for (name, args, input) in [
+        (
+            "pre-push",
+            vec!["origin", "file:///remote"],
+            b"push-input\n".as_slice(),
+        ),
+        ("post-merge", vec!["1"], b"".as_slice()),
+        (
+            "post-rewrite",
+            vec!["rebase"],
+            b"rewrite-input\n".as_slice(),
+        ),
+    ] {
+        let mut child = Command::new(hooks_dir.join(name))
+            .args(&args)
+            .env("PATH", &bin)
+            .env("CVC_ARGS", &args_log)
+            .env("CVC_STDIN", &stdin_log)
+            .stdin(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().expect("piped stdin").write_all(input)?;
+        assert!(child.wait()?.success(), "nonzero cvc blocked {name}");
+    }
+    let args = fs::read_to_string(args_log)?;
+    assert!(args.contains("hook pre-push origin file:///remote"));
+    assert!(args.contains("hook post-merge 1"));
+    assert!(args.contains("hook post-rewrite rebase"));
+    let stdin = fs::read_to_string(stdin_log)?;
+    assert!(stdin.contains("push-input"));
+    assert!(stdin.contains("rewrite-input"));
     Ok(())
 }
 

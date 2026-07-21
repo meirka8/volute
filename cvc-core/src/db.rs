@@ -1,10 +1,15 @@
 use crate::models::{
-    ArtifactLink, Author, CommitSha, ContextItem, Conversation, FutureSharePolicy, Interaction,
-    InteractionId, PublicationState, Tombstone, TombstoneReasonCode, ToolExecution, ToolStatus,
+    ArtifactLink, Author, CommitSha, ContextItem, Conversation, DerivationEvent, DerivationOrigin,
+    DerivationRelation, EvidenceKind, FutureSharePolicy, Interaction, InteractionId,
+    PublicationState, RangeEvidence, SourceAuthorizationRow, SourceObservationRow, SourceSnapshot,
+    Tombstone, TombstoneReasonCode, ToolExecution, ToolStatus,
 };
 use crate::privacy::{self, Capture};
 use chrono::{TimeZone, Utc};
-use rusqlite::{ffi, params, Connection, ErrorCode, OptionalExtension, Row, Transaction};
+use rusqlite::{
+    ffi, params, Connection, ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
+use sha2::Digest;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -22,11 +27,36 @@ pub enum DbError {
     InvalidLink(String),
     #[error("Artifact link integrity conflict: {0}")]
     LinkConflict(String),
+    #[error("pending squash target capacity reached ({limit}); discovery deferred")]
+    SquashQueueCapacity { limit: i64 },
     #[error("local deletion completed, but filesystem snapshots, backups, and SSD wear-leveling may retain prior bytes")]
     ResidualStorageWarning,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryDisposition {
+    Retryable,
+    Permanent,
+}
+
+impl DbError {
+    pub(crate) fn retry_disposition(&self) -> RetryDisposition {
+        match self {
+            Self::Sqlite(_)
+            | Self::Io(_)
+            | Self::LinkConflict(_)
+            | Self::SquashQueueCapacity { .. } => RetryDisposition::Retryable,
+            Self::Migration(_)
+            | Self::Timestamp(_)
+            | Self::InvalidLink(_)
+            | Self::ResidualStorageWarning => RetryDisposition::Permanent,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, DbError>;
+const MAX_PENDING_SQUASH_TARGETS: i64 = 4096;
+const MAX_RESOLVED_SQUASH_TARGETS: i64 = 512;
 
 fn prepare_store_path(path: &Path) -> Result<()> {
     // SQLite's in-memory URI has no filesystem object to secure.
@@ -107,7 +137,81 @@ fn enforce_store_permissions(path: &Path) -> Result<()> {
 }
 
 fn is_safe_commit_sha(value: &str) -> bool {
-    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+fn parse_legacy_source(value: &str) -> Option<(String, String)> {
+    let rest = value.strip_prefix("legacy:")?;
+    let (interaction, commit) = rest.split_once(':')?;
+    let canonical = interaction.parse::<InteractionId>().ok()?.to_string();
+    if canonical == interaction
+        && is_safe_commit_sha(commit)
+        && !commit.bytes().any(|b| b.is_ascii_uppercase())
+    {
+        Some((interaction.into(), commit.into()))
+    } else {
+        None
+    }
+}
+fn is_event_source_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+fn relation_name(v: DerivationRelation) -> &'static str {
+    match v {
+        DerivationRelation::Generated => "generated",
+        DerivationRelation::Temporal => "temporal",
+        DerivationRelation::Verified => "verified",
+        DerivationRelation::RewriteExact => "rewrite_exact",
+        DerivationRelation::SquashExact => "squash_exact",
+    }
+}
+fn evidence_name(v: EvidenceKind) -> &'static str {
+    match v {
+        EvidenceKind::LocallyObserved => "locally_observed",
+        EvidenceKind::ImportedLegacy => "imported_legacy",
+        EvidenceKind::RemoteAssertion => "remote_assertion",
+    }
+}
+fn origin_name(v: DerivationOrigin) -> &'static str {
+    match v {
+        DerivationOrigin::LocalHook => "local_hook",
+        DerivationOrigin::LocalLinker => "local_linker",
+        DerivationOrigin::RemoteAssertion => "remote_assertion",
+        DerivationOrigin::LegacyImport => "legacy_import",
+    }
+}
+
+fn snapshot_interaction(snapshot: &SourceSnapshot) -> Option<String> {
+    match snapshot {
+        SourceSnapshot::Legacy { interaction, .. } => Some(interaction.clone()),
+        SourceSnapshot::Event {
+            canonical_payload, ..
+        } => serde_json::from_str::<DerivationEvent>(canonical_payload)
+            .ok()
+            .map(|event| event.interaction_id.to_string()),
+    }
+}
+fn source_id_for_snapshot(snapshot: &SourceSnapshot) -> Option<String> {
+    match snapshot {
+        SourceSnapshot::Legacy {
+            interaction,
+            commit,
+            ..
+        } => Some(format!("legacy:{interaction}:{commit}")),
+        SourceSnapshot::Event {
+            event_id,
+            canonical_payload,
+            ..
+        } => serde_json::from_str::<DerivationEvent>(canonical_payload)
+            .ok()
+            .filter(|event| event.event_id == *event_id)
+            .map(|_| event_id.clone()),
+    }
 }
 
 fn is_unique_constraint(error: &rusqlite::ffi::Error) -> bool {
@@ -187,6 +291,9 @@ impl CvcStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "secure_delete", "ON")?;
+        // Hooks must fail quickly and leave their durable inbox for a later CVC
+        // invocation rather than holding up Git's rewrite machinery.
+        conn.busy_timeout(std::time::Duration::from_millis(250))?;
         enforce_store_permissions(path)?;
 
         let store = Self {
@@ -339,6 +446,53 @@ impl CvcStore {
                 self.conn.execute_batch("ALTER TABLE tombstones ADD COLUMN state TEXT NOT NULL DEFAULT 'published' CHECK(state IN ('pending','published'));")?;
             }
             self.conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_tombstones_remote ON tombstones(remote_fingerprint); CREATE UNIQUE INDEX IF NOT EXISTS idx_tombstones_scope_identity ON tombstones(interaction_id,scope_kind,COALESCE(remote_fingerprint,''));")?;
+            // v5 derivations are immutable and intentionally not endpoint keyed:
+            // several independently observed explanations can coexist.
+            self.conn.execute_batch("CREATE TABLE IF NOT EXISTS derivation_events (event_id TEXT PRIMARY KEY, interaction_id TEXT NOT NULL, target_commit TEXT NOT NULL, relation TEXT NOT NULL CHECK(relation IN ('generated','temporal','verified','rewrite_exact','squash_exact')), evidence_version INTEGER NOT NULL, evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('locally_observed','imported_legacy','remote_assertion')), origin TEXT NOT NULL CHECK(origin IN ('local_hook','local_linker','remote_assertion','legacy_import')), source_event_ids TEXT NOT NULL, old_oid TEXT, new_oid TEXT, range_id TEXT, linked_by TEXT, payload TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_derivation_endpoint ON derivation_events(interaction_id,target_commit); CREATE TABLE IF NOT EXISTS derivation_authorizations (event_id TEXT NOT NULL, remote_fingerprint TEXT NOT NULL, source_event_id TEXT NOT NULL, PRIMARY KEY(event_id,remote_fingerprint,source_event_id)); CREATE TABLE IF NOT EXISTS rewrite_batches (batch_id TEXT PRIMARY KEY, mode TEXT NOT NULL, payload_hash TEXT NOT NULL); ")?;
+            let authorization_sql: String = self.conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='derivation_authorizations'", [], |row| row.get(0))?;
+            let compact_authorization_sql: String = authorization_sql
+                .chars()
+                .filter(|character| !character.is_ascii_whitespace())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if !compact_authorization_sql
+                .contains("primarykey(event_id,remote_fingerprint,source_event_id)")
+            {
+                self.conn.execute_batch("ALTER TABLE derivation_authorizations RENAME TO derivation_authorizations_legacy; CREATE TABLE derivation_authorizations (event_id TEXT NOT NULL, remote_fingerprint TEXT NOT NULL, source_event_id TEXT NOT NULL, PRIMARY KEY(event_id,remote_fingerprint,source_event_id)); INSERT OR IGNORE INTO derivation_authorizations SELECT event_id,remote_fingerprint,source_event_id FROM derivation_authorizations_legacy; DROP TABLE derivation_authorizations_legacy;")?;
+            }
+            // Trust is an observation, not a property of immutable remote event
+            // bytes. `source_key` makes NULL fingerprints addressable without
+            // allowing SQLite's NULL uniqueness semantics to create duplicates.
+            self.conn.execute_batch("CREATE TABLE IF NOT EXISTS derivation_observations (event_id TEXT NOT NULL, source_fingerprint TEXT, source_key TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('local_hook','local_api','remote_sync')), trusted_local INTEGER NOT NULL CHECK(trusted_local IN (0,1)) CHECK(trusted_local=0 OR origin IN ('local_hook','local_api')), PRIMARY KEY(event_id,source_key)); CREATE INDEX IF NOT EXISTS idx_derivation_observations_trust ON derivation_observations(event_id,trusted_local); ")?;
+            self.conn.execute_batch("CREATE TABLE IF NOT EXISTS range_evidence (range_id TEXT PRIMARY KEY, payload TEXT NOT NULL, payload_digest TEXT NOT NULL, changeset_algorithm TEXT NOT NULL, changeset_digest TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_range_changeset ON range_evidence(changeset_algorithm,changeset_digest); CREATE TABLE IF NOT EXISTS range_observations (range_id TEXT NOT NULL, source_key TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('explicit','pre_push','remote_sync')), trusted_local INTEGER NOT NULL CHECK(trusted_local IN (0,1)) CHECK(trusted_local=0 OR origin IN ('explicit','pre_push')), source_ref TEXT, source_remote TEXT, PRIMARY KEY(range_id,source_key)); CREATE INDEX IF NOT EXISTS idx_range_trust ON range_observations(range_id,trusted_local); CREATE TABLE IF NOT EXISTS range_authorizations (range_id TEXT NOT NULL,remote_fingerprint TEXT NOT NULL,PRIMARY KEY(range_id,remote_fingerprint)); CREATE TABLE IF NOT EXISTS range_source_snapshots (range_id TEXT NOT NULL,source_id TEXT NOT NULL,snapshot TEXT NOT NULL,PRIMARY KEY(range_id,source_id)); CREATE TABLE IF NOT EXISTS branch_scan_cursors (worktree_key TEXT NOT NULL,symbolic_ref TEXT NOT NULL,last_tip TEXT NOT NULL,PRIMARY KEY(worktree_key,symbolic_ref));")?;
+            self.conn.execute_batch("CREATE TABLE IF NOT EXISTS range_interaction_sources (range_id TEXT NOT NULL,interaction_id TEXT NOT NULL,source_id TEXT NOT NULL,snapshot TEXT NOT NULL,PRIMARY KEY(range_id,interaction_id,source_id)); CREATE INDEX IF NOT EXISTS idx_range_interaction_sources ON range_interaction_sources(range_id,interaction_id); CREATE TABLE IF NOT EXISTS pending_squash_targets (worktree_key TEXT NOT NULL,symbolic_ref TEXT NOT NULL,target_commit TEXT NOT NULL,parent_commit TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','matched','unsupported')),discovered_order INTEGER NOT NULL,last_attempt_seq INTEGER NOT NULL DEFAULT 0,attempt_count INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(worktree_key,symbolic_ref,target_commit)); CREATE INDEX IF NOT EXISTS idx_pending_squash ON pending_squash_targets(worktree_key,symbolic_ref,status,last_attempt_seq,discovered_order);")?;
+            let pending_columns: Vec<String> = self
+                .conn
+                .prepare("PRAGMA table_info(pending_squash_targets)")?
+                .query_map([], |r| r.get(1))?
+                .collect::<std::result::Result<_, _>>()?;
+            if !pending_columns
+                .iter()
+                .any(|column| column == "last_attempt_seq")
+            {
+                self.conn.execute_batch("ALTER TABLE pending_squash_targets ADD COLUMN last_attempt_seq INTEGER NOT NULL DEFAULT 0;")?;
+            }
+            if !pending_columns
+                .iter()
+                .any(|column| column == "attempt_count")
+            {
+                self.conn.execute_batch("ALTER TABLE pending_squash_targets ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;")?;
+            }
+            // Migrate old endpoint-based local proof exactly once. Re-running
+            // this on every open would let a later public/untrusted link become
+            // trusted merely by reopening the store.
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cvc_internal_migrations(name TEXT PRIMARY KEY);",
+            )?;
+            let migrated: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM cvc_internal_migrations WHERE name='legacy-link-observations/v1')", [], |row| row.get(0))?;
+            if !migrated {
+                self.conn.execute_batch("INSERT OR IGNORE INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) SELECT 'legacy:' || interaction_id || ':' || git_commit_hash,NULL,'legacy:' || interaction_id || ':' || git_commit_hash,'local_api',1 FROM artifact_links a JOIN interactions i ON i.id=a.interaction_id WHERE i.capture_source!='sync_import'; INSERT INTO cvc_internal_migrations(name) VALUES('legacy-link-observations/v1');")?;
+            }
             Ok(())
         })();
         match convergence {
@@ -446,10 +600,13 @@ impl CvcStore {
     /// Import a completely preflighted remote batch.  Preparing happens before
     /// opening the transaction so a hostile late payload cannot leave even a
     /// sanitized prefix in the WAL.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn import_sync_batch(
         &self,
         captures: Vec<Capture>,
         links: Vec<(InteractionId, CommitSha, String, Option<String>)>,
+        events: Vec<DerivationEvent>,
+        ranges: Vec<RangeEvidence>,
         remote_fingerprint: Option<&str>,
         tombstones: &[Tombstone],
         published_ids: &[InteractionId],
@@ -473,6 +630,7 @@ impl CvcStore {
         // The complete, already validated pull is one commit: suppression,
         // detachment/deletion, sanitized imports, links and publication proof.
         Self::apply_tombstones_tx(&tx, tombstones, "sync", remote_fingerprint)?;
+        Self::import_ranges_tx(&tx, &ranges, remote_fingerprint)?;
         for capture in &captures {
             if Self::is_tombstoned_for_source_tx(&tx, &capture.interaction.id, remote_fingerprint)?
             {
@@ -523,6 +681,27 @@ impl CvcStore {
                 }
                 Err(error) => return Err(error.into()),
             }
+        }
+        for event in events {
+            if Self::is_tombstoned_for_source_tx(&tx, &event.interaction_id, remote_fingerprint)? {
+                continue;
+            }
+            if !event.verify_id()
+                || !event.sources_are_canonical()
+                || !is_safe_commit_sha(event.target_commit.as_str())
+            {
+                return Err(DbError::InvalidLink(
+                    "invalid imported derivation event".into(),
+                ));
+            }
+            let payload =
+                serde_json::to_string(&event).map_err(|e| DbError::Migration(e.to_string()))?;
+            match tx.execute("INSERT INTO derivation_events(event_id,interaction_id,target_commit,relation,evidence_version,evidence_kind,origin,source_event_ids,old_oid,new_oid,range_id,linked_by,payload) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![event.event_id,event.interaction_id.to_string(),event.target_commit.as_str(),relation_name(event.relation),event.evidence.version,evidence_name(event.evidence.kind),origin_name(event.origin),serde_json::to_string(&event.source_event_ids).map_err(|e|DbError::Migration(e.to_string()))?,event.old_oid.as_ref().map(CommitSha::as_str),event.new_oid.as_ref().map(CommitSha::as_str),event.range_id,event.linked_by,payload]) { Ok(_)=>{},Err(rusqlite::Error::SqliteFailure(e,_)) if is_unique_constraint(&e)=>{let old:String=tx.query_row("SELECT payload FROM derivation_events WHERE event_id=?1",params![event.event_id],|r|r.get(0))?;if old!=payload{return Err(DbError::LinkConflict("imported derivation conflict".into()));}},Err(e)=>return Err(e.into()) }
+            if let Some(remote) = remote_fingerprint {
+                tx.execute("INSERT OR IGNORE INTO derivation_authorizations(event_id,remote_fingerprint,source_event_id) VALUES(?1,?2,?1)",params![event.event_id,remote])?;
+            }
+            let key = remote_fingerprint.unwrap_or("");
+            tx.execute("INSERT OR IGNORE INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) VALUES(?1,?2,?3,'remote_sync',0)", params![event.event_id,remote_fingerprint,key])?;
         }
         if let Some(remote) = remote_fingerprint {
             for id in published_ids {
@@ -797,6 +976,55 @@ impl CvcStore {
                 "UPDATE interactions SET parent_id=NULL WHERE parent_id=?1",
                 params![t.interaction_id.as_str()],
             )?;
+            let all_events: Vec<(String, String, String)> = tx
+                .prepare("SELECT event_id,interaction_id,source_event_ids FROM derivation_events")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            let target = t.interaction_id.to_string();
+            let mut removed: std::collections::HashSet<String> = all_events
+                .iter()
+                .filter(|(_, interaction, sources)| {
+                    interaction == &target
+                        || serde_json::from_str::<Vec<String>>(sources)
+                            .ok()
+                            .is_some_and(|sources| {
+                                sources
+                                    .iter()
+                                    .any(|source| source.starts_with(&format!("legacy:{target}:")))
+                            })
+                })
+                .map(|(id, _, _)| id.clone())
+                .collect();
+            loop {
+                let before = removed.len();
+                for (id, _, sources) in &all_events {
+                    if serde_json::from_str::<Vec<String>>(sources)
+                        .ok()
+                        .is_some_and(|sources| {
+                            sources.iter().any(|source| removed.contains(source))
+                        })
+                    {
+                        removed.insert(id.clone());
+                    }
+                }
+                if removed.len() == before {
+                    break;
+                }
+            }
+            for event_id in removed {
+                tx.execute(
+                    "DELETE FROM derivation_authorizations WHERE event_id=?1",
+                    params![event_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM derivation_observations WHERE event_id=?1",
+                    params![event_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM derivation_events WHERE event_id=?1",
+                    params![event_id],
+                )?;
+            }
             for table in [
                 "context_items",
                 "tool_executions",
@@ -1058,6 +1286,640 @@ impl CvcStore {
         self.link_interaction_with_metadata(interaction_id, commit_sha, link_type, None)
     }
 
+    /// Apply a completely built rewrite batch in one immediate transaction.
+    /// Existing links are evidence and are never replaced or deleted.
+    pub(crate) fn apply_rewrite_events(
+        &mut self,
+        batch_id: &str,
+        mode: &str,
+        payload_hash: &str,
+        events: &[DerivationEvent],
+        snapshots: &[SourceSnapshot],
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((old_mode, old_hash)) = tx
+            .query_row(
+                "SELECT mode,payload_hash FROM rewrite_batches WHERE batch_id=?1",
+                params![batch_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            if old_mode == mode && old_hash == payload_hash {
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(DbError::LinkConflict(
+                "rewrite batch identity conflict".into(),
+            ));
+        }
+        // Full source CAS: source shape, local trust observations, destination
+        // authority and tombstone state are all read again after the immediate
+        // transaction has excluded competing writers.
+        for snapshot in snapshots {
+            if !Self::source_snapshot_matches_tx(&tx, snapshot)? {
+                return Err(DbError::LinkConflict(
+                    "rewrite source changed during preflight".into(),
+                ));
+            }
+        }
+        for event in events {
+            if !event.verify_id()
+                || !event.sources_are_canonical()
+                || event.source_event_ids.is_empty()
+                || event.relation != DerivationRelation::RewriteExact
+                || event.evidence.kind != EvidenceKind::LocallyObserved
+                || event.origin != DerivationOrigin::LocalHook
+            {
+                return Err(DbError::InvalidLink("invalid rewrite derivation".into()));
+            }
+            for source_id in &event.source_event_ids {
+                let snapshot = snapshots
+                    .iter()
+                    .find(|snapshot| source_id_for_snapshot(snapshot).as_deref() == Some(source_id))
+                    .ok_or_else(|| DbError::InvalidLink("rewrite source not snapshotted".into()))?;
+                let owned = if let Some((interaction, _)) = parse_legacy_source(source_id) {
+                    interaction == event.interaction_id.to_string()
+                        && snapshot_interaction(snapshot).as_deref() == Some(interaction.as_str())
+                } else if is_event_source_id(source_id) {
+                    matches!(snapshot, SourceSnapshot::Event { event_id, .. } if event_id == source_id)
+                        && tx
+                            .query_row(
+                                "SELECT interaction_id FROM derivation_events WHERE event_id=?1",
+                                params![source_id],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()?
+                            .as_deref()
+                            == Some(event.interaction_id.to_string().as_str())
+                } else {
+                    false
+                };
+                if !owned {
+                    return Err(DbError::InvalidLink(
+                        "rewrite source ownership mismatch".into(),
+                    ));
+                }
+            }
+            let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM interactions WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM tombstones WHERE interaction_id=?1)", params![event.interaction_id.to_string()], |r|r.get(0))?;
+            if !exists {
+                return Err(DbError::InvalidLink(
+                    "rewrite source interaction missing or tombstoned".into(),
+                ));
+            }
+            let payload =
+                serde_json::to_string(event).map_err(|e| DbError::Migration(e.to_string()))?;
+            match tx.execute("INSERT INTO derivation_events(event_id,interaction_id,target_commit,relation,evidence_version,evidence_kind,origin,source_event_ids,old_oid,new_oid,range_id,linked_by,payload) VALUES(?1,?2,?3,'rewrite_exact',?4,'locally_observed','local_hook',?5,?6,?7,NULL,?8,?9)", params![event.event_id,event.interaction_id.to_string(),event.target_commit.as_str(),event.evidence.version,serde_json::to_string(&event.source_event_ids).map_err(|e| DbError::Migration(e.to_string()))?,event.old_oid.as_ref().map(CommitSha::as_str),event.new_oid.as_ref().map(CommitSha::as_str),event.linked_by,payload]) {
+                Ok(_) => {}, Err(rusqlite::Error::SqliteFailure(e,_)) if is_unique_constraint(&e) => { let old:String=tx.query_row("SELECT payload FROM derivation_events WHERE event_id=?1",params![event.event_id],|r|r.get(0))?; if old != payload{return Err(DbError::LinkConflict("rewrite event conflict".into()));} }, Err(e)=>return Err(e.into()) }
+            tx.execute("INSERT OR IGNORE INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) VALUES(?1,NULL,'local:hook','local_hook',1)", params![event.event_id])?;
+            // Destination authority is inherited from the exact source rows
+            // captured by preflight, never inferred from the interaction alone.
+            for source in snapshots.iter().filter(|snapshot| match snapshot {
+                SourceSnapshot::Legacy {
+                    interaction,
+                    commit,
+                    ..
+                } => event
+                    .source_event_ids
+                    .iter()
+                    .any(|id| id == &format!("legacy:{interaction}:{commit}")),
+                SourceSnapshot::Event { event_id, .. } => {
+                    event.source_event_ids.iter().any(|id| id == event_id)
+                }
+            }) {
+                let rows = match source {
+                    SourceSnapshot::Legacy {
+                        authorization_rows, ..
+                    }
+                    | SourceSnapshot::Event {
+                        authorization_rows, ..
+                    } => authorization_rows,
+                };
+                for row in rows {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO derivation_authorizations(event_id,remote_fingerprint,source_event_id) VALUES(?1,?2,?3)",
+                        params![event.event_id, row.remote_fingerprint, row.source_event_id],
+                    )?;
+                }
+            }
+        }
+        tx.execute(
+            "INSERT INTO rewrite_batches(batch_id,mode,payload_hash) VALUES(?1,?2,?3)",
+            params![batch_id, mode, payload_hash],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn source_snapshot_matches_tx(tx: &Transaction<'_>, snapshot: &SourceSnapshot) -> Result<bool> {
+        Ok(Self::source_snapshots_tx(
+            tx,
+            match snapshot {
+                SourceSnapshot::Legacy {
+                    interaction,
+                    commit,
+                    ..
+                } => Some((interaction, commit)),
+                SourceSnapshot::Event { event_id, .. } => {
+                    // Event comparisons below do not need an endpoint filter.
+                    let expected = Self::event_snapshot_tx(tx, event_id)?;
+                    return Ok(expected.as_ref() == Some(snapshot));
+                }
+            },
+        )?
+        .iter()
+        .any(|x| x == snapshot))
+    }
+
+    /// Capture the complete source set used by a rewrite preflight. Ordering is
+    /// canonical so changing SQL iteration order cannot create false CAS hits.
+    pub(crate) fn rewrite_source_snapshots(
+        &self,
+        id: &InteractionId,
+        commit: &CommitSha,
+    ) -> Result<Vec<SourceSnapshot>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let id_text = id.to_string();
+        let result = Self::source_snapshots_tx(&tx, Some((&id_text, commit.as_str())))?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Persist one immutable range and the exact mutable observations captured
+    /// with it. A remote authorization is explicit and destination-scoped.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_range(
+        &self,
+        range: &RangeEvidence,
+        snapshots: &[crate::RangeSourceSnapshot],
+        origin: crate::RangeObservationOrigin,
+        source_key: &str,
+        source_ref: Option<&str>,
+        source_remote: Option<&str>,
+        authorized_remote: Option<&str>,
+    ) -> Result<()> {
+        if !range.verify_id() || source_key.is_empty() || source_key.len() > 1024 {
+            return Err(DbError::InvalidLink("invalid range evidence".into()));
+        }
+        let payload =
+            serde_json::to_string(range).map_err(|e| DbError::Migration(e.to_string()))?;
+        let digest = hex::encode(sha2::Sha256::digest(payload.as_bytes()));
+        let tx = self.conn.unchecked_transaction()?;
+        match tx.execute("INSERT INTO range_evidence(range_id,payload,payload_digest,changeset_algorithm,changeset_digest) VALUES(?1,?2,?3,?4,?5)",params![range.range_id,payload,digest,range.changeset_algorithm,range.changeset_digest]) {
+            Ok(_)=>{}, Err(rusqlite::Error::SqliteFailure(e,_)) if is_unique_constraint(&e)=>{
+                let old:(String,String)=tx.query_row("SELECT payload,payload_digest FROM range_evidence WHERE range_id=?1",params![range.range_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                if old!=(payload.clone(),digest.clone()){return Err(DbError::LinkConflict("range identity conflict".into()));}
+            }, Err(e)=>return Err(e.into())
+        }
+        tx.execute("INSERT INTO range_observations(range_id,source_key,origin,trusted_local,source_ref,source_remote) VALUES(?1,?2,?3,1,?4,?5) ON CONFLICT(range_id,source_key) DO UPDATE SET source_ref=excluded.source_ref,source_remote=excluded.source_remote WHERE origin=excluded.origin AND trusted_local=1",params![range.range_id,source_key,match origin { crate::RangeObservationOrigin::Explicit=>"explicit",crate::RangeObservationOrigin::PrePush=>"pre_push" },source_ref,source_remote])?;
+        for source in snapshots {
+            if snapshot_interaction(&source.snapshot).as_deref()
+                != Some(&source.interaction_id.to_string())
+                || source_id_for_snapshot(&source.snapshot).as_deref()
+                    != Some(source.source_id.as_str())
+            {
+                return Err(DbError::InvalidLink(
+                    "range source ownership mismatch".into(),
+                ));
+            }
+            let encoded = serde_json::to_string(&source.snapshot)
+                .map_err(|e| DbError::Migration(e.to_string()))?;
+            match tx.execute(
+                "INSERT INTO range_interaction_sources(range_id,interaction_id,source_id,snapshot) VALUES(?1,?2,?3,?4)",
+                params![range.range_id, source.interaction_id.to_string(), source.source_id, encoded],
+            ) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(e, _)) if is_unique_constraint(&e) => {
+                    let old:String=tx.query_row("SELECT snapshot FROM range_interaction_sources WHERE range_id=?1 AND interaction_id=?2 AND source_id=?3",params![range.range_id,source.interaction_id.to_string(),source.source_id],|r|r.get(0))?;
+                    if old != encoded {
+                        return Err(DbError::LinkConflict(
+                            "range source snapshot conflict".into(),
+                        ));
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if let Some(remote) = authorized_remote {
+            tx.execute("INSERT OR IGNORE INTO range_authorizations(range_id,remote_fingerprint) VALUES(?1,?2)",params![range.range_id,remote])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn trusted_ranges_for_changeset(
+        &self,
+        algorithm: &str,
+        digest: &str,
+    ) -> Result<Vec<(RangeEvidence, Vec<crate::RangeSourceSnapshot>)>> {
+        let mut stmt=self.conn.prepare("SELECT r.payload FROM range_evidence r WHERE r.changeset_algorithm=?1 AND r.changeset_digest=?2 AND EXISTS(SELECT 1 FROM range_observations o WHERE o.range_id=r.range_id AND o.trusted_local=1) ORDER BY r.range_id")?;
+        let payloads = stmt
+            .query_map(params![algorithm, digest], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out = Vec::new();
+        for payload in payloads {
+            let range: RangeEvidence =
+                serde_json::from_str(&payload).map_err(|e| DbError::Migration(e.to_string()))?;
+            if !range.verify_id() {
+                return Err(DbError::LinkConflict("stored range hash mismatch".into()));
+            }
+            let mut s=self.conn.prepare("SELECT interaction_id,source_id,snapshot FROM range_interaction_sources WHERE range_id=?1 ORDER BY interaction_id,source_id")?;
+            let snapshots = s
+                .query_map(params![range.range_id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|(interaction, id, p)| {
+                    serde_json::from_str(&p)
+                        .and_then(|snapshot| {
+                            interaction
+                                .parse()
+                                .map(|interaction_id| crate::RangeSourceSnapshot {
+                                    interaction_id,
+                                    source_id: id,
+                                    snapshot,
+                                })
+                                .map_err(serde::de::Error::custom)
+                        })
+                        .map_err(|e| DbError::Migration(e.to_string()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            out.push((range, snapshots));
+        }
+        Ok(out)
+    }
+
+    pub fn projection_ranges(&self, remote: &str) -> Result<Vec<RangeEvidence>> {
+        let mut s=self.conn.prepare("SELECT r.payload FROM range_evidence r WHERE EXISTS(SELECT 1 FROM range_observations o WHERE o.range_id=r.range_id AND o.trusted_local=1) AND EXISTS(SELECT 1 FROM derivation_events e JOIN derivation_observations eo ON eo.event_id=e.event_id AND eo.trusted_local=1 JOIN derivation_authorizations a ON a.event_id=e.event_id WHERE e.range_id=r.range_id AND a.remote_fingerprint=?1) ORDER BY r.range_id")?;
+        let result = s
+            .query_map(params![remote], |r| r.get::<_, String>(0))?
+            .map(|r| {
+                serde_json::from_str(&r?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into);
+        result
+    }
+
+    pub(crate) fn import_ranges_tx(
+        tx: &Transaction<'_>,
+        ranges: &[RangeEvidence],
+        remote: Option<&str>,
+    ) -> Result<()> {
+        for range in ranges {
+            if !range.verify_id() {
+                return Err(DbError::InvalidLink("invalid imported range".into()));
+            }
+            let payload =
+                serde_json::to_string(range).map_err(|e| DbError::Migration(e.to_string()))?;
+            let digest = hex::encode(sha2::Sha256::digest(payload.as_bytes()));
+            match tx.execute("INSERT INTO range_evidence(range_id,payload,payload_digest,changeset_algorithm,changeset_digest) VALUES(?1,?2,?3,?4,?5)",params![range.range_id,payload,digest,range.changeset_algorithm,range.changeset_digest]) {Ok(_)=>{},Err(rusqlite::Error::SqliteFailure(e,_)) if is_unique_constraint(&e)=>{let old:String=tx.query_row("SELECT payload FROM range_evidence WHERE range_id=?1",params![range.range_id],|r|r.get(0))?;if old!=payload{return Err(DbError::LinkConflict("imported range conflict".into()));}},Err(e)=>return Err(e.into())}
+            let key = remote.unwrap_or("");
+            tx.execute("INSERT OR IGNORE INTO range_observations(range_id,source_key,origin,trusted_local,source_ref,source_remote) VALUES(?1,?2,'remote_sync',0,NULL,?2)",params![range.range_id,key])?;
+        }
+        Ok(())
+    }
+
+    pub fn scan_cursor(&self, worktree: &str, symbolic_ref: &str) -> Result<Option<String>> {
+        self.conn.query_row("SELECT last_tip FROM branch_scan_cursors WHERE worktree_key=?1 AND symbolic_ref=?2",params![worktree,symbolic_ref],|r|r.get(0)).optional().map_err(Into::into)
+    }
+
+    pub fn discover_squash_targets(
+        &self,
+        worktree: &str,
+        symbolic_ref: &str,
+        expected_cursor: Option<&str>,
+        new_cursor: &str,
+        targets: &[(String, String, bool)],
+    ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let old:Option<String>=tx.query_row("SELECT last_tip FROM branch_scan_cursors WHERE worktree_key=?1 AND symbolic_ref=?2",params![worktree,symbolic_ref],|r|r.get(0)).optional()?;
+        if old.as_deref() != expected_cursor {
+            return Ok(false);
+        }
+        let unresolved:i64=tx.query_row("SELECT COUNT(*) FROM pending_squash_targets WHERE worktree_key=?1 AND symbolic_ref=?2 AND status='pending'",params![worktree,symbolic_ref],|r|r.get(0))?;
+        let mut genuinely_new = 0i64;
+        for (target, _, _) in targets {
+            let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM pending_squash_targets WHERE worktree_key=?1 AND symbolic_ref=?2 AND target_commit=?3)",params![worktree,symbolic_ref,target],|r|r.get(0))?;
+            if !exists {
+                genuinely_new += 1;
+            }
+        }
+        if unresolved.saturating_add(genuinely_new) > MAX_PENDING_SQUASH_TARGETS {
+            return Err(DbError::SquashQueueCapacity {
+                limit: MAX_PENDING_SQUASH_TARGETS,
+            });
+        }
+        let mut order:i64=tx.query_row("SELECT COALESCE(MAX(discovered_order),0) FROM pending_squash_targets WHERE worktree_key=?1 AND symbolic_ref=?2",params![worktree,symbolic_ref],|r|r.get(0))?;
+        for (target, parent, supported) in targets {
+            order += 1;
+            tx.execute("INSERT OR IGNORE INTO pending_squash_targets(worktree_key,symbolic_ref,target_commit,parent_commit,status,discovered_order) VALUES(?1,?2,?3,?4,?5,?6)",params![worktree,symbolic_ref,target,parent,if *supported{"pending"}else{"unsupported"},order])?;
+        }
+        tx.execute("INSERT INTO branch_scan_cursors(worktree_key,symbolic_ref,last_tip) VALUES(?1,?2,?3) ON CONFLICT(worktree_key,symbolic_ref) DO UPDATE SET last_tip=excluded.last_tip",params![worktree,symbolic_ref,new_cursor])?;
+        tx.execute("DELETE FROM pending_squash_targets WHERE rowid IN (SELECT rowid FROM pending_squash_targets WHERE worktree_key=?1 AND symbolic_ref=?2 AND status!='pending' ORDER BY discovered_order DESC LIMIT -1 OFFSET ?3)",params![worktree,symbolic_ref,MAX_RESOLVED_SQUASH_TARGETS])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn pending_squash_targets(
+        &self,
+        worktree: &str,
+        symbolic_ref: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let mut s=self.conn.prepare("SELECT target_commit,parent_commit FROM pending_squash_targets WHERE worktree_key=?1 AND symbolic_ref=?2 AND status='pending' ORDER BY last_attempt_seq ASC,discovered_order ASC LIMIT 128")?;
+        let result = s
+            .query_map(params![worktree, symbolic_ref], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(Into::into);
+        result
+    }
+
+    pub fn mark_squash_attempt(
+        &self,
+        worktree: &str,
+        symbolic_ref: &str,
+        target: &str,
+    ) -> Result<()> {
+        self.conn.execute("UPDATE pending_squash_targets SET attempt_count=attempt_count+1,last_attempt_seq=(SELECT COALESCE(MAX(last_attempt_seq),0)+1 FROM pending_squash_targets WHERE worktree_key=?1 AND symbolic_ref=?2) WHERE worktree_key=?1 AND symbolic_ref=?2 AND target_commit=?3 AND status='pending'",params![worktree,symbolic_ref,target])?;
+        Ok(())
+    }
+
+    /// Atomic squash write with range/source/cursor CAS. The callback rechecks
+    /// Git HEAD after BEGIN IMMEDIATE has excluded competing DB decisions.
+    pub(crate) fn apply_squash_plan(
+        &mut self,
+        repo: &git2::Repository,
+        plan: &crate::squash::ValidatedSquashPlan,
+    ) -> Result<usize> {
+        let view = plan.db_view();
+        let worktree = view.worktree;
+        let symbolic_ref = view.symbolic_ref;
+        let expected_cursor = Some(view.expected_cursor);
+        let candidate = view.candidate;
+        let expected_parent = view.expected_parent;
+        let expected_head = view.expected_head;
+        let range = view.range;
+        let snapshots = view.sources;
+        let events = view.events;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cursor:Option<String>=tx.query_row("SELECT last_tip FROM branch_scan_cursors WHERE worktree_key=?1 AND symbolic_ref=?2",params![worktree,symbolic_ref],|r|r.get(0)).optional()?;
+        let git_valid = repo.head().ok().is_some_and(|head| {
+            head.name() == Some(symbolic_ref)
+                && head
+                    .peel_to_commit()
+                    .ok()
+                    .is_some_and(|commit| commit.id().to_string() == expected_head)
+        }) && git2::Oid::from_str(candidate)
+            .ok()
+            .and_then(|oid| repo.find_commit(oid).ok())
+            .is_some_and(|commit| {
+                commit.parent_count() == 1
+                    && commit
+                        .parent_id(0)
+                        .ok()
+                        .is_some_and(|parent| parent.to_string() == expected_parent)
+            });
+        if cursor.as_deref() != expected_cursor || !git_valid {
+            return Err(DbError::LinkConflict(
+                "squash cursor or HEAD changed".into(),
+            ));
+        }
+        let payload:String=tx.query_row("SELECT payload FROM range_evidence WHERE range_id=?1 AND EXISTS(SELECT 1 FROM range_observations WHERE range_id=?1 AND trusted_local=1)",params![range.range_id],|r|r.get(0))?;
+        if payload != serde_json::to_string(range).map_err(|e| DbError::Migration(e.to_string()))? {
+            return Err(DbError::LinkConflict("squash range changed".into()));
+        }
+        let persisted:Vec<(String,String,String)>=tx.prepare("SELECT interaction_id,source_id,snapshot FROM range_interaction_sources WHERE range_id=?1 ORDER BY interaction_id,source_id")?.query_map(params![range.range_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<std::result::Result<_,_>>()?;
+        let supplied_rows: Vec<(String, String, String)> = snapshots
+            .iter()
+            .map(|source| {
+                Ok((
+                    source.interaction_id.to_string(),
+                    source.source_id.clone(),
+                    serde_json::to_string(&source.snapshot)
+                        .map_err(|e| DbError::Migration(e.to_string()))?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        if persisted != supplied_rows {
+            return Err(DbError::LinkConflict(
+                "complete squash source set changed".into(),
+            ));
+        }
+        for source in snapshots {
+            if snapshot_interaction(&source.snapshot).as_deref()
+                != Some(&source.interaction_id.to_string())
+                || source_id_for_snapshot(&source.snapshot).as_deref()
+                    != Some(source.source_id.as_str())
+            {
+                return Err(DbError::InvalidLink(
+                    "squash source ownership mismatch".into(),
+                ));
+            }
+            let actual: String = tx.query_row(
+                "SELECT snapshot FROM range_interaction_sources WHERE range_id=?1 AND interaction_id=?2 AND source_id=?3",
+                params![range.range_id, source.interaction_id.to_string(),source.source_id],
+                |r| r.get(0),
+            )?;
+            if actual
+                != serde_json::to_string(&source.snapshot)
+                    .map_err(|e| DbError::Migration(e.to_string()))?
+                || !Self::source_snapshot_matches_tx(&tx, &source.snapshot)?
+            {
+                return Err(DbError::LinkConflict("squash source changed".into()));
+            }
+        }
+        let supplied: std::collections::HashSet<_> = snapshots
+            .iter()
+            .map(|source| (source.interaction_id.to_string(), source.source_id.clone()))
+            .collect();
+        let cited: std::collections::HashSet<_> = events
+            .iter()
+            .flat_map(|event| {
+                event
+                    .source_event_ids
+                    .iter()
+                    .map(move |source| (event.interaction_id.to_string(), source.clone()))
+            })
+            .collect();
+        if supplied != cited {
+            return Err(DbError::InvalidLink("squash source set mismatch".into()));
+        }
+        let mut inserted = 0;
+        for event in events {
+            if !event.verify_id()
+                || event.relation != DerivationRelation::SquashExact
+                || event.target_commit.as_str() != candidate
+                || event.evidence.version != 1
+                || event.evidence.kind != EvidenceKind::LocallyObserved
+                || event.origin != DerivationOrigin::LocalHook
+                || event.old_oid.is_some()
+                || event.new_oid.is_some()
+                || event.range_id.as_deref() != Some(&range.range_id)
+                || !event.sources_are_canonical()
+            {
+                return Err(DbError::InvalidLink("invalid squash event".into()));
+            }
+            let alive:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM interactions WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM tombstones WHERE interaction_id=?1)",params![event.interaction_id.to_string()],|r|r.get(0))?;
+            if !alive {
+                return Err(DbError::LinkConflict("squash source tombstoned".into()));
+            }
+            let body =
+                serde_json::to_string(event).map_err(|e| DbError::Migration(e.to_string()))?;
+            match tx.execute("INSERT INTO derivation_events(event_id,interaction_id,target_commit,relation,evidence_version,evidence_kind,origin,source_event_ids,old_oid,new_oid,range_id,linked_by,payload) VALUES(?1,?2,?3,'squash_exact',1,'locally_observed','local_hook',?4,NULL,NULL,?5,?6,?7)",params![event.event_id,event.interaction_id.to_string(),event.target_commit.as_str(),serde_json::to_string(&event.source_event_ids).unwrap_or_default(),event.range_id,event.linked_by,body]) {Ok(_)=>inserted+=1,Err(rusqlite::Error::SqliteFailure(e,_)) if is_unique_constraint(&e)=>{let old:String=tx.query_row("SELECT payload FROM derivation_events WHERE event_id=?1",params![event.event_id],|r|r.get(0))?;if old!=body{return Err(DbError::LinkConflict("squash event conflict".into()));}},Err(e)=>return Err(e.into())}
+            tx.execute("INSERT OR IGNORE INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) VALUES(?1,NULL,'local:hook','local_hook',1)",params![event.event_id])?;
+            let owned: Vec<_> = snapshots
+                .iter()
+                .filter(|source| {
+                    source.interaction_id == event.interaction_id
+                        && event.source_event_ids.contains(&source.source_id)
+                })
+                .collect();
+            if owned.len() != event.source_event_ids.len()
+                || owned
+                    .iter()
+                    .map(|s| s.source_id.as_str())
+                    .collect::<Vec<_>>()
+                    != event
+                        .source_event_ids
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+            {
+                return Err(DbError::InvalidLink(
+                    "squash source ownership mismatch".into(),
+                ));
+            }
+            for source in owned {
+                let auth = match &source.snapshot {
+                    SourceSnapshot::Legacy {
+                        authorization_rows, ..
+                    }
+                    | SourceSnapshot::Event {
+                        authorization_rows, ..
+                    } => authorization_rows,
+                };
+                for row in auth {
+                    tx.execute("INSERT OR IGNORE INTO derivation_authorizations(event_id,remote_fingerprint,source_event_id) VALUES(?1,?2,?3)",params![event.event_id,row.remote_fingerprint,row.source_event_id])?;
+                }
+            }
+        }
+        let parent:String=tx.query_row("SELECT parent_commit FROM pending_squash_targets WHERE worktree_key=?1 AND symbolic_ref=?2 AND target_commit=?3 AND status='pending'",params![worktree,symbolic_ref,candidate],|r|r.get(0))?;
+        if parent != expected_parent {
+            return Err(DbError::LinkConflict(
+                "squash topology snapshot changed".into(),
+            ));
+        }
+        tx.execute("UPDATE pending_squash_targets SET status='matched' WHERE worktree_key=?1 AND symbolic_ref=?2 AND target_commit=?3 AND status='pending'",params![worktree,symbolic_ref,candidate])?;
+        tx.execute("DELETE FROM pending_squash_targets WHERE rowid IN (SELECT rowid FROM pending_squash_targets WHERE worktree_key=?1 AND symbolic_ref=?2 AND status!='pending' ORDER BY discovered_order DESC LIMIT -1 OFFSET ?3)",params![worktree,symbolic_ref,MAX_RESOLVED_SQUASH_TARGETS])?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn update_scan_cursor(
+        &self,
+        worktree: &str,
+        symbolic_ref: &str,
+        expected: Option<&str>,
+        tip: &str,
+    ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let old:Option<String>=tx.query_row("SELECT last_tip FROM branch_scan_cursors WHERE worktree_key=?1 AND symbolic_ref=?2",params![worktree,symbolic_ref],|r|r.get(0)).optional()?;
+        if old.as_deref() != expected {
+            return Ok(false);
+        };
+        tx.execute("INSERT INTO branch_scan_cursors(worktree_key,symbolic_ref,last_tip) VALUES(?1,?2,?3) ON CONFLICT(worktree_key,symbolic_ref) DO UPDATE SET last_tip=excluded.last_tip",params![worktree,symbolic_ref,tip])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn source_snapshots_tx(
+        tx: &Transaction<'_>,
+        endpoint: Option<(&str, &str)>,
+    ) -> Result<Vec<SourceSnapshot>> {
+        let Some((id, commit)) = endpoint else {
+            return Ok(Vec::new());
+        };
+        let legacy_key = format!("legacy:{id}:{commit}");
+        let mut auth: Vec<SourceAuthorizationRow> = tx.prepare("SELECT remote_fingerprint FROM interaction_shares WHERE interaction_id=?1 ORDER BY remote_fingerprint")?.query_map(params![id], |r| Ok(SourceAuthorizationRow { remote_fingerprint: r.get(0)?, source_event_id: legacy_key.clone() }))?.collect::<std::result::Result<_,_>>()?;
+        auth.sort();
+        auth.dedup();
+        let mut out = Vec::new();
+        let mut s = tx.prepare("SELECT link_type,linked_by FROM artifact_links WHERE interaction_id=?1 AND git_commit_hash=?2 ORDER BY link_type,COALESCE(linked_by,'')")?;
+        for row in s.query_map(params![id, commit], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })? {
+            let (link_type, linked_by) = row?;
+            let key = legacy_key.clone();
+            let trusted: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM derivation_observations WHERE event_id=?1 AND trusted_local=1)",params![key],|r|r.get(0))?;
+            let alive: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM interactions WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM tombstones WHERE interaction_id=?1)",params![id],|r|r.get(0))?;
+            if trusted && alive {
+                out.push(SourceSnapshot::Legacy {
+                    interaction: id.into(),
+                    commit: commit.into(),
+                    link_type,
+                    linked_by,
+                    authorization_rows: auth.clone(),
+                });
+            }
+        }
+        let mut events = tx.prepare("SELECT event_id FROM derivation_events WHERE interaction_id=?1 AND target_commit=?2 ORDER BY event_id")?;
+        for event_id in events.query_map(params![id, commit], |r| r.get::<_, String>(0))? {
+            if let Some(snapshot) = Self::event_snapshot_tx(tx, &event_id?)? {
+                if matches!(&snapshot, SourceSnapshot::Event { trusted_local_observations, .. } if !trusted_local_observations.is_empty())
+                {
+                    out.push(snapshot);
+                }
+            }
+        }
+        out.sort_by_key(|v| serde_json::to_string(v).unwrap_or_default());
+        Ok(out)
+    }
+
+    fn event_snapshot_tx(tx: &Transaction<'_>, event_id: &str) -> Result<Option<SourceSnapshot>> {
+        let payload: Option<String> = tx
+            .query_row(
+                "SELECT payload FROM derivation_events WHERE event_id=?1",
+                params![event_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let digest = format!("{:x}", sha2::Sha256::digest(payload.as_bytes()));
+        let mut observations: Vec<SourceObservationRow> = tx.prepare("SELECT source_fingerprint,source_key,origin,trusted_local FROM derivation_observations WHERE event_id=?1 AND trusted_local=1 ORDER BY source_key")?.query_map(params![event_id],|r|Ok(SourceObservationRow { source_fingerprint:r.get(0)?, source_key:r.get(1)?, origin:r.get(2)?, trusted_local:r.get::<_,i64>(3)? != 0 }))?.collect::<std::result::Result<_,_>>()?;
+        observations.sort();
+        observations.dedup();
+        let mut auth: Vec<SourceAuthorizationRow> = tx.prepare("SELECT remote_fingerprint,source_event_id FROM derivation_authorizations WHERE event_id=?1 ORDER BY remote_fingerprint,source_event_id")?.query_map(params![event_id],|r|Ok(SourceAuthorizationRow { remote_fingerprint:r.get(0)?, source_event_id:r.get(1)? }))?.collect::<std::result::Result<_,_>>()?;
+        auth.sort();
+        auth.dedup();
+        Ok(Some(SourceSnapshot::Event {
+            event_id: event_id.into(),
+            canonical_payload: payload,
+            canonical_payload_digest: digest,
+            trusted_local_observations: observations,
+            authorization_rows: auth,
+        }))
+    }
+
     /// Add an immutable artifact link. `linked_by` records the author identity
     /// from the commit which triggered an automatic link, when available.
     pub fn link_interaction_with_metadata(
@@ -1076,7 +1938,8 @@ impl CvcStore {
             .map(privacy::scrub)
             .transpose()
             .map_err(|e| DbError::InvalidLink(e.to_string()))?;
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT OR IGNORE INTO artifact_links (interaction_id, git_commit_hash, link_type, linked_by) VALUES (?1, ?2, ?3, ?4)",
             params![
                 interaction_id.to_string(),
@@ -1085,6 +1948,7 @@ impl CvcStore {
                 linked_by,
             ]
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1112,6 +1976,25 @@ impl CvcStore {
         links: &[(&InteractionId, &str)],
         commit_sha: &CommitSha,
         linked_by: Option<&str>,
+    ) -> Result<usize> {
+        self.link_automatic_interaction_batch_inner(links, commit_sha, linked_by, false)
+    }
+
+    pub(crate) fn link_automatic_interaction_batch_trusted(
+        &self,
+        links: &[(&InteractionId, &str)],
+        commit_sha: &CommitSha,
+        linked_by: Option<&str>,
+    ) -> Result<usize> {
+        self.link_automatic_interaction_batch_inner(links, commit_sha, linked_by, true)
+    }
+
+    fn link_automatic_interaction_batch_inner(
+        &self,
+        links: &[(&InteractionId, &str)],
+        commit_sha: &CommitSha,
+        linked_by: Option<&str>,
+        trusted_local: bool,
     ) -> Result<usize> {
         if let Some((_, link_type)) = links
             .iter()
@@ -1183,6 +2066,10 @@ impl CvcStore {
                     }
                 }
                 Err(error) => return Err(error.into()),
+            }
+            if trusted_local {
+                let key = format!("legacy:{}:{}", interaction_id, commit_sha.as_str());
+                transaction.execute("INSERT OR IGNORE INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) VALUES(?1,NULL,?1,'local_api',1)", params![key])?;
             }
         }
         transaction.commit()?;
@@ -1423,7 +2310,7 @@ impl CvcStore {
     }
 
     pub fn get_artifact_links(&self, interaction_id: &InteractionId) -> Result<Vec<ArtifactLink>> {
-        let mut stmt = self.conn.prepare("SELECT interaction_id, git_commit_hash, link_type, linked_by FROM artifact_links WHERE interaction_id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT interaction_id, git_commit_hash, link_type, linked_by FROM artifact_links WHERE interaction_id = ?1 UNION SELECT interaction_id, target_commit, relation, linked_by FROM derivation_events WHERE interaction_id=?1")?;
 
         let rows = stmt.query_map(params![interaction_id.to_string()], |row| {
             Ok(ArtifactLink {
@@ -1445,6 +2332,67 @@ impl CvcStore {
         }
         Ok(items)
     }
+    /// Legacy endpoint rows only, for v1-v4 node/link serialization.
+    pub fn get_legacy_artifact_links(
+        &self,
+        interaction_id: &InteractionId,
+    ) -> Result<Vec<ArtifactLink>> {
+        let mut stmt=self.conn.prepare("SELECT interaction_id,git_commit_hash,link_type,linked_by FROM artifact_links WHERE interaction_id=?1")?;
+        let rows = stmt.query_map(params![interaction_id.to_string()], |row| {
+            Ok(ArtifactLink {
+                interaction_id: row.get::<_, String>(0)?.parse().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                git_commit_hash: CommitSha::new(row.get::<_, String>(1)?),
+                link_type: row.get(2)?,
+                linked_by: row.get(3)?,
+            })
+        })?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// Events are publishable only with authority for this exact destination.
+    /// A remote assertion is evidence received from elsewhere, never outbound
+    /// authority and never a locally-observed rewrite source.
+    pub fn projection_derivation_events(
+        &self,
+        _ids: &[InteractionId],
+        remote: &str,
+    ) -> Result<Vec<DerivationEvent>> {
+        let mut out = Vec::new();
+        // Include authorized suppressed sources in the candidate set so the
+        // caller can compute transitive closure before removing them. Returning
+        // only currently projectable interaction IDs would orphan descendants
+        // and let them survive a tombstone.
+        let mut s=self.conn.prepare("SELECT e.payload FROM derivation_events e WHERE EXISTS(SELECT 1 FROM interaction_shares i WHERE i.interaction_id=e.interaction_id AND i.remote_fingerprint=?1) AND EXISTS(SELECT 1 FROM derivation_observations o WHERE o.event_id=e.event_id AND o.trusted_local=1) AND EXISTS(SELECT 1 FROM derivation_authorizations a WHERE a.event_id=e.event_id AND a.remote_fingerprint=?1) ORDER BY e.event_id")?;
+        for row in s.query_map(params![remote], |r| r.get::<_, String>(0))? {
+            let e: DerivationEvent =
+                serde_json::from_str(&row?).map_err(|e| DbError::Migration(e.to_string()))?;
+            if e.verify_id() {
+                out.push(e)
+            } else {
+                return Err(DbError::LinkConflict(
+                    "stored derivation event hash mismatch".into(),
+                ));
+            }
+        }
+        Ok(out)
+    }
+    pub fn has_locally_observed_source(
+        &self,
+        id: &InteractionId,
+        commit: &CommitSha,
+    ) -> Result<bool> {
+        self.conn.query_row("SELECT EXISTS(SELECT 1 FROM artifact_links a JOIN derivation_observations o ON o.event_id='legacy:' || a.interaction_id || ':' || a.git_commit_hash WHERE a.interaction_id=?1 AND a.git_commit_hash=?2 AND o.trusted_local=1) OR EXISTS(SELECT 1 FROM derivation_events e JOIN derivation_observations o ON o.event_id=e.event_id WHERE e.interaction_id=?1 AND e.target_commit=?2 AND o.trusted_local=1)",params![id.to_string(),commit.as_str()],|r|r.get(0)).map_err(Into::into)
+    }
 
     /// Get all unique commits that have linked interactions, along with their interactions
     /// Returns `(commit_sha, Vec<Interaction>)` pairs ordered by latest timestamp.
@@ -1452,7 +2400,7 @@ impl CvcStore {
         // First get all unique commits ordered by most recent interaction
         let mut commit_stmt = self.conn.prepare(
             "SELECT DISTINCT al.git_commit_hash, MAX(i.timestamp) as max_ts
-             FROM artifact_links al
+             FROM (SELECT interaction_id,git_commit_hash FROM artifact_links UNION SELECT interaction_id,target_commit FROM derivation_events) al
              JOIN interactions i ON al.interaction_id = i.id
              GROUP BY al.git_commit_hash
              ORDER BY max_ts DESC",
@@ -1481,8 +2429,8 @@ impl CvcStore {
             "SELECT i.id, i.conversation_id, i.parent_id, i.timestamp, i.author, i.user_prompt,
                     i.model_name, i.model_cot, i.model_response, i.source_request_id
              FROM interactions i
-             JOIN artifact_links al ON i.id = al.interaction_id
-             WHERE al.git_commit_hash = ?1
+              JOIN (SELECT interaction_id,git_commit_hash FROM artifact_links UNION SELECT interaction_id,target_commit FROM derivation_events) al ON i.id = al.interaction_id
+              WHERE al.git_commit_hash = ?1
              ORDER BY i.timestamp DESC",
         )?;
 
@@ -1530,5 +2478,119 @@ impl CvcStore {
             interactions.push(interaction?);
         }
         Ok(interactions)
+    }
+}
+
+#[cfg(test)]
+mod trusted_api_tests {
+    use super::*;
+    use crate::models::Evidence;
+    use crate::privacy::{McpCapture, PreparedPolicy};
+
+    #[test]
+    fn squash_queue_capacity_is_classified_as_retryable() {
+        assert_eq!(
+            DbError::SquashQueueCapacity { limit: 1 }.retry_disposition(),
+            RetryDisposition::Retryable
+        );
+        assert_eq!(
+            DbError::InvalidLink("invalid squash plan".into()).retry_disposition(),
+            RetryDisposition::Permanent
+        );
+    }
+
+    #[test]
+    fn private_rewrite_cas_rejects_changed_event_observation_and_authorization(
+    ) -> anyhow::Result<()> {
+        for mutation in 0..3 {
+            let mut store = CvcStore::open(":memory:")?;
+            let interaction = Interaction {
+                id: InteractionId::new(),
+                conversation_id: "cas".into(),
+                parent_id: None,
+                timestamp: Utc::now(),
+                author: Author::Human,
+                user_prompt: "cas".into(),
+                model_name: None,
+                model_cot: None,
+                model_response: None,
+                source_request_id: None,
+            };
+            store.capture_mcp(McpCapture::new(
+                Conversation {
+                    id: "cas".into(),
+                    title: "cas".into(),
+                    created_at: interaction.timestamp,
+                },
+                interaction.clone(),
+                Vec::new(),
+                Vec::new(),
+                PreparedPolicy::built_ins_only(),
+            ))?;
+            let mut source = DerivationEvent {
+                event_id: String::new(),
+                interaction_id: interaction.id.clone(),
+                target_commit: CommitSha::new("a".repeat(40)),
+                relation: DerivationRelation::Generated,
+                evidence: Evidence {
+                    version: 1,
+                    kind: EvidenceKind::LocallyObserved,
+                },
+                origin: DerivationOrigin::LocalLinker,
+                source_event_ids: Vec::new(),
+                old_oid: None,
+                new_oid: None,
+                range_id: None,
+                linked_by: None,
+            };
+            source.event_id = source.canonical_id();
+            store.conn.execute("INSERT INTO derivation_events(event_id,interaction_id,target_commit,relation,evidence_version,evidence_kind,origin,source_event_ids,payload) VALUES(?1,?2,?3,'generated',1,'locally_observed','local_linker','[]',?4)", params![source.event_id,interaction.id.to_string(),source.target_commit.as_str(),serde_json::to_string(&source)?])?;
+            store.conn.execute("INSERT INTO derivation_observations(event_id,source_key,origin,trusted_local) VALUES(?1,'local','local_api',1)",params![source.event_id])?;
+            store.conn.execute("INSERT INTO derivation_authorizations(event_id,remote_fingerprint,source_event_id) VALUES(?1,'remote','source')",params![source.event_id])?;
+            let snapshots =
+                store.rewrite_source_snapshots(&interaction.id, &source.target_commit)?;
+            let mut derived = DerivationEvent {
+                event_id: String::new(),
+                interaction_id: interaction.id.clone(),
+                target_commit: CommitSha::new("b".repeat(40)),
+                relation: DerivationRelation::RewriteExact,
+                evidence: Evidence {
+                    version: 1,
+                    kind: EvidenceKind::LocallyObserved,
+                },
+                origin: DerivationOrigin::LocalHook,
+                source_event_ids: vec![source.event_id.clone()],
+                old_oid: Some(source.target_commit.clone()),
+                new_oid: Some(CommitSha::new("b".repeat(40))),
+                range_id: None,
+                linked_by: None,
+            };
+            derived.event_id = derived.canonical_id();
+            match mutation {
+                0 => store.conn.execute(
+                    "UPDATE derivation_events SET payload=payload || ' ' WHERE event_id=?1",
+                    params![source.event_id],
+                )?,
+                1 => store.conn.execute(
+                    "DELETE FROM derivation_observations WHERE event_id=?1",
+                    params![source.event_id],
+                )?,
+                _ => store.conn.execute(
+                    "DELETE FROM derivation_authorizations WHERE event_id=?1",
+                    params![source.event_id],
+                )?,
+            };
+            assert!(store
+                .apply_rewrite_events("batch", "amend", "hash", &[derived], &snapshots)
+                .is_err());
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM derivation_events", [], |row| row
+                        .get::<_, i64>(0))?,
+                1
+            );
+        }
+        Ok(())
     }
 }

@@ -40,10 +40,12 @@ export interface ArtifactLinkData {
   link_type: ArtifactLinkType;
   /** Commit author attribution when the automatic link was created. */
   linked_by?: string | null;
+  /** FORMAT5 immutable evidence; absent for legacy/v3 links. */
+  derivation_event?: import("../lib/format5").DerivationEvent;
 }
 
 /** Link types emitted by current automatic linking and supported legacy blobs. */
-export type ArtifactLinkType = "generated" | "temporal" | "verified" | "refactored";
+export type ArtifactLinkType = "generated" | "temporal" | "verified" | "rewrite_exact" | "squash_exact";
 
 /** The append-only `links/<interaction-id>/<commit-sha>.json` record in sync format v3. */
 export type CVCLinkRecord = ArtifactLinkData;
@@ -128,12 +130,14 @@ export function mergeArtifactLinks(
 ): InteractionNode {
   if (linkRecords.length === 0) return interaction;
 
+  // Endpoint identity is intentionally separate from evidence identity: several
+  // immutable derivations can justify one interaction/commit relationship.
   const links = new Map<string, ArtifactLinkData>();
   for (const link of interaction.artifact_links) {
-    links.set(`${link.git_commit_hash}:${link.link_type}`, link);
+    links.set(link.derivation_event?.event_id ?? `${link.git_commit_hash}:${link.link_type}`, link);
   }
   for (const link of linkRecords) {
-    const key = `${link.git_commit_hash}:${link.link_type}`;
+    const key = link.derivation_event?.event_id ?? `${link.git_commit_hash}:${link.link_type}`;
     links.set(key, { ...links.get(key), ...link });
   }
 

@@ -168,12 +168,19 @@ The primary controller.
 
 ## 6. Implementation Phases
 
-### 5.4 Format v4 suppression and browser retention
+### 5.4 FORMAT5 evidence, suppression, and browser retention
 
-The reviewer supports sync formats v1–v4. For v4 it validates and loads the
-`tombstones/` tree before nodes; a valid tombstone suppresses its target regardless of
-whether that target appears in a legacy flat path or a sharded `nodes/` path. It evicts
-the target's React Query node-cache key on observation. Invalid or truncated tombstone
+The reviewer supports sync formats v1–v5. For v5 it validates bounded, canonical
+`events/` derivation records and `ranges/` `RangeEvidence`, including the
+`cvc.changeset/v1` identity and exact source/range closure, before it joins an event to a
+validated node and `by-commit` pointer. This is wire-format validation only: labels such as
+**Publisher-asserted Git rewrite** and **Publisher-asserted squash equivalence** do not mean
+the browser independently verified local Git objects, trust observations, or authorization.
+
+For v4+ it validates and loads the `tombstones/` tree before nodes; a valid tombstone
+suppresses its target regardless of whether that target appears in a legacy flat path or a
+sharded `nodes/` path, and suppresses that interaction's v5 derivation/range closure. It
+evicts the target's React Query node-cache key on observation. Invalid or truncated tombstone
 data is an error, not permission to display a possibly suppressed interaction.
 
 This is UI/cache suppression only. A tombstone is not physical Git-object deletion, and
@@ -200,7 +207,7 @@ not render a possibly suppressed timeline.
 
 ### Phase 2: The Data Overlay
 
-- Implement `CVCLoader`: Fetches `pull_request`, gets commit range, fetches `refs/cvc/main` blobs.
+- Implement `CVCLoader`: Fetches `pull_request`, gets commit range in bounded 100-commit pages (maximum 100 pages), includes the reported merged PR SHA, then fetches `refs/cvc/main` blobs. Invalid pagination or merged SHA fails the cognitive overlay closed.
     
 - Implement the "Join Logic": matching Commit SHAs to Interaction IDs locally in the browser.
     

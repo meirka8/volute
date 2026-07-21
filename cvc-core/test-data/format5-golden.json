@@ -1,0 +1,38 @@
+{
+  "event": {
+    "event_id": "a5b182bd90e298bcb84948ce7d7d6caa1f9b4f2e993131267459776479556576",
+    "interaction_id": "11111111-1111-4111-8111-111111111111",
+    "target_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "relation": "rewrite_exact",
+    "evidence": {
+      "version": 1,
+      "kind": "locally_observed"
+    },
+    "origin": "local_hook",
+    "source_event_ids": [
+      "legacy:11111111-1111-4111-8111-111111111111:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+    "old_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "new_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "range_id": null,
+    "linked_by": null
+  },
+  "range": {
+    "range_id": "13e56effb5b051a74275009163cb3277f1188573b588474f5abb0d0feae2fd93",
+    "format": "cvc.range-evidence/v1",
+    "version": 1,
+    "repository_identity": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "object_format": "sha1",
+    "base_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tip_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "base_tree_oid": "dddddddddddddddddddddddddddddddddddddddd",
+    "result_tree_oid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "commits": [
+      {
+        "commit_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ],
+    "changeset_algorithm": "cvc.changeset/v1",
+    "changeset_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  }
+}

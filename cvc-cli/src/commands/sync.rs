@@ -266,9 +266,9 @@ pub async fn push(requested: Option<&str>, manual: bool) -> Result<()> {
     let destination = privacy::remote_destination(&repo, &name)?;
     push_destination(&repo, &store, &destination, !manual)
 }
-pub async fn auto_push(cwd: &Path) -> Result<()> {
+pub async fn auto_push_remote(cwd: &Path, requested: Option<&str>) -> Result<()> {
     let (repo, store) = open(cwd)?;
-    let name = remote(&repo, None)?;
+    let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
     let status = privacy::privacy_status_for_fingerprint(&repo, &destination.fingerprint)?;
     if !status.sharing_consented || !status.auto_push {
@@ -379,12 +379,43 @@ pub async fn reconcile(requested: Option<&str>) -> Result<()> {
     Ok(())
 }
 pub async fn pull() -> Result<()> {
-    let (repo, store) = open(&env::current_dir()?)?;
+    let (repo, mut store) = open(&env::current_dir()?)?;
     let name = remote(&repo, None)?;
     let destination = privacy::remote_destination(&repo, &name)?;
     let _operation_lock = privacy::destination_operation_lock(&repo, &destination.fingerprint)?;
     let n = sync::fetch_and_pull_destination(&repo, &store, &destination)?;
+    let _ =
+        cvc_core::squash::scan_for(&repo, &mut store, false, std::time::Duration::from_secs(30))?;
     println!("Pulled {n} interaction(s) from '{name}'.");
+    Ok(())
+}
+
+pub async fn observe_range(base: &str, tip: &str, requested: Option<&str>) -> Result<()> {
+    let (repo, store) = open(&env::current_dir()?)?;
+    let base = repo.revparse_single(base)?.peel_to_commit()?.id();
+    let tip = repo.revparse_single(tip)?.peel_to_commit()?.id();
+    let authorization = if let Some(name) = requested {
+        let destination = privacy::remote_destination(&repo, name)?;
+        typed_acknowledgement(&format!(
+            "I AUTHORIZE RANGE {} {} {}",
+            base, tip, destination.fingerprint
+        ))?;
+        Some(destination.fingerprint)
+    } else {
+        None
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let range = cvc_core::squash::observe_explicit_range_with_abort(
+        &repo,
+        &store,
+        base,
+        tip,
+        None,
+        requested,
+        authorization.as_deref(),
+        || std::time::Instant::now() >= deadline,
+    )?;
+    println!("Observed exact range {}.", range.range_id);
     Ok(())
 }
 

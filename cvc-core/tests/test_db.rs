@@ -31,6 +31,35 @@ impl CaptureFixture for CvcStore {
 }
 
 #[test]
+fn public_link_api_cannot_create_trusted_source_even_after_reopen() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("index.db");
+    let id = InteractionId::new();
+    let interaction = Interaction {
+        id: id.clone(),
+        conversation_id: "sealed-link".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "untrusted public fixture".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    let sha = CommitSha::new("a".repeat(40));
+    {
+        let store = CvcStore::open(&path)?;
+        store.create_interaction(&interaction)?;
+        store.link_interaction(&id, &sha, "generated")?;
+        assert!(!store.has_locally_observed_source(&id, &sha)?);
+    }
+    let reopened = CvcStore::open(&path)?;
+    assert!(!reopened.has_locally_observed_source(&id, &sha)?);
+    Ok(())
+}
+
+#[test]
 fn test_db_workflow() -> anyhow::Result<()> {
     // 1. Setup in-memory DB
     let store = CvcStore::open(":memory:")?;

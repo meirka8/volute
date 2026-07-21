@@ -69,6 +69,11 @@ enum Commands {
     },
     /// Delete local CVC projections only; this does not erase a remote.
     DeleteLocal { interaction_id: String },
+    /// Manage exact derivation evidence.
+    Relink {
+        #[command(subcommand)]
+        command: RelinkCommands,
+    },
     /// Internal hook commands
     Hook {
         #[command(subcommand)]
@@ -96,13 +101,43 @@ enum Commands {
 #[derive(Subcommand)]
 enum HookCommands {
     PostCommit,
-    PrePush,
+    PrePush {
+        remote_name: String,
+        remote_url: String,
+    },
+    PostMerge {
+        /// Git supplies 0/1 to indicate whether the merge was a squash.
+        squash: Option<String>,
+    },
+    PostRewrite {
+        mode: String,
+    },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn main() -> std::process::ExitCode {
+    let args: Vec<_> = std::env::args_os().collect();
+    let advisory_hook = args.get(1).is_some_and(|arg| arg == "hook");
+    let result = (|| -> Result<()> {
+        let cli = Cli::try_parse_from(&args)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(dispatch(cli))
+    })();
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) if advisory_hook => {
+            eprintln!("CVC Hook Warning: advisory hook skipped: {error}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
 
+async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init => {
             commands::init::run().await?;
@@ -120,7 +155,14 @@ async fn main() -> Result<()> {
             HookCommands::PostCommit => {
                 commands::hook::post_commit().await?;
             }
-            HookCommands::PrePush => commands::hook::pre_push().await?,
+            HookCommands::PrePush {
+                remote_name,
+                remote_url,
+            } => commands::hook::pre_push(&remote_name, &remote_url).await?,
+            HookCommands::PostMerge { squash } => {
+                commands::hook::post_merge(squash.as_deref()).await?
+            }
+            HookCommands::PostRewrite { mode } => commands::hook::post_rewrite(&mode).await?,
         },
         Commands::Privacy { command } => match command {
             PrivacyCommands::Status { remote } => {
@@ -159,6 +201,11 @@ async fn main() -> Result<()> {
         Commands::DeleteLocal { interaction_id } => {
             commands::sync::delete_local(&interaction_id).await?
         }
+        Commands::Relink { command } => match command {
+            RelinkCommands::ObserveRange { base, tip, remote } => {
+                commands::sync::observe_range(&base, &tip, remote.as_deref()).await?
+            }
+        },
         Commands::Run { args } => {
             commands::run::run(args).await?;
         }
@@ -177,6 +224,16 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Subcommand)]
+enum RelinkCommands {
+    ObserveRange {
+        base: String,
+        tip: String,
+        #[arg(long)]
+        remote: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -199,6 +256,23 @@ enum PrivacyCommands {
         #[arg(long)]
         remote: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod hook_cli_tests {
+    use super::*;
+
+    #[test]
+    fn clap_accepts_git_hook_argument_shapes() {
+        for args in [
+            vec!["cvc", "hook", "post-commit"],
+            vec!["cvc", "hook", "pre-push", "origin", "file:///remote"],
+            vec!["cvc", "hook", "post-merge", "1"],
+            vec!["cvc", "hook", "post-rewrite", "rebase"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+    }
 }
 
 #[derive(Subcommand)]

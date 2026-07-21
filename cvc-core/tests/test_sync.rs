@@ -3,13 +3,36 @@ use cvc_core::db::CvcStore;
 use cvc_core::models::*;
 use cvc_core::privacy::{McpCapture, PreparedPolicy};
 use cvc_core::sync::{self, SyncNode};
-use git2::{FileMode, Repository, Signature};
+use git2::{FileMode, ObjectType, Repository, Signature};
 use rusqlite::Connection;
 use std::sync::mpsc;
 use std::time::Duration;
 use tempfile::TempDir;
 
 const TEST_DESTINATION: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[test]
+fn pull_rejects_non_utf8_sync_paths() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let blob = repo.blob(b"{}")?;
+    let mut raw = b"100644 bad\xff\0".to_vec();
+    raw.extend_from_slice(blob.as_bytes());
+    let tree_oid = repo.odb()?.write(ObjectType::Tree, &raw)?;
+    let tree = repo.find_tree(tree_oid)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    repo.commit(
+        Some("refs/cvc/non-utf8"),
+        &signature,
+        &signature,
+        "non utf8",
+        &tree,
+        &[],
+    )?;
+    let store = CvcStore::open(temp.path().join("index.db"))?;
+    assert!(sync::pull_from_ref(&repo, &store, "refs/cvc/non-utf8").is_err());
+    Ok(())
+}
 
 trait CaptureFixture {
     fn create_conversation(&self, _: &Conversation) -> cvc_core::db::Result<()>;
@@ -70,6 +93,624 @@ fn project_fixture_to_ref(
         }
         sync::ProjectionResult::NoChanges => {}
     }
+    Ok(())
+}
+
+fn derivation(
+    interaction_id: &InteractionId,
+    commit: char,
+    source_event_ids: Vec<String>,
+) -> DerivationEvent {
+    let mut event = DerivationEvent {
+        event_id: String::new(),
+        interaction_id: interaction_id.clone(),
+        target_commit: CommitSha::new(commit.to_string().repeat(40)),
+        relation: DerivationRelation::Generated,
+        evidence: Evidence {
+            version: 1,
+            kind: EvidenceKind::LocallyObserved,
+        },
+        origin: DerivationOrigin::LocalLinker,
+        source_event_ids,
+        old_oid: None,
+        new_oid: None,
+        range_id: None,
+        linked_by: None,
+    };
+    event.event_id = event.canonical_id();
+    event
+}
+
+fn trust_and_authorize_event(
+    db_path: &std::path::Path,
+    event: &DerivationEvent,
+) -> anyhow::Result<()> {
+    let db = Connection::open(db_path)?;
+    db.execute("INSERT INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) VALUES(?1,NULL,'fixture-local','local_api',1)", [&event.event_id])?;
+    db.execute("INSERT INTO derivation_authorizations(event_id,remote_fingerprint,source_event_id) VALUES(?1,?2,?1)", rusqlite::params![event.event_id, TEST_DESTINATION])?;
+    Ok(())
+}
+
+fn insert_event_fixture(db_path: &std::path::Path, event: &DerivationEvent) -> anyhow::Result<()> {
+    let db = Connection::open(db_path)?;
+    db.execute(
+        "INSERT INTO derivation_events(event_id,interaction_id,target_commit,relation,evidence_version,evidence_kind,origin,source_event_ids,old_oid,new_oid,range_id,linked_by,payload) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        rusqlite::params![
+            event.event_id,
+            event.interaction_id.to_string(),
+            event.target_commit.as_str(),
+            match event.relation { DerivationRelation::Generated => "generated", DerivationRelation::Temporal => "temporal", DerivationRelation::Verified => "verified", DerivationRelation::RewriteExact => "rewrite_exact", DerivationRelation::SquashExact => "squash_exact" },
+            event.evidence.version,
+            match event.evidence.kind { EvidenceKind::LocallyObserved => "locally_observed", EvidenceKind::ImportedLegacy => "imported_legacy", EvidenceKind::RemoteAssertion => "remote_assertion" },
+            match event.origin { DerivationOrigin::LocalHook => "local_hook", DerivationOrigin::LocalLinker => "local_linker", DerivationOrigin::RemoteAssertion => "remote_assertion", DerivationOrigin::LegacyImport => "legacy_import" },
+            serde_json::to_string(&event.source_event_ids)?,
+            event.old_oid.as_ref().map(CommitSha::as_str),
+            event.new_oid.as_ref().map(CommitSha::as_str),
+            event.range_id,
+            event.linked_by,
+            serde_json::to_string(event)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn wire_event_ids(repo: &Repository, tree: &git2::Tree<'_>) -> anyhow::Result<Vec<String>> {
+    let Some(events) = tree.get_name("events") else {
+        return Ok(Vec::new());
+    };
+    let mut ids = Vec::new();
+    for shard in events.to_object(repo)?.peel_to_tree()?.iter() {
+        for entry in shard.to_object(repo)?.peel_to_tree()?.iter() {
+            let event: DerivationEvent =
+                serde_json::from_slice(entry.to_object(repo)?.peel_to_blob()?.content())?;
+            ids.push(event.event_id);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+#[test]
+fn tombstone_prunes_transitive_event_dag_and_rebuilds_index_from_one_tree() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let db_path = temp.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let target = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "target".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "remove".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    let retained = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "retained".into(),
+        user_prompt: "keep".into(),
+        ..target.clone()
+    };
+    store.create_interaction(&target)?;
+    store.create_interaction(&retained)?;
+    let first = derivation(&target.id, 'a', Vec::new());
+    let second = derivation(&target.id, 'b', vec![first.event_id.clone()]);
+    let third = derivation(&target.id, 'c', vec![second.event_id.clone()]);
+    let unrelated = derivation(&retained.id, 'd', Vec::new());
+    for event in [&first, &second, &third, &unrelated] {
+        insert_event_fixture(&db_path, event)?;
+        trust_and_authorize_event(&db_path, event)?;
+    }
+    project_fixture_to_ref(&repo, &store, "refs/cvc/dag-prune")?;
+    assert_eq!(
+        wire_event_ids(
+            &repo,
+            &repo
+                .find_reference("refs/cvc/dag-prune")?
+                .peel_to_commit()?
+                .tree()?
+        )?
+        .len(),
+        4
+    );
+
+    store.tombstone_remote(
+        &target.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::Security,
+        None,
+    )?;
+    let later = derivation(&retained.id, 'e', vec![unrelated.event_id.clone()]);
+    insert_event_fixture(&db_path, &later)?;
+    trust_and_authorize_event(&db_path, &later)?;
+    project_fixture_to_ref(&repo, &store, "refs/cvc/dag-prune")?;
+    let tree = repo
+        .find_reference("refs/cvc/dag-prune")?
+        .peel_to_commit()?
+        .tree()?;
+    assert_eq!(
+        wire_event_ids(&repo, &tree)?,
+        vec![later.event_id.clone(), unrelated.event_id.clone()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+    let index = tree
+        .get_name("by-commit")
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    for removed in ['a', 'b', 'c'] {
+        assert!(index.get_name(&removed.to_string().repeat(40)).is_none());
+    }
+    for kept in ['d', 'e'] {
+        assert!(index.get_name(&kept.to_string().repeat(40)).is_some());
+    }
+    Ok(())
+}
+
+#[test]
+fn outbound_events_require_trusted_observation_and_exact_destination_authority(
+) -> anyhow::Result<()> {
+    const OTHER: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let db_path = temp.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let item = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "trust".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "authority".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&item)?;
+    store.share_conversation_for_remote(
+        &item.conversation_id,
+        OTHER,
+        FutureSharePolicy::Private,
+    )?;
+
+    let allowed = derivation(&item.id, 'a', Vec::new());
+    insert_event_fixture(&db_path, &allowed)?;
+    trust_and_authorize_event(&db_path, &allowed)?;
+    let mut assertion = derivation(&item.id, 'b', Vec::new());
+    assertion.evidence.kind = EvidenceKind::RemoteAssertion;
+    assertion.origin = DerivationOrigin::RemoteAssertion;
+    assertion.event_id = assertion.canonical_id();
+    insert_event_fixture(&db_path, &assertion)?;
+    {
+        let db = Connection::open(&db_path)?;
+        db.execute("INSERT INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) VALUES(?1,NULL,'fingerprintless','remote_sync',0)", [&assertion.event_id])?;
+        db.execute("INSERT INTO derivation_authorizations(event_id,remote_fingerprint,source_event_id) VALUES(?1,?2,?1)", rusqlite::params![assertion.event_id, TEST_DESTINATION])?;
+    }
+    let projection = sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION)?;
+    let oid = match projection {
+        sync::ProjectionResult::Candidate { oid, .. } => oid,
+        _ => anyhow::bail!("expected projection"),
+    };
+    assert_eq!(
+        wire_event_ids(&repo, &repo.find_commit(oid)?.tree()?)?,
+        vec![allowed.event_id.clone()]
+    );
+
+    let other = sync::push_projection_to_ref(&repo, &store, "", OTHER)?;
+    let oid = match other {
+        sync::ProjectionResult::Candidate { oid, .. } => oid,
+        _ => anyhow::bail!("node should project"),
+    };
+    let tree = repo.find_commit(oid)?.tree()?;
+    assert!(
+        wire_event_ids(&repo, &tree)?.is_empty(),
+        "destination A authority must not cross to B"
+    );
+    assert!(
+        tree.get_name("by-commit").is_none(),
+        "assertions must not leak index pointers"
+    );
+    Ok(())
+}
+
+#[test]
+fn format5_always_emits_and_requires_empty_reserved_trees() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "empty-v5".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "empty namespaces".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&item)?;
+    project_fixture_to_ref(&repo, &store, "refs/cvc/empty-v5")?;
+    let tree = repo
+        .find_reference("refs/cvc/empty-v5")?
+        .peel_to_commit()?
+        .tree()?;
+    for namespace in ["events", "ranges"] {
+        let subtree = tree
+            .get_name(namespace)
+            .expect("FORMAT5 namespace")
+            .to_object(&repo)?
+            .peel_to_tree()?;
+        assert!(subtree.is_empty());
+    }
+    let mut malformed = repo.treebuilder(Some(&tree))?;
+    malformed.remove("ranges")?;
+    let malformed = repo.find_tree(malformed.write()?)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    repo.commit(
+        Some("refs/cvc/missing-v5-namespace"),
+        &signature,
+        &signature,
+        "missing namespace",
+        &malformed,
+        &[],
+    )?;
+    let imported = CvcStore::open(temp.path().join("imported.db"))?;
+    assert!(sync::pull_from_ref(&repo, &imported, "refs/cvc/missing-v5-namespace").is_err());
+    Ok(())
+}
+
+#[test]
+fn projection_refuses_dangling_exact_event_instead_of_pruning_it() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let db_path = temp.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let item = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "dangling-event".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "reject dangling".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&item)?;
+    let mut event = derivation(&item.id, 'b', vec!["f".repeat(64)]);
+    event.relation = DerivationRelation::RewriteExact;
+    event.old_oid = Some(CommitSha::new("a".repeat(40)));
+    event.new_oid = Some(CommitSha::new("b".repeat(40)));
+    event.event_id = event.canonical_id();
+    insert_event_fixture(&db_path, &event)?;
+    trust_and_authorize_event(&db_path, &event)?;
+    assert!(sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION).is_err());
+    Ok(())
+}
+
+#[test]
+fn pull_rejects_dangling_event_before_tombstone_pruning_with_duplicate_legacy_endpoint(
+) -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let source = CvcStore::open(temp.path().join("source.db"))?;
+    let item = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "pre-prune-validation".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "must reject malformed wire graph".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&item)?;
+    source.link_interaction(&item.id, &CommitSha::new("a".repeat(40)), "generated")?;
+    project_fixture_to_ref(&repo, &source, "refs/cvc/pre-prune-valid")?;
+    let baseline = repo
+        .find_reference("refs/cvc/pre-prune-valid")?
+        .peel_to_commit()?
+        .tree()?;
+    assert!(baseline.get_name("links").is_some());
+
+    let tombstone = Tombstone::new(item.id.clone(), TombstoneReasonCode::Security, None);
+    let tombstone_file = format!("{}.json", item.id);
+    let tombstone_shard_name = &item.id.as_str()[..2];
+    let mut tombstone_shard = repo.treebuilder(None)?;
+    tombstone_shard.insert(
+        &tombstone_file,
+        repo.blob(&serde_json::to_vec(&tombstone)?)?,
+        FileMode::Blob.into(),
+    )?;
+    let mut tombstones = repo.treebuilder(None)?;
+    tombstones.insert(
+        tombstone_shard_name,
+        tombstone_shard.write()?,
+        FileMode::Tree.into(),
+    )?;
+
+    let mut dangling = derivation(&item.id, 'b', vec!["f".repeat(64)]);
+    dangling.relation = DerivationRelation::RewriteExact;
+    dangling.old_oid = Some(CommitSha::new("a".repeat(40)));
+    dangling.new_oid = Some(CommitSha::new("b".repeat(40)));
+    dangling.event_id = dangling.canonical_id();
+    let event_file = format!("{}.json", dangling.event_id);
+    let mut event_shard = repo.treebuilder(None)?;
+    event_shard.insert(
+        &event_file,
+        repo.blob(&serde_json::to_vec(&dangling)?)?,
+        FileMode::Blob.into(),
+    )?;
+    let mut events = repo.treebuilder(Some(
+        &baseline
+            .get_name("events")
+            .expect("events")
+            .to_object(&repo)?
+            .peel_to_tree()?,
+    ))?;
+    events.insert(
+        &dangling.event_id[..2],
+        event_shard.write()?,
+        FileMode::Tree.into(),
+    )?;
+    let mut root = repo.treebuilder(Some(&baseline))?;
+    root.insert("tombstones", tombstones.write()?, FileMode::Tree.into())?;
+    root.insert("events", events.write()?, FileMode::Tree.into())?;
+    let malformed = repo.find_tree(root.write()?)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    repo.commit(
+        Some("refs/cvc/pre-prune-malformed"),
+        &signature,
+        &signature,
+        "malformed before pruning",
+        &malformed,
+        &[],
+    )?;
+    let imported = CvcStore::open(temp.path().join("imported.db"))?;
+    assert!(sync::pull_from_ref(&repo, &imported, "refs/cvc/pre-prune-malformed").is_err());
+    assert!(imported.get_all_interaction_ids()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn format5_rejects_malformed_ranges_and_by_commit_shapes_or_targets() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let source = CvcStore::open(temp.path().join("source.db"))?;
+    let item = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "index-validation".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "index".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&item)?;
+    source.link_interaction(&item.id, &CommitSha::new("a".repeat(40)), "generated")?;
+    project_fixture_to_ref(&repo, &source, "refs/cvc/valid-index")?;
+    let baseline = repo
+        .find_reference("refs/cvc/valid-index")?
+        .peel_to_commit()?
+        .tree()?;
+    let signature = Signature::now("test", "test@example.test")?;
+
+    let publish = |name: &str, tree: git2::Oid| -> anyhow::Result<()> {
+        let tree = repo.find_tree(tree)?;
+        repo.commit(
+            Some(name),
+            &signature,
+            &signature,
+            "malformed fixture",
+            &tree,
+            &[],
+        )?;
+        Ok(())
+    };
+    // Non-empty ranges are not accepted until their bounded canonical schema is
+    // implemented; silently retaining arbitrary evidence would be a trust bug.
+    let mut ranges = repo.treebuilder(None)?;
+    ranges.insert("unexpected.json", repo.blob(b"{}")?, FileMode::Blob.into())?;
+    let mut root = repo.treebuilder(Some(&baseline))?;
+    root.insert("ranges", ranges.write()?, FileMode::Tree.into())?;
+    publish("refs/cvc/bad-ranges", root.write()?)?;
+
+    let empty = repo.blob(b"")?;
+    let bad_body = repo.blob(b"not empty")?;
+    for (case, commit_name, pointer_name, pointer_oid, pointer_mode) in [
+        (
+            "uppercase",
+            "A".repeat(40),
+            item.id.to_string(),
+            empty,
+            FileMode::Blob,
+        ),
+        (
+            "commit",
+            "short".into(),
+            item.id.to_string(),
+            empty,
+            FileMode::Blob,
+        ),
+        (
+            "uuid",
+            "a".repeat(40),
+            "not-a-uuid".into(),
+            empty,
+            FileMode::Blob,
+        ),
+        (
+            "body",
+            "a".repeat(40),
+            item.id.to_string(),
+            bad_body,
+            FileMode::Blob,
+        ),
+        (
+            "nesting",
+            "a".repeat(40),
+            item.id.to_string(),
+            repo.treebuilder(None)?.write()?,
+            FileMode::Tree,
+        ),
+        (
+            "stale",
+            "b".repeat(40),
+            item.id.to_string(),
+            empty,
+            FileMode::Blob,
+        ),
+    ] {
+        let mut pointers = repo.treebuilder(None)?;
+        pointers.insert(&pointer_name, pointer_oid, pointer_mode.into())?;
+        let mut index = repo.treebuilder(None)?;
+        index.insert(&commit_name, pointers.write()?, FileMode::Tree.into())?;
+        let mut root = repo.treebuilder(Some(&baseline))?;
+        root.insert("by-commit", index.write()?, FileMode::Tree.into())?;
+        publish(&format!("refs/cvc/bad-index-{case}"), root.write()?)?;
+    }
+    let mut root = repo.treebuilder(Some(&baseline))?;
+    root.insert(
+        "by-commit",
+        repo.blob(b"wrong root type")?,
+        FileMode::Blob.into(),
+    )?;
+    publish("refs/cvc/bad-index-root", root.write()?)?;
+
+    for name in [
+        "bad-ranges",
+        "bad-index-root",
+        "bad-index-uppercase",
+        "bad-index-commit",
+        "bad-index-uuid",
+        "bad-index-body",
+        "bad-index-nesting",
+        "bad-index-stale",
+    ] {
+        let store = CvcStore::open(temp.path().join(format!("{name}.db")))?;
+        assert!(
+            sync::pull_from_ref(&repo, &store, &format!("refs/cvc/{name}")).is_err(),
+            "accepted {name}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn hard_redaction_fixture_removes_multihop_derivation_closure() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let db_path = temp.path().join("hard-dag.db");
+    let store = CvcStore::open(&db_path)?;
+    let target = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "hard-target".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "remove".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    let retained = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "hard-retained".into(),
+        user_prompt: "retain".into(),
+        ..target.clone()
+    };
+    store.create_interaction(&target)?;
+    store.create_interaction(&retained)?;
+    let first = derivation(&target.id, 'a', Vec::new());
+    let second = derivation(&target.id, 'b', vec![first.event_id.clone()]);
+    let third = derivation(&target.id, 'c', vec![second.event_id.clone()]);
+    let unrelated = derivation(&retained.id, 'd', Vec::new());
+    for event in [&first, &second, &third, &unrelated] {
+        insert_event_fixture(&db_path, event)?;
+        trust_and_authorize_event(&db_path, event)?;
+    }
+    project_fixture_to_ref(&repo, &store, "refs/cvc/hard-dag")?;
+    let unredacted = repo
+        .find_reference("refs/cvc/hard-dag")?
+        .peel_to_commit()?
+        .tree()?;
+    let stale_events = unredacted.get_name("events").unwrap().id();
+    let stale_index = unredacted.get_name("by-commit").unwrap().id();
+
+    store.tombstone_remote(
+        &target.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::Security,
+        None,
+    )?;
+    project_fixture_to_ref(&repo, &store, "refs/cvc/hard-dag")?;
+    let suppressed = repo
+        .find_reference("refs/cvc/hard-dag")?
+        .peel_to_commit()?
+        .tree()?;
+    let mut stale = repo.treebuilder(Some(&suppressed))?;
+    stale.insert("events", stale_events, FileMode::Tree.into())?;
+    stale.insert("by-commit", stale_index, FileMode::Tree.into())?;
+    let stale_tree = repo.find_tree(stale.write()?)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    let stale_tip = repo.commit(
+        None,
+        &signature,
+        &signature,
+        "stale redaction evidence",
+        &stale_tree,
+        &[],
+    )?;
+    repo.reference(
+        "refs/remotes/fixture/cvc/main",
+        stale_tip,
+        true,
+        "stale fixture",
+    )?;
+
+    let candidate = sync::build_hard_redaction_plan(
+        &repo,
+        Some("refs/remotes/fixture/cvc/main"),
+        TEST_DESTINATION,
+        &target.id,
+    )?;
+    let replacement = repo
+        .find_commit(git2::Oid::from_str(&candidate.plan.replacement_commit)?)?
+        .tree()?;
+    assert_eq!(
+        wire_event_ids(&repo, &replacement)?,
+        vec![unrelated.event_id]
+    );
+    let index = replacement
+        .get_name("by-commit")
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    for removed in ['a', 'b', 'c'] {
+        assert!(index.get_name(&removed.to_string().repeat(40)).is_none());
+    }
+    assert!(index.get_name(&"d".repeat(40)).is_some());
+    assert_eq!(
+        repo.find_reference("refs/remotes/fixture/cvc/main")?
+            .target(),
+        Some(stale_tip)
+    );
     Ok(())
 }
 
@@ -951,6 +1592,8 @@ fn push_upgrades_v2_format_without_downgrading_data() -> anyhow::Result<()> {
     let previous = repo.find_reference(ref_name)?.peel_to_commit()?;
     let mut builder = repo.treebuilder(Some(&previous.tree()?))?;
     builder.insert("FORMAT", repo.blob(b"2")?, FileMode::Blob.into())?;
+    builder.remove("events")?;
+    builder.remove("ranges")?;
     let tree = repo.find_tree(builder.write()?)?;
     let signature = Signature::now("Test User", "test@example.com")?;
     repo.commit(
@@ -967,7 +1610,7 @@ fn push_upgrades_v2_format_without_downgrading_data() -> anyhow::Result<()> {
     project_fixture_to_ref(&repo, &source, ref_name)?;
     let upgraded_tree = repo.find_reference(ref_name)?.peel_to_commit()?.tree()?;
     let marker = repo.find_blob(upgraded_tree.get_name("FORMAT").unwrap().id())?;
-    assert_eq!(marker.content(), b"4");
+    assert_eq!(marker.content(), b"5");
 
     let fresh = CvcStore::open(temp_dir.path().join("fresh.db"))?;
     sync::pull_from_ref(&repo, &fresh, ref_name)?;
@@ -1647,7 +2290,7 @@ fn test_sync_v2_round_trip() -> anyhow::Result<()> {
         .get_name("FORMAT")
         .expect("FORMAT marker should be written");
     let format_blob = repo.find_blob(format_entry.id())?;
-    assert_eq!(format_blob.content(), b"4");
+    assert_eq!(format_blob.content(), b"5");
 
     let nodes_tree = pushed_tree
         .get_name("nodes")

@@ -533,7 +533,7 @@ describe("usePRInteractions", () => {
 
     const { result, queryClient } = renderWithClient("owner", "repo", 11);
     await waitFor(() => expect(result.current.data?.interactions.map((node) => node.id)).toEqual([ID_ONE]));
-    expect(queryClient.getQueryData(["cvc-node", "owner", "repo", ID_ONE])).toBeDefined();
+    expect(queryClient.getQueryData(["cvc-node", "owner", "repo", "cvc-before", ID_ONE])).toBeDefined();
 
     await result.current.refetch();
     await waitFor(() => expect(result.current.isError).toBe(true));
@@ -541,7 +541,7 @@ describe("usePRInteractions", () => {
     // React Query normally retains previous successful data on a failed refetch.
     // FORMAT/tombstone trust failures are exceptional: no stale interaction may render.
     expect(result.current.data?.interactions).toEqual([]);
-    expect(queryClient.getQueryData(["cvc-node", "owner", "repo", ID_ONE])).toBeUndefined();
+    expect(queryClient.getQueryData(["cvc-node", "owner", "repo", "cvc-before", ID_ONE])).toBeUndefined();
     expect(queryClient.getQueryData(["cvc-by-commit", "owner", "repo", "cvc-before", "commit-a"])).toBeUndefined();
   });
 });

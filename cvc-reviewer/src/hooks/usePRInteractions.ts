@@ -4,6 +4,7 @@ import { createGithubClient, type GithubClient } from "../api/github";
 import { CommitRanger } from "../lib/CommitRanger";
 import { InteractionMapper } from "../lib/InteractionMapper";
 import { purgeCognitiveCache } from "../lib/cognitiveCache";
+import { eventLink, fetchFormat5Evidence, readBoundedJson, type DerivationEvent } from "../lib/format5";
 import {
   normalizeInteraction,
   mergeArtifactLinks,
@@ -25,6 +26,11 @@ const TOMBSTONE_MAX_COUNT = 10_000;
 const TOMBSTONE_MAX_BYTES = 16 * 1024 * 1024;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/i;
+const FORMAT5_NODE_LIMIT = 4 * 1024 * 1024;
+const FORMAT5_MAX_NODES = 10_000;
+const FORMAT5_MAX_CONTEXT_ITEMS = 256;
+const FORMAT5_MAX_TOOL_EXECUTIONS = 256;
+const FORMAT5_MAX_STRING_BYTES = 1024 * 1024;
 
 export interface PRInteractionsResult {
   interactions: InteractionNode[];
@@ -147,6 +153,19 @@ function isInteractionId(value: string): boolean {
   return UUID_PATTERN.test(value);
 }
 
+function validNode(value: unknown, id: string): value is CVCBlobData {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const node = value as Record<string, unknown>; const interaction = node.interaction as Record<string, unknown> | undefined;
+  if (!interaction) return false;
+  const exact = (item: unknown, keys: string[]) => !!item && typeof item === "object" && !Array.isArray(item) && Object.keys(item as object).every((key) => keys.includes(key) || keys.includes(`${key}?`)) && keys.filter((key) => !key.endsWith("?")).every((key) => key in (item as object));
+  const optionalString = (v: unknown) => v == null || typeof v === "string" && v.length <= FORMAT5_MAX_STRING_BYTES;
+  if (!exact(node, ["interaction", "context_items", "tool_executions", "artifact_links"]) || !exact(interaction, ["id", "conversation_id", "parent_id", "timestamp", "author", "user_prompt", "model_name", "model_cot", "model_response", "source_request_id"]) || interaction.id !== id || !isInteractionId(id) || typeof interaction.conversation_id !== "string" || interaction.conversation_id.length > FORMAT5_MAX_STRING_BYTES || !optionalString(interaction.parent_id) || (interaction.parent_id != null && !isInteractionId(interaction.parent_id as string)) || typeof interaction.timestamp !== "string" || Number.isNaN(Date.parse(interaction.timestamp)) || !["human", "agent", "system", "external"].includes(String(interaction.author)) || typeof interaction.user_prompt !== "string" || interaction.user_prompt.length > FORMAT5_MAX_STRING_BYTES || !optionalString(interaction.model_name) || !optionalString(interaction.model_cot) || !optionalString(interaction.model_response) || !optionalString(interaction.source_request_id) || !Array.isArray(node.context_items) || node.context_items.length > FORMAT5_MAX_CONTEXT_ITEMS || !Array.isArray(node.tool_executions) || node.tool_executions.length > FORMAT5_MAX_TOOL_EXECUTIONS || !Array.isArray(node.artifact_links)) return false;
+  const contextValid = node.context_items.every((item) => { const x = item as Record<string, unknown>; return exact(item, ["id", "interaction_id", "file_path", "git_blob_sha", "dirty_patch", "start_line", "end_line"]) && (x.id == null || Number.isSafeInteger(x.id)) && x.interaction_id === id && typeof x.file_path === "string" && x.file_path.length > 0 && optionalString(x.git_blob_sha) && optionalString(x.dirty_patch) && (x.start_line == null || Number.isSafeInteger(x.start_line) && (x.start_line as number) >= 0) && (x.end_line == null || Number.isSafeInteger(x.end_line) && (x.end_line as number) >= 0); });
+  const toolsValid = node.tool_executions.every((item) => { const x = item as Record<string, unknown>; return exact(item, ["id", "interaction_id", "tool_protocol", "tool_name", "arguments", "status"]) && (x.id == null || Number.isSafeInteger(x.id)) && x.interaction_id === id && typeof x.tool_protocol === "string" && typeof x.tool_name === "string" && typeof x.arguments === "string" && (x.status === "success" || x.status === "failure"); });
+  const linksValid = node.artifact_links.every((item) => { const x = item as Record<string, unknown>; return exact(item, ["interaction_id", "git_commit_hash", "link_type", "linked_by?"]) && x.interaction_id === id && typeof x.git_commit_hash === "string" && COMMIT_SHA_PATTERN.test(x.git_commit_hash) && ["generated", "temporal", "verified"].includes(String(x.link_type)) && optionalString(x.linked_by); });
+  return contextValid && toolsValid && linksValid;
+}
+
 function assertInteractionId(value: string): asserts value is string {
   if (!isInteractionId(value)) {
     throw new Error("Invalid interaction ID in CVC by-commit index");
@@ -197,15 +216,8 @@ async function fetchRawFile(
 }
 
 async function fetchBlobJson<T>(url: string, token: string): Promise<T> {
-  const response = await fetch(url, {
-    headers: {
-      Authorization: `token ${token}`,
-      Accept: "application/vnd.github.v3.raw",
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`Failed to fetch blob: ${response.statusText}`);
-  }
+  const response = await fetch(url, { headers: { Authorization: `token ${token}`, Accept: "application/vnd.github.v3.raw" } });
+  if (!response.ok) throw new Error(`Failed to fetch blob: ${response.statusText}`);
   return response.json();
 }
 
@@ -318,7 +330,7 @@ async function fetchDirectoryListing(
   repo: string,
   path: string,
   ref: string,
-): Promise<{ name: string }[]> {
+): Promise<{ name: string; size?: number; type?: string }[]> {
   try {
     const { data } = await client.octokit.rest.repos.getContent({
       owner,
@@ -326,7 +338,7 @@ async function fetchDirectoryListing(
       path,
       ref,
     });
-    return Array.isArray(data) ? data : [];
+    return Array.isArray(data) ? data.map((entry) => ({ name: entry.name, size: entry.size, type: entry.type })) : [];
   } catch (error: unknown) {
     if (isNotFound(error)) return [];
     throw error;
@@ -343,7 +355,7 @@ function fetchByCommitCached(
   repo: string,
   commitSha: string,
   cvcMainSha: string,
-): Promise<{ name: string }[]> {
+): Promise<{ name: string; size?: number; type?: string }[]> {
   return queryClient.fetchQuery({
     queryKey: ["cvc-by-commit", owner, repo, cvcMainSha, commitSha],
     queryFn: () =>
@@ -366,10 +378,13 @@ function fetchNodeCached(
   owner: string,
   repo: string,
   id: string,
+  refTip: string,
   fetchData: () => Promise<CVCBlobData>,
 ): Promise<InteractionNode> {
   return queryClient.fetchQuery({
-    queryKey: ["cvc-node", owner, repo, id],
+    // A UUID is not a Git object identity. Scope cached node bytes to the
+    // advertised ref so a rewritten/refetched projection cannot reuse stale data.
+    queryKey: ["cvc-node", owner, repo, refTip, id],
     queryFn: async () => normalizeInteraction(await fetchData()),
     staleTime: Infinity,
   });
@@ -378,7 +393,12 @@ function fetchNodeCached(
 function evictTombstonedNodes(queryClient: QueryClient, owner: string, repo: string, ids: Iterable<string>) {
   for (const id of ids) {
     // removeQueries updates the persisted dehydrated cache as well as memory.
-    queryClient.removeQueries({ queryKey: ["cvc-node", owner, repo, id], exact: true });
+    queryClient.removeQueries({
+      predicate: (query) => {
+        const key = query.queryKey;
+        return key[0] === "cvc-node" && key[1] === owner && key[2] === repo && key[key.length - 1] === id;
+      },
+    });
   }
 }
 
@@ -443,7 +463,7 @@ async function fetchLegacyCapped(
   const capped = blobs.slice(0, LEGACY_FETCH_CAP);
 
   const allInteractions = await fetchNodesInBatches(capped, (blob) =>
-    fetchNodeCached(queryClient, owner, repo, idFromBlobPath(blob.path!), () =>
+    fetchNodeCached(queryClient, owner, repo, idFromBlobPath(blob.path!), treeSha, () =>
       fetchBlobJson<CVCBlobData>(blob.url!, token),
     ),
   );
@@ -522,7 +542,8 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
          failClosed();
          throw new Error("CVC FORMAT must be a blob");
        }
-       const formatEntry = rawFormatEntry;
+        const formatEntry = rawFormatEntry;
+        let format = "";
        if (formatEntry) {
          let raw: string;
          try {
@@ -531,13 +552,22 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
            failClosed();
            throw error;
          }
-          if (!/^[1-4]\s*$/.test(raw)) {
+           if (!/^[1-5]\s*$/.test(raw)) {
             failClosed();
             throw new Error("Unsupported or malformed CVC FORMAT");
-          }
-       }
+           }
+           format = raw.trim();
+        }
 
-       // Projected by-commit directories intentionally omit deleted interactions,
+         const isFormat5 = format === "5";
+        const eventsEntry = rootTree.tree.find((entry) => entry.path === "events");
+        const rangesEntry = rootTree.tree.find((entry) => entry.path === "ranges");
+        if (isFormat5 && (eventsEntry?.type !== "tree" || rangesEntry?.type !== "tree")) {
+          failClosed();
+          throw new Error("FORMAT5 requires events and ranges trees");
+        }
+
+        // Projected by-commit directories intentionally omit deleted interactions,
        // so they cannot be used to discover tombstones. Enumerate the complete
        // reserved namespace on every ref tip before consulting any node cache.
        let tombstonedIds = new Set<string>();
@@ -554,6 +584,18 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
          }
        }
        evictTombstonedNodes(queryClient, owner, repo, tombstonedIds);
+
+        // FORMAT5 is evidence-first: events/ranges are authoritative and are read
+        // independently from immutable node blobs or legacy embedded links.
+        let v5Events: DerivationEvent[] = [];
+        if (isFormat5) {
+          try {
+            v5Events = (await fetchFormat5Evidence(client, owner, repo, eventsEntry?.sha, rangesEntry?.sha, token)).events;
+          } catch (error) {
+            failClosed();
+            throw error;
+          }
+        }
 
        if (!hasByCommitIndex) {
          return fetchLegacyCapped(
@@ -574,43 +616,102 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
         ),
       );
 
-      const ids = new Set<string>();
-      const linkReferences: { interactionId: string; commitSha: string }[] = [];
-      for (const [index, entries] of perCommitEntries.entries()) {
-        for (const entry of entries) {
-          assertInteractionId(entry.name);
+       const ids = new Set<string>();
+       const linkReferences: { interactionId: string; commitSha: string }[] = [];
+       let relevantEvents: DerivationEvent[] = [];
+       for (const [index, entries] of perCommitEntries.entries()) {
+         for (const entry of entries) {
+           assertInteractionId(entry.name);
+           if (isFormat5 && (entry.type !== "file" || entry.size !== 0)) {
+             failClosed();
+             throw new Error("FORMAT5 by-commit pointer is malformed or non-empty");
+           }
           ids.add(entry.name);
           linkReferences.push({ interactionId: entry.name, commitSha: commitShas[index] });
-        }
-      }
+       }
 
-       const visibleIds = new Set(Array.from(ids).filter((id) => !tombstonedIds.has(id)));
+       }
+
+       if (isFormat5) {
+         const pointerEndpoints = new Set(linkReferences.map((ref) => `${ref.interactionId}:${ref.commitSha}`));
+         for (const event of v5Events) if (commitShas.includes(event.target_commit) && !pointerEndpoints.has(`${event.interaction_id}:${event.target_commit}`)) throw new Error("FORMAT5 event is missing its by-commit pointer");
+         const eventsById = new Map(v5Events.map((event) => [event.event_id, event]));
+         const closure = new Map<string, DerivationEvent>();
+         const include = (event: DerivationEvent) => {
+           if (closure.has(event.event_id)) return;
+           closure.set(event.event_id, event);
+           for (const source of event.source_event_ids) { const sourceEvent = eventsById.get(source); if (sourceEvent) include(sourceEvent); }
+         };
+         for (const event of v5Events) if (commitShas.includes(event.target_commit) && pointerEndpoints.has(`${event.interaction_id}:${event.target_commit}`)) include(event);
+         relevantEvents = [...closure.values()];
+         for (const event of relevantEvents) if (!tombstonedIds.has(event.interaction_id)) ids.add(event.interaction_id);
+         if (ids.size > FORMAT5_MAX_NODES) throw new Error("FORMAT5 relevant node set exceeds safe limit");
+       }
+
+        const visibleIds = new Set(Array.from(ids).filter((id) => !tombstonedIds.has(id)));
+       const nodeBudget = { bytes: 0 };
 
       const interactions = await fetchNodesInBatches(Array.from(visibleIds), (id) =>
-        fetchNodeCached(queryClient, owner, repo, id, async () => {
+        fetchNodeCached(queryClient, owner, repo, id, cvcMainSha, async () => {
           const path = `nodes/${id.slice(0, 2)}/${id}.json`;
-          const raw = await fetchRawFile(owner, repo, path, cvcMainSha, token);
-          return JSON.parse(raw) as CVCBlobData;
+           const payload: unknown = isFormat5
+             ? await readBoundedJson(githubContentsUrl(owner, repo, path, cvcMainSha), token, nodeBudget, FORMAT5_NODE_LIMIT)
+             : JSON.parse(await fetchRawFile(owner, repo, path, cvcMainSha, token));
+          // FORMAT5's derived graph must never be joined to an unvalidated node.
+          // Preserve permissive decoding for v1-v4 historical blobs.
+          if (isFormat5 && !validNode(payload, id)) throw new Error(`Invalid CVC node at ${path}`);
+          return payload as CVCBlobData;
         }),
       );
 
-      const linkRecords = hasV3LinkRecords
-        ? await fetchLinkRecordsInBatches(linkReferences, ({ interactionId, commitSha }) =>
+       const legacyReferences = isFormat5 ? relevantEvents.flatMap((event) => event.source_event_ids.flatMap((source) => {
+         const match = /^legacy:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):([0-9a-f]{40})$/.exec(source);
+         return match ? [{ interactionId: match[1], commitSha: match[2] }] : [];
+       })) : [];
+       const allLinkReferences = [...new Map([...linkReferences, ...legacyReferences].map((ref) => [`${ref.interactionId}:${ref.commitSha}`, ref])).values()];
+       const linkRecords = hasV3LinkRecords
+         ? await fetchLinkRecordsInBatches(allLinkReferences, ({ interactionId, commitSha }) =>
             visibleIds.has(interactionId)
               ? fetchLinkRecord(owner, repo, interactionId, commitSha, cvcMainSha, token)
               : Promise.resolve(null),
           )
         : [];
       const recordsByInteraction = new Map<string, CVCLinkRecord[]>();
-      for (const record of linkRecords) {
+       for (const record of linkRecords) {
         const records = recordsByInteraction.get(record.interaction_id) ?? [];
         records.push(record);
-        recordsByInteraction.set(record.interaction_id, records);
-      }
+         recordsByInteraction.set(record.interaction_id, records);
+       }
 
-      return {
+       if (isFormat5) {
+         const nodes = new Map(interactions.map((node) => [node.id, node]));
+         for (const event of relevantEvents) for (const source of event.source_event_ids) {
+           const match = /^legacy:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):([0-9a-f]{40})$/.exec(source);
+           if (!match) continue;
+           const [, sourceId, sourceCommit] = match;
+           const embedded = nodes.get(sourceId)?.artifact_links.some((link) => link.git_commit_hash === sourceCommit);
+           const sideChannel = recordsByInteraction.get(sourceId)?.some((link) => link.git_commit_hash === sourceCommit);
+           if (sourceId !== event.interaction_id || (!embedded && !sideChannel)) {
+             failClosed();
+             throw new Error("FORMAT5 legacy source does not resolve to a validated node link");
+           }
+         }
+       }
+
+       const eventRecordsByInteraction = new Map<string, ReturnType<typeof eventLink>[]>();
+        for (const event of relevantEvents) {
+         if (!commitShas.includes(event.target_commit) || !visibleIds.has(event.interaction_id)) continue;
+         const records = eventRecordsByInteraction.get(event.interaction_id) ?? [];
+         records.push(eventLink(event));
+         eventRecordsByInteraction.set(event.interaction_id, records);
+       }
+
+       return {
         interactions: interactions.map((interaction) =>
-          mergeArtifactLinks(interaction, recordsByInteraction.get(interaction.id) ?? []),
+          mergeArtifactLinks(interaction, [
+            ...(recordsByInteraction.get(interaction.id) ?? []),
+            ...(eventRecordsByInteraction.get(interaction.id) ?? []),
+          ]),
         ),
         truncated: false,
         hasHistory: true,

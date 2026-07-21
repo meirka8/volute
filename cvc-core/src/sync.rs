@@ -1,6 +1,7 @@
 use crate::db::CvcStore;
 use crate::models::{
-    ArtifactLink, ContextItem, Interaction, RedactionPlan, Tombstone, ToolExecution,
+    ArtifactLink, ContextItem, DerivationEvent, Interaction, RangeEvidence, RedactionPlan,
+    Tombstone, ToolExecution,
 };
 use chrono::{Timelike, Utc};
 use git2::{Direction, FileMode, ObjectType, Repository, Tree, TreeBuilder};
@@ -13,11 +14,13 @@ use thiserror::Error;
 
 /// Tree layout version written by outbound projection. Stored at the ref tree's root as a
 /// blob named `FORMAT`.
-const SYNC_FORMAT_VERSION: &[u8] = b"4";
+const SYNC_FORMAT_VERSION: &[u8] = b"5";
 const MAX_SYNC_NODES: usize = 10_000;
 const MAX_SYNC_BLOB_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SYNC_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 const MAX_SYNC_LINK_EVENTS: usize = 20_000;
+const MAX_SYNC_DERIVATION_EVENTS: usize = 20_000;
+const MAX_SYNC_RANGES: usize = 10_000;
 const MAX_SYNC_TOMBSTONES: usize = 4_096;
 const MAX_SYNC_TOMBSTONE_BYTES: usize = 16 * 1024;
 const MAX_SYNC_LINKS_PER_NODE: usize = 256;
@@ -156,7 +159,12 @@ struct SyncLinkRecord {
 }
 
 fn is_safe_commit_sha(value: &str) -> bool {
-    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    // This libgit2 build is SHA-1 only; reject SHA-256-shaped values rather
+    // than claiming repository-algorithm validation we cannot perform.
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn is_automatic_link_type(value: &str) -> bool {
@@ -303,6 +311,148 @@ fn count_tree_entries(repo: &Repository, tree: &Tree) -> Result<u64> {
     Ok(total)
 }
 
+/// Remove the complete derivation closure for suppressed interactions.  Event
+/// identity, not iteration order, drives the fixed point, so multi-hop DAGs are
+/// removed even when their blobs sort before their sources.
+fn prune_event_closure(
+    repo: &Repository,
+    events: &Tree<'_>,
+    suppressed: &HashSet<String>,
+) -> Result<git2::Oid> {
+    let mut parsed = Vec::new();
+    for shard in events.iter() {
+        if shard.kind() != Some(ObjectType::Tree) {
+            return Err(SyncError::Ref("invalid events tree".into()));
+        }
+        let shard_name = shard.name().unwrap_or_default().to_owned();
+        for entry in repo.find_tree(shard.id())?.iter() {
+            if entry.kind() != Some(ObjectType::Blob) {
+                return Err(SyncError::Ref("invalid event blob".into()));
+            }
+            let event: DerivationEvent =
+                serde_json::from_slice(repo.find_blob(entry.id())?.content())?;
+            if !validate_derivation_event(&event) {
+                return Err(SyncError::Ref("invalid event in redaction baseline".into()));
+            }
+            parsed.push((
+                shard_name.clone(),
+                entry.name().unwrap_or_default().to_owned(),
+                event,
+            ));
+        }
+    }
+    let mut removed: HashSet<String> = parsed
+        .iter()
+        .filter(|(_, _, event)| {
+            suppressed.contains(&event.interaction_id.to_string())
+                || event.source_event_ids.iter().any(|source| {
+                    suppressed.iter().any(|id| {
+                        source.starts_with(&format!("legacy:{id}:"))
+                            || (source.starts_with("endpoint:")
+                                && source.ends_with(&format!(":{id}")))
+                    })
+                })
+        })
+        .map(|(_, _, event)| event.event_id.clone())
+        .collect();
+    loop {
+        let before = removed.len();
+        for (_, _, event) in &parsed {
+            if event.source_event_ids.iter().any(|id| removed.contains(id)) {
+                removed.insert(event.event_id.clone());
+            }
+        }
+        if removed.len() == before {
+            break;
+        }
+    }
+    let mut outer = repo.treebuilder(Some(events))?;
+    for shard in events.iter() {
+        let shard_name = shard.name().unwrap_or_default();
+        let subtree = repo.find_tree(shard.id())?;
+        let mut builder = repo.treebuilder(Some(&subtree))?;
+        for (_, file, event) in parsed.iter().filter(|(name, _, _)| name == shard_name) {
+            if removed.contains(&event.event_id) {
+                builder.remove(file)?;
+            }
+        }
+        outer.insert(shard_name, builder.write()?, FileMode::Tree.into())?;
+    }
+    outer.write().map_err(Into::into)
+}
+
+/// Immutable range payloads carry no interaction identity. Redaction follows
+/// event ownership/closure and removes a range only when no surviving event
+/// references it.
+fn prune_range_sources(
+    repo: &Repository,
+    root: &Tree<'_>,
+    suppressed: &HashSet<String>,
+) -> Result<Option<git2::Oid>> {
+    let Some(ranges) = child_tree(repo, Some(root), "ranges") else {
+        return Ok(None);
+    };
+    let mut bytes = 0;
+    let surviving = retain_event_closure(
+        collect_derivation_events(repo, root, &mut bytes, MAX_SYNC_TOTAL_BYTES)?,
+        suppressed,
+        &HashSet::new(),
+    );
+    let referenced: HashSet<_> = surviving
+        .iter()
+        .filter_map(|event| event.range_id.as_deref())
+        .collect();
+    let mut outer = repo.treebuilder(Some(&ranges))?;
+    for shard in ranges.iter() {
+        let name = shard.name().unwrap_or_default();
+        let subtree = repo.find_tree(shard.id())?;
+        let mut builder = repo.treebuilder(Some(&subtree))?;
+        for entry in subtree.iter() {
+            let range: RangeEvidence =
+                serde_json::from_slice(repo.find_blob(entry.id())?.content())?;
+            if !referenced.contains(range.range_id.as_str()) {
+                builder.remove(entry.name().unwrap_or_default())?;
+            }
+        }
+        outer.insert(name, builder.write()?, FileMode::Tree.into())?;
+    }
+    Ok(Some(outer.write()?))
+}
+
+fn retain_event_closure(
+    events: Vec<DerivationEvent>,
+    suppressed: &HashSet<String>,
+    _baseline_event_ids: &HashSet<String>,
+) -> Vec<DerivationEvent> {
+    let mut removed: HashSet<String> = events
+        .iter()
+        .filter(|event| {
+            suppressed.contains(&event.interaction_id.to_string())
+                || event.source_event_ids.iter().any(|source| {
+                    suppressed
+                        .iter()
+                        .any(|id| source.starts_with(&format!("legacy:{id}:")))
+                })
+        })
+        .map(|event| event.event_id.clone())
+        .collect();
+    loop {
+        let before = removed.len();
+        for event in &events {
+            if event.source_event_ids.iter().any(|id| removed.contains(id)) {
+                removed.insert(event.event_id.clone());
+            }
+        }
+        if before == removed.len() {
+            break;
+        }
+    }
+    events
+        .into_iter()
+        .filter(|event| !removed.contains(&event.event_id))
+        .collect()
+}
+
 /// Build a parentless local replacement from an exact fetched v4 baseline.
 /// It never contacts a remote and leaves the candidate ref owned by RAII.
 pub fn build_hard_redaction_plan<'repo>(
@@ -328,10 +478,10 @@ pub fn build_hard_redaction_plan<'repo>(
     {
         let format = tree
             .get_name("FORMAT")
-            .ok_or_else(|| SyncError::Ref("hard redaction requires v4 FORMAT".into()))?;
-        if repo.find_blob(format.id())?.content().trim_ascii() != b"4" {
+            .ok_or_else(|| SyncError::Ref("hard redaction requires v5 FORMAT".into()))?;
+        if repo.find_blob(format.id())?.content().trim_ascii() != b"5" {
             return Err(SyncError::Ref(
-                "hard redaction requires exact v4 baseline".into(),
+                "hard redaction requires exact v5 baseline".into(),
             ));
         }
     }
@@ -392,6 +542,29 @@ pub fn build_hard_redaction_plan<'repo>(
         }
         root.insert("links", lb.write()?, FileMode::Tree.into())?;
     }
+    if let Some(events) = child_tree(repo, Some(&tree), "events") {
+        root.insert(
+            "events",
+            prune_event_closure(repo, &events, &HashSet::from([id.clone()]))?,
+            FileMode::Tree.into(),
+        )?;
+    }
+    if let Some(ranges) = prune_range_sources(repo, &tree, &HashSet::from([id.clone()]))? {
+        root.insert("ranges", ranges, FileMode::Tree.into())?;
+    }
+    let redacted_without_index = repo.find_tree(root.write()?)?;
+    validate_by_commit_structure(repo, &redacted_without_index)?;
+    let endpoints = projected_endpoints(repo, &redacted_without_index)?;
+    root = repo.treebuilder(Some(&redacted_without_index))?;
+    if endpoints.is_empty() {
+        let _ = remove_if_present(&mut root, "by-commit")?;
+    } else {
+        root.insert(
+            "by-commit",
+            build_by_commit_tree(repo, &endpoints)?,
+            FileMode::Tree.into(),
+        )?;
+    }
     let replacement_tree = root.write()?;
     let replacement = repo.find_tree(replacement_tree)?;
     // Validate every representation that the reader understands is gone; the
@@ -419,6 +592,7 @@ pub fn build_hard_redaction_plan<'repo>(
             }
         }
     }
+    assert_no_redacted_event_reference(repo, &replacement, target)?;
     let sig = repo
         .signature()
         .or_else(|_| git2::Signature::now("cvc", "cvc@local"))?;
@@ -440,6 +614,54 @@ pub fn build_hard_redaction_plan<'repo>(
         plan,
         candidate: CandidateRef::new(repo, temp_ref),
     })
+}
+
+fn assert_no_redacted_event_reference(
+    repo: &Repository,
+    root: &Tree,
+    target: &crate::models::InteractionId,
+) -> Result<()> {
+    let Some(events) = child_tree(repo, Some(root), "events") else {
+        return Ok(());
+    };
+    let mut parsed = Vec::new();
+    for shard in events.iter() {
+        if shard.kind() != Some(ObjectType::Tree) {
+            return Err(SyncError::Ref("invalid events tree".into()));
+        }
+        for entry in repo.find_tree(shard.id())?.iter() {
+            if entry.kind() != Some(ObjectType::Blob) {
+                return Err(SyncError::Ref("invalid event blob".into()));
+            }
+            let event: DerivationEvent =
+                serde_json::from_slice(repo.find_blob(entry.id())?.content())?;
+            if event.interaction_id == *target
+                || event.source_event_ids.iter().any(|source| {
+                    source.starts_with(&format!("legacy:{}:", target))
+                        || (source.starts_with("endpoint:")
+                            && source.ends_with(&format!(":{target}")))
+                })
+            {
+                return Err(SyncError::Ref(
+                    "redaction validation found target event reference".into(),
+                ));
+            }
+            parsed.push(event);
+        }
+    }
+    let ids: HashSet<_> = parsed.iter().map(|event| event.event_id.as_str()).collect();
+    if parsed.iter().any(|event| {
+        event.source_event_ids.iter().any(|source| {
+            source.len() == 64
+                && source.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !ids.contains(source.as_str())
+        })
+    }) {
+        return Err(SyncError::Ref(
+            "redaction validation found dangling event source".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Ensures a plan still matches the freshly advertised/fetched tracking tip.
@@ -497,6 +719,7 @@ pub fn apply_hard_redaction_locally(repo: &Repository, plan: &RedactionPlan) -> 
             }
         }
     }
+    assert_no_redacted_event_reference(repo, &tree, &plan.target_id)?;
     repo.reference(
         "refs/cvc/main",
         commit.id(),
@@ -582,6 +805,7 @@ fn validate_redaction_replacement(repo: &Repository, plan: &RedactionPlan) -> Re
             ));
         }
     }
+    assert_no_redacted_event_reference(repo, &tree, &plan.target_id)?;
     Ok(())
 }
 
@@ -620,6 +844,7 @@ pub fn push_projection_to_ref<'repo>(
         (!baseline_ref.is_empty()).then_some(baseline_ref),
         &ids,
         &tombstones,
+        remote_fingerprint,
     )?;
     // `push_ids_to_ref` deliberately avoids creating a commit/ref when the
     // verified baseline already contains this exact projection.  Treat that as
@@ -645,6 +870,7 @@ fn push_ids_to_ref(
     baseline_ref: Option<&str>,
     all_ids: &[crate::models::InteractionId],
     tombstones: &[Tombstone],
+    remote_fingerprint: &str,
 ) -> Result<git2::Oid> {
     if !validate_ref_name(ref_name) {
         return Err(SyncError::Ref(format!("Invalid ref name: {}", ref_name)));
@@ -661,11 +887,13 @@ fn push_ids_to_ref(
         if let Ok(reference) = repo.find_reference(seed_ref) {
             if let Ok(commit) = reference.peel_to_commit() {
                 let tree = commit.tree()?;
+                validate_v5_reserved_namespaces(repo, &tree)?;
                 root_builder = repo.treebuilder(Some(&tree))?;
                 existing_root_tree = Some(tree);
                 parent_commit = Some(commit);
             } else if let Ok(obj) = reference.peel(ObjectType::Tree) {
                 if let Some(tree) = obj.as_tree() {
+                    validate_v5_reserved_namespaces(repo, tree)?;
                     root_builder = repo.treebuilder(Some(tree))?;
                     existing_root_tree = Some(repo.find_tree(tree.id())?);
                 }
@@ -676,9 +904,6 @@ fn push_ids_to_ref(
         // ref absent. Never seed outbound bytes from a mutable local shadow ref.
     }
 
-    let existing_nodes_tree = child_tree(repo, existing_root_tree.as_ref(), "nodes");
-    let existing_by_commit_tree = child_tree(repo, existing_root_tree.as_ref(), "by-commit");
-    let existing_links_tree = child_tree(repo, existing_root_tree.as_ref(), "links");
     let mut emitted_bytes = 0usize;
 
     // Tombstones dominate every historical projection. Remove all target paths
@@ -694,7 +919,33 @@ fn push_ids_to_ref(
             existing_root_tree.as_ref(),
             &tombstoned,
         )?;
+        // Event blobs are immutable, but the current projection must not retain
+        // a tombstoned interaction's derivation references.
+        if let Some(events) = child_tree(repo, existing_root_tree.as_ref(), "events") {
+            root_builder.insert(
+                "events",
+                prune_event_closure(repo, &events, &tombstoned)?,
+                FileMode::Tree.into(),
+            )?;
+        }
+        if let Some(root) = existing_root_tree.as_ref() {
+            if let Some(ranges) = prune_range_sources(repo, root, &tombstoned)? {
+                root_builder.insert("ranges", ranges, FileMode::Tree.into())?;
+            }
+        }
     }
+    // From this point onward the original seed is deliberately inaccessible.
+    // Every namespace builder, including indexes and newly appended events,
+    // starts from the materialized privacy-pruned tree.
+    if !tombstoned.is_empty() {
+        let pruned = repo.find_tree(root_builder.write()?)?;
+        root_builder = repo.treebuilder(Some(&pruned))?;
+        existing_root_tree = Some(pruned);
+    }
+    let existing_nodes_tree = child_tree(repo, existing_root_tree.as_ref(), "nodes");
+    let existing_links_tree = child_tree(repo, existing_root_tree.as_ref(), "links");
+    let existing_events_tree = child_tree(repo, existing_root_tree.as_ref(), "events");
+    let existing_ranges_tree = child_tree(repo, existing_root_tree.as_ref(), "ranges");
     // --- nodes/<prefix>/<id>.json ---
     let mut prefix_builders: HashMap<String, TreeBuilder> = HashMap::new();
 
@@ -737,7 +988,7 @@ fn push_ids_to_ref(
         })?;
         let mut context_items = db.get_context_items(id)?;
         let mut tool_executions = db.get_tool_executions(id)?;
-        let mut artifact_links = db.get_artifact_links(id)?;
+        let mut artifact_links = db.get_legacy_artifact_links(id)?;
         crate::privacy::final_scrub_for_sync(
             &mut interaction,
             &mut context_items,
@@ -810,54 +1061,13 @@ fn push_ids_to_ref(
         root_builder.insert("nodes", nodes_oid, FileMode::Tree.into())?;
     }
 
-    // --- by-commit/<sha>/<id>: written/updated whenever artifact links exist ---
-    let mut commit_builders: HashMap<String, TreeBuilder> = HashMap::new();
-
-    for id in all_ids {
-        for link in db.get_artifact_links(id)? {
-            let commit_sha = link.git_commit_hash.as_str().to_string();
-            let pointer_name = id.as_str();
-
-            let already_indexed = child_tree(repo, existing_by_commit_tree.as_ref(), &commit_sha)
-                .map(|sub| sub.get_name(&pointer_name).is_some())
-                .unwrap_or(false);
-            if already_indexed {
-                continue;
-            }
-
-            let builder = match commit_builders.entry(commit_sha.clone()) {
-                Entry::Occupied(e) => e.into_mut(),
-                Entry::Vacant(e) => {
-                    let b = child_treebuilder(repo, existing_by_commit_tree.as_ref(), &commit_sha)?;
-                    e.insert(b)
-                }
-            };
-            if builder.get(&pointer_name)?.is_none() {
-                // Zero-byte pointer: by-commit/ is a pure index, the content lives in nodes/.
-                let empty_oid = repo.blob(b"")?;
-                builder.insert(&pointer_name, empty_oid, FileMode::Blob.into())?;
-            }
-        }
-    }
-
-    if !commit_builders.is_empty() {
-        let mut by_commit_builder =
-            child_treebuilder(repo, existing_root_tree.as_ref(), "by-commit")?;
-        for (commit_sha, builder) in &commit_builders {
-            let oid = builder.write()?;
-            by_commit_builder.insert(commit_sha, oid, FileMode::Tree.into())?;
-        }
-        let by_commit_oid = by_commit_builder.write()?;
-        root_builder.insert("by-commit", by_commit_oid, FileMode::Tree.into())?;
-    }
-
     // --- links/<interaction-id>/<commit-sha>.json ---
     // Only automatic links need this append-only side channel. Historical
     // custom link types remain available in their legacy node blobs.
     let mut link_builders: HashMap<String, TreeBuilder> = HashMap::new();
     for id in all_ids {
         let id_string = id.as_str();
-        for link in db.get_artifact_links(id)? {
+        for link in db.get_legacy_artifact_links(id)? {
             if !is_automatic_link_type(&link.link_type)
                 || !is_safe_commit_sha(link.git_commit_hash.as_str())
             {
@@ -944,6 +1154,124 @@ fn push_ids_to_ref(
         root_builder.insert("links", links_builder.write()?, FileMode::Tree.into())?;
     }
 
+    // --- events/<sha256[0..2]>/<sha256>.json ---
+    // Names are derived from the canonical body ID, so path/body disagreement is
+    // detectable without trusting mutable endpoint paths.
+    let mut event_shards: HashMap<String, TreeBuilder> = HashMap::new();
+    let mut baseline_event_bytes = 0;
+    let baseline_event_ids: HashSet<String> = existing_root_tree
+        .as_ref()
+        .map(|root| {
+            collect_derivation_events(repo, root, &mut baseline_event_bytes, MAX_SYNC_TOTAL_BYTES)
+        })
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| event.event_id)
+        .collect();
+    for event in retain_event_closure(
+        db.projection_derivation_events(all_ids, remote_fingerprint)?,
+        &tombstoned,
+        &baseline_event_ids,
+    ) {
+        if !event.verify_id()
+            || event.event_id.len() != 64
+            || !event.event_id.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(SyncError::Ref("invalid local derivation event".into()));
+        }
+        let shard = &event.event_id[..2];
+        let file = format!("{}.json", event.event_id);
+        let exists = child_tree(repo, existing_events_tree.as_ref(), shard)
+            .and_then(|t| t.get_name(&file).map(|e| e.id()));
+        let bytes = serde_json::to_vec(&event)?;
+        if let Some(oid) = exists {
+            if repo.find_blob(oid)?.content() != bytes.as_slice() {
+                return Err(SyncError::Ref("immutable derivation event conflict".into()));
+            }
+            continue;
+        }
+        let b = match event_shards.entry(shard.to_string()) {
+            Entry::Occupied(x) => x.into_mut(),
+            Entry::Vacant(x) => x.insert(child_treebuilder(
+                repo,
+                existing_events_tree.as_ref(),
+                shard,
+            )?),
+        };
+        add_sync_bytes(&mut emitted_bytes, bytes.len(), MAX_SYNC_TOTAL_BYTES)?;
+        b.insert(&file, repo.blob(&bytes)?, FileMode::Blob.into())?;
+    }
+    if !event_shards.is_empty() {
+        let mut outer = child_treebuilder(repo, existing_root_tree.as_ref(), "events")?;
+        for (s, b) in event_shards {
+            outer.insert(&s, b.write()?, FileMode::Tree.into())?;
+        }
+        root_builder.insert("events", outer.write()?, FileMode::Tree.into())?;
+    }
+
+    // --- ranges/<sha256[0..2]>/<sha256>.json ---
+    let mut range_shards: HashMap<String, TreeBuilder> = HashMap::new();
+    for range in db.projection_ranges(remote_fingerprint)? {
+        if !range.verify_id() {
+            return Err(SyncError::Ref("invalid local range".into()));
+        }
+        let shard = &range.range_id[..2];
+        let file = format!("{}.json", range.range_id);
+        let bytes = serde_json::to_vec(&range)?;
+        if let Some(oid) = child_tree(repo, existing_ranges_tree.as_ref(), shard)
+            .and_then(|t| t.get_name(&file).map(|e| e.id()))
+        {
+            if repo.find_blob(oid)?.content() != bytes {
+                return Err(SyncError::Ref("immutable range conflict".into()));
+            }
+            continue;
+        }
+        let b = match range_shards.entry(shard.into()) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(child_treebuilder(
+                repo,
+                existing_ranges_tree.as_ref(),
+                shard,
+            )?),
+        };
+        add_sync_bytes(&mut emitted_bytes, bytes.len(), MAX_SYNC_TOTAL_BYTES)?;
+        b.insert(&file, repo.blob(&bytes)?, FileMode::Blob.into())?;
+    }
+    if !range_shards.is_empty() {
+        let mut outer = child_treebuilder(repo, existing_root_tree.as_ref(), "ranges")?;
+        for (s, b) in range_shards {
+            outer.insert(&s, b.write()?, FileMode::Tree.into())?;
+        }
+        root_builder.insert("ranges", outer.write()?, FileMode::Tree.into())?;
+    }
+    for namespace in ["events", "ranges"] {
+        if root_builder.get(namespace)?.is_none() {
+            root_builder.insert(
+                namespace,
+                repo.treebuilder(None)?.write()?,
+                FileMode::Tree.into(),
+            )?;
+        }
+    }
+
+    // The index is a derived view, never an append-only authority. Rebuild it
+    // from the one final pruned/projected tree so stale baseline pointers cannot
+    // survive privacy pruning or point at unprojectable assertions.
+    let projected_without_index = repo.find_tree(root_builder.write()?)?;
+    validate_by_commit_structure(repo, &projected_without_index)?;
+    validate_tree_derivation_graph(repo, &projected_without_index)?;
+    let expected = projected_endpoints(repo, &projected_without_index)?;
+    if expected.is_empty() {
+        let _ = remove_if_present(&mut root_builder, "by-commit")?;
+    } else {
+        root_builder.insert(
+            "by-commit",
+            build_by_commit_tree(repo, &expected)?,
+            FileMode::Tree.into(),
+        )?;
+    }
+
     // --- FORMAT marker: upgrade known numeric predecessors, never downgrade ---
     let existing_format = if let Some(entry) = existing_root_tree
         .as_ref()
@@ -960,12 +1288,12 @@ fn push_ids_to_ref(
     } else {
         None
     };
-    if existing_format.is_some_and(|version| version > 4) {
+    if existing_format.is_some_and(|version| version > 5) {
         return Err(SyncError::Ref(
             "remote FORMAT is newer than supported".into(),
         ));
     }
-    if existing_format.is_none_or(|version| version < 4) {
+    if existing_format.is_none_or(|version| version < 5) {
         let format_oid = repo.blob(SYNC_FORMAT_VERSION)?;
         root_builder.insert("FORMAT", format_oid, FileMode::Blob.into())?;
     }
@@ -1019,7 +1347,9 @@ fn collect_interaction_blobs(
     out: &mut Vec<(String, git2::Oid)>,
 ) -> Result<()> {
     for entry in tree.iter() {
-        let name = entry.name().unwrap_or_default();
+        let name = entry
+            .name()
+            .ok_or_else(|| SyncError::Ref("non-UTF-8 sync path".into()))?;
         match entry.kind() {
             Some(ObjectType::Blob) => {
                 if let Some(id_str) = name.strip_suffix(".json") {
@@ -1027,7 +1357,10 @@ fn collect_interaction_blobs(
                 }
             }
             Some(ObjectType::Tree) if max_depth > 0 => {
-                if name == "by-commit" || name == "links" || name == "tombstones" {
+                if matches!(
+                    name,
+                    "by-commit" | "links" | "tombstones" | "events" | "ranges"
+                ) {
                     continue;
                 }
                 let sub = repo.find_tree(entry.id())?;
@@ -1037,6 +1370,239 @@ fn collect_interaction_blobs(
         }
     }
     Ok(())
+}
+
+const MAX_BY_COMMIT_POINTERS: usize = 100_000;
+
+fn validate_by_commit_structure(
+    repo: &Repository,
+    root: &Tree<'_>,
+) -> Result<HashSet<(String, String)>> {
+    let Some(entry) = root.get_name("by-commit") else {
+        return Ok(HashSet::new());
+    };
+    if entry.kind() != Some(ObjectType::Tree) {
+        return Err(SyncError::Ref("by-commit must be a tree".into()));
+    }
+    let mut out = HashSet::new();
+    for commit_entry in repo.find_tree(entry.id())?.iter() {
+        let commit = commit_entry.name().unwrap_or_default();
+        if commit_entry.kind() != Some(ObjectType::Tree)
+            || !is_safe_commit_sha(commit)
+            || commit.bytes().any(|byte| byte.is_ascii_uppercase())
+            || git2::Oid::from_str(commit).is_err()
+        {
+            return Err(SyncError::Ref("invalid by-commit commit entry".into()));
+        }
+        for pointer in repo.find_tree(commit_entry.id())?.iter() {
+            let id = pointer.name().unwrap_or_default();
+            let canonical = id
+                .parse::<crate::models::InteractionId>()
+                .map(|parsed| parsed.to_string())
+                .map_err(|_| SyncError::Ref("invalid by-commit interaction name".into()))?;
+            if canonical != id || pointer.kind() != Some(ObjectType::Blob) {
+                return Err(SyncError::Ref("invalid by-commit pointer".into()));
+            }
+            if !repo.find_blob(pointer.id())?.content().is_empty() {
+                return Err(SyncError::Ref(
+                    "by-commit pointer body must be empty".into(),
+                ));
+            }
+            if !out.insert((commit.to_owned(), id.to_owned())) {
+                return Err(SyncError::Ref("duplicate by-commit pointer".into()));
+            }
+            if out.len() > MAX_BY_COMMIT_POINTERS {
+                return Err(SyncError::Ref("too many by-commit pointers".into()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn projected_endpoints(repo: &Repository, root: &Tree<'_>) -> Result<HashSet<(String, String)>> {
+    let mut refs = Vec::new();
+    collect_interaction_blobs(repo, root, 2, &mut refs)?;
+    let mut nodes = HashSet::new();
+    let mut endpoints = HashSet::new();
+    for (path_id, oid) in refs {
+        let node: SyncNode = serde_json::from_slice(repo.find_blob(oid)?.content())?;
+        let id = node.interaction.id.to_string();
+        if id != path_id {
+            return Err(SyncError::Ref("projected node identity mismatch".into()));
+        }
+        nodes.insert(id.clone());
+        for link in node.artifact_links {
+            if link.interaction_id.to_string() != id
+                || !is_safe_commit_sha(link.git_commit_hash.as_str())
+            {
+                return Err(SyncError::Ref("invalid projected legacy link".into()));
+            }
+            endpoints.insert((link.git_commit_hash.as_str().to_owned(), id.clone()));
+        }
+    }
+    let mut decoded = 0;
+    for record in collect_link_records(repo, root, &mut decoded, MAX_SYNC_TOTAL_BYTES)? {
+        if nodes.contains(&record.interaction_id) {
+            endpoints.insert((record.git_commit_hash, record.interaction_id));
+        }
+    }
+    for event in collect_derivation_events(repo, root, &mut decoded, MAX_SYNC_TOTAL_BYTES)? {
+        let id = event.interaction_id.to_string();
+        if !nodes.contains(&id) {
+            return Err(SyncError::Ref("event target has no projected node".into()));
+        }
+        endpoints.insert((event.target_commit.as_str().to_owned(), id));
+    }
+    if endpoints.len() > MAX_BY_COMMIT_POINTERS {
+        return Err(SyncError::Ref("too many projected endpoints".into()));
+    }
+    Ok(endpoints)
+}
+
+fn parse_legacy_source(source: &str) -> Option<(String, String)> {
+    let rest = source.strip_prefix("legacy:")?;
+    let (interaction, commit) = rest.split_once(':')?;
+    let canonical = interaction
+        .parse::<crate::models::InteractionId>()
+        .ok()?
+        .to_string();
+    if canonical != interaction
+        || !is_safe_commit_sha(commit)
+        || commit.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some((interaction.to_owned(), commit.to_owned()))
+}
+
+fn is_event_source(source: &str) -> bool {
+    source.len() == 64
+        && source
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn validate_closed_derivation_graph(
+    events: &[DerivationEvent],
+    legacy: &HashSet<(String, String)>,
+) -> Result<()> {
+    let by_id: HashMap<_, _> = events
+        .iter()
+        .map(|event| (event.event_id.as_str(), event))
+        .collect();
+    if by_id.len() != events.len() {
+        return Err(SyncError::Ref("duplicate derivation event id".into()));
+    }
+    for event in events {
+        if matches!(
+            event.relation,
+            crate::models::DerivationRelation::RewriteExact
+                | crate::models::DerivationRelation::SquashExact
+        ) && event.source_event_ids.is_empty()
+        {
+            return Err(SyncError::Ref("exact derivation has no source".into()));
+        }
+        for source in &event.source_event_ids {
+            if let Some((interaction, commit)) = parse_legacy_source(source) {
+                if interaction != event.interaction_id.to_string()
+                    || !legacy.contains(&(interaction, commit))
+                {
+                    return Err(SyncError::Ref(
+                        "legacy derivation source does not resolve".into(),
+                    ));
+                }
+            } else if is_event_source(source) {
+                let parent = by_id
+                    .get(source.as_str())
+                    .ok_or_else(|| SyncError::Ref("dangling derivation event source".into()))?;
+                if parent.interaction_id != event.interaction_id {
+                    return Err(SyncError::Ref("cross-interaction derivation source".into()));
+                }
+            } else {
+                return Err(SyncError::Ref("invalid derivation source grammar".into()));
+            }
+        }
+    }
+    fn visit<'a>(
+        id: &'a str,
+        by_id: &HashMap<&'a str, &'a DerivationEvent>,
+        visiting: &mut HashSet<&'a str>,
+        visited: &mut HashSet<&'a str>,
+    ) -> Result<()> {
+        if visited.contains(id) {
+            return Ok(());
+        }
+        if !visiting.insert(id) {
+            return Err(SyncError::Ref("cyclic derivation graph".into()));
+        }
+        let event = by_id
+            .get(id)
+            .ok_or_else(|| SyncError::Ref("missing derivation event".into()))?;
+        for source in &event.source_event_ids {
+            if is_event_source(source) {
+                visit(source, by_id, visiting, visited)?;
+            }
+        }
+        visiting.remove(id);
+        visited.insert(id);
+        Ok(())
+    }
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for id in by_id.keys() {
+        visit(id, &by_id, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
+fn projected_legacy_sources(
+    repo: &Repository,
+    root: &Tree<'_>,
+) -> Result<HashSet<(String, String)>> {
+    let mut refs = Vec::new();
+    collect_interaction_blobs(repo, root, 2, &mut refs)?;
+    let mut result = HashSet::new();
+    for (path_id, oid) in refs {
+        let node: SyncNode = serde_json::from_slice(repo.find_blob(oid)?.content())?;
+        for link in node.artifact_links {
+            if link.interaction_id.to_string() == path_id {
+                result.insert((path_id.clone(), link.git_commit_hash.as_str().to_owned()));
+            }
+        }
+    }
+    let mut decoded = 0;
+    for link in collect_link_records(repo, root, &mut decoded, MAX_SYNC_TOTAL_BYTES)? {
+        result.insert((link.interaction_id, link.git_commit_hash));
+    }
+    Ok(result)
+}
+
+fn validate_tree_derivation_graph(repo: &Repository, root: &Tree<'_>) -> Result<()> {
+    let mut decoded = 0;
+    let events = collect_derivation_events(repo, root, &mut decoded, MAX_SYNC_TOTAL_BYTES)?;
+    let legacy = projected_legacy_sources(repo, root)?;
+    validate_closed_derivation_graph(&events, &legacy)
+}
+
+fn build_by_commit_tree(
+    repo: &Repository,
+    endpoints: &HashSet<(String, String)>,
+) -> Result<git2::Oid> {
+    let mut grouped: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (commit, id) in endpoints {
+        grouped.entry(commit).or_default().push(id);
+    }
+    let empty = repo.blob(b"")?;
+    let mut root = repo.treebuilder(None)?;
+    for (commit, mut ids) in grouped {
+        ids.sort_unstable();
+        let mut subtree = repo.treebuilder(None)?;
+        for id in ids {
+            subtree.insert(id, empty, FileMode::Blob.into())?;
+        }
+        root.insert(commit, subtree.write()?, FileMode::Tree.into())?;
+    }
+    root.write().map_err(Into::into)
 }
 
 pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<()> {
@@ -1082,6 +1648,7 @@ pub fn pull_from_ref_with_limits(
     let tree = obj
         .as_tree()
         .ok_or_else(|| SyncError::Ref("Ref is not a tree".into()))?;
+    let mut format_version = 1u64;
     if let Some(entry) = tree.get_name("FORMAT") {
         let blob = repo.find_blob(entry.id())?;
         let text = std::str::from_utf8(blob.content())
@@ -1090,10 +1657,29 @@ pub fn pull_from_ref_with_limits(
             .trim()
             .parse::<u64>()
             .map_err(|_| SyncError::Ref("FORMAT is not numeric".into()))?;
-        if !(1..=4).contains(&version) {
+        if !(1..=5).contains(&version) {
             return Err(SyncError::Ref("unsupported FORMAT".into()));
         }
+        format_version = version;
     }
+    for name in ["events", "ranges"] {
+        match tree.get_name(name) {
+            Some(e) => {
+                if format_version < 5 {
+                    return Err(SyncError::Ref("v5 namespace in legacy FORMAT".into()));
+                }
+                if e.kind() != Some(ObjectType::Tree) {
+                    return Err(SyncError::Ref("v5 namespace must be tree".into()));
+                }
+            }
+            None if format_version == 5 => {
+                return Err(SyncError::Ref("FORMAT5 namespace missing".into()));
+            }
+            None => {}
+        }
+    }
+    validate_v5_reserved_namespaces(repo, tree)?;
+    let wire_index = validate_by_commit_structure(repo, tree)?;
 
     // Tombstones are read and structurally validated before any node or link.
     // This makes ordering in the tree irrelevant and prevents resurrection by a
@@ -1197,6 +1783,68 @@ pub fn pull_from_ref_with_limits(
             .into_iter()
             .filter(|r| !tombstoned.contains(&r.interaction_id))
             .collect();
+    // Validate the complete wire graph before applying any suppression. A
+    // tombstone must never turn malformed evidence into an acceptable snapshot.
+    let incoming_events =
+        collect_derivation_events(repo, tree, &mut decoded_bytes, limits.max_total_bytes)?;
+    let incoming_legacy_sources = projected_legacy_sources(repo, tree)?;
+    validate_closed_derivation_graph(&incoming_events, &incoming_legacy_sources)?;
+    let events = retain_event_closure(incoming_events, &tombstoned, &HashSet::new());
+    let ranges = collect_ranges(repo, tree, &mut decoded_bytes, limits.max_total_bytes)?;
+    let range_ids: HashSet<_> = ranges.iter().map(|range| range.range_id.as_str()).collect();
+    if events.iter().any(|event| {
+        event.relation == crate::models::DerivationRelation::SquashExact
+            && event
+                .range_id
+                .as_deref()
+                .is_none_or(|id| !range_ids.contains(id))
+    }) {
+        return Err(SyncError::Ref(
+            "squash event references missing range".into(),
+        ));
+    }
+    let mut wire_legacy_sources = HashSet::new();
+    for (id, value) in &wire_nodes {
+        let node: SyncNode = serde_json::from_value(value.clone())?;
+        for link in node.artifact_links {
+            wire_legacy_sources.insert((id.clone(), link.git_commit_hash.as_str().to_owned()));
+        }
+    }
+    wire_legacy_sources.extend(records.iter().map(|record| {
+        (
+            record.interaction_id.clone(),
+            record.git_commit_hash.clone(),
+        )
+    }));
+    validate_closed_derivation_graph(&events, &wire_legacy_sources)?;
+    let mut expected_index = HashSet::new();
+    for (id, value) in &wire_nodes {
+        let node: SyncNode = serde_json::from_value(value.clone())?;
+        for link in node.artifact_links {
+            expected_index.insert((link.git_commit_hash.as_str().to_owned(), id.clone()));
+        }
+    }
+    for record in &records {
+        expected_index.insert((
+            record.git_commit_hash.clone(),
+            record.interaction_id.clone(),
+        ));
+    }
+    for event in &events {
+        expected_index.insert((
+            event.target_commit.as_str().to_owned(),
+            event.interaction_id.to_string(),
+        ));
+    }
+    let effective_wire_index: HashSet<_> = wire_index
+        .into_iter()
+        .filter(|(_, id)| !tombstoned.contains(id))
+        .collect();
+    if format_version >= 2 && effective_wire_index != expected_index {
+        return Err(SyncError::Ref(
+            "by-commit index is inconsistent with projected evidence".into(),
+        ));
+    }
     let mut known_interactions = existing_ids;
     known_interactions.extend(
         nodes_to_insert
@@ -1204,6 +1852,13 @@ pub fn pull_from_ref_with_limits(
             .map(|node| node.interaction.id.to_string()),
     );
     validate_records_against_store(db, &records, &known_interactions, &nodes_to_insert)?;
+    for event in &events {
+        if !known_interactions.contains(&event.interaction_id.to_string()) {
+            return Err(SyncError::Ref(
+                "derivation references missing interaction".into(),
+            ));
+        }
+    }
 
     // 5. Robust Topological Sort (DFS)
     // We need to ensure that if B depends on A (B.parent_id = A.id), A is inserted first.
@@ -1307,12 +1962,215 @@ pub fn pull_from_ref_with_limits(
     db.import_sync_batch(
         captures,
         links,
+        events,
+        ranges,
         remote_fingerprint,
         &tombstones,
         &published_ids,
     )?;
 
     Ok(())
+}
+
+fn validate_v5_reserved_namespaces(repo: &Repository, root: &Tree) -> Result<()> {
+    let format = root
+        .get_name("FORMAT")
+        .map(|e| repo.find_blob(e.id()))
+        .transpose()?;
+    let is_v5 = format
+        .as_ref()
+        .is_some_and(|b| b.content().trim_ascii() == b"5");
+    if is_v5
+        && ["events", "ranges"]
+            .iter()
+            .any(|name| root.get_name(name).is_none())
+    {
+        return Err(SyncError::Ref("FORMAT5 namespace missing".into()));
+    }
+    if let Some(ranges) = root.get_name("ranges") {
+        if !is_v5 || ranges.kind() != Some(ObjectType::Tree) {
+            return Err(SyncError::Ref("invalid reserved ranges namespace".into()));
+        }
+        let mut bytes = 0;
+        let _ = collect_ranges(repo, root, &mut bytes, MAX_SYNC_TOTAL_BYTES)?;
+    }
+    if let Some(events) = root.get_name("events") {
+        if !is_v5 || events.kind() != Some(ObjectType::Tree) {
+            return Err(SyncError::Ref("invalid reserved events namespace".into()));
+        }
+    }
+    // Parse the complete event namespace during baseline validation too. Push
+    // must never preserve an invalid v5 event merely because it was received
+    // before this client was upgraded.
+    if root.get_name("events").is_some() {
+        let mut bytes = 0;
+        let _ = collect_derivation_events(repo, root, &mut bytes, MAX_SYNC_TOTAL_BYTES)?;
+    }
+    Ok(())
+}
+
+fn collect_ranges(
+    repo: &Repository,
+    root: &Tree,
+    decoded: &mut usize,
+    max: usize,
+) -> Result<Vec<RangeEvidence>> {
+    let Some(tree) = child_tree(repo, Some(root), "ranges") else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut seen = HashMap::new();
+    for shard in tree.iter() {
+        let name = shard.name().unwrap_or_default();
+        if name.len() != 2
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            || shard.kind() != Some(ObjectType::Tree)
+        {
+            return Err(SyncError::Ref("invalid range shard".into()));
+        }
+        for entry in repo.find_tree(shard.id())?.iter() {
+            if out.len() >= MAX_SYNC_RANGES {
+                return Err(SyncError::Ref("too many ranges".into()));
+            }
+            let file = entry.name().unwrap_or_default();
+            let id = file
+                .strip_suffix(".json")
+                .filter(|x| {
+                    x.len() == 64
+                        && x.bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                })
+                .ok_or_else(|| SyncError::Ref("invalid range filename".into()))?;
+            if &id[..2] != name || entry.kind() != Some(ObjectType::Blob) {
+                return Err(SyncError::Ref("range path mismatch".into()));
+            }
+            let blob = repo.find_blob(entry.id())?;
+            if blob.size() > MAX_SYNC_BLOB_BYTES {
+                return Err(SyncError::Ref("range too large".into()));
+            }
+            add_sync_bytes(decoded, blob.size(), max)?;
+            let range: RangeEvidence = serde_json::from_slice(blob.content())?;
+            if range.range_id != id || !range.verify_id() {
+                return Err(SyncError::Ref("range body/hash mismatch".into()));
+            }
+            if let Some(old) = seen.insert(range.range_id.clone(), blob.content().to_vec()) {
+                if old != blob.content() {
+                    return Err(SyncError::Ref("conflicting range".into()));
+                }
+            } else {
+                out.push(range)
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn collect_derivation_events(
+    repo: &Repository,
+    root: &Tree,
+    decoded: &mut usize,
+    max: usize,
+) -> Result<Vec<DerivationEvent>> {
+    let Some(tree) = child_tree(repo, Some(root), "events") else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut ids = HashMap::new();
+    for shard in tree.iter() {
+        let name = shard.name().unwrap_or_default();
+        if name.len() != 2
+            || !name.bytes().all(|b| b.is_ascii_hexdigit())
+            || shard.kind() != Some(ObjectType::Tree)
+        {
+            return Err(SyncError::Ref("invalid event shard".into()));
+        }
+        let sub = repo.find_tree(shard.id())?;
+        for entry in sub.iter() {
+            if out.len() >= MAX_SYNC_DERIVATION_EVENTS {
+                return Err(SyncError::Ref("too many derivation events".into()));
+            }
+            let file = entry.name().unwrap_or_default();
+            let id = file
+                .strip_suffix(".json")
+                .filter(|x| x.len() == 64 && x.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or_else(|| SyncError::Ref("invalid event filename".into()))?;
+            if &id[..2] != name || entry.kind() != Some(ObjectType::Blob) {
+                return Err(SyncError::Ref("event path mismatch".into()));
+            }
+            let blob = repo.find_blob(entry.id())?;
+            if blob.size() > MAX_SYNC_BLOB_BYTES {
+                return Err(SyncError::Ref("event too large".into()));
+            }
+            add_sync_bytes(decoded, blob.size(), max)?;
+            let event: DerivationEvent = serde_json::from_slice(blob.content())?;
+            if event.event_id != id || !validate_derivation_event(&event) {
+                return Err(SyncError::Ref("event body/hash mismatch".into()));
+            }
+            if let Some(old) = ids.insert(event.event_id.clone(), blob.content().to_vec()) {
+                if old != blob.content() {
+                    return Err(SyncError::Ref("conflicting duplicate event".into()));
+                }
+            } else {
+                out.push(event);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn validate_derivation_event(event: &DerivationEvent) -> bool {
+    use crate::models::{DerivationOrigin as O, DerivationRelation as R, EvidenceKind as E};
+    if !event.verify_id()
+        || !event.sources_are_canonical()
+        || event.event_id.len() != 64
+        || !event.event_id.bytes().all(|b| b.is_ascii_hexdigit())
+        || !is_safe_commit_sha(event.target_commit.as_str())
+        || event.evidence.version != 1
+        || event
+            .linked_by
+            .as_deref()
+            .is_some_and(|x| x.is_empty() || x.len() > 1024 * 1024)
+    {
+        return false;
+    }
+    if event.source_event_ids.iter().any(|source| {
+        source.len() > 512 || (parse_legacy_source(source).is_none() && !is_event_source(source))
+    }) {
+        return false;
+    }
+    match event.relation {
+        R::RewriteExact => {
+            !event.source_event_ids.is_empty()
+                && event
+                    .old_oid
+                    .as_ref()
+                    .is_some_and(|x| is_safe_commit_sha(x.as_str()))
+                && event
+                    .new_oid
+                    .as_ref()
+                    .is_some_and(|x| x.as_str() == event.target_commit.as_str())
+                && event.range_id.is_none()
+                && event.evidence.kind == E::LocallyObserved
+                && event.origin == O::LocalHook
+        }
+        R::SquashExact => {
+            !event.source_event_ids.is_empty()
+                && event.old_oid.is_none()
+                && event.new_oid.is_none()
+                && event.range_id.as_ref().is_some_and(|x| {
+                    x.len() == 64
+                        && x.bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                })
+                && event.evidence.kind == E::LocallyObserved
+                && event.origin == O::LocalHook
+        }
+        R::Generated | R::Temporal | R::Verified => {
+            event.old_oid.is_none() && event.new_oid.is_none() && event.range_id.is_none()
+        }
+    }
 }
 
 fn collect_tombstones(
@@ -1803,4 +2661,65 @@ fn topo_visit(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod derivation_graph_tests {
+    use super::*;
+    use crate::models::{
+        CommitSha, DerivationOrigin, DerivationRelation, Evidence, EvidenceKind, InteractionId,
+    };
+
+    fn event(id: &str, interaction: &str, sources: Vec<String>) -> DerivationEvent {
+        DerivationEvent {
+            event_id: id.into(),
+            interaction_id: interaction.parse::<InteractionId>().expect("UUID fixture"),
+            target_commit: CommitSha::new("c".repeat(40)),
+            relation: DerivationRelation::RewriteExact,
+            evidence: Evidence {
+                version: 1,
+                kind: EvidenceKind::LocallyObserved,
+            },
+            origin: DerivationOrigin::LocalHook,
+            source_event_ids: sources,
+            old_oid: Some(CommitSha::new("a".repeat(40))),
+            new_oid: Some(CommitSha::new("c".repeat(40))),
+            range_id: None,
+            linked_by: None,
+        }
+    }
+
+    #[test]
+    fn graph_rejects_empty_dangling_cross_interaction_and_cycle() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let first = "11111111-1111-4111-8111-111111111111";
+        let second = "22222222-2222-4222-8222-222222222222";
+        let legacy = HashSet::new();
+        assert!(validate_closed_derivation_graph(&[event(&a, first, vec![])], &legacy).is_err());
+        assert!(
+            validate_closed_derivation_graph(&[event(&a, first, vec![b.clone()])], &legacy)
+                .is_err()
+        );
+        assert!(validate_closed_derivation_graph(
+            &[
+                event(
+                    &a,
+                    first,
+                    vec![format!("legacy:{first}:{}", "d".repeat(40))]
+                ),
+                event(&b, second, vec![a.clone()]),
+            ],
+            &HashSet::from([(first.into(), "d".repeat(40))]),
+        )
+        .is_err());
+        assert!(validate_closed_derivation_graph(
+            &[
+                event(&a, first, vec![b.clone()]),
+                event(&b, first, vec![a.clone()]),
+            ],
+            &legacy,
+        )
+        .is_err());
+    }
 }

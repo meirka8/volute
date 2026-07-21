@@ -39,10 +39,16 @@ npm run build
 
 ## CVC sync compatibility and retention
 
-The reviewer reads CVC sync formats v1–v4, including legacy node-embedded links and
-append-only `links/<interaction-id>/<commit-sha>.json` records. Format v4 adds
-destination-scoped tombstones. Tombstones are loaded before nodes and win over every
-legacy or sharded node representation, so tombstoned interactions are not rendered.
+The reviewer reads CVC sync formats v1–v5, including legacy node-embedded links and
+append-only `links/<interaction-id>/<commit-sha>.json` records. Format v5 adds immutable
+`events/` derivation records and `ranges/` `RangeEvidence` (including
+`cvc.changeset/v1` evidence); it validates their canonical IDs, closure, bounds, and
+required `by-commit` pointers before joining them to nodes. The reviewer labels all
+FORMAT5 derivations—including `rewrite_exact` and `squash_exact`—as **publisher-asserted,
+unverified**: it validates wire integrity but does not independently inspect the publisher's
+local Git history or establish local trust. Format v4 adds destination-scoped tombstones.
+Tombstones are loaded before nodes and win over every legacy or sharded node representation,
+as well as the target's FORMAT5 derivation/range closure, so tombstoned interactions are not rendered.
 The reviewer evicts the corresponding `cvc-node` query-cache entry when it observes a
 tombstone; it refuses malformed/truncated tombstone trees rather than showing an
 incomplete timeline. Immutable cognitive entries may be retained in this browser's
@@ -60,3 +66,9 @@ use a private browser context and clear its session data when appropriate.
 Temporal links are shown as **lower confidence** because they are inferred from timing
 rather than file context. Interaction IDs are UUIDs, not Git content addresses.
 Linking-identity attribution is retained for compatibility but is not a public badge.
+
+The PR commit range is fetched in bounded 100-commit pages (up to 100 pages). For a merged
+PR, the reported merge SHA is included alongside listed commit SHAs; malformed data or an
+over-limit page sequence fails the cognitive overlay closed. Any malformed, missing, or
+truncated FORMAT5 namespace, unsafe artifact, or validation failure purges/refuses the
+cognitive cache rather than rendering a partial timeline.
