@@ -281,12 +281,11 @@ pub fn persist_inbox(dir: &Path, mode: &str, raw: &[u8]) -> Result<PathBuf, Rewr
         return Err(RewriteError::Retryable("rewrite inbox quota exceeded"));
     }
     let tmp = dir.join(format!(".{key}.tmp"));
-    let mut f = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-    {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut f = match options.open(&tmp) {
         Ok(file) => file,
         // Another hook can publish the same deterministic inbox concurrently.
         // Its completed file is safe to replay; do not turn that benign race
