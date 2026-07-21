@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-The **CVC Reviewer** is a visualization layer for Pull Requests that overlays the "Cognitive History" (reasoning, prompts, chain-of-thought) atop the standard "Artifact History" (code diffs).
+The **CVC Reviewer** is a visualization layer for Pull Requests that overlays available CVC interaction data (prompts, context, optional exposed reasoning, and responses) atop standard code diffs. It does not guarantee that a provider's hidden chain-of-thought exists in CVC data.
 
 **Primary Mandates:**
 
@@ -144,7 +144,7 @@ This is the heart of CVC Reviewer. It visualizes the `refs/cvc/main` data linked
         
     - _Model Node:_ Icon + Response Summary.
         
-    - _Hidden Data:_ Chain of Thought is collapsed by default behind a "Reasoning" toggle (like a spoiler tag).
+    - _Optional Data:_ Reasoning is shown only when the source exposed and stored it; hidden chain-of-thought is not assumed.
         
 - **Reverse Blame (The "Why" Click):**
     
@@ -168,6 +168,34 @@ The primary controller.
 
 ## 6. Implementation Phases
 
+### 5.4 FORMAT5 evidence, suppression, and browser retention
+
+The reviewer supports sync formats v1–v5. For v5 it validates bounded, canonical
+`events/` derivation records and `ranges/` `RangeEvidence`, including the
+`cvc.changeset/v1` identity and exact source/range closure, before it joins an event to a
+validated node and `by-commit` pointer. This is wire-format validation only: labels such as
+**Publisher-asserted Git rewrite** and **Publisher-asserted squash equivalence** do not mean
+the browser independently verified local Git objects, trust observations, or authorization.
+
+For v4+ it validates and loads the `tombstones/` tree before nodes; a valid tombstone
+suppresses its target regardless of whether that target appears in a legacy flat path or a
+sharded `nodes/` path, and suppresses that interaction's v5 derivation/range closure. It
+evicts the target's React Query node-cache key on observation. Invalid or truncated tombstone
+data is an error, not permission to display a possibly suppressed interaction.
+
+This is UI/cache suppression only. A tombstone is not physical Git-object deletion, and
+cache eviction cannot clear GitHub responses, browser session storage, developer tools,
+downloads, clones, forks, reflogs, caches, or backups. The current PAT is held in the
+browser session, including session storage; the application has no server-side token
+store, but users remain responsible for their browser environment.
+
+Immutable cognitive query results may remain in the reviewer's IndexedDB query cache for
+up to 30 days. Tombstone observation removes affected entries from both in-memory and
+persisted cache projections. Logout and PAT/account replacement clear all reviewer React
+Query and IndexedDB caches. A malformed, missing, or truncated tombstone namespace—or a
+malformed format marker—is fail-closed: the reviewer purges its cognitive cache and does
+not render a possibly suppressed timeline.
+
 ### Phase 1: The Static Harness
 
 - Setup React+Vite+Tailwind.
@@ -179,7 +207,7 @@ The primary controller.
 
 ### Phase 2: The Data Overlay
 
-- Implement `CVCLoader`: Fetches `pull_request`, gets commit range, fetches `refs/cvc/main` blobs.
+- Implement `CVCLoader`: Fetches `pull_request`, gets commit range in bounded 100-commit pages (maximum 100 pages), includes the reported merged PR SHA, then fetches `refs/cvc/main` blobs. Invalid pagination or merged SHA fails the cognitive overlay closed.
     
 - Implement the "Join Logic": matching Commit SHAs to Interaction IDs locally in the browser.
     

@@ -17,12 +17,14 @@ import {
   TimelineGetResponse,
   InteractionGetParams,
   InteractionDetail,
+  PrivacyStatus,
 } from "./protocol";
 import {
   expandPath,
   isExecutable,
   findBinary,
 } from "../setup/binaryUtils";
+import { isPrivacyStatus } from "../privacy";
 
 /**
  * Volute VC Language Client - manages the connection to the volute-lsp server
@@ -55,7 +57,7 @@ export class VoluteLanguageClient {
       );
     }
 
-    this.outputChannel.appendLine(`Using volute-lsp binary: ${serverPath}`);
+    this.outputChannel.appendLine("Using configured Volute language server binary");
 
     const serverOptions: ServerOptions = {
       run: {
@@ -80,7 +82,6 @@ export class VoluteLanguageClient {
       // We use a broad document selector but the server will handle filtering
       documentSelector: [{ scheme: "file" }],
       outputChannel: this.outputChannel,
-      traceOutputChannel: this.outputChannel,
       initializationOptions: {
         workspaceFolders:
           vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [],
@@ -100,6 +101,11 @@ export class VoluteLanguageClient {
 
     // Set trace level
     if (trace !== "off") {
+      if (trace === "verbose") {
+        void vscode.window.showWarningMessage(
+          "Volute verbose protocol tracing can expose captured chat payloads in its trace output. Disable it unless actively debugging.",
+        );
+      }
       this.client.setTrace(
         trace === "verbose" ? Trace.Verbose : Trace.Messages,
       );
@@ -137,6 +143,20 @@ export class VoluteLanguageClient {
     return this.client?.isRunning() ?? false;
   }
 
+  /** Read policy state before any extension code reads chat-session storage. */
+  async getPrivacyStatus(): Promise<PrivacyStatus | null> {
+    if (!this.client?.isRunning()) {
+      return null;
+    }
+    try {
+      const response = await this.client.sendRequest<unknown>("cvc/privacy/status");
+      return isPrivacyStatus(response) ? response : null;
+    } catch (error) {
+      this.outputChannel.appendLine("Privacy status request failed");
+      return null;
+    }
+  }
+
   /**
    * Send session start notification to the server
    */
@@ -160,9 +180,7 @@ export class VoluteLanguageClient {
       );
       return;
     }
-    this.outputChannel.appendLine(
-      `LSP: Sending turn/start (id: ${params.id}, prompt: ${params.prompt.substring(0, 50)}...)`,
-    );
+    this.outputChannel.appendLine("LSP: Sending turn/start");
     await this.client.sendNotification("$/cvc/turn/start", params);
   }
 
@@ -176,9 +194,7 @@ export class VoluteLanguageClient {
       );
       return;
     }
-    this.outputChannel.appendLine(
-      `LSP: Sending turn/end (id: ${params.id}, response length: ${params.response?.length ?? 0}, raw parts: ${params.rawResponse?.length ?? 0}, model: ${params.model})`,
-    );
+    this.outputChannel.appendLine("LSP: Sending turn/end");
     await this.client.sendNotification("$/cvc/turn/end", params);
   }
 
@@ -193,9 +209,7 @@ export class VoluteLanguageClient {
       );
       return;
     }
-    this.outputChannel.appendLine(
-      `LSP: Sending turn/batch (source: ${params.sourceRequestId}, segments: ${params.interactions.length}, model: ${params.model})`,
-    );
+    this.outputChannel.appendLine(`LSP: Sending turn/batch (${params.interactions.length} segments)`);
     await this.client.sendNotification("$/cvc/turn/batch", params);
   }
 
@@ -231,9 +245,7 @@ export class VoluteLanguageClient {
       );
       return response;
     } catch (error) {
-      this.outputChannel.appendLine(
-        `Timeline request failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      this.outputChannel.appendLine("Timeline request failed");
       return null;
     }
   }
@@ -267,9 +279,7 @@ export class VoluteLanguageClient {
       );
       return response;
     } catch (error) {
-      this.outputChannel.appendLine(
-        `Interaction request failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      this.outputChannel.appendLine("Interaction request failed");
       return null;
     }
   }
@@ -292,9 +302,7 @@ export class VoluteLanguageClient {
       if (await isExecutable(expandedPath)) {
         return expandedPath;
       }
-      this.outputChannel.appendLine(
-        `Warning: Configured lspPath "${configuredPath}" is not executable`,
-      );
+      this.outputChannel.appendLine("Warning: Configured lspPath is not executable");
     }
 
     // 2. Check bundled binary in extension

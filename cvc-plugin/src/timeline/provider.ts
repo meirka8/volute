@@ -43,11 +43,14 @@ export class TimelineTreeProvider implements vscode.TreeDataProvider<TimelineTre
    */
   private initializeGitListener() {
     try {
+      // VS Code's built-in Git extension does not expose its API types here.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const gitExtension = vscode.extensions.getExtension<any>("vscode.git")?.exports;
       if (gitExtension) {
         const api = gitExtension.getAPI(1);
         if (api) {
           // Listen for repository opens
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const disposable = api.onDidOpenRepository((repo: any) => {
             this.registerRepoListener(repo);
             this.refresh();
@@ -56,17 +59,19 @@ export class TimelineTreeProvider implements vscode.TreeDataProvider<TimelineTre
 
           // Register for existing repositories
           if (api.repositories) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             api.repositories.forEach((repo: any) => {
               this.registerRepoListener(repo);
             });
           }
         }
       }
-    } catch (e) {
-      this.outputChannel.appendLine(`Failed to initialize git listener: ${e}`);
+    } catch {
+      this.outputChannel.appendLine("Failed to initialize git listener");
     }
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private registerRepoListener(repo: any) {
     const disposable = repo.state.onDidChange(() => {
       // Refresh when git state changes (commit, checkout, etc)
@@ -89,6 +94,7 @@ export class TimelineTreeProvider implements vscode.TreeDataProvider<TimelineTre
    */
   private getHeadSha(): string | undefined {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const gitExtension = vscode.extensions.getExtension<any>("vscode.git")?.exports;
       const api = gitExtension?.getAPI(1);
 
@@ -100,8 +106,8 @@ export class TimelineTreeProvider implements vscode.TreeDataProvider<TimelineTre
           return repo.state.HEAD.commit;
         }
       }
-    } catch (e) {
-      this.outputChannel.appendLine(`Error getting HEAD SHA: ${e}`);
+    } catch {
+      this.outputChannel.appendLine("Error getting HEAD SHA");
     }
     return undefined;
   }
@@ -135,9 +141,8 @@ export class TimelineTreeProvider implements vscode.TreeDataProvider<TimelineTre
           `Timeline loaded: ${this.pendingThoughts.length} pending, ${this.commits.length} commits`,
         );
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.outputChannel.appendLine(`Failed to refresh timeline: ${message}`);
+    } catch {
+      this.outputChannel.appendLine("Failed to refresh timeline");
     } finally {
       this.isLoading = false;
       this._onDidChangeTreeData.fire();

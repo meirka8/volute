@@ -4,6 +4,7 @@ import * as path from "path";
 import * as fs from "fs";
 import { VoluteLanguageClient } from "../lsp/client";
 import type { InteractionSegment } from "../lsp/protocol";
+import { isExactWorkspaceStorage } from "../privacy";
 
 /**
  * Structure of a chat session file (partial - only fields we care about)
@@ -57,7 +58,7 @@ interface ChatResponsePart {
 }
 
 /**
- * ChatSessionWatcher - The Invisible Stenographer
+ * ChatSessionWatcher - passive, consent-gated local observer.
  *
  * Passively monitors VS Code's Copilot Chat session files to capture
  * conversations without interfering with Copilot's functionality.
@@ -67,6 +68,7 @@ export class ChatSessionWatcher {
   private readonly lspClient: VoluteLanguageClient;
   private watcher: vscode.FileSystemWatcher | undefined;
   private chatSessionsDir: string | undefined;
+  private active = false;
 
   // Track checksums of processed requests to detect actual changes
   private requestChecksums: Map<string, string> = new Map();
@@ -91,10 +93,15 @@ export class ChatSessionWatcher {
    * Start watching for chat session changes
    */
   async start(context: vscode.ExtensionContext): Promise<void> {
+    this.active = true;
     this.outputChannel.appendLine("ChatSessionWatcher: Starting...");
 
     // Find the chat sessions directory
     this.chatSessionsDir = await this.findChatSessionsDir(context);
+
+    if (!this.active) {
+      return;
+    }
 
     if (!this.chatSessionsDir) {
       this.outputChannel.appendLine(
@@ -103,9 +110,7 @@ export class ChatSessionWatcher {
       return;
     }
 
-    this.outputChannel.appendLine(
-      `ChatSessionWatcher: Watching ${this.chatSessionsDir}`,
-    );
+    this.outputChannel.appendLine("ChatSessionWatcher: Exact workspace storage selected");
 
     // Create file system watcher for JSON files in the chat sessions directory
     const pattern = new vscode.RelativePattern(this.chatSessionsDir, "*.json*");
@@ -120,6 +125,10 @@ export class ChatSessionWatcher {
     // Do an initial scan of existing sessions
     await this.scanExistingSessions();
 
+    if (!this.active) {
+      return;
+    }
+
     // Start polling as a backup mechanism (file watchers can be unreliable)
     this.startPolling();
 
@@ -130,6 +139,9 @@ export class ChatSessionWatcher {
    * Stop watching
    */
   stop(): void {
+    // Stop is the revocation boundary: callbacks and any in-flight async work
+    // re-check this flag before reading or forwarding session content.
+    this.active = false;
     // Clear all debounce timers
     for (const timer of this.debounceTimers.values()) {
       clearTimeout(timer);
@@ -144,6 +156,7 @@ export class ChatSessionWatcher {
 
     this.watcher?.dispose();
     this.watcher = undefined;
+    this.chatSessionsDir = undefined;
     this.outputChannel.appendLine("ChatSessionWatcher: Stopped");
   }
 
@@ -160,7 +173,7 @@ export class ChatSessionWatcher {
    * Poll all session files for new requests
    */
   private async pollForChanges(): Promise<void> {
-    if (!this.chatSessionsDir) {
+    if (!this.active || !this.chatSessionsDir) {
       return;
     }
 
@@ -169,6 +182,9 @@ export class ChatSessionWatcher {
       const jsonFiles = files.filter((f) => f.endsWith(".json") || f.endsWith(".jsonl"));
 
       for (const file of jsonFiles) {
+        if (!this.active) {
+          return;
+        }
         const filePath = path.join(this.chatSessionsDir, file);
         await this.processSessionFile(filePath);
       }
@@ -194,9 +210,7 @@ export class ChatSessionWatcher {
     const workspaceStorageDir = path.join(userDir, "workspaceStorage");
 
     if (!fs.existsSync(workspaceStorageDir)) {
-      this.outputChannel.appendLine(
-        `ChatSessionWatcher: workspaceStorage not found at ${workspaceStorageDir}`,
-      );
+      this.outputChannel.appendLine("ChatSessionWatcher: workspaceStorage not found");
       return undefined;
     }
 
@@ -230,10 +244,7 @@ export class ChatSessionWatcher {
         const workspaceData = JSON.parse(workspaceJson);
 
         // Check if this is our workspace
-        if (
-          workspaceData.folder === workspaceUri ||
-          workspaceData.workspace === workspaceUri
-        ) {
+        if (isExactWorkspaceStorage(workspaceData, workspaceUri)) {
           const chatSessionsPath = path.join(
             workspaceStorageDir,
             dir,
@@ -249,44 +260,22 @@ export class ChatSessionWatcher {
       }
     }
 
-    // Fallback: try to find any chatSessions directory with recent activity
-    this.outputChannel.appendLine(
-      "ChatSessionWatcher: Falling back to most recent chatSessions directory",
-    );
-
-    let mostRecentDir: string | undefined;
-    let mostRecentTime = 0;
-
-    for (const dir of storageDirs) {
-      const chatSessionsPath = path.join(
-        workspaceStorageDir,
-        dir,
-        "chatSessions",
-      );
-
-      try {
-        const stats = await fs.promises.stat(chatSessionsPath);
-        if (stats.isDirectory() && stats.mtimeMs > mostRecentTime) {
-          mostRecentTime = stats.mtimeMs;
-          mostRecentDir = chatSessionsPath;
-        }
-      } catch {
-        // Directory doesn't exist or can't be accessed
-      }
-    }
-
-    return mostRecentDir;
+    // Never select another workspace's storage based on recency. If VS Code
+    // cannot map this workspace exactly, passive observation remains disabled.
+    this.outputChannel.appendLine("ChatSessionWatcher: No exact workspace storage mapping found");
+    return undefined;
   }
 
   /**
    * Handle a chat session file change
    */
   private onSessionFileChanged(uri: vscode.Uri): void {
+    if (!this.active) {
+      return;
+    }
     const filePath = uri.fsPath;
 
-    this.outputChannel.appendLine(
-      `ChatSessionWatcher: File change detected: ${path.basename(filePath)}`,
-    );
+    this.outputChannel.appendLine("ChatSessionWatcher: Session file change detected");
 
     // Debounce per-file to avoid processing incomplete writes
     const existingTimer = this.debounceTimers.get(filePath);
@@ -306,7 +295,7 @@ export class ChatSessionWatcher {
    * Scan existing session files on startup
    */
   private async scanExistingSessions(): Promise<void> {
-    if (!this.chatSessionsDir) {
+    if (!this.active || !this.chatSessionsDir) {
       return;
     }
 
@@ -321,6 +310,9 @@ export class ChatSessionWatcher {
       // Process each file to build the set of known checksums
       // We don't send these to LSP on startup to avoid duplicates
       for (const file of jsonFiles) {
+        if (!this.active) {
+          return;
+        }
         const filePath = path.join(this.chatSessionsDir, file);
         await this.indexSessionFile(filePath);
       }
@@ -328,10 +320,8 @@ export class ChatSessionWatcher {
       this.outputChannel.appendLine(
         `ChatSessionWatcher: Indexed ${this.requestChecksums.size} existing requests`,
       );
-    } catch (error) {
-      this.outputChannel.appendLine(
-        `ChatSessionWatcher: Error scanning sessions: ${error}`,
-      );
+    } catch {
+      this.outputChannel.appendLine("ChatSessionWatcher: Error scanning sessions");
     }
   }
 
@@ -339,8 +329,14 @@ export class ChatSessionWatcher {
    * Index a session file without sending to LSP (for startup)
    */
   private async indexSessionFile(filePath: string): Promise<void> {
+    if (!this.active) {
+      return;
+    }
     try {
       const content = await fs.promises.readFile(filePath, "utf-8");
+      if (!this.active) {
+        return;
+      }
       const session = this.parseSessionFile(content, filePath);
 
       if (!session) {
@@ -362,8 +358,14 @@ export class ChatSessionWatcher {
    * Process a session file and extract new/updated interactions
    */
   private async processSessionFile(filePath: string): Promise<void> {
+    if (!this.active) {
+      return;
+    }
     try {
       const content = await fs.promises.readFile(filePath, "utf-8");
+      if (!this.active) {
+        return;
+      }
       const session = this.parseSessionFile(content, filePath);
 
       if (!session) {
@@ -373,6 +375,9 @@ export class ChatSessionWatcher {
       const modelName = this.extractModelName(session);
 
       for (const request of session.requests || []) {
+        if (!this.active) {
+          return;
+        }
         // Calculate current checksum of content
         const currentChecksum = this.calculateChecksum(request);
         const lastChecksum = this.requestChecksums.get(request.requestId);
@@ -382,9 +387,7 @@ export class ChatSessionWatcher {
           continue;
         }
 
-        this.outputChannel.appendLine(
-          `ChatSessionWatcher: Processing request update ${request.requestId} (checksum changed)`,
-        );
+        this.outputChannel.appendLine("ChatSessionWatcher: Processing request update");
 
         // Update tracking
         this.requestChecksums.set(request.requestId, currentChecksum);
@@ -392,10 +395,8 @@ export class ChatSessionWatcher {
         // Extract and send interaction data
         await this.sendInteractionToLsp(request, session.sessionId, modelName);
       }
-    } catch (error) {
-      this.outputChannel.appendLine(
-        `ChatSessionWatcher: Error processing ${filePath}: ${error}`,
-      );
+    } catch {
+      this.outputChannel.appendLine("ChatSessionWatcher: Error processing session file");
     }
   }
 
@@ -427,7 +428,7 @@ export class ChatSessionWatcher {
       if (firstLine.kind === 0 && firstLine.v) {
         session = firstLine.v;
       }
-    } catch (e) {
+    } catch {
       return undefined;
     }
 
@@ -455,7 +456,9 @@ export class ChatSessionWatcher {
    * Apply a delta update to the session object
    * k is an array of keys/indices path, v is the value to set or merge
    */
-  private applyUpdate(obj: any, path: (string | number)[], value: any): void {
+  // VS Code's persisted JSONL patch payload is intentionally schema-flexible.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private applyUpdate(obj: any, path: (string | number)[], value: unknown): void {
     let current = obj;
     for (let i = 0; i < path.length - 1; i++) {
       const key = path[i];
@@ -487,7 +490,7 @@ export class ChatSessionWatcher {
       .filter(p => ["text", "markdownContent", "toolInvocationSerialized", "thinking"].includes(p.kind))
       .map(p => {
         // Only hash stable fields that represent content
-        const stablePart: any = {
+        const stablePart: Record<string, unknown> = {
           kind: p.kind,
           value: p.value,
         };
@@ -554,7 +557,7 @@ export class ChatSessionWatcher {
     });
 
     this.outputChannel.appendLine(
-      `ChatSessionWatcher: Logged ${segments.length} segment(s) for request ${request.requestId} (${prompt.substring(0, 50)}...)`,
+      `ChatSessionWatcher: Logged ${segments.length} segment(s) for a chat request`,
     );
   }
 

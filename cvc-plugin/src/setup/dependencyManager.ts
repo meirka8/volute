@@ -70,10 +70,7 @@ export async function detectDependencies(
   };
 
   outputChannel.appendLine(
-    `Dependency check: CLI=${status.cvcCli.found ? status.cvcCli.path : "MISSING"}, ` +
-      `LSP=${status.cvcLsp.found ? status.cvcLsp.path : "MISSING"}, ` +
-      `MCP=${status.cvcMcp.found ? status.cvcMcp.path : "MISSING"}, ` +
-      `Repo initialized=${status.repoInitialized}`,
+    `Dependency check: CLI=${status.cvcCli.found}, LSP=${status.cvcLsp.found}, MCP=${status.cvcMcp.found}, Repo initialized=${status.repoInitialized}`,
   );
 
   return status;

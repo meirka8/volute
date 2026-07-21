@@ -4,7 +4,7 @@
 
 The **Volute CVC VS Code Extension** is the primary "Head" of the system for developers using VS Code, Cursor, or Windsurf (where extensions are supported). It serves two critical functions:
 
-1. **Input (The Passive Observer):** Reads GitHub Copilot Chat session storage files that VS Code stores locally, capturing prompts, responses, and available reasoning/context for this workflow without changing the user's normal Copilot flow.
+1. **Input (The Passive Observer):** After local capture acknowledgement, reads only the exact current workspace's GitHub Copilot Chat session storage files. It can capture prompts, responses, optional exposed reasoning, tool metadata, and context patches available in that workflow without changing the user's normal Copilot flow.
 
 2. **Visualization (The Cognitive Timeline):** Provides a real-time Side Panel view of the "Shadow Graph," showing both **Pending Thoughts** (uncommitted reasoning) and **Historical Context** (thoughts linked to previous commits).
 
@@ -45,22 +45,24 @@ To support the UI features, we extend the standard LSP with custom methods:
 
 ### 3.1 Feature A: The Chat Session Watcher (Primary - Passive Observer)
 
-**The Invisible Stenographer** - Reads GitHub Copilot Chat session files in the background without any extra user action.
+**Consent-gated local observer** — reads GitHub Copilot Chat session files only after local acknowledgement. It never falls back to another workspace's storage directory.
 
 - **Mechanism:**
 
-    1. **Discovery:** On activation, locates the VS Code workspace storage directory containing `chatSessions/*.json` files.
+    1. **Gate then discovery:** Before constructing a watcher or reading workspace storage, the extension asks the local LSP for read-only acknowledgement status. It discovers `chatSessions/*.json` only for an exact `workspace.json` match to the current workspace; no heuristic/recent-directory fallback is allowed.
+
+    2. **Continuous revocation gate:** Every privacy-status refresh is a revocation boundary. If consent is revoked, unavailable, or cannot positively establish passive capture permission, the extension immediately stops and discards any active watcher before showing acknowledgement UI. A later positive acknowledgement creates a fresh watcher; it does not resume a stale observer.
     
-    2. **File Watching:** Uses `vscode.workspace.createFileSystemWatcher()` to monitor the `chatSessions` directory for changes.
+    3. **File Watching:** Uses `vscode.workspace.createFileSystemWatcher()` to monitor the `chatSessions` directory for changes.
     
-    3. **Parsing:** When a chat session file is modified, it reads the content.
+    4. **Parsing:** When a chat session file is modified, it reads the content.
     
-    4. **Processing:** The raw JSON content (or file path) is processed by `cvc-core` (via `cvc-lsp`) to reconstruct the full fidelity of the conversation, including:
+    5. **Processing:** The raw JSON content (or file path) is processed by `cvc-core` (via `cvc-lsp`) to reconstruct the full fidelity of the conversation, including:
         - User prompts and context variables
         - Full model responses (including multiple parts)
         - Tool invocations (MCP, local tools) and their outputs
         - Code edits (TextEditGroups)
-        - Thinking or reasoning blocks when present in the locally stored session data
+        - Thinking or reasoning blocks only when present in the locally stored session data (not guaranteed hidden chain-of-thought)
 
 - **Data Extracted:**
 
@@ -70,7 +72,7 @@ To support the UI features, we extend the standard LSP with custom methods:
     - `requests[].variableData.variables` - Context
     - `requests[].response[]` - Complex list of response parts:
         - `value` (Text content)
-        - `kind: "thinking"` (Chain of thought)
+        - `kind: "thinking"` (reasoning only when the session exposes it; not guaranteed hidden chain-of-thought)
         - `kind: "toolInvocationSerialized"` (Tool usage)
         - `kind: "textEditGroup"` (Code application)
     - `inputState.selectedModel` - Model identifier
@@ -84,7 +86,7 @@ To support the UI features, we extend the standard LSP with custom methods:
 - **Benefits:**
 
     - Zero interference with Copilot's capabilities (RAG, tools, workspace indexing)
-    - Captures locally stored reasoning/context from models and tools when that data is present in the VS Code session files
+    - Captures locally stored prompts, responses, exposed reasoning when present, tool metadata, and context patches; capture remains private by default
     - Works with any model the user selects
     - Should be clearly disclosed in user-facing docs because it depends on local VS Code chat session storage
 
@@ -144,7 +146,7 @@ A dedicated Tree View in the Side Bar (or Explorer Container).
 
 - **Interaction:**
 
-    - **Click:** Opens a **Webview Panel** displaying the full detailed view of the interaction (Prompt, Context Files, Chain of Thought, Tool Outputs).
+    - **Click:** Opens a **Webview Panel** displaying available interaction fields (prompt, context files, exposed reasoning when present, and tool outputs).
 
     - **Context Menu:**
 
@@ -163,7 +165,7 @@ The extension should feel invisible until needed.
 
 - **No Configuration:** It automatically finds the `cvc-lsp` binary (bundled → `~/.cvc/bin` → PATH) and connects. If not found, it prompts the user to install — it does **not** silently auto-download.
 
-- **Silent Operation:** The Chat Session Watcher operates entirely in the background with no user prompts or notifications unless errors occur.
+- **Acknowledged operation:** Before passive access, the extension shows the capture notice and remains off until the user completes the CLI's interactive terminal acknowledgement. Opening the terminal alone changes nothing; the user must complete `cvc privacy acknowledge-capture` and refresh status.
 
 
 ## 5. Security Strategy
@@ -172,7 +174,7 @@ The extension should feel invisible until needed.
 
 - **Sanitization:** Ensure markdown rendering in the Webview sanitizes HTML to prevent XSS from "poisoned" thoughts.
 
-- **Local Only:** Chat session files are read locally; no data is sent externally except to the local LSP server.
+- **Local by default:** Chat session files are read locally and passed only to the local LSP/CVC cache. Captured data is private by default. Remote sharing requires separate destination consent and explicit sharing through the CLI.
 
 
 ## 6. Implementation Notes

@@ -8,6 +8,7 @@ import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client
 import { createAsyncStoragePersister } from "@tanstack/query-async-storage-persister";
 import { get as idbGet, set as idbSet, del as idbDel } from "idb-keyval";
 import { ThemeToggle } from "./components/ui/ThemeToggle";
+import { REVIEWER_QUERY_CACHE_KEY } from "./lib/cognitiveCache";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -25,7 +26,7 @@ const queryClient = new QueryClient({
 // IndexedDB means a returning visitor's PR view can render from cache instantly
 // instead of re-fetching history it already has.
 const persister = createAsyncStoragePersister({
-  key: "cvc-reviewer-query-cache",
+  key: REVIEWER_QUERY_CACHE_KEY,
   storage: {
     getItem: async (key: string) => (await idbGet(key)) ?? null,
     setItem: (key: string, value: string) => idbSet(key, value),

@@ -1,29 +1,14 @@
 # CVC MCP Server Setup
 
-This guide explains how to build the `cvc-mcp` server and configure it for MCP-compatible clients such as VS Code, Cursor, and Claude Desktop.
+`cvc-mcp` lets an MCP-compatible client store concise interaction records in the current repository's local CVC cache. MCP captures are **private by default** and are sanitized before persistence. The server cannot grant capture acknowledgement, remote sharing consent, conversation sharing, or auto-push.
 
-## 1. Building the Server
-
-First, build the release binary. Run this command from the project root (`/path/to/project/root`):
+## Build and configure
 
 ```bash
 cargo build --release -p cvc-mcp
 ```
 
-The binary will be located at:
-`/path/to/project/root/target/release/cvc-mcp`
-
-## 2. Configuration for IDEs and Claude Desktop
-
-You need to add the server configuration to your MCP client config file. If you want to launch `cvc-mcp` from your PATH, install it globally via npm first: `npm install -g @volute_cvc/cvc-mcp`. If you prefer to use the binary you built above, point your client config at its absolute path instead.
-
-**Config File Locations:**
-- **VS Code / Cursor:** Typically in workspace `.vscode/mcp.json` or in client settings. Check your specific client documentation.
-- **Claude Desktop:** `~/config/Claude/claude_desktop_config.json` (Linux) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS).
-
-**Configuration JSON:**
-
-Add the following entry to the `mcpServers` object:
+Configure the built binary, or the `cvc-mcp` executable installed from npm, in the MCP client:
 
 ```json
 {
@@ -31,26 +16,25 @@ Add the following entry to the `mcpServers` object:
     "cvc": {
       "command": "cvc-mcp",
       "args": [],
-      "env": {
-        "RUST_LOG": "info"
-      }
+      "env": { "RUST_LOG": "info" }
     }
   }
 }
 ```
 
-## 3. Verification
+Common client locations include workspace `.vscode/mcp.json`, client settings, and Claude Desktop's configuration file. Use the client documentation for its exact location.
 
-After configuring, restart your IDE or Claude Desktop. Confirm these CVC tools appear:
-- `commit_thought` — Save a concise task record, key reasoning, and optional result.
-- `read_history` — Read recent saved CVC history for prior context or decisions.
-- `get_context` — Inspect git-backed context for one file before summarizing or recording it.
-- `setup_cvc` — Initialize CVC storage and hooks for the current repository.
+## Tools and privacy boundary
 
-## 4. Troubleshooting
+- `commit_thought` saves a concise task record, reasoning supplied by the client, and an optional result locally.
+- `read_history` reads local saved history.
+- `get_context` inspects Git-backed context for one file.
+- `setup_cvc` initializes CVC storage and hooks.
 
-If the server fails to start:
-1.  Check the logs.
-2.  Ensure the path to the binary is correct and absolute.
-3.  Ensure the binary is executable (`chmod +x ...`).
-4.  Try running the command manually in a terminal to check for startup errors.
+`commit_thought` is not a promise to capture hidden model chain-of-thought; it only records fields the MCP client explicitly supplies. Repository `.thoughtignore` and built-in scrubbing apply before the SQLite transaction. Scrubbing is defense in depth, not a guarantee that every secret or sensitive value is recognized.
+
+The MCP server does not publish CVC data. Sync import may fetch an already-shared `refs/cvc/main` projection, but importing does not make local captures shared and does not authorize a destination. Use the interactive CLI for acknowledgement, `cvc share ... --remote ...`, and manual or separately enabled auto-push.
+
+## Troubleshooting
+
+Ensure the binary path is executable and that the MCP process starts in the intended Git repository. Run the binary in a terminal and inspect logs if the client cannot start it.

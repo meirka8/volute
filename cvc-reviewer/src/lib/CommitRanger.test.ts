@@ -38,4 +38,31 @@ describe("CommitRanger", () => {
 
     expect(await ranger.getCommitShas("owner", "repo", 1)).toEqual([]);
   });
+
+  it("paginates commit lists and adds the merged commit SHA once", async () => {
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({ sha: `commit-${index}` }));
+    const listCommits = vi
+      .fn()
+      .mockResolvedValueOnce({ data: firstPage })
+      .mockResolvedValueOnce({ data: [{ sha: "commit-99" }, { sha: "commit-100" }] });
+    const get = vi.fn().mockResolvedValue({
+      data: { merged_at: "2026-07-21T00:00:00Z", merge_commit_sha: "a".repeat(40) },
+    });
+    const client = {
+      octokit: { rest: { pulls: { listCommits, get } } },
+    } as unknown as GithubClient;
+
+    const shas = await new CommitRanger(client).getCommitShas("owner", "repo", 42);
+
+    expect(listCommits).toHaveBeenNthCalledWith(1, {
+      owner: "owner", repo: "repo", pull_number: 42, per_page: 100,
+    });
+    expect(listCommits).toHaveBeenNthCalledWith(2, {
+      owner: "owner", repo: "repo", pull_number: 42, per_page: 100, page: 2,
+    });
+    expect(get).toHaveBeenCalledWith({ owner: "owner", repo: "repo", pull_number: 42 });
+    expect(shas).toHaveLength(102);
+    expect(shas).toContain("commit-100");
+    expect(shas).toContain("a".repeat(40));
+  });
 });

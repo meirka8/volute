@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 

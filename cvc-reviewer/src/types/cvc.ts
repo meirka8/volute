@@ -37,7 +37,40 @@ export interface ToolExecution {
 export interface ArtifactLinkData {
   interaction_id: string;
   git_commit_hash: string;
-  link_type: "generated" | "verified" | "refactored";
+  link_type: ArtifactLinkType;
+  /** Commit author attribution when the automatic link was created. */
+  linked_by?: string | null;
+  /** FORMAT5 immutable evidence; absent for legacy/v3 links. */
+  derivation_event?: import("../lib/format5").DerivationEvent;
+}
+
+/** Link types emitted by current automatic linking and supported legacy blobs. */
+export type ArtifactLinkType = "generated" | "temporal" | "verified" | "rewrite_exact" | "squash_exact";
+
+/** The append-only `links/<interaction-id>/<commit-sha>.json` record in sync format v3. */
+export type CVCLinkRecord = ArtifactLinkData;
+
+export interface CVCTombstone {
+  format: "cvc.tombstone/v1";
+  version: 1;
+  interaction_id: string;
+  deleted_at: string;
+  reason_code: "user_requested" | "security" | "retention";
+  previous_node_oid?: string | null;
+}
+
+export function validTombstone(value: unknown, pathId: string): value is CVCTombstone {
+  if (!value || typeof value !== "object") return false;
+  const t = value as Record<string, unknown>;
+  const allowed = new Set(["format", "version", "interaction_id", "deleted_at", "reason_code", "previous_node_oid"]);
+  if (Object.keys(t).some((key) => !allowed.has(key))) return false;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const oid = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
+  return t.format === "cvc.tombstone/v1" && t.version === 1 &&
+    typeof t.interaction_id === "string" && t.interaction_id === pathId && uuid.test(pathId) &&
+    typeof t.deleted_at === "string" && !Number.isNaN(Date.parse(t.deleted_at)) &&
+    (t.reason_code === "user_requested" || t.reason_code === "security" || t.reason_code === "retention") &&
+    (t.previous_node_oid == null || (typeof t.previous_node_oid === "string" && oid.test(t.previous_node_oid)));
 }
 
 // Normalized InteractionNode for UI use (flattened structure)
@@ -84,6 +117,31 @@ export function normalizeInteraction(blob: CVCBlobData): InteractionNode {
     tool_executions: tool_executions || [],
     artifact_links: artifact_links || [],
   };
+}
+
+/**
+ * Adds append-only v3 link records to an immutable node blob. A node may have been
+ * pushed while floating, so its original `artifact_links` array cannot be rewritten.
+ * Existing legacy links are retained; a matching v3 record fills in newer metadata.
+ */
+export function mergeArtifactLinks(
+  interaction: InteractionNode,
+  linkRecords: CVCLinkRecord[],
+): InteractionNode {
+  if (linkRecords.length === 0) return interaction;
+
+  // Endpoint identity is intentionally separate from evidence identity: several
+  // immutable derivations can justify one interaction/commit relationship.
+  const links = new Map<string, ArtifactLinkData>();
+  for (const link of interaction.artifact_links) {
+    links.set(link.derivation_event?.event_id ?? `${link.git_commit_hash}:${link.link_type}`, link);
+  }
+  for (const link of linkRecords) {
+    const key = link.derivation_event?.event_id ?? `${link.git_commit_hash}:${link.link_type}`;
+    links.set(key, { ...links.get(key), ...link });
+  }
+
+  return { ...interaction, artifact_links: Array.from(links.values()) };
 }
 
 export interface CVCTreeItem {

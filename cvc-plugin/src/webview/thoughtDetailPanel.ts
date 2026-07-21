@@ -764,7 +764,7 @@ export class ThoughtDetailPanel {
       // Basic sanitization - remove script tags and event handlers
       return this.sanitizeHtml(typeof html === "string" ? html : "");
     } catch (error) {
-      this.outputChannel.appendLine(`Markdown render error: ${error}`);
+      this.outputChannel.appendLine("Markdown render error");
       return this.escapeHtml(text);
     }
   }

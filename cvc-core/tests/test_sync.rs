@@ -1,9 +1,1764 @@
 use chrono::Utc;
 use cvc_core::db::CvcStore;
 use cvc_core::models::*;
+use cvc_core::privacy::{McpCapture, PreparedPolicy};
 use cvc_core::sync::{self, SyncNode};
-use git2::{FileMode, Repository, Signature};
+use git2::{FileMode, ObjectType, Repository, Signature};
+use rusqlite::Connection;
+use std::sync::mpsc;
+use std::time::Duration;
 use tempfile::TempDir;
+
+const TEST_DESTINATION: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[test]
+fn pull_rejects_non_utf8_sync_paths() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let blob = repo.blob(b"{}")?;
+    let mut raw = b"100644 bad\xff\0".to_vec();
+    raw.extend_from_slice(blob.as_bytes());
+    let tree_oid = repo.odb()?.write(ObjectType::Tree, &raw)?;
+    let tree = repo.find_tree(tree_oid)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    repo.commit(
+        Some("refs/cvc/non-utf8"),
+        &signature,
+        &signature,
+        "non utf8",
+        &tree,
+        &[],
+    )?;
+    let store = CvcStore::open(temp.path().join("index.db"))?;
+    assert!(sync::pull_from_ref(&repo, &store, "refs/cvc/non-utf8").is_err());
+    Ok(())
+}
+
+trait CaptureFixture {
+    fn create_conversation(&self, _: &Conversation) -> cvc_core::db::Result<()>;
+    fn create_interaction(&self, interaction: &Interaction) -> cvc_core::db::Result<()>;
+}
+impl CaptureFixture for CvcStore {
+    fn create_conversation(&self, _: &Conversation) -> cvc_core::db::Result<()> {
+        Ok(())
+    }
+    fn create_interaction(&self, interaction: &Interaction) -> cvc_core::db::Result<()> {
+        self.capture_mcp(McpCapture::new(
+            Conversation {
+                id: interaction.conversation_id.clone(),
+                title: "fixture".into(),
+                created_at: interaction.timestamp,
+            },
+            interaction.clone(),
+            Vec::new(),
+            Vec::new(),
+            PreparedPolicy::built_ins_only(),
+        ))
+        .and_then(|_| {
+            self.share_conversation_for_remote(
+                &interaction.conversation_id,
+                TEST_DESTINATION,
+                FutureSharePolicy::Private,
+            )
+            .map(|_| ())
+        })
+    }
+}
+
+/// Test-only transport shim: make the current destination ref an explicit remote
+/// baseline, then accept the exact candidate produced by the production projection.
+/// It deliberately never lets the candidate seed itself from a mutable local ref.
+fn project_fixture_to_ref(
+    repo: &Repository,
+    store: &CvcStore,
+    ref_name: &str,
+) -> anyhow::Result<()> {
+    const BASELINE: &str = "refs/remotes/fixture/cvc/main";
+    let baseline = if let Ok(reference) = repo.find_reference(ref_name) {
+        repo.reference(
+            BASELINE,
+            reference.target().expect("fixture ref has direct target"),
+            true,
+            "fixture: verified remote baseline",
+        )?;
+        BASELINE
+    } else {
+        ""
+    };
+    let projection = sync::push_projection_to_ref(repo, store, baseline, TEST_DESTINATION)?;
+    match projection {
+        sync::ProjectionResult::Candidate { oid, candidate, .. } => {
+            repo.reference(ref_name, oid, true, "fixture: remote accepted candidate")?;
+            drop(candidate);
+        }
+        sync::ProjectionResult::NoChanges => {}
+    }
+    Ok(())
+}
+
+fn derivation(
+    interaction_id: &InteractionId,
+    commit: char,
+    source_event_ids: Vec<String>,
+) -> DerivationEvent {
+    let mut event = DerivationEvent {
+        event_id: String::new(),
+        interaction_id: interaction_id.clone(),
+        target_commit: CommitSha::new(commit.to_string().repeat(40)),
+        relation: DerivationRelation::Generated,
+        evidence: Evidence {
+            version: 1,
+            kind: EvidenceKind::LocallyObserved,
+        },
+        origin: DerivationOrigin::LocalLinker,
+        source_event_ids,
+        old_oid: None,
+        new_oid: None,
+        range_id: None,
+        linked_by: None,
+    };
+    event.event_id = event.canonical_id();
+    event
+}
+
+fn trust_and_authorize_event(
+    db_path: &std::path::Path,
+    event: &DerivationEvent,
+) -> anyhow::Result<()> {
+    let db = Connection::open(db_path)?;
+    db.execute("INSERT INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) VALUES(?1,NULL,'fixture-local','local_api',1)", [&event.event_id])?;
+    db.execute("INSERT INTO derivation_authorizations(event_id,remote_fingerprint,source_event_id) VALUES(?1,?2,?1)", rusqlite::params![event.event_id, TEST_DESTINATION])?;
+    Ok(())
+}
+
+fn insert_event_fixture(db_path: &std::path::Path, event: &DerivationEvent) -> anyhow::Result<()> {
+    let db = Connection::open(db_path)?;
+    db.execute(
+        "INSERT INTO derivation_events(event_id,interaction_id,target_commit,relation,evidence_version,evidence_kind,origin,source_event_ids,old_oid,new_oid,range_id,linked_by,payload) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        rusqlite::params![
+            event.event_id,
+            event.interaction_id.to_string(),
+            event.target_commit.as_str(),
+            match event.relation { DerivationRelation::Generated => "generated", DerivationRelation::Temporal => "temporal", DerivationRelation::Verified => "verified", DerivationRelation::RewriteExact => "rewrite_exact", DerivationRelation::SquashExact => "squash_exact" },
+            event.evidence.version,
+            match event.evidence.kind { EvidenceKind::LocallyObserved => "locally_observed", EvidenceKind::ImportedLegacy => "imported_legacy", EvidenceKind::RemoteAssertion => "remote_assertion" },
+            match event.origin { DerivationOrigin::LocalHook => "local_hook", DerivationOrigin::LocalLinker => "local_linker", DerivationOrigin::RemoteAssertion => "remote_assertion", DerivationOrigin::LegacyImport => "legacy_import" },
+            serde_json::to_string(&event.source_event_ids)?,
+            event.old_oid.as_ref().map(CommitSha::as_str),
+            event.new_oid.as_ref().map(CommitSha::as_str),
+            event.range_id,
+            event.linked_by,
+            serde_json::to_string(event)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn wire_event_ids(repo: &Repository, tree: &git2::Tree<'_>) -> anyhow::Result<Vec<String>> {
+    let Some(events) = tree.get_name("events") else {
+        return Ok(Vec::new());
+    };
+    let mut ids = Vec::new();
+    for shard in events.to_object(repo)?.peel_to_tree()?.iter() {
+        for entry in shard.to_object(repo)?.peel_to_tree()?.iter() {
+            let event: DerivationEvent =
+                serde_json::from_slice(entry.to_object(repo)?.peel_to_blob()?.content())?;
+            ids.push(event.event_id);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+#[test]
+fn tombstone_prunes_transitive_event_dag_and_rebuilds_index_from_one_tree() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let db_path = temp.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let target = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "target".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "remove".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    let retained = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "retained".into(),
+        user_prompt: "keep".into(),
+        ..target.clone()
+    };
+    store.create_interaction(&target)?;
+    store.create_interaction(&retained)?;
+    let first = derivation(&target.id, 'a', Vec::new());
+    let second = derivation(&target.id, 'b', vec![first.event_id.clone()]);
+    let third = derivation(&target.id, 'c', vec![second.event_id.clone()]);
+    let unrelated = derivation(&retained.id, 'd', Vec::new());
+    for event in [&first, &second, &third, &unrelated] {
+        insert_event_fixture(&db_path, event)?;
+        trust_and_authorize_event(&db_path, event)?;
+    }
+    project_fixture_to_ref(&repo, &store, "refs/cvc/dag-prune")?;
+    assert_eq!(
+        wire_event_ids(
+            &repo,
+            &repo
+                .find_reference("refs/cvc/dag-prune")?
+                .peel_to_commit()?
+                .tree()?
+        )?
+        .len(),
+        4
+    );
+
+    store.tombstone_remote(
+        &target.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::Security,
+        None,
+    )?;
+    let later = derivation(&retained.id, 'e', vec![unrelated.event_id.clone()]);
+    insert_event_fixture(&db_path, &later)?;
+    trust_and_authorize_event(&db_path, &later)?;
+    project_fixture_to_ref(&repo, &store, "refs/cvc/dag-prune")?;
+    let tree = repo
+        .find_reference("refs/cvc/dag-prune")?
+        .peel_to_commit()?
+        .tree()?;
+    assert_eq!(
+        wire_event_ids(&repo, &tree)?,
+        vec![later.event_id.clone(), unrelated.event_id.clone()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+    let index = tree
+        .get_name("by-commit")
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    for removed in ['a', 'b', 'c'] {
+        assert!(index.get_name(&removed.to_string().repeat(40)).is_none());
+    }
+    for kept in ['d', 'e'] {
+        assert!(index.get_name(&kept.to_string().repeat(40)).is_some());
+    }
+    Ok(())
+}
+
+#[test]
+fn outbound_events_require_trusted_observation_and_exact_destination_authority(
+) -> anyhow::Result<()> {
+    const OTHER: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let db_path = temp.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let item = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "trust".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "authority".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&item)?;
+    store.share_conversation_for_remote(
+        &item.conversation_id,
+        OTHER,
+        FutureSharePolicy::Private,
+    )?;
+
+    let allowed = derivation(&item.id, 'a', Vec::new());
+    insert_event_fixture(&db_path, &allowed)?;
+    trust_and_authorize_event(&db_path, &allowed)?;
+    let mut assertion = derivation(&item.id, 'b', Vec::new());
+    assertion.evidence.kind = EvidenceKind::RemoteAssertion;
+    assertion.origin = DerivationOrigin::RemoteAssertion;
+    assertion.event_id = assertion.canonical_id();
+    insert_event_fixture(&db_path, &assertion)?;
+    {
+        let db = Connection::open(&db_path)?;
+        db.execute("INSERT INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) VALUES(?1,NULL,'fingerprintless','remote_sync',0)", [&assertion.event_id])?;
+        db.execute("INSERT INTO derivation_authorizations(event_id,remote_fingerprint,source_event_id) VALUES(?1,?2,?1)", rusqlite::params![assertion.event_id, TEST_DESTINATION])?;
+    }
+    let projection = sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION)?;
+    let oid = match projection {
+        sync::ProjectionResult::Candidate { oid, .. } => oid,
+        _ => anyhow::bail!("expected projection"),
+    };
+    assert_eq!(
+        wire_event_ids(&repo, &repo.find_commit(oid)?.tree()?)?,
+        vec![allowed.event_id.clone()]
+    );
+
+    let other = sync::push_projection_to_ref(&repo, &store, "", OTHER)?;
+    let oid = match other {
+        sync::ProjectionResult::Candidate { oid, .. } => oid,
+        _ => anyhow::bail!("node should project"),
+    };
+    let tree = repo.find_commit(oid)?.tree()?;
+    assert!(
+        wire_event_ids(&repo, &tree)?.is_empty(),
+        "destination A authority must not cross to B"
+    );
+    assert!(
+        tree.get_name("by-commit").is_none(),
+        "assertions must not leak index pointers"
+    );
+    Ok(())
+}
+
+#[test]
+fn format5_always_emits_and_requires_empty_reserved_trees() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "empty-v5".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "empty namespaces".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&item)?;
+    project_fixture_to_ref(&repo, &store, "refs/cvc/empty-v5")?;
+    let tree = repo
+        .find_reference("refs/cvc/empty-v5")?
+        .peel_to_commit()?
+        .tree()?;
+    for namespace in ["events", "ranges"] {
+        let subtree = tree
+            .get_name(namespace)
+            .expect("FORMAT5 namespace")
+            .to_object(&repo)?
+            .peel_to_tree()?;
+        assert!(subtree.is_empty());
+    }
+    let mut malformed = repo.treebuilder(Some(&tree))?;
+    malformed.remove("ranges")?;
+    let malformed = repo.find_tree(malformed.write()?)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    repo.commit(
+        Some("refs/cvc/missing-v5-namespace"),
+        &signature,
+        &signature,
+        "missing namespace",
+        &malformed,
+        &[],
+    )?;
+    let imported = CvcStore::open(temp.path().join("imported.db"))?;
+    assert!(sync::pull_from_ref(&repo, &imported, "refs/cvc/missing-v5-namespace").is_err());
+    Ok(())
+}
+
+#[test]
+fn projection_refuses_dangling_exact_event_instead_of_pruning_it() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let db_path = temp.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let item = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "dangling-event".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "reject dangling".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&item)?;
+    let mut event = derivation(&item.id, 'b', vec!["f".repeat(64)]);
+    event.relation = DerivationRelation::RewriteExact;
+    event.old_oid = Some(CommitSha::new("a".repeat(40)));
+    event.new_oid = Some(CommitSha::new("b".repeat(40)));
+    event.event_id = event.canonical_id();
+    insert_event_fixture(&db_path, &event)?;
+    trust_and_authorize_event(&db_path, &event)?;
+    assert!(sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION).is_err());
+    Ok(())
+}
+
+#[test]
+fn pull_rejects_dangling_event_before_tombstone_pruning_with_duplicate_legacy_endpoint(
+) -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let source = CvcStore::open(temp.path().join("source.db"))?;
+    let item = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "pre-prune-validation".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "must reject malformed wire graph".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&item)?;
+    source.link_interaction(&item.id, &CommitSha::new("a".repeat(40)), "generated")?;
+    project_fixture_to_ref(&repo, &source, "refs/cvc/pre-prune-valid")?;
+    let baseline = repo
+        .find_reference("refs/cvc/pre-prune-valid")?
+        .peel_to_commit()?
+        .tree()?;
+    assert!(baseline.get_name("links").is_some());
+
+    let tombstone = Tombstone::new(item.id.clone(), TombstoneReasonCode::Security, None);
+    let tombstone_file = format!("{}.json", item.id);
+    let tombstone_shard_name = &item.id.as_str()[..2];
+    let mut tombstone_shard = repo.treebuilder(None)?;
+    tombstone_shard.insert(
+        &tombstone_file,
+        repo.blob(&serde_json::to_vec(&tombstone)?)?,
+        FileMode::Blob.into(),
+    )?;
+    let mut tombstones = repo.treebuilder(None)?;
+    tombstones.insert(
+        tombstone_shard_name,
+        tombstone_shard.write()?,
+        FileMode::Tree.into(),
+    )?;
+
+    let mut dangling = derivation(&item.id, 'b', vec!["f".repeat(64)]);
+    dangling.relation = DerivationRelation::RewriteExact;
+    dangling.old_oid = Some(CommitSha::new("a".repeat(40)));
+    dangling.new_oid = Some(CommitSha::new("b".repeat(40)));
+    dangling.event_id = dangling.canonical_id();
+    let event_file = format!("{}.json", dangling.event_id);
+    let mut event_shard = repo.treebuilder(None)?;
+    event_shard.insert(
+        &event_file,
+        repo.blob(&serde_json::to_vec(&dangling)?)?,
+        FileMode::Blob.into(),
+    )?;
+    let mut events = repo.treebuilder(Some(
+        &baseline
+            .get_name("events")
+            .expect("events")
+            .to_object(&repo)?
+            .peel_to_tree()?,
+    ))?;
+    events.insert(
+        &dangling.event_id[..2],
+        event_shard.write()?,
+        FileMode::Tree.into(),
+    )?;
+    let mut root = repo.treebuilder(Some(&baseline))?;
+    root.insert("tombstones", tombstones.write()?, FileMode::Tree.into())?;
+    root.insert("events", events.write()?, FileMode::Tree.into())?;
+    let malformed = repo.find_tree(root.write()?)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    repo.commit(
+        Some("refs/cvc/pre-prune-malformed"),
+        &signature,
+        &signature,
+        "malformed before pruning",
+        &malformed,
+        &[],
+    )?;
+    let imported = CvcStore::open(temp.path().join("imported.db"))?;
+    assert!(sync::pull_from_ref(&repo, &imported, "refs/cvc/pre-prune-malformed").is_err());
+    assert!(imported.get_all_interaction_ids()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn format5_rejects_malformed_ranges_and_by_commit_shapes_or_targets() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let source = CvcStore::open(temp.path().join("source.db"))?;
+    let item = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "index-validation".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "index".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&item)?;
+    source.link_interaction(&item.id, &CommitSha::new("a".repeat(40)), "generated")?;
+    project_fixture_to_ref(&repo, &source, "refs/cvc/valid-index")?;
+    let baseline = repo
+        .find_reference("refs/cvc/valid-index")?
+        .peel_to_commit()?
+        .tree()?;
+    let signature = Signature::now("test", "test@example.test")?;
+
+    let publish = |name: &str, tree: git2::Oid| -> anyhow::Result<()> {
+        let tree = repo.find_tree(tree)?;
+        repo.commit(
+            Some(name),
+            &signature,
+            &signature,
+            "malformed fixture",
+            &tree,
+            &[],
+        )?;
+        Ok(())
+    };
+    // Non-empty ranges are not accepted until their bounded canonical schema is
+    // implemented; silently retaining arbitrary evidence would be a trust bug.
+    let mut ranges = repo.treebuilder(None)?;
+    ranges.insert("unexpected.json", repo.blob(b"{}")?, FileMode::Blob.into())?;
+    let mut root = repo.treebuilder(Some(&baseline))?;
+    root.insert("ranges", ranges.write()?, FileMode::Tree.into())?;
+    publish("refs/cvc/bad-ranges", root.write()?)?;
+
+    let empty = repo.blob(b"")?;
+    let bad_body = repo.blob(b"not empty")?;
+    for (case, commit_name, pointer_name, pointer_oid, pointer_mode) in [
+        (
+            "uppercase",
+            "A".repeat(40),
+            item.id.to_string(),
+            empty,
+            FileMode::Blob,
+        ),
+        (
+            "commit",
+            "short".into(),
+            item.id.to_string(),
+            empty,
+            FileMode::Blob,
+        ),
+        (
+            "uuid",
+            "a".repeat(40),
+            "not-a-uuid".into(),
+            empty,
+            FileMode::Blob,
+        ),
+        (
+            "body",
+            "a".repeat(40),
+            item.id.to_string(),
+            bad_body,
+            FileMode::Blob,
+        ),
+        (
+            "nesting",
+            "a".repeat(40),
+            item.id.to_string(),
+            repo.treebuilder(None)?.write()?,
+            FileMode::Tree,
+        ),
+        (
+            "stale",
+            "b".repeat(40),
+            item.id.to_string(),
+            empty,
+            FileMode::Blob,
+        ),
+    ] {
+        let mut pointers = repo.treebuilder(None)?;
+        pointers.insert(&pointer_name, pointer_oid, pointer_mode.into())?;
+        let mut index = repo.treebuilder(None)?;
+        index.insert(&commit_name, pointers.write()?, FileMode::Tree.into())?;
+        let mut root = repo.treebuilder(Some(&baseline))?;
+        root.insert("by-commit", index.write()?, FileMode::Tree.into())?;
+        publish(&format!("refs/cvc/bad-index-{case}"), root.write()?)?;
+    }
+    let mut root = repo.treebuilder(Some(&baseline))?;
+    root.insert(
+        "by-commit",
+        repo.blob(b"wrong root type")?,
+        FileMode::Blob.into(),
+    )?;
+    publish("refs/cvc/bad-index-root", root.write()?)?;
+
+    for name in [
+        "bad-ranges",
+        "bad-index-root",
+        "bad-index-uppercase",
+        "bad-index-commit",
+        "bad-index-uuid",
+        "bad-index-body",
+        "bad-index-nesting",
+        "bad-index-stale",
+    ] {
+        let store = CvcStore::open(temp.path().join(format!("{name}.db")))?;
+        assert!(
+            sync::pull_from_ref(&repo, &store, &format!("refs/cvc/{name}")).is_err(),
+            "accepted {name}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn hard_redaction_fixture_removes_multihop_derivation_closure() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let db_path = temp.path().join("hard-dag.db");
+    let store = CvcStore::open(&db_path)?;
+    let target = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "hard-target".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "remove".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    let retained = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "hard-retained".into(),
+        user_prompt: "retain".into(),
+        ..target.clone()
+    };
+    store.create_interaction(&target)?;
+    store.create_interaction(&retained)?;
+    let first = derivation(&target.id, 'a', Vec::new());
+    let second = derivation(&target.id, 'b', vec![first.event_id.clone()]);
+    let third = derivation(&target.id, 'c', vec![second.event_id.clone()]);
+    let unrelated = derivation(&retained.id, 'd', Vec::new());
+    for event in [&first, &second, &third, &unrelated] {
+        insert_event_fixture(&db_path, event)?;
+        trust_and_authorize_event(&db_path, event)?;
+    }
+    project_fixture_to_ref(&repo, &store, "refs/cvc/hard-dag")?;
+    let unredacted = repo
+        .find_reference("refs/cvc/hard-dag")?
+        .peel_to_commit()?
+        .tree()?;
+    let stale_events = unredacted.get_name("events").unwrap().id();
+    let stale_index = unredacted.get_name("by-commit").unwrap().id();
+
+    store.tombstone_remote(
+        &target.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::Security,
+        None,
+    )?;
+    project_fixture_to_ref(&repo, &store, "refs/cvc/hard-dag")?;
+    let suppressed = repo
+        .find_reference("refs/cvc/hard-dag")?
+        .peel_to_commit()?
+        .tree()?;
+    let mut stale = repo.treebuilder(Some(&suppressed))?;
+    stale.insert("events", stale_events, FileMode::Tree.into())?;
+    stale.insert("by-commit", stale_index, FileMode::Tree.into())?;
+    let stale_tree = repo.find_tree(stale.write()?)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    let stale_tip = repo.commit(
+        None,
+        &signature,
+        &signature,
+        "stale redaction evidence",
+        &stale_tree,
+        &[],
+    )?;
+    repo.reference(
+        "refs/remotes/fixture/cvc/main",
+        stale_tip,
+        true,
+        "stale fixture",
+    )?;
+
+    let candidate = sync::build_hard_redaction_plan(
+        &repo,
+        Some("refs/remotes/fixture/cvc/main"),
+        TEST_DESTINATION,
+        &target.id,
+    )?;
+    let replacement = repo
+        .find_commit(git2::Oid::from_str(&candidate.plan.replacement_commit)?)?
+        .tree()?;
+    assert_eq!(
+        wire_event_ids(&repo, &replacement)?,
+        vec![unrelated.event_id]
+    );
+    let index = replacement
+        .get_name("by-commit")
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    for removed in ['a', 'b', 'c'] {
+        assert!(index.get_name(&removed.to_string().repeat(40)).is_none());
+    }
+    assert!(index.get_name(&"d".repeat(40)).is_some());
+    assert_eq!(
+        repo.find_reference("refs/remotes/fixture/cvc/main")?
+            .target(),
+        Some(stale_tip)
+    );
+    Ok(())
+}
+
+#[test]
+fn post_node_link_records_reach_fresh_and_existing_pulls() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let source = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let conversation = Conversation {
+        id: "late-link".into(),
+        title: "late-link".into(),
+        created_at: Utc::now(),
+    };
+    source.create_conversation(&conversation)?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: conversation.id.clone(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "floating first".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&interaction)?;
+    let ref_name = "refs/cvc/late-link";
+    project_fixture_to_ref(&repo, &source, ref_name)?;
+
+    let existing = CvcStore::open(temp_dir.path().join("existing.db"))?;
+    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    assert!(existing.get_artifact_links(&interaction.id)?.is_empty());
+
+    let sha = CommitSha::new("a".repeat(40));
+    source.link_automatic_interactions(
+        std::slice::from_ref(&interaction.id),
+        &sha,
+        "generated",
+        Some("linker@example.com"),
+    )?;
+    project_fixture_to_ref(&repo, &source, ref_name)?;
+
+    let fresh = CvcStore::open(temp_dir.path().join("fresh.db"))?;
+    sync::pull_from_ref(&repo, &fresh, ref_name)?;
+    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    for store in [&fresh, &existing] {
+        let links = store.get_artifact_links(&interaction.id)?;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].link_type, "generated");
+        assert_eq!(links[0].linked_by.as_deref(), Some("linker@example.com"));
+    }
+    Ok(())
+}
+
+#[test]
+fn v4_tombstone_precedes_nodes_links_and_stale_clone_data() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let source = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "redact-me".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "must disappear".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&interaction)?;
+    source.link_automatic_interactions(
+        std::slice::from_ref(&interaction.id),
+        &CommitSha::new("a".repeat(40)),
+        "generated",
+        None,
+    )?;
+    let ref_name = "refs/cvc/tombstone";
+    project_fixture_to_ref(&repo, &source, ref_name)?;
+    let stale_oid = repo.find_reference(ref_name)?.target().expect("direct ref");
+    repo.reference(
+        "refs/cvc/stale-before-redaction",
+        stale_oid,
+        true,
+        "fixture stale clone",
+    )?;
+
+    // A second clone first sees the published node and link.
+    let second_clone = CvcStore::open(temp_dir.path().join("second.db"))?;
+    sync::pull_from_ref(&repo, &second_clone, ref_name)?;
+    assert!(second_clone.get_interaction(&interaction.id)?.is_some());
+    assert_eq!(second_clone.get_artifact_links(&interaction.id)?.len(), 1);
+
+    source.apply_tombstones(
+        &[cvc_core::models::Tombstone::new(
+            interaction.id.clone(),
+            TombstoneReasonCode::Security,
+            None,
+        )],
+        "fixture",
+        Some(TEST_DESTINATION),
+    )?;
+    project_fixture_to_ref(&repo, &source, ref_name)?;
+    sync::pull_from_ref(&repo, &second_clone, ref_name)?;
+    assert!(second_clone.is_tombstoned(&interaction.id)?);
+    assert!(second_clone.get_interaction(&interaction.id)?.is_none());
+    assert!(second_clone.get_artifact_links(&interaction.id)?.is_empty());
+
+    // Replaying a stale clone's old node/link tree must not resurrect it.
+    sync::pull_from_ref(&repo, &second_clone, "refs/cvc/stale-before-redaction")?;
+    assert!(second_clone.get_interaction(&interaction.id)?.is_none());
+
+    let tree = repo.find_reference(ref_name)?.peel_to_commit()?.tree()?;
+    assert!(tree.get_name(&format!("{}.json", interaction.id)).is_none());
+    let nodes = tree
+        .get_name("nodes")
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    let shard = nodes
+        .get_name(&interaction.id.as_str()[..2])
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    assert!(shard
+        .get_name(&format!("{}.json", interaction.id))
+        .is_none());
+    let links = tree
+        .get_name("links")
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    assert!(links.get_name(&interaction.id.to_string()).is_none());
+    Ok(())
+}
+
+#[test]
+fn hard_redaction_plan_verifies_applies_locally_and_retains_tombstone() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("store.db"))?;
+    let target = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "redaction-plan".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "remove me".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    let unrelated = Interaction {
+        id: InteractionId::new(),
+        user_prompt: "retain me".into(),
+        ..target.clone()
+    };
+    store.create_interaction(&target)?;
+    store.create_interaction(&unrelated)?;
+    store.link_automatic_interactions(
+        std::slice::from_ref(&target.id),
+        &CommitSha::new("d".repeat(40)),
+        "generated",
+        None,
+    )?;
+    project_fixture_to_ref(&repo, &store, "refs/cvc/redaction-plan")?;
+    store.tombstone_remote(
+        &target.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::Security,
+        None,
+    )?;
+    project_fixture_to_ref(&repo, &store, "refs/cvc/redaction-plan")?;
+    let tip = repo
+        .find_reference("refs/cvc/redaction-plan")?
+        .target()
+        .unwrap();
+    repo.reference(
+        "refs/remotes/fixture/cvc/main",
+        tip,
+        true,
+        "fixture baseline",
+    )?;
+
+    let candidate = sync::build_hard_redaction_plan(
+        &repo,
+        Some("refs/remotes/fixture/cvc/main"),
+        TEST_DESTINATION,
+        &target.id,
+    )?;
+    let plan = candidate.plan.clone();
+    assert!(sync::verify_redaction_plan(
+        &repo,
+        &plan,
+        "refs/remotes/fixture/cvc/main"
+    )?);
+    sync::apply_hard_redaction_locally(&repo, &plan)?;
+    let local = repo.find_reference("refs/cvc/main")?.peel_to_commit()?;
+    assert_eq!(local.parent_count(), 0);
+    let tree = local.tree()?;
+    let target_file = format!("{}.json", target.id);
+    assert!(tree.get_name(&target_file).is_none());
+    let nodes = tree
+        .get_name("nodes")
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    let target_shard = nodes
+        .get_name(&target.id.as_str()[..2])
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    assert!(target_shard.get_name(&target_file).is_none());
+    let unrelated_shard = nodes
+        .get_name(&unrelated.id.as_str()[..2])
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    assert!(unrelated_shard
+        .get_name(&format!("{}.json", unrelated.id))
+        .is_some());
+    let tombstones = tree
+        .get_name("tombstones")
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    let tombstone_shard = tombstones
+        .get_name(&target.id.as_str()[..2])
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    assert!(tombstone_shard.get_name(&target_file).is_some());
+    assert_eq!(
+        repo.find_reference("refs/cvc/redaction-plan")?.target(),
+        Some(tip),
+        "local apply must not mutate remote baseline"
+    );
+    repo.reference(
+        "refs/remotes/fixture/cvc/main",
+        local.id(),
+        true,
+        "stale plan",
+    )?;
+    assert!(!sync::verify_redaction_plan(
+        &repo,
+        &plan,
+        "refs/remotes/fixture/cvc/main"
+    )?);
+    for mut tampered in [
+        {
+            let mut p = plan.clone();
+            p.repository_fingerprint = "wrong".into();
+            p
+        },
+        {
+            let mut p = plan.clone();
+            p.tombstone_oid = "0".repeat(40);
+            p
+        },
+        {
+            let mut p = plan.clone();
+            p.unrelated_entries_retained += 1;
+            p
+        },
+    ] {
+        assert!(sync::apply_hard_redaction_locally(&repo, &tampered).is_err());
+        // Avoid retaining the mutable binding in the assertion loop.
+        tampered.warning.clear();
+    }
+    drop(candidate);
+    Ok(())
+}
+
+#[test]
+fn remote_tombstones_only_suppress_stale_data_from_the_matching_source() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let source = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "remote-scope".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "stale remote node".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&interaction)?;
+    source.link_automatic_interactions(
+        std::slice::from_ref(&interaction.id),
+        &CommitSha::new("b".repeat(40)),
+        "generated",
+        None,
+    )?;
+    project_fixture_to_ref(&repo, &source, "refs/cvc/stale-remote")?;
+    let stale = repo
+        .find_reference("refs/cvc/stale-remote")?
+        .target()
+        .expect("fixture ref has a direct target");
+
+    // The later remote state contains the tombstone, while a stale clone retains
+    // the old immutable node and link blobs.
+    let tombstone = source.tombstone_remote(
+        &interaction.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::Security,
+        None,
+    )?;
+    project_fixture_to_ref(&repo, &source, "refs/cvc/redacted-remote")?;
+    repo.reference(
+        "refs/cvc/stale-remote",
+        stale,
+        true,
+        "fixture: stale clone before redaction",
+    )?;
+
+    let target = CvcStore::open(temp_dir.path().join("target.db"))?;
+    // Exercise the production remote-aware pull API: the received tombstone is
+    // authority only for this exact source fingerprint.
+    sync::pull_from_ref_for_remote(
+        &repo,
+        &target,
+        "refs/cvc/redacted-remote",
+        Some(TEST_DESTINATION),
+    )?;
+    sync::pull_from_ref_for_remote(
+        &repo,
+        &target,
+        "refs/cvc/stale-remote",
+        Some(TEST_DESTINATION),
+    )?;
+    assert!(target.get_interaction(&interaction.id)?.is_none());
+    assert!(target.get_artifact_links(&interaction.id)?.is_empty());
+
+    // A tombstone from this destination must not suppress an independently
+    // authorized source, even where the immutable interaction ID is identical.
+    sync::pull_from_ref_for_remote(
+        &repo,
+        &target,
+        "refs/cvc/stale-remote",
+        Some(&"f".repeat(64)),
+    )?;
+    assert!(target.get_interaction(&interaction.id)?.is_some());
+    assert_eq!(target.get_artifact_links(&interaction.id)?.len(), 1);
+    assert!(!target.is_tombstoned(&interaction.id)?);
+    // The received record is remote-scoped, not a local/global tombstone.
+    assert_eq!(tombstone.interaction_id, interaction.id);
+    Ok(())
+}
+
+#[test]
+fn matching_wire_tombstone_reconciles_pending_redaction_on_no_change_projection(
+) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let source = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let target_path = temp_dir.path().join("target.db");
+    let target = CvcStore::open(&target_path)?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "reconcile-redaction".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "redaction transport was ambiguous".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    for store in [&source, &target] {
+        store.create_interaction(&interaction)?;
+        store.share_conversation_for_remote(
+            &interaction.conversation_id,
+            TEST_DESTINATION,
+            FutureSharePolicy::Private,
+        )?;
+    }
+    source.link_automatic_interactions(
+        std::slice::from_ref(&interaction.id),
+        &CommitSha::new("c".repeat(40)),
+        "generated",
+        None,
+    )?;
+    project_fixture_to_ref(&repo, &source, "refs/cvc/reconcile-stale")?;
+    let wire_tombstone = source.tombstone_remote(
+        &interaction.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::Security,
+        None,
+    )?;
+    // Model a timeout after the local redaction write: it is pending until the
+    // exact matching wire record proves that this destination received it.
+    target.apply_tombstones(
+        std::slice::from_ref(&wire_tombstone),
+        "local",
+        Some(TEST_DESTINATION),
+    )?;
+    let connection = Connection::open(&target_path)?;
+    let pending_state: String = connection.query_row(
+        "SELECT state FROM tombstones WHERE interaction_id=?1 AND scope_kind='remote' AND remote_fingerprint=?2",
+        [&interaction.id.to_string(), TEST_DESTINATION],
+        |row| row.get(0),
+    )?;
+    assert_eq!(pending_state, "pending");
+    // The pending local record already suppresses a stale clone from this exact
+    // destination; neither its node nor link may reappear before reconciliation.
+    sync::pull_from_ref_for_remote(
+        &repo,
+        &target,
+        "refs/cvc/reconcile-stale",
+        Some(TEST_DESTINATION),
+    )?;
+    assert!(target.get_interaction(&interaction.id)?.is_none());
+    assert!(target.get_artifact_links(&interaction.id)?.is_empty());
+    project_fixture_to_ref(&repo, &source, "refs/cvc/reconcile-redaction")?;
+    let wire_oid = repo
+        .find_reference("refs/cvc/reconcile-redaction")?
+        .target()
+        .expect("fixture ref has a direct target");
+
+    sync::pull_from_ref_for_remote(
+        &repo,
+        &target,
+        "refs/cvc/reconcile-redaction",
+        Some(TEST_DESTINATION),
+    )?;
+    let state: String = connection.query_row(
+        "SELECT state FROM tombstones WHERE interaction_id=?1 AND scope_kind='remote' AND remote_fingerprint=?2",
+        [&interaction.id.to_string(), TEST_DESTINATION],
+        |row| row.get(0),
+    )?;
+    assert_eq!(state, "published");
+    assert!(target.get_interaction(&interaction.id)?.is_none());
+
+    repo.reference(
+        "refs/remotes/fixture/cvc/main",
+        wire_oid,
+        true,
+        "fixture: reconciliation baseline",
+    )?;
+    assert!(matches!(
+        sync::push_projection_to_ref(
+            &repo,
+            &target,
+            "refs/remotes/fixture/cvc/main",
+            TEST_DESTINATION,
+        )?,
+        sync::ProjectionResult::NoChanges
+    ));
+    Ok(())
+}
+
+#[test]
+fn pull_rejects_a_tombstones_root_with_the_wrong_object_type() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("store.db"))?;
+    let tombstones_blob = repo.blob(b"not a tree")?;
+    let mut root = repo.treebuilder(None)?;
+    root.insert("tombstones", tombstones_blob, FileMode::Blob.into())?;
+    let tree = repo.find_tree(root.write()?)?;
+    let signature = Signature::now("CVC Test", "test@example.com")?;
+    repo.commit(
+        Some("refs/cvc/bad-tombstones-root"),
+        &signature,
+        &signature,
+        "bad tombstones root",
+        &tree,
+        &[],
+    )?;
+
+    let error = sync::pull_from_ref(&repo, &store, "refs/cvc/bad-tombstones-root")
+        .expect_err("reserved tombstones root must be a tree");
+    assert!(error.to_string().contains("tombstones must be a tree"));
+    assert!(store.get_all_interaction_ids()?.is_empty());
+    Ok(())
+}
+
+fn commit_tombstone_tree(
+    repo: &Repository,
+    reference: &str,
+    tombstones: &[Tombstone],
+) -> anyhow::Result<()> {
+    let mut shards: std::collections::HashMap<String, git2::TreeBuilder<'_>> =
+        std::collections::HashMap::new();
+    for tombstone in tombstones {
+        let id = tombstone.interaction_id.to_string();
+        let shard = id[..2].to_owned();
+        let blob = repo.blob(&serde_json::to_vec(tombstone)?)?;
+        let builder = match shards.entry(shard.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(repo.treebuilder(None)?)
+            }
+        };
+        builder.insert(format!("{id}.json"), blob, FileMode::Blob.into())?;
+    }
+    let mut tombstone_root = repo.treebuilder(None)?;
+    for (shard, builder) in shards {
+        tombstone_root.insert(&shard, builder.write()?, FileMode::Tree.into())?;
+    }
+    let mut root = repo.treebuilder(None)?;
+    root.insert("tombstones", tombstone_root.write()?, FileMode::Tree.into())?;
+    let tree = repo.find_tree(root.write()?)?;
+    let signature = Signature::now("CVC Test", "test@example.com")?;
+    repo.commit(
+        Some(reference),
+        &signature,
+        &signature,
+        "tombstones",
+        &tree,
+        &[],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn pull_tombstone_budgets_reject_before_database_mutation() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("store.db"))?;
+    let planted = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "planted".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "retain".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&planted)?;
+    let tombstones: Vec<_> = (0..3)
+        .map(|_| Tombstone::new(InteractionId::new(), TombstoneReasonCode::Security, None))
+        .collect();
+    commit_tombstone_tree(&repo, "refs/cvc/budget-count", &tombstones)?;
+    let limits = sync::SyncReadLimits {
+        max_tombstones: 2,
+        max_tombstone_bytes: 16 * 1024,
+        max_total_bytes: 1024 * 1024,
+    };
+    assert!(
+        sync::pull_from_ref_with_limits(&repo, &store, "refs/cvc/budget-count", None, limits)
+            .is_err()
+    );
+    assert!(store.get_interaction(&planted.id)?.is_some());
+
+    commit_tombstone_tree(&repo, "refs/cvc/budget-bytes", &tombstones[..2])?;
+    let limits = sync::SyncReadLimits {
+        max_tombstones: 3,
+        max_tombstone_bytes: 16 * 1024,
+        max_total_bytes: 1,
+    };
+    assert!(
+        sync::pull_from_ref_with_limits(&repo, &store, "refs/cvc/budget-bytes", None, limits)
+            .is_err()
+    );
+    assert!(store.get_interaction(&planted.id)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn pull_duplicate_node_and_tombstone_representations_are_atomic() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("store.db"))?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "duplicate".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "same".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    let node = SyncNode {
+        interaction: interaction.clone(),
+        context_items: vec![],
+        tool_executions: vec![],
+        artifact_links: vec![],
+    };
+    let bytes = serde_json::to_vec(&node)?;
+    let file = format!("{}.json", interaction.id);
+    let blob = repo.blob(&bytes)?;
+    let mut shard = repo.treebuilder(None)?;
+    shard.insert(&file, blob, FileMode::Blob.into())?;
+    let mut nodes = repo.treebuilder(None)?;
+    nodes.insert(
+        &interaction.id.as_str()[..2],
+        shard.write()?,
+        FileMode::Tree.into(),
+    )?;
+    let mut root = repo.treebuilder(None)?;
+    root.insert(&file, blob, FileMode::Blob.into())?;
+    root.insert("nodes", nodes.write()?, FileMode::Tree.into())?;
+    let tree = repo.find_tree(root.write()?)?;
+    let sig = Signature::now("CVC Test", "test@example.com")?;
+    repo.commit(
+        Some("refs/cvc/duplicates-ok"),
+        &sig,
+        &sig,
+        "duplicate",
+        &tree,
+        &[],
+    )?;
+    sync::pull_from_ref(&repo, &store, "refs/cvc/duplicates-ok")?;
+    assert_eq!(store.get_all_interaction_ids()?.len(), 1);
+
+    let mut altered = node;
+    altered.interaction.user_prompt = "different".into();
+    let mut bad_shard = repo.treebuilder(None)?;
+    bad_shard.insert(
+        &file,
+        repo.blob(&serde_json::to_vec(&altered)?)?,
+        FileMode::Blob.into(),
+    )?;
+    let mut bad_nodes = repo.treebuilder(None)?;
+    bad_nodes.insert(
+        &interaction.id.as_str()[..2],
+        bad_shard.write()?,
+        FileMode::Tree.into(),
+    )?;
+    let mut bad_root = repo.treebuilder(None)?;
+    bad_root.insert(&file, blob, FileMode::Blob.into())?;
+    bad_root.insert("nodes", bad_nodes.write()?, FileMode::Tree.into())?;
+    let bad_tree = repo.find_tree(bad_root.write()?)?;
+    repo.commit(
+        Some("refs/cvc/duplicates-bad"),
+        &sig,
+        &sig,
+        "bad duplicate",
+        &bad_tree,
+        &[],
+    )?;
+    let empty = CvcStore::open(temp.path().join("empty.db"))?;
+    assert!(sync::pull_from_ref(&repo, &empty, "refs/cvc/duplicates-bad").is_err());
+    assert!(empty.get_all_interaction_ids()?.is_empty());
+    // A valid Git tree cannot encode the same canonical shard/name twice. The
+    // transport-neutral canonicalizer is the seam for pack/alternate readers.
+    let tombstone = Tombstone::new(interaction.id.clone(), TombstoneReasonCode::Security, None);
+    let mut conflicting = tombstone.clone();
+    conflicting.reason_code = TombstoneReasonCode::Retention;
+    assert!(sync::validate_tombstone_records(&[tombstone.clone(), tombstone]).is_ok());
+    assert!(sync::validate_tombstone_records(&[conflicting.clone(), conflicting.clone()]).is_ok());
+    let original = Tombstone::new(interaction.id, TombstoneReasonCode::Security, None);
+    assert!(sync::validate_tombstone_records(&[original, conflicting]).is_err());
+    Ok(())
+}
+
+#[test]
+fn tombstone_deletion_reports_logical_cleanup_for_local_and_imported_records() -> anyhow::Result<()>
+{
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("store.db"))?;
+    let local = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "local-cleanup".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "delete".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&local)?;
+    store.tombstone_local(&local.id, TombstoneReasonCode::Security, None)?;
+    assert!(store.get_interaction(&local.id)?.is_none());
+    let report = store.compact_after_deletion()?;
+    assert_eq!(report.busy, 0);
+    assert_eq!(report.log_frames, 0);
+    assert_eq!(report.checkpointed_frames, 0);
+    assert_eq!(report.wal_bytes, 0);
+
+    let imported = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "remote-cleanup".into(),
+        ..local.clone()
+    };
+    store.create_interaction(&imported)?;
+    let tombstone = Tombstone::new(imported.id.clone(), TombstoneReasonCode::Security, None);
+    commit_tombstone_tree(
+        &repo,
+        "refs/cvc/import-cleanup",
+        std::slice::from_ref(&tombstone),
+    )?;
+    sync::pull_from_ref_for_remote(
+        &repo,
+        &store,
+        "refs/cvc/import-cleanup",
+        Some(TEST_DESTINATION),
+    )?;
+    assert!(store.get_interaction(&imported.id)?.is_none());
+    let report = store.compact_after_deletion()?;
+    assert_eq!(
+        (
+            report.busy,
+            report.log_frames,
+            report.checkpointed_frames,
+            report.wal_bytes
+        ),
+        (0, 0, 0, 0)
+    );
+    Ok(())
+}
+
+#[test]
+fn projection_reports_no_changes_against_verified_baseline() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "no-change".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "only once".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&interaction)?;
+
+    let first = sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION)?;
+    let sync::ProjectionResult::Candidate { oid, candidate, .. } = first else {
+        anyhow::bail!("initial projection must create a candidate");
+    };
+    repo.reference(
+        "refs/remotes/fixture/cvc/main",
+        oid,
+        true,
+        "verified fixture baseline",
+    )?;
+    drop(candidate);
+
+    assert!(matches!(
+        sync::push_projection_to_ref(
+            &repo,
+            &store,
+            "refs/remotes/fixture/cvc/main",
+            TEST_DESTINATION,
+        )?,
+        sync::ProjectionResult::NoChanges
+    ));
+    Ok(())
+}
+
+#[test]
+fn failed_transport_cleanup_removes_projection_candidate() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "cleanup".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "cleanup candidate".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&interaction)?;
+    let projection = sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION)?;
+    let sync::ProjectionResult::Candidate { candidate, .. } = projection else {
+        anyhow::bail!("fixture expected projection candidate");
+    };
+    let temp_ref = candidate.ref_name().to_owned();
+    let destination = cvc_core::privacy::RemoteDestination {
+        name: "unreachable".into(),
+        effective_url: temp_dir.path().join("missing-remote").display().to_string(),
+        fingerprint: "a".repeat(64),
+        ref_name: "refs/cvc/main".into(),
+    };
+    assert!(sync::push_temp_ref(&repo, &destination, &temp_ref).is_err());
+    drop(candidate);
+    assert!(repo.find_reference(&temp_ref).is_err());
+    Ok(())
+}
+
+#[test]
+fn candidate_guard_cleans_up_on_early_error() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "cancelled".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "cancel before publish".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store.create_interaction(&interaction)?;
+    let projection = sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION)?;
+    let sync::ProjectionResult::Candidate { candidate, .. } = projection else {
+        anyhow::bail!("fixture expected projection candidate");
+    };
+    let temp_ref = candidate.ref_name().to_owned();
+    let cancelled = (|| -> anyhow::Result<()> {
+        let _candidate = candidate;
+        anyhow::bail!("simulated TTY cancellation")
+    })();
+    assert!(cancelled.is_err());
+    assert!(repo.find_reference(&temp_ref).is_err());
+    Ok(())
+}
+
+#[test]
+fn destination_operation_lock_serializes_same_destination() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let fingerprint = "b".repeat(64);
+    let held = cvc_core::privacy::destination_operation_lock(&repo, &fingerprint)?;
+    let path = temp_dir.path().to_owned();
+    let fingerprint_for_thread = fingerprint.clone();
+    let (acquired, receiver) = mpsc::channel();
+    let worker = std::thread::spawn(move || -> anyhow::Result<()> {
+        let repo = Repository::open(path)?;
+        let _lock = cvc_core::privacy::destination_operation_lock(&repo, &fingerprint_for_thread)?;
+        acquired.send(()).unwrap();
+        Ok(())
+    });
+    assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(held);
+    receiver.recv_timeout(Duration::from_secs(2))?;
+    worker.join().expect("lock worker panicked")?;
+    Ok(())
+}
+
+#[test]
+fn push_upgrades_v2_format_without_downgrading_data() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let source = CvcStore::open(temp_dir.path().join("source.db"))?;
+    source.create_conversation(&Conversation {
+        id: "upgrade".into(),
+        title: "upgrade".into(),
+        created_at: Utc::now(),
+    })?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "upgrade".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "preserve me".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&interaction)?;
+    let ref_name = "refs/cvc/upgrade";
+    project_fixture_to_ref(&repo, &source, ref_name)?;
+
+    let previous = repo.find_reference(ref_name)?.peel_to_commit()?;
+    let mut builder = repo.treebuilder(Some(&previous.tree()?))?;
+    builder.insert("FORMAT", repo.blob(b"2")?, FileMode::Blob.into())?;
+    builder.remove("events")?;
+    builder.remove("ranges")?;
+    let tree = repo.find_tree(builder.write()?)?;
+    let signature = Signature::now("Test User", "test@example.com")?;
+    repo.commit(
+        Some(ref_name),
+        &signature,
+        &signature,
+        "v2 marker",
+        &tree,
+        &[&previous],
+    )?;
+
+    let existing = CvcStore::open(temp_dir.path().join("existing.db"))?;
+    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    project_fixture_to_ref(&repo, &source, ref_name)?;
+    let upgraded_tree = repo.find_reference(ref_name)?.peel_to_commit()?.tree()?;
+    let marker = repo.find_blob(upgraded_tree.get_name("FORMAT").unwrap().id())?;
+    assert_eq!(marker.content(), b"5");
+
+    let fresh = CvcStore::open(temp_dir.path().join("fresh.db"))?;
+    sync::pull_from_ref(&repo, &fresh, ref_name)?;
+    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    assert!(fresh.get_interaction(&interaction.id)?.is_some());
+    assert!(existing.get_interaction(&interaction.id)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn v3_pull_surfaces_conflicting_link_attribution() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let source = CvcStore::open(temp_dir.path().join("source.db"))?;
+    source.create_conversation(&Conversation {
+        id: "conflict".into(),
+        title: "conflict".into(),
+        created_at: Utc::now(),
+    })?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "conflict".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "conflict".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&interaction)?;
+    let ref_name = "refs/cvc/conflict";
+    project_fixture_to_ref(&repo, &source, ref_name)?;
+    let target = CvcStore::open(temp_dir.path().join("target.db"))?;
+    sync::pull_from_ref(&repo, &target, ref_name)?;
+    let sha = CommitSha::new("c".repeat(40));
+    target.link_automatic_interactions(
+        std::slice::from_ref(&interaction.id),
+        &sha,
+        "generated",
+        Some("local@example.com"),
+    )?;
+    source.link_automatic_interactions(
+        std::slice::from_ref(&interaction.id),
+        &sha,
+        "generated",
+        Some("remote@example.com"),
+    )?;
+    project_fixture_to_ref(&repo, &source, ref_name)?;
+    assert!(sync::pull_from_ref(&repo, &target, ref_name).is_err());
+    Ok(())
+}
+
+#[test]
+fn push_rejects_existing_immutable_link_record_mismatch() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let db_path = temp_dir.path().join("source.db");
+    let source = CvcStore::open(&db_path)?;
+    source.create_conversation(&Conversation {
+        id: "push-conflict".into(),
+        title: "push-conflict".into(),
+        created_at: Utc::now(),
+    })?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "push-conflict".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "push".into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    source.create_interaction(&interaction)?;
+    let sha = CommitSha::new("d".repeat(40));
+    source.link_automatic_interactions(
+        std::slice::from_ref(&interaction.id),
+        &sha,
+        "generated",
+        Some("first@example.com"),
+    )?;
+    let ref_name = "refs/cvc/push-conflict";
+    project_fixture_to_ref(&repo, &source, ref_name)?;
+    // Exact replay is the immutable-record no-op case.
+    project_fixture_to_ref(&repo, &source, ref_name)?;
+
+    let raw = Connection::open(&db_path)?;
+    raw.execute(
+        "UPDATE artifact_links SET linked_by = 'second@example.com'",
+        [],
+    )?;
+    drop(raw);
+    assert!(project_fixture_to_ref(&repo, &source, ref_name).is_err());
+    Ok(())
+}
+
+#[test]
+fn pull_rejects_malformed_legacy_embedded_link() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let signature = Signature::now("Test User", "test@example.com")?;
+    let node_id = InteractionId::new();
+    let node = SyncNode {
+        interaction: Interaction {
+            id: node_id.clone(),
+            conversation_id: "bad".into(),
+            parent_id: None,
+            timestamp: Utc::now(),
+            author: Author::Human,
+            user_prompt: "bad".into(),
+            model_name: None,
+            model_cot: None,
+            model_response: None,
+            source_request_id: None,
+        },
+        context_items: vec![],
+        tool_executions: vec![],
+        artifact_links: vec![ArtifactLink {
+            interaction_id: InteractionId::new(),
+            git_commit_hash: CommitSha::new("not-an-oid"),
+            link_type: "verified".into(),
+            linked_by: None,
+        }],
+    };
+    let mut builder = repo.treebuilder(None)?;
+    builder.insert(
+        format!("{}.json", node_id),
+        repo.blob(serde_json::to_vec(&node)?.as_slice())?,
+        FileMode::Blob.into(),
+    )?;
+    let tree = repo.find_tree(builder.write()?)?;
+    repo.commit(
+        Some("refs/cvc/bad"),
+        &signature,
+        &signature,
+        "bad",
+        &tree,
+        &[],
+    )?;
+    let store = CvcStore::open(temp_dir.path().join("target.db"))?;
+    assert!(sync::pull_from_ref(&repo, &store, "refs/cvc/bad").is_err());
+    assert!(store.get_all_interaction_ids()?.is_empty());
+    Ok(())
+}
 
 #[test]
 fn test_sync_push_pull() -> anyhow::Result<()> {
@@ -45,7 +1800,7 @@ fn test_sync_push_pull() -> anyhow::Result<()> {
 
     // 3. Push to Ref
     let ref_name = "refs/cvc/test";
-    sync::push_to_ref(&repo, &store, ref_name)?;
+    project_fixture_to_ref(&repo, &store, ref_name)?;
 
     // Verify ref exists
     let _ref_obj = repo.find_reference(ref_name)?;
@@ -105,7 +1860,7 @@ fn test_sync_creates_commits() -> anyhow::Result<()> {
 
     // 3. Push to Ref
     let ref_name = "refs/cvc/test";
-    sync::push_to_ref(&repo, &store, ref_name)?;
+    project_fixture_to_ref(&repo, &store, ref_name)?;
 
     // 4. Verify ref points to a Commit
     let reference = repo.find_reference(ref_name)?;
@@ -127,7 +1882,7 @@ fn test_sync_creates_commits() -> anyhow::Result<()> {
         source_request_id: None,
     };
     store.create_interaction(&inter2)?;
-    sync::push_to_ref(&repo, &store, ref_name)?;
+    project_fixture_to_ref(&repo, &store, ref_name)?;
 
     let reference = repo.find_reference(ref_name)?;
     let head_commit = reference.peel_to_commit()?;
@@ -177,11 +1932,11 @@ fn test_sync_idempotency() -> anyhow::Result<()> {
     let ref_name = "refs/cvc/test";
 
     // 3. First Push
-    sync::push_to_ref(&repo, &store, ref_name)?;
+    project_fixture_to_ref(&repo, &store, ref_name)?;
     let initial_commit_oid = repo.find_reference(ref_name)?.peel_to_commit()?.id();
 
     // 4. Second Push (No new data)
-    sync::push_to_ref(&repo, &store, ref_name)?;
+    project_fixture_to_ref(&repo, &store, ref_name)?;
     let second_commit_oid = repo.find_reference(ref_name)?.peel_to_commit()?.id();
 
     // 5. Verify OID hasn't changed
@@ -204,7 +1959,7 @@ fn test_sync_idempotency() -> anyhow::Result<()> {
         source_request_id: None,
     };
     store.create_interaction(&inter2)?;
-    sync::push_to_ref(&repo, &store, ref_name)?;
+    project_fixture_to_ref(&repo, &store, ref_name)?;
     let third_commit_oid = repo.find_reference(ref_name)?.peel_to_commit()?.id();
 
     assert_ne!(
@@ -280,7 +2035,7 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
     store_a.create_interaction(&inter_a)?;
 
     let ref_name = "refs/cvc/main";
-    sync::push_to_ref(&repo_a, &store_a, ref_name)?;
+    project_fixture_to_ref(&repo_a, &store_a, ref_name)?;
 
     // Push ref to remote
     let mut remote_callbacks = git2::RemoteCallbacks::new();
@@ -310,7 +2065,7 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
     store_b.create_interaction(&inter_b)?;
 
     // B pushes locally
-    sync::push_to_ref(&repo_b, &store_b, ref_name)?;
+    project_fixture_to_ref(&repo_b, &store_b, ref_name)?;
 
     // 6. User B tries to push and fails (Simulation)
     // We expect this to fail because remote has A's work, which is not in B's history.
@@ -350,7 +2105,7 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
     repo_b.reference(ref_name, remote_oid, true, "Reset to remote")?;
 
     // Push local again (Should now be a merge/union on top of A)
-    sync::push_to_ref(&repo_b, &store_b, ref_name)?;
+    project_fixture_to_ref(&repo_b, &store_b, ref_name)?;
 
     // Push to remote (Should succeed)
     origin_b.push(
@@ -408,7 +2163,7 @@ fn test_fetch_and_pull_from_fresh_clone() -> anyhow::Result<()> {
         source_request_id: None,
     };
     store_a.create_interaction(&inter_a)?;
-    sync::push_to_ref(&repo_a, &store_a, "refs/cvc/main")?;
+    project_fixture_to_ref(&repo_a, &store_a, "refs/cvc/main")?;
 
     let mut push_callbacks = git2::RemoteCallbacks::new();
     push_callbacks.credentials(|_, _, _| git2::Cred::default());
@@ -431,20 +2186,23 @@ fn test_fetch_and_pull_from_fresh_clone() -> anyhow::Result<()> {
 
     // `git fetch` needs a resolvable remote URL; the bare repo is a local path here,
     // which the system `git` CLI (fetch_and_pull's first attempt) handles fine.
-    let new_count = sync::fetch_and_pull(&repo_b, &store_b, "origin")?;
+    let destination_b = cvc_core::privacy::remote_destination(&repo_b, "origin")?;
+    let new_count = sync::fetch_and_pull_destination(&repo_b, &store_b, &destination_b)?;
 
-    assert_eq!(new_count, 1, "should report exactly one newly ingested interaction");
+    assert_eq!(
+        new_count, 1,
+        "should report exactly one newly ingested interaction"
+    );
     let fetched = store_b.get_interaction(&inter_a.id)?;
     assert!(fetched.is_some(), "machine B should now have A's thought");
     assert_eq!(fetched.unwrap().user_prompt, "Thought from machine A");
 
-    // The local shadow ref should now be fast-forwarded to what was fetched.
-    let local_ref = repo_b.find_reference("refs/cvc/main")?;
+    // The destination-scoped tracking ref is the only fetched baseline.
     let remote_ref = repo_b.find_reference("refs/remotes/origin/cvc/main")?;
-    assert_eq!(local_ref.target(), remote_ref.target());
+    assert!(remote_ref.target().is_some());
 
     // Calling again with nothing new on the remote should be a no-op.
-    let second_count = sync::fetch_and_pull(&repo_b, &store_b, "origin")?;
+    let second_count = sync::fetch_and_pull_destination(&repo_b, &store_b, &destination_b)?;
     assert_eq!(second_count, 0, "should report zero on a repeat sync");
 
     Ok(())
@@ -482,17 +2240,31 @@ fn test_sync_v2_round_trip() -> anyhow::Result<()> {
         model_response: Some("response".to_string()),
         source_request_id: None,
     };
-    store.create_interaction(&linked)?;
-    store.link_interaction(&linked.id, &commit_sha, "generated")?;
-    store.add_context_item(&ContextItem {
-        id: None,
-        interaction_id: linked.id.clone(),
-        file_path: "src/lib.rs".to_string(),
-        git_blob_sha: Some("deadbeef".to_string()),
-        dirty_patch: None,
-        start_line: None,
-        end_line: None,
-    })?;
+    store.capture_mcp(McpCapture::new(
+        Conversation {
+            id: linked.conversation_id.clone(),
+            title: "fixture".into(),
+            created_at: linked.timestamp,
+        },
+        linked.clone(),
+        vec![ContextItem {
+            id: None,
+            interaction_id: linked.id.clone(),
+            file_path: "src/lib.rs".to_string(),
+            git_blob_sha: Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()),
+            dirty_patch: None,
+            start_line: None,
+            end_line: None,
+        }],
+        Vec::new(),
+        PreparedPolicy::built_ins_only(),
+    ))?;
+    store.link_interaction_with_metadata(
+        &linked.id,
+        &commit_sha,
+        "generated",
+        Some("author@example.com"),
+    )?;
 
     // ... and a floating one (nodes/ only, no by-commit/ entry).
     let floating = Interaction {
@@ -510,7 +2282,7 @@ fn test_sync_v2_round_trip() -> anyhow::Result<()> {
     store.create_interaction(&floating)?;
 
     let ref_name = "refs/cvc/main";
-    sync::push_to_ref(&repo, &store, ref_name)?;
+    project_fixture_to_ref(&repo, &store, ref_name)?;
 
     // Verify the v2 layout actually landed: FORMAT marker, sharded nodes/, by-commit/ index.
     let pushed_tree = repo.find_reference(ref_name)?.peel_to_commit()?.tree()?;
@@ -518,7 +2290,7 @@ fn test_sync_v2_round_trip() -> anyhow::Result<()> {
         .get_name("FORMAT")
         .expect("FORMAT marker should be written");
     let format_blob = repo.find_blob(format_entry.id())?;
-    assert_eq!(format_blob.content(), b"2");
+    assert_eq!(format_blob.content(), b"5");
 
     let nodes_tree = pushed_tree
         .get_name("nodes")
@@ -569,6 +2341,10 @@ fn test_sync_v2_round_trip() -> anyhow::Result<()> {
     let fetched_links = store_2.get_artifact_links(&linked.id)?;
     assert_eq!(fetched_links.len(), 1);
     assert_eq!(fetched_links[0].git_commit_hash, commit_sha);
+    assert_eq!(
+        fetched_links[0].linked_by.as_deref(),
+        Some("author@example.com")
+    );
 
     let fetched_context = store_2.get_context_items(&linked.id)?;
     assert_eq!(fetched_context.len(), 1);
@@ -626,7 +2402,10 @@ fn test_pull_from_ref_reads_legacy_v1_layout() -> anyhow::Result<()> {
     sync::pull_from_ref(&repo, &store, "refs/cvc/main")?;
 
     let fetched = store.get_interaction(&id)?;
-    assert!(fetched.is_some(), "legacy v1 interaction should be ingested");
+    assert!(
+        fetched.is_some(),
+        "legacy v1 interaction should be ingested"
+    );
     assert_eq!(fetched.unwrap().user_prompt, "Legacy thought");
 
     // A push against this legacy tree should leave the old entry alone and start
@@ -646,7 +2425,7 @@ fn test_pull_from_ref_reads_legacy_v1_layout() -> anyhow::Result<()> {
         model_response: None,
         source_request_id: None,
     })?;
-    sync::push_to_ref(&repo, &store, "refs/cvc/main")?;
+    project_fixture_to_ref(&repo, &store, "refs/cvc/main")?;
 
     let updated_tree = repo
         .find_reference("refs/cvc/main")?

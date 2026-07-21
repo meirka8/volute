@@ -1,8 +1,7 @@
 use crate::tools;
 use anyhow::{Context, Result};
-use chrono::Utc;
 use cvc_core::db::CvcStore;
-use cvc_core::models::{Conversation, InteractionId};
+use cvc_core::models::InteractionId;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -31,24 +30,11 @@ impl AppState {
     }
 }
 
-/// Starts a new session on `state`: creates a fresh conversation titled after the
-/// connecting client and resets parent chaining. Called once per MCP `initialize`
-/// handshake. Returns the new conversation ID.
+/// Starts a new logical session. The aggregate capture boundary creates its
+/// conversation only when the first scrubbed thought is persisted.
 pub fn start_session(state: &AppState, client_name: &str) -> anyhow::Result<String> {
     let id = Uuid::new_v4().to_string();
-    let title = format!("{} session {}", client_name, Utc::now().to_rfc3339());
-
-    {
-        let store = state
-            .store
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Failed to lock store"))?;
-        store.create_conversation(&Conversation {
-            id: id.clone(),
-            title,
-            created_at: Utc::now(),
-        })?;
-    }
+    let _ = client_name;
 
     *state
         .conversation_id
@@ -99,7 +85,7 @@ pub async fn run() -> Result<()> {
         std::fs::create_dir_all(parent).context("Failed to create cvc directory")?;
     }
 
-    let store = CvcStore::open(db_path).context("Failed to open CVC database")?;
+    let store = CvcStore::open_initialized(db_path).context("Failed to open CVC database")?;
     store.init().context("Failed to run migrations")?;
     let state = Arc::new(AppState::new(Arc::new(Mutex::new(store))));
 

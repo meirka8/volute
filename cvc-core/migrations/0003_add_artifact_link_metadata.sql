@@ -1,0 +1,3 @@
+-- Historical marker retained for packaged migration ordering. Runtime schema
+-- normalization in CvcStore::init transactionally rebuilds artifact_links when
+-- necessary, including interrupted states where only linked_by was added.

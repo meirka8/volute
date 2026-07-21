@@ -10,6 +10,17 @@
  */
 export type Author = "human" | "agent" | "system" | "external";
 
+/** Read-only policy state. It contains no interaction or remote identity data. */
+export interface PrivacyStatus {
+  captureAcknowledged: boolean;
+  captureNoticeVersion: number;
+  passiveCaptureAllowed: boolean;
+  privateByDefault: boolean;
+  privateDefaultStatement: string;
+  sharingSummary: string;
+  autoPushEnabled: boolean;
+}
+
 /**
  * Parameters for $/cvc/session/start notification
  * Signals the beginning of a logical task (e.g., opening a chat window)

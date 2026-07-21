@@ -93,7 +93,8 @@ function getActionLines(interaction: InteractionNode): string[] {
 
   if (interaction.artifact_links.length > 0) {
     return interaction.artifact_links.map(
-      (link) => `${link.link_type} ${link.git_commit_hash.substring(0, 7)}`,
+      (link) =>
+        `${link.link_type === 'temporal' ? 'low-confidence temporal link' : link.link_type} ${link.git_commit_hash.substring(0, 7)}`,
     );
   }
 
@@ -133,6 +134,22 @@ function getSignal(interaction: InteractionNode) {
     label: 'Green check',
     className: 'border border-success/20 bg-success/10 text-success',
   };
+}
+
+function confidence(link: InteractionNode['artifact_links'][number]) {
+  const event = link.derivation_event;
+  // Every event arrived through a Git publisher. Claimed local origin/evidence is
+  // wire data, not independent reviewer verification.
+  if (event?.relation === 'rewrite_exact') return { label: 'Publisher-asserted Git rewrite', detail: `Publisher-asserted, unverified Git rewrite from ${event.old_oid?.slice(0, 12) ?? 'an earlier commit'}.`, className: 'border border-dashed border-warning/50 text-warning' };
+  if (event?.relation === 'squash_exact') return { label: 'Publisher-asserted squash equivalence', detail: `Publisher-asserted, unverified squash equivalence; source range ${event.range_id?.slice(0, 12) ?? 'recorded'}.`, className: 'border border-dashed border-warning/50 text-warning' };
+  if (event) return { label: 'Publisher assertion — unverified', detail: 'This Git-published relationship has not been independently verified by the reviewer.', className: 'border border-dashed border-warning/50 text-warning' };
+  switch (link.link_type) {
+    case 'temporal': return { label: 'Temporal — lower confidence', detail: 'Inferred from timing rather than exact file context.', className: 'border border-dashed border-line text-muted' };
+    case 'rewrite_exact': return { label: 'Original generated', detail: 'Generated from the original CVC link.', className: 'border border-line text-muted' };
+    case 'squash_exact': return { label: 'Original generated', detail: 'Generated from the original CVC link.', className: 'border border-line text-muted' };
+    case 'verified': return { label: 'User verified', detail: 'Explicitly verified by a user.', className: 'border border-action/40 text-action' };
+    default: return { label: 'Original generated', detail: 'Generated from the original CVC link.', className: 'border border-line text-muted' };
+  }
 }
 
 export function TimelineNode({
@@ -217,8 +234,13 @@ export function TimelineNode({
           : 'border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70'
       )}
       onClick={onSelect}
+      role="button"
       tabIndex={0}
+      aria-pressed={isSelected}
       onKeyDown={(e) => {
+        // Nested controls own their keyboard activation; their Enter/Space
+        // events must not select the card as a side effect.
+        if (e.target !== e.currentTarget) return;
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
           onSelect?.();
@@ -346,16 +368,25 @@ export function TimelineNode({
 
         {interaction.artifact_links && interaction.artifact_links.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
-          {interaction.artifact_links.map((link) => (
+           {interaction.artifact_links.map((link) => {
+             const confidenceInfo = confidence(link);
+             return (
             <span
-              key={`${link.git_commit_hash}-${link.link_type}`}
-              className="inline-flex items-center gap-1 rounded-full bg-canvas/80 px-3 py-1 text-xs text-muted"
+              key={link.derivation_event?.event_id ?? `${link.git_commit_hash}-${link.link_type}-${link.linked_by ?? ''}`}
+              className={clsx(
+                'inline-flex items-center gap-1 rounded-full bg-canvas/80 px-3 py-1 text-xs text-muted',
+                confidenceInfo.className,
+              )}
+              aria-label={`${confidenceInfo.label}: commit ${link.git_commit_hash.substring(0, 7)}. ${confidenceInfo.detail}`}
+              title={confidenceInfo.detail}
             >
               <GitCommit size={10} />
               <span className="font-mono">{link.git_commit_hash.substring(0, 7)}</span>
-              <span className="text-muted/80">({link.link_type})</span>
+              <span className="text-muted/80">
+                ({confidenceInfo.label})
+              </span>
             </span>
-          ))}
+          )})}
           </div>
         )}
       </div>

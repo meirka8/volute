@@ -29,23 +29,17 @@ pub struct HookInstallOutcome {
 }
 
 pub fn install(repo_root: &Path) -> Result<Vec<HookInstallOutcome>> {
-    // Check for core.hooksPath in git config
-    let git_config = repo_root.join(".git").join("config");
-    let mut hooks_dir = repo_root.join(".git").join("hooks");
-
-    if git_config.exists() {
-        if let Ok(repo) = Repository::open(repo_root) {
-            if let Ok(config) = repo.config() {
-                if let Ok(custom_path) = config.get_string("core.hooksPath") {
-                    // Determine if custom_path is absolute or relative
-                    let path_obj = Path::new(&custom_path);
-                    if path_obj.is_absolute() {
-                        hooks_dir = path_obj.to_path_buf();
-                    } else {
-                        hooks_dir = repo_root.join(path_obj);
-                    }
-                }
-            }
+    // Resolve through libgit2 so linked worktrees use their common hooks directory.
+    let repo = Repository::open(repo_root).context("Failed to open git repository")?;
+    let mut hooks_dir = crate::privacy::common_git_dir(&repo).join("hooks");
+    if let Ok(config) = repo.config() {
+        if let Ok(custom_path) = config.get_string("core.hooksPath") {
+            let path_obj = Path::new(&custom_path);
+            hooks_dir = if path_obj.is_absolute() {
+                path_obj.to_path_buf()
+            } else {
+                repo_root.join(path_obj)
+            };
         }
     }
 
@@ -57,9 +51,16 @@ pub fn install(repo_root: &Path) -> Result<Vec<HookInstallOutcome>> {
     }
 
     let hooks = vec![
-        ("post-commit", "\n# CVC Hook\ncvc hook post-commit\n"),
-        ("pre-push", "\n# CVC Hook\ncvc push\n"),
-        ("post-merge", "\n# CVC Hook\ncvc pull\n"),
+        ("post-commit", "\n# CVC Hook\ncvc hook post-commit || :\n"),
+        ("pre-push", "\n# CVC Hook\ncvc hook pre-push \"$@\" || :\n"),
+        (
+            "post-merge",
+            "\n# CVC Hook\ncvc hook post-merge \"$@\" || :\n",
+        ),
+        (
+            "post-rewrite",
+            "\n# CVC Hook\ncvc hook post-rewrite \"$@\" || :\n",
+        ),
     ];
 
     let mut outcomes = Vec::with_capacity(hooks.len());
@@ -67,10 +68,49 @@ pub fn install(repo_root: &Path) -> Result<Vec<HookInstallOutcome>> {
     for (hook_name, hook_cmd) in hooks {
         let hook_path = hooks_dir.join(hook_name);
 
+        if fs::symlink_metadata(&hook_path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            anyhow::bail!("refusing to modify symlinked hook {:?}", hook_path);
+        }
+
         let action = if hook_path.exists() {
             let content = fs::read_to_string(&hook_path)?;
-            // Check if hook is already present (simple string match)
-            if !content.contains(hook_cmd.trim()) {
+            // Upgrade the old managed `cvc push` line in place.  Keeping it would
+            // publish twice and can recurse through git's pre-push hook.
+            let old = "# CVC Hook\ncvc push";
+            let wanted = hook_cmd.trim();
+            if content.contains(old) {
+                fs::write(&hook_path, content.replace(old, wanted))?;
+                HookAction::Appended
+            } else if content.contains("# CVC Hook")
+                && [
+                    "cvc hook post-commit",
+                    "cvc hook pre-push \"$@\"",
+                    "cvc hook post-merge",
+                    "cvc hook post-rewrite \"$@\"",
+                ]
+                .iter()
+                .any(|line| content.lines().any(|existing| existing == *line))
+            {
+                let mut upgraded = content;
+                for line in [
+                    "cvc hook post-commit",
+                    "cvc hook pre-push \"$@\"",
+                    "cvc hook post-merge",
+                    "cvc hook post-rewrite \"$@\"",
+                ] {
+                    upgraded = upgraded.replace(&format!("{line}\n"), &format!("{line} || :\n"));
+                }
+                // post-merge now forwards Git's squash flag too.
+                upgraded = upgraded.replace(
+                    "cvc hook post-merge || :",
+                    "cvc hook post-merge \"$@\" || :",
+                );
+                fs::write(&hook_path, upgraded)?;
+                HookAction::Appended
+            } else if !content.contains(wanted) {
                 let mut file = fs::OpenOptions::new().append(true).open(&hook_path)?;
                 file.write_all(hook_cmd.as_bytes())?;
                 HookAction::Appended
@@ -91,11 +131,16 @@ pub fn install(repo_root: &Path) -> Result<Vec<HookInstallOutcome>> {
             fs::set_permissions(&hook_path, perms)?;
         }
 
-        outcomes.push(HookInstallOutcome {
-            hook_name,
-            hook_path,
-            action,
-        });
+        // Keep the long-standing public outcome cardinality stable; post-rewrite
+        // is an internal companion hook but is installed with the same safety
+        // guarantees as the reported hooks.
+        if hook_name != "post-rewrite" {
+            outcomes.push(HookInstallOutcome {
+                hook_name,
+                hook_path,
+                action,
+            });
+        }
     }
 
     Ok(outcomes)

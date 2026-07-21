@@ -2,6 +2,21 @@ use cvc_core::models::Author;
 use cvc_core::vscode::ResponsePartRaw;
 use serde::{Deserialize, Serialize};
 
+/// Read-only privacy state used by clients to gate passive collection. This
+/// deliberately contains policy state only; it never includes captured data or
+/// remote URLs/fingerprints.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivacyStatusResponse {
+    pub capture_acknowledged: bool,
+    pub capture_notice_version: u32,
+    pub passive_capture_allowed: bool,
+    pub private_by_default: bool,
+    pub private_default_statement: String,
+    pub sharing_summary: String,
+    pub auto_push_enabled: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionStartParams {
     pub title: String,

@@ -24,11 +24,8 @@ pub fn open_repo<P: AsRef<Path>>(path: P) -> Result<Repository> {
 
 fn validate_path(path: &Path) -> Result<()> {
     for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                return Err(GitError::Path("Path traversal detected (..) ".into()))
-            }
-            _ => {}
+        if component == Component::ParentDir {
+            return Err(GitError::Path("Path traversal detected (..) ".into()));
         }
     }
     Ok(())

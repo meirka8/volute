@@ -65,7 +65,7 @@
             "verbose"
           ],
           "default": "off",
-          "description": "Traces the communication between VS Code and the Volute language server."
+          "description": "Traces communication with the Volute language server. Default is off. Verbose tracing can expose captured chat payloads in trace output."
         }
       }
     },
@@ -91,6 +91,22 @@
         "title": "Check Setup",
         "category": "Volute",
         "icon": "$(checklist)"
+      },
+      {
+        "command": "volute.refreshPrivacyStatus",
+        "title": "Refresh Privacy Status",
+        "category": "Volute",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "volute.acknowledgePrivacyCapture",
+        "title": "Acknowledge Local Capture in Terminal",
+        "category": "Volute"
+      },
+      {
+        "command": "volute.shareRemote",
+        "title": "Share with Remote in Terminal",
+        "category": "Volute"
       }
     ],
     "viewsContainers": {
@@ -120,15 +136,6 @@
         }
       ]
     },
-    "chatParticipants": [
-      {
-        "id": "volute.chat",
-        "fullName": "Volute CVC",
-        "name": "volute",
-        "description": "Background status and history for the Volute CVC watcher. Use GitHub Copilot Chat normally without addressing this participant.",
-        "isSticky": false
-      }
-    ],
     "walkthroughs": [
       {
         "id": "volute.welcome",
@@ -136,18 +143,28 @@
         "description": "Learn how to track your cognitive process alongside your code",
         "steps": [
           {
+            "id": "volute.welcome.privacy",
+            "title": "Review Local Capture and Sharing",
+            "description": "Passive capture is off until you acknowledge the CLI notice. CVC may capture prompts, responses, exposed reasoning, and tool/context patches from this workspace’s locally stored chat sessions. Data is stored in `.git/cvc/index.db` and is private by default. Sharing through hidden `refs/cvc/main` requires a separate remote-consent/share action. Scrubbing has limits, and content shared through Git may be permanent.\n\n[Acknowledge in Terminal](command:volute.acknowledgePrivacyCapture) · [Refresh Privacy Status](command:volute.refreshPrivacyStatus)",
+            "media": {
+              "markdown": "## Your choice\n\nOpening the terminal does not enable capture. Complete the CLI's exact TTY challenge, then refresh status. CVC does not claim that data can never leave your machine: local capture stays local by default; a separately consented share can publish data to a remote."
+            }
+          },
+          {
             "id": "volute.welcome.setup",
             "title": "Check Your Setup",
             "description": "Volute CVC needs a few components to work. Let's make sure everything is installed.\n\n[Check Setup](command:volute.checkSetup)",
             "media": {
               "markdown": "## Components\n\n- **CVC CLI** (`cvc`) — Handles local repo setup, commit linking, and optional terminal history checks\n- **CVC Language Server** (`cvc-lsp`) — Powers the extension\n- **CVC MCP Server** (`cvc-mcp`) — Not needed for this VS Code workflow. Required only for non-VS-Code AI clients."
             },
-            "completionEvents": ["onCommand:volute.checkSetup"]
+            "completionEvents": [
+              "onCommand:volute.checkSetup"
+            ]
           },
           {
             "id": "volute.welcome.intro",
             "title": "Welcome to Volute CVC",
-            "description": "Volute CVC keeps the reasoning behind your AI-assisted changes next to the code. In VS Code, the watcher reads GitHub Copilot chat session files stored locally by VS Code and links captured context to your commits.\n\n[Learn More](https://cvc.dev)",
+            "description": "Volute CVC keeps the reasoning behind your AI-assisted changes next to the code. In VS Code, passive reading of locally stored GitHub Copilot chat sessions starts only after capture acknowledgement. Captured data is private by default; remote sharing requires separate consent.\n\n[Learn More](https://cvc.dev)",
             "media": {
               "markdown": "# Git, Augmented\n\nUse GitHub Copilot in VS Code the way you normally do. Volute CVC reads GitHub Copilot chat session files stored locally by VS Code for this workflow, then shows the captured context in the timeline panel."
             }
@@ -155,7 +172,7 @@
           {
             "id": "volute.welcome.chat",
             "title": "Open a New Copilot Chat",
-            "description": "Open GitHub Copilot Chat, start a new conversation, and work normally. The watcher reads Copilot chat session files stored locally by VS Code automatically - there is nothing extra to invoke.\n\n[Open Chat](command:workbench.action.chat.open)",
+            "description": "Open GitHub Copilot Chat, start a new conversation, and work normally. After you acknowledge local capture, the watcher reads only this workspace’s Copilot chat session files stored locally by VS Code.\n\n[Open Chat](command:workbench.action.chat.open)",
             "media": {
               "markdown": "## Watcher-Based Workflow\n\nThe VS Code watcher is built for GitHub Copilot's chat storage format and reads the local `chatSessions` files that VS Code maintains for Copilot Chat. It does not rely on a separate CVC chat participant."
             }
@@ -189,12 +206,13 @@
     "package": "npm run check-types && node esbuild.js --production",
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "npm run compile && vscode-test"
   },
   "devDependencies": {
+    "@types/marked": "^5.0.0",
+    "@types/mocha": "^10.0.10",
     "@types/node": "^20.11.0",
     "@types/uuid": "^9.0.0",
-    "@types/marked": "^5.0.0",
     "@types/vscode": "^1.90.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",

@@ -5,8 +5,9 @@ mod state;
 
 use backend::Backend;
 use protocol::{
-    InteractionDetail, InteractionGetParams, LinkCommitParams, SessionStartParams,
-    TimelineGetParams, TimelineGetResponse, TurnBatchParams, TurnEndParams, TurnStartParams,
+    InteractionDetail, InteractionGetParams, LinkCommitParams, PrivacyStatusResponse,
+    SessionStartParams, TimelineGetParams, TimelineGetResponse, TurnBatchParams, TurnEndParams,
+    TurnStartParams,
 };
 use state::AppState;
 use std::sync::Arc;
@@ -26,6 +27,17 @@ async fn main() {
         client,
         state: state_backend,
     })
+    .custom_method(
+        "cvc/privacy/status",
+        |backend: &Backend, _: serde_json::Value| {
+            let state = backend.state.clone();
+            async move {
+                Ok::<PrivacyStatusResponse, tower_lsp::jsonrpc::Error>(
+                    handlers::handle_privacy_status(state).await,
+                )
+            }
+        },
+    )
     .custom_method(
         "$/cvc/session/start",
         |backend: &Backend, params: SessionStartParams| {

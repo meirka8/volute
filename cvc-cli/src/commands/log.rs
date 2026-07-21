@@ -12,7 +12,7 @@ pub async fn run() -> Result<()> {
     }
 
     let db_path = cvc_dir.join("index.db");
-    let store = CvcStore::open(&db_path)?;
+    let store = CvcStore::open_initialized(&db_path)?;
 
     // Simplistic log: Get all IDs and show them.
     let ids = store.get_all_interaction_ids()?;
@@ -22,7 +22,7 @@ pub async fn run() -> Result<()> {
 
     for id in ids {
         if let Some(interaction) = store.get_interaction(&id)? {
-            println!("Node: {}", interaction.id.to_string());
+            println!("Node: {}", interaction.id);
             println!("Time: {}", interaction.timestamp);
             println!("Auth: {:?}", interaction.author);
             println!(

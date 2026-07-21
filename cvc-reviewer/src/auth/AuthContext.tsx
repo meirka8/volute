@@ -1,7 +1,9 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { createContext, useContext, useState, useRef, useEffect } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { StorageService } from './StorageService';
 import { PaymentRequiredError } from './errors';
+import { clearReviewerCaches } from '../lib/cognitiveCache';
 
 // Use strict types for the context
 interface AuthContextType {
@@ -16,6 +18,7 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+    const queryClient = useQueryClient();
     const isHostedMode = import.meta.env.VITE_HOSTED_MODE === 'true';
     const platformUrl = import.meta.env.VITE_PLATFORM_API_URL || 'https://app.cvc.dev';
 
@@ -157,6 +160,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             });
 
             if (response.ok) {
+                // A new PAT may represent a different GitHub account. Never let it
+                // inherit a previous account's hydrated or IndexedDB graph cache.
+                await clearReviewerCaches(queryClient);
                 setToken(newToken);
                 StorageService.setToken(newToken);
                 return true;
@@ -169,6 +175,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
 
     const logout = () => {
+        // This intentionally runs before hosted navigation as well: a redirect can
+        // be interrupted, whereas browser-resident cognitive data must be removed.
+        void clearReviewerCaches(queryClient);
         if (isHostedMode) {
             // In hosted mode, log out via the platform
             window.location.href = `${platformUrl}/logout`; // Or platform specific route

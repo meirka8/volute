@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-**Cognitive Version Control (CVC)** is a system designed to augment standard Git version control by tracking the "trajectory of intent" alongside the "history of artifacts." While Git captures **what** changed (diffs) and **when**, CVC captures **why** (prompts, context, and AI Chain-of-Thought).
+**Cognitive Version Control (CVC)** augments Git with a private-by-default record of development intent. Git captures **what** changed and **when**; CVC may retain prompts, context, tool metadata, model-visible reasoning, and responses when a capture source exposes them. CVC does **not** guarantee access to, capture of, or publication of a model's hidden chain-of-thought.
 
 The system operates as a "Shadow DAG" (Directed Acyclic Graph), creating a parallel history of reasoning that is tightly coupled with, but distinct from, the Git commit graph.
 
@@ -42,7 +42,7 @@ A Node consists of:
         
     - _Dynamic Context:_ Files read or discovered by the agent during execution (e.g., via tool use).
         
-- **The Derivation:** The AI's hidden "Chain of Thought" (CoT) and final response.
+- **The Derivation:** A model response and any reasoning content the integration actually exposes. Hidden chain-of-thought is neither assumed nor guaranteed.
     
 - **The Outcome:** A linkage to the resulting Git Commit SHA.
     
@@ -158,7 +158,7 @@ CREATE TABLE conversations (
 
 -- The primary nodes in the graph
 CREATE TABLE interactions (
-    id TEXT PRIMARY KEY, -- SHA-256 of content
+    id TEXT PRIMARY KEY, -- UUID interaction ID (not a Git content address)
     conversation_id TEXT, -- The logic container
     parent_id TEXT,      -- Pointer to previous thought (DAG structure)
     timestamp INTEGER,
@@ -170,7 +170,7 @@ CREATE TABLE interactions (
     user_prompt TEXT,    -- The chat message, ticket body, or tool output
     
     model_name TEXT,
-    model_cot TEXT,      -- Chain of Thought (Hidden reasoning)
+    model_cot TEXT,      -- optional exposed reasoning; hidden CoT is not guaranteed
     model_response TEXT, -- Final visible response
     
     FOREIGN KEY(conversation_id) REFERENCES conversations(id),
@@ -220,12 +220,19 @@ CREATE TABLE tool_executions (
 -- Mapping thoughts to code
 -- Supports Many-to-One: Multiple interaction nodes can link to a single Git commit.
 CREATE TABLE artifact_links (
-    interaction_id TEXT,
+    interaction_id TEXT, -- UUID referring to interactions.id
     git_commit_hash TEXT,
-    link_type TEXT, -- e.g., 'generated', 'verified', 'refactored'
+    link_type TEXT NOT NULL DEFAULT 'generated', -- automatic: 'generated' or low-confidence 'temporal'
+    linked_by TEXT, -- configured repository signature email; linking-identity attribution
     PRIMARY KEY (interaction_id, git_commit_hash)
 );
 ```
+
+### 7.1 Current privacy and publication schema
+
+The implemented schema adds `interactions.visibility` (`private` by default), `capture_source`, and `scrubber_version`. Conversation and interaction share records are keyed by a destination fingerprint; publication is independently tracked as `pending`, `published`, or `unknown` for that exact destination. This prevents a consent, share, or observed publication at one URL from authorizing another URL, including a changed push URL.
+
+`tombstones` are local-only or destination-scoped for remote suppression. Their immutable wire form is `cvc.tombstone/v1` and contains an interaction UUID, timestamp, small reason code, and optional prior node object ID—never prompt or path text. Tombstones take precedence over every node, link, index, derivation event, and range-source representation during import and projection. Destination authority is not transitive: a share, publication observation, authorization, or tombstone from destination A grants nothing at destination B.
 
 ## 8. Software Architecture
 
@@ -312,7 +319,7 @@ This is the heartbeat of the system.
     
     - _Trigger:_ Model finishes streaming response.
         
-    - _Payload:_ `{ "response": "I fixed it.", "chain_of_thought": "...", "model": "gpt-4" }`
+    - _Payload:_ `{ "response": "I fixed it.", "model": "gpt-4" }` plus optional reasoning only when the provider exposes it.
         
 
 ### 9.3 Artifact Linking
@@ -414,28 +421,20 @@ To ensure data integrity without disrupting the developer's flow, CVC employs an
 
 - **Logic:** Interactions are committed to the SQLite database immediately upon the completion of a turn (`$/cvc/turn/end`).
     
-- **Rationale:** We cannot rely on memory buffers. IDE crashes, window reloads, or power failures would result in the loss of the "Chain of Thought."
+- **Rationale:** We cannot rely on memory buffers. IDE crashes, window reloads, or power failures would otherwise lose the locally available interaction record.
     
 - **State:** At this stage, interactions are considered **"Floating"**. They exist, they are searchable, but they are not yet attached to a permanent Git artifact (Commit SHA).
     
 
 ### 11.2 The "Late Binding" of Artifacts
 
-The connection between the Cognitive Graph and the Git Graph is solidified only when the code is actually committed.
+The connection between the Cognitive Graph and Git Graph is considered only after a standard `git commit`, normally through the `post-commit` hook. The hook is fail-safe: a linker error is reported as a warning and never fails the Git commit.
 
-- **Trigger:** A standard `git commit` event.
-    
-    - _Mechanism:_ A `post-commit` hook or an IDE event listener.
-        
-- **The Binding Logic:**
-    
-    1. CVC queries the `interactions` table for all **Floating Nodes** (unlinked).
-        
-    2. It filters for nodes created by the **current user** within the **current repository**.
-        
-    3. It creates entries in the `artifact_links` table, associating these interaction IDs with the new Git Commit SHA.
-        
-- **Edge Case (The "Abandoned Thought"):** If a user has a conversation but never commits code (e.g., "How do I center a div?"), those nodes remain Floating forever (or until garbage collection). This is a feature, not a bug; it preserves the research history even if no artifact resulted.
+- **Policy and eligibility:** `LinkPolicy` considers floating nodes only when their timestamp is strictly after `max(first-parent commit time, now - link window)`. The first-parent time prevents a later commit from claiming earlier work; when there is no parent, the window bound is used. `cvc.linkWindow` accepts `0..=2592000` seconds (30 days), defaulting to `86400`; missing, malformed, negative, overflowing, or over-max values safely fall back to the default. `0` deliberately disables automatic linking. Nodes more than five minutes in the future are excluded; a first-parent timestamp beyond that skew fails closed and produces no automatic links.
+- **Changed paths:** The linker compares the commit tree with its first parent (or an empty tree for a root commit), considering both old and new paths so renames and deletions can overlap. A node with explicit file context qualifies only when a normalized context path overlaps a changed path.
+- **Binding:** One eligible overlapping node qualifies its conversation, and all eligible nodes in that conversation receive a `generated` link. An eligible node with no explicit context items can receive a lower-confidence `temporal` link instead. The complete automatic decision is persisted atomically, so a failure cannot half-bind a conversation. `linked_by` records the configured repository signature email as linking-identity attribution; it is not an author-based eligibility filter. Conflicting automatic link type or provenance fails rather than silently overwriting an existing record.
+- **No weak heuristics:** Automatic linking never infers provenance from author, commit message, file-set similarity, or a `CVC-Session` trailer; that trailer is not implemented.
+- **No forced association:** Stale nodes, nodes with explicit but disjoint context, and abandoned conversations remain floating. This conservatism is intentional: mislinked provenance is worse than no link.
     
 
 ### 11.3 VS Code Context persistence
@@ -460,19 +459,38 @@ To enable collaboration without requiring a dedicated database server, CVC utili
 
 ### 12.2 The Sync Mechanism
 
+The reader is compatible with sync formats **v1 through v5**. New outbound projections write format **v5**. V5 retains legacy-compatible node and link forms, preserves v4 tombstones, and adds immutable derivation evidence:
+
+```text
+nodes/<id[0..2]>/<interaction-id>.json   # immutable interaction node
+by-commit/<commit-sha>/<interaction-id>  # zero-byte lookup index
+links/<interaction-id>/<commit-sha>.json # immutable automatic-link event
+tombstones/<id[0..2]>/<interaction-id>.json # immutable suppression record
+events/<event-id[0..2]>/<event-id>.json     # immutable derivation event
+ranges/<range-id[0..2]>/<range-id>.json     # immutable RangeEvidence
+```
+
+Interaction IDs are UUIDs; they are not Git content addresses. The JSON blobs are content-addressed Git objects separately. The `links/` event stream preserves node immutability: an interaction first pushed while floating can acquire an automatic link later. V5 derivation events are likewise immutable, canonical SHA-256-addressed explanations of a relation and its source events; range evidence is separately canonical SHA-256-addressed. Local trust observations and destination-specific source authorization are deliberately not portable claims in the Git tree. Tombstones are applied before nodes and suppress all legacy and sharded representations of their target **plus its v5 derivation/range closure** for that destination. They are suppression records, not proof of physical object deletion.
+
+`RangeEvidence` is `cvc.range-evidence/v1`: SHA-1 object IDs, a repository identity, strict base/tip, ordered range members, base/result tree IDs, and a `cvc.changeset/v1` digest. The changeset hashes a bounded canonical, length-prefixed sequence of sorted raw-path deltas. Each delta contains its status and complete old/new endpoints (existence, object kind, mode, SHA-1 object ID); rename/copy detection is disabled, so configuration cannot change the delete/add representation. It covers binary, symlink, gitlink, and type changes, not patch text. This implementation is SHA-1-only because the current libgit2/object handling is SHA-1-oriented; unsupported object formats fail closed.
+
 **1. The Push Flow (Hydration):**
 
-- **Trigger:** User runs `git cvc push` (or hooked into `git push`).
+- **Trigger:** A user explicitly shares a conversation for a destination and then runs `cvc push --manual --remote <name>`, or enables destination-specific auto-push after separate acknowledgement. A bare `cvc push` is auto-consent-gated.
     
 - **Scan:** CVC identifies new, un-synced Interaction Nodes in the local SQLite DB.
     
-- **Serialize:** Each node is serialized into a deterministic JSON format.
+- **Serialize:** Each new node is serialized into an immutable JSON blob; later automatic links and derivations are serialized as separate immutable events, with referenced range evidence where applicable.
     
 - **Write:** These JSONs are written as Git Blobs (Objects) into a custom Tree.
     
 - **Update Ref:** The `refs/cvc/main` ref is updated to point to this new Tree.
     
-- **Transport:** The custom ref is pushed to the remote (`git push origin refs/cvc/main`).
+- **Transport:** The custom ref is pushed only after destination consent and the required manual TTY acknowledgement (unless that destination has acknowledged auto-push).
+
+**3. Redaction and local cleanup:** `cvc redact` confirms an authorized interaction and creates a pending, destination-scoped tombstone. The required next command is `cvc push --manual --remote <name>`, which projects that tombstone. A later `redact` may build a `RedactionPlan` only after the fetched v5 baseline contains the tombstone; `--apply-local` changes only the local current CVC ref. `cvc delete-local` is local suppression and never propagates. Projection prunes the tombstoned node, indexes, derivation events, and range-source closure, while retaining the tombstone itself.
+
+Tombstones are suppression, not physical erasure. SQLite uses `secure_delete` and attempts `wal_checkpoint(TRUNCATE)` followed by `VACUUM` after logical deletion, but those best-effort operations cannot guarantee removal from filesystem layers, SSD wear leveling, snapshots, backups, failed-operation WAL remnants, or immutable Git objects. Rotate exposed credentials first. Remote hard rewrite is unsupported pending an atomic force-with-lease design; no blind force-push procedure is supported.
     
 
 **2. The Pull Flow (Ingestion):**
@@ -481,33 +499,34 @@ To enable collaboration without requiring a dedicated database server, CVC utili
     
 - **Fetch:** CVC fetches the remote `refs/cvc/main`.
     
-- **Diff:** It detects new Blobs in the remote tree that are missing locally.
+- **Diff:** It detects new node blobs, link/derivation events, range evidence, and tombstones in the remote tree that are missing locally.
     
-- **Ingest:** It reads the JSON blobs and inserts them into the local SQLite `interactions` table.
+- **Ingest:** It inserts new node blobs into the local SQLite cache and merges link/derivation events and ranges, including events for nodes already present locally. Remote evidence remains a remote assertion/observation; importing it does not establish local trust or destination authority.
     
 - **Result:** The local "Cache" is now consistent with the distributed "Truth."
     
 
 ### 12.3 Conflict Resolution
 
-- **Architecture:** Because Interaction Nodes are **Content-Addressable** (ID = Hash) and **Immutable** (Append-Only), true merge conflicts are impossible.
+- **Architecture:** Interaction IDs are UUIDs, while immutable node and link-event blobs are Git-content-addressed. Independent entries union cleanly in the append-only tree.
     
 - **Scenario:** Alice and Bob both push new thoughts.
     
-- **Result:** The `refs/cvc/main` tree simply becomes the union of Alice's blobs and Bob's blobs. Git handles the deduplication of identical objects automatically.
+- **Result:** The `refs/cvc/main` tree can union independent blobs. If two automatic records name the same interaction and commit but disagree on link type or `linked_by`, ingestion fails rather than silently replacing provenance.
     
 
 ## 13. Future Considerations & Open Questions
 
 While the Core Architecture is defined, the following areas represent edge cases and complex features deferred for future refinement.
 
-### 13.1 Security & Secret Sanitization
+### 13.1 Implemented privacy, secret detection, and retention caveats
 
 - **The Risk:** Since interactions are synced to the remote, accidental pasting of API keys in chat could lead to permanent leaks in the Git Object DB.
     
-- **Potential Solution:** An active scrubber/filter running in the Proxy/LSP layer that masks patterns matching common keys (`sk-...`, `AWS...`) before writing to SQLite.
-    
-- **Mechanism:** Implementation of a `.thoughtignore` file for pattern matching.
+- **Implemented boundary:** Aggregate capture is sanitized before any capture transaction. Built-in bounded detectors cover several high-confidence credential forms and credential-bearing JSON keys; a repository `.thoughtignore` can add path exclusions and literal/regex masks. Detection is defense in depth, not a guarantee: novel encodings, secrets not matching a detector, and data already copied elsewhere may remain. Never put secrets in `.thoughtignore` itself.
+- **Retention:** `cvc delete-local` creates local suppression and never propagates. `cvc redact` creates a pending destination tombstone; project it next with `cvc push --manual --remote <name>`. A remote tombstone hides the target from future CVC projections for that destination, but does not erase already reachable Git objects. SQLite `secure_delete`, WAL checkpoint/truncation, and `VACUUM` are best-effort local cleanup only. Rotate exposed credentials first. Host support/removal requests are best effort; clones, forks, reflogs, caches, backups, filesystem layers, SSD wear leveling, and snapshots may preserve data.
+- **Protected rewrite:** `RedactionPlan` is a 0600 local plan built against a freshly fetched v5 baseline. `--apply-local` switches only local `refs/cvc/main`; it does not guarantee deletion. Remote hard rewrite is **not implemented** until an atomic force-with-lease transport exists. No blind force command is a supported recovery procedure.
+- **Reference:** See [Privacy.md](../Privacy.md) for the exact implemented `.thoughtignore` syntax, bounds, validation, and fail-closed behavior.
     
 
 ### 13.2 Garbage Collection (The "Floating Node" Buildup)
@@ -517,18 +536,20 @@ While the Core Architecture is defined, the following areas represent edge cases
 - **Potential Solution:** A configurable `gc.ttl` (Time To Live). If a node is unlinked and older than 30 days, `git cvc gc` prunes it.
     
 
-### 13.3 Advanced Git Rewrites (Rebase/Squash)
+### 13.3 Exact Git rewrites and squashes
 
-- **The Complexity:** When a user squashes 5 commits into 1, the `artifact_links` table points to 5 non-existent SHAs and misses the new SHA.
-    
-- **The Strategy:** The "One Big Branch" storage model makes the _thoughts_ safe. The challenge is UI. We likely need a `post-rewrite` hook to heuristically re-link the old thought-chains to the new squashed SHA, creating a "many-to-one" history visualization.
+`post-rewrite` is installed as an advisory hook. It accepts only Git's strict, newline-terminated `amend` input (exactly one old/new full-OID pair) or `rebase` stream, verifies every new commit is reachable from HEAD, then durably queues the input before replay. It derives `rewrite_exact` only from trusted locally observed source events; malformed input is quarantined and retryable work remains in the inbox. Hook failure never blocks Git.
+
+Squash recognition is intentionally exact, not heuristic. `cvc relink observe-range <BASE> <TIP>` records locally observed `RangeEvidence` only when `BASE` is a strict ancestor and the unique merge base of `TIP`; members are ordered and bounded. A one-parent candidate may receive `squash_exact` only if its parent→candidate `cvc.changeset/v1` equals the evidence's base→tip digest, exactly one locally trusted range matches, every referenced range object resolves, and source snapshots plus cursor/HEAD state pass transactional CAS checks. Missing evidence, ambiguous matching ranges, unavailable objects, or a deadline leave the target pending/floating—there is no guarantee of relinking.
+
+Scans maintain a cursor per worktree and symbolic branch. Newly discovered candidates enter a bounded pending queue; attempts are ordered by least-recently attempted, then discovery order, so retryable/deadline work is not starved. The 5-second post-commit budget and longer pull/post-merge budgets are cooperative structural limits: checks occur between operations, but one libgit2 operation may exceed the nominal deadline.
     
 
 ### 13.4 Selective Synchronization (Private Thoughts)
 
 - **The Need:** A user may want to commit the code publicly but keep the conversation private (e.g., "Explain this basic concept to me").
     
-- **Potential Solution:** A `private` flag in the `interactions` table. The "Push" mechanism filters these out, ensuring they remain local-only.
+- **Implemented:** Interactions are private by default. Sharing records an exact current conversation snapshot for one remote; `--future` separately opts future turns into sharing for that remote. Consent is a separate, destination-fingerprinted acknowledgement, and auto-push is off until separately acknowledged.
     
 
 ### 13.5 Large Context Blobs
