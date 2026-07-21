@@ -186,7 +186,10 @@ fn inbox_is_replayable_but_never_accepts_world_readable_history() -> anyhow::Res
         b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
     let path = rewrite::persist_inbox(&inbox, "amend", raw)?;
     #[cfg(unix)]
-    assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+    {
+        assert_eq!(fs::metadata(&inbox)?.permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+    }
     assert_eq!(rewrite::persist_inbox(&inbox, "amend", raw)?, path);
 
     #[cfg(unix)]
