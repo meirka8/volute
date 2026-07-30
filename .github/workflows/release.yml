@@ -171,6 +171,7 @@ jobs:
   publish-marketplace:
     name: Publish VS Code Marketplace extension
     runs-on: ubuntu-latest
+    environment: vscode-marketplace
     needs: [check-release-version, create-release]
     permissions:
       contents: read
@@ -205,9 +206,11 @@ jobs:
   publish-npm:
     name: Publish MCP npm wrapper
     runs-on: ubuntu-latest
+    environment: npm-publish
     needs: [check-release-version, create-release]
     permissions:
       contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -216,10 +219,10 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+      - name: Install npm 12.0.2 for trusted publishing
+        run: npm install --global npm@12.0.2
       - name: Publish MCP npm wrapper
         working-directory: npm/cvc-mcp
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
-          npm publish --access public --registry=https://registry.npmjs.org/
+          npm publish --access public --provenance --registry=https://registry.npmjs.org/
