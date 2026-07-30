@@ -56,7 +56,7 @@ export interface TurnEndParams {
   id: string;
   /** The model's response text */
   response?: string;
-  /** Chain of thought / reasoning (if available) */
+  /** Reasoning supplied by the integration, if exposed. */
   chainOfThought?: string;
   /** Model name/identifier */
   model?: string;
@@ -83,14 +83,14 @@ export interface TurnBatchParams {
 /**
  * A single segment of a chat interaction.
  * The first segment is typically author: "human" with the prompt.
- * Subsequent segments are author: "agent" with chain of thought + response.
+ * Subsequent segments are author: "agent" with exposed reasoning + response.
  */
 export interface InteractionSegment {
   /** Author of this segment */
   author: Author;
   /** User prompt (only on human segments) */
   userPrompt?: string;
-  /** Chain of thought / thinking block (only on agent segments) */
+  /** Reasoning block exposed by the source (only on agent segments). */
   chainOfThought?: string;
   /** Visible response text */
   response?: string;
@@ -191,7 +191,7 @@ export interface InteractionDetail {
   userPrompt: string;
   /** Model name used */
   modelName?: string;
-  /** Chain of thought / reasoning */
+  /** Reasoning supplied by the integration, if exposed. */
   chainOfThought?: string;
   /** Model's response */
   modelResponse?: string;

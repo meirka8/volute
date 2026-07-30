@@ -11,13 +11,13 @@
 
 ## 2. Epic: Setup & Authentication (The "Alcatraz" Flow)
 
-**Goal:** Establish trust immediately. The user must feel confident that their credentials and code remain local/direct.
+**Goal:** Make the selected authentication mode and its data flow understandable, including browser storage and network boundaries.
 
 ### Story 2.1: The Direct GitHub Login (Bob)
 
 > As a security-conscious reviewer, I want to authenticate directly with GitHub without routing my credentials through a CVC backend, so that I can better understand where my repository access is being used.
 
-- **Scenario:** Bob opens `reviewer.cvc.dev`. He sees a "Paste PAT" input field and a prominent "Client-Side Only" badge.
+- **Scenario:** Bob opens a local-PAT deployment. He sees a "Paste PAT" input field and a clear "Local PAT mode" disclosure rather than an absolute client-side privacy claim.
     
 - **Action:** He disconnects his WiFi and pastes a fake token. The UI attempts a `fetch` and fails locally. He reconnects and pastes his real PAT.
     
@@ -52,13 +52,13 @@
 
 ### Story 3.2: The "Reverse Blame" Discovery (Charlie)
 
-> As a junior engineer reading code, I want to click on a specific line and see the conversation that created it, so I can learn the reasoning behind specific logic.
+> As a junior engineer reading code, I want to click on a specific line and see interactions linked to its commit, so I can review any available context associated with that logic.
 
 - **Scenario:** Charlie is reviewing a PR and sees a weird `if (!user) return;` guard clause that seems redundant.
     
 - **Action:** He clicks the line number in the diff.
     
-- **Reaction:** The Right Pane auto-scrolls and highlights the exact interaction where the Agent said: _"We need this guard clause because the `auth` middleware might run after this hook in edge case X."_
+- **Reaction:** The Right Pane auto-scrolls to an interaction linked to the associated commit. This link is commit-level provenance, not proof that one interaction generated that exact line. If the stored response includes _"We need this guard clause because the `auth` middleware might run after this hook in edge case X,"_ Charlie can use that statement as review context.
     
 - **Success:** Charlie learns about the race condition without pinging the senior dev.
     

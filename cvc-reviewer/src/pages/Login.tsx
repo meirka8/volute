@@ -108,7 +108,7 @@ export default function Login() {
                         <div className="mt-4 border-t border-line/80 pt-4 text-center text-xs text-muted">
                             <p className="flex items-center justify-center gap-2">
                                 <ShieldCheck className="w-3 h-3" />
-                                In local mode, your token stays in this browser session and is used for direct GitHub API requests from the client.
+                                In local mode, your token is retained in browser session storage and sent in direct requests to api.github.com. Browser storage is not a secret vault.
                             </p>
                         </div>
                     </form>

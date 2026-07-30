@@ -6,7 +6,7 @@ The **Volute CVC VS Code Extension** is the primary "Head" of the system for dev
 
 1. **Input (The Passive Observer):** After local capture acknowledgement, reads only the exact current workspace's GitHub Copilot Chat session storage files. It can capture prompts, responses, optional exposed reasoning, tool metadata, and context patches available in that workflow without changing the user's normal Copilot flow.
 
-2. **Visualization (The Cognitive Timeline):** Provides a real-time Side Panel view of the "Shadow Graph," showing both **Pending Thoughts** (uncommitted reasoning) and **Historical Context** (thoughts linked to previous commits).
+2. **Visualization (The Cognitive Timeline):** Provides a real-time Side Panel view of the "Shadow Graph," showing both **Pending Thoughts** (uncommitted captured interactions) and **Historical Context** (interactions linked to previous commits).
 
 
 ## 2. Architecture & Communication
@@ -57,22 +57,22 @@ To support the UI features, we extend the standard LSP with custom methods:
     
     4. **Parsing:** When a chat session file is modified, it reads the content.
     
-    5. **Processing:** The raw JSON content (or file path) is processed by `cvc-core` (via `cvc-lsp`) to reconstruct the full fidelity of the conversation, including:
+    5. **Processing:** The raw JSON content (or file path) is processed by `cvc-core` (via `cvc-lsp`) to extract supported fields that are present in the locally stored session data, including:
         - User prompts and context variables
-        - Full model responses (including multiple parts)
+        - Model response parts present in the session data
         - Tool invocations (MCP, local tools) and their outputs
         - Code edits (TextEditGroups)
-        - Thinking or reasoning blocks only when present in the locally stored session data (not guaranteed hidden chain-of-thought)
+        - Exposed reasoning blocks only when present in the locally stored session data (hidden model reasoning is not captured)
 
 - **Data Extracted:**
 
-    The parser ensures complete reconstruction of the session, handling the complex `requests[].response` list which contains mixed content types (text, tool calls, edits).
+    The parser handles supported fields in the `requests[].response` list, which can contain mixed content types (text, tool calls, edits). It does not claim a complete or verbatim reconstruction of model activity outside those stored fields.
 
     - `requests[].message.text` - User prompt
     - `requests[].variableData.variables` - Context
     - `requests[].response[]` - Complex list of response parts:
         - `value` (Text content)
-        - `kind: "thinking"` (reasoning only when the session exposes it; not guaranteed hidden chain-of-thought)
+        - `kind: "thinking"` (reasoning only when the session exposes it; hidden model reasoning is not captured)
         - `kind: "toolInvocationSerialized"` (Tool usage)
         - `kind: "textEditGroup"` (Code application)
     - `inputState.selectedModel` - Model identifier
@@ -130,7 +130,7 @@ A dedicated Tree View in the Side Bar (or Explorer Container).
 
         - _Content:_ Thoughts recorded since the last commit. These are currently "Unbound."
 
-        - _Context:_ "Will be linked to next commit."
+        - _Context:_ "May be eligible for the next commit under the configured linking policy."
 
     - **History (Bound)**
 

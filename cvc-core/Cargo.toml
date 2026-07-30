@@ -1,7 +1,10 @@
 [package]
 name = "cvc-core"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
+description = "Core library for Cognitive Version Control"
+license = "Apache-2.0"
+repository = "https://github.com/meirka8/volute"
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled", "time"] }

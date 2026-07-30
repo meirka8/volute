@@ -1,0 +1,225 @@
+name: Release OSS components
+
+on:
+  push:
+    tags: ["v*"]
+
+# Pins resolved from the official action repositories with git ls-remote:
+# actions/checkout@v4: 11d5960a326750d5838078e36cf38b85af677262
+# actions/setup-node@v4: 49933ea5288caeca8642d1e84afbd3f7d6820020
+# actions/upload-artifact@v4: ea165f8d65b6e75b540449e92b4886f43607fa02
+# actions/download-artifact@v4: d3f86a106a0bac45b974a628896c90dbdf5c8093
+# dtolnay/rust-toolchain@stable: 4cda84d5c5c54efe2404f9d843567869ab1699d4
+# Swatinem/rust-cache@v2: 42dc69e1aa15d09112580998cf2ef0119e2e91ae
+# softprops/action-gh-release@v2: 3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-release-version:
+    name: Verify release tag and package versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Require an exact matching release version
+        run: node .github/scripts/check-release-version.mjs "$GITHUB_REF_NAME"
+
+  build-binaries:
+    name: Build ${{ matrix.build }}
+    runs-on: ${{ matrix.os }}
+    needs: check-release-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            vsce_target: linux-x64
+          - build: macos-x64
+            # Supported GitHub-hosted Intel runner; artifact target remains x64.
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            vsce_target: darwin-x64
+          - build: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            vsce_target: darwin-arm64
+          - build: windows-x64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            vsce_target: win32-x64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} -p cvc-cli -p cvc-mcp -p cvc-lsp
+      - name: Package Unix binaries
+        if: runner.os != 'Windows'
+        run: tar -czf cvc-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release cvc cvc-mcp cvc-lsp -C "$GITHUB_WORKSPACE" LICENSE
+      - name: Package Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/cvc.exe,target/${{ matrix.target }}/release/cvc-mcp.exe,target/${{ matrix.target }}/release/cvc-lsp.exe,LICENSE -DestinationPath cvc-${{ matrix.target }}.zip
+      - name: Upload binary archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binaries-${{ matrix.build }}
+          path: cvc-${{ matrix.target }}.*
+          if-no-files-found: error
+      - name: Upload LSP binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cvc-lsp-${{ matrix.vsce_target }}
+          path: target/${{ matrix.target }}/release/cvc-lsp${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
+
+  build-extension:
+    name: Package extension ${{ matrix.vsce_target }}
+    runs-on: ubuntu-latest
+    needs: build-binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vsce_target: linux-x64
+            lsp_binary: cvc-lsp
+          - vsce_target: darwin-x64
+            lsp_binary: cvc-lsp
+          - vsce_target: darwin-arm64
+            lsp_binary: cvc-lsp
+          - vsce_target: win32-x64
+            lsp_binary: cvc-lsp.exe
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cvc-plugin/package-lock.json
+      - name: Install extension dependencies
+        working-directory: cvc-plugin
+        run: npm ci
+      - name: Stamp extension version from tag
+        working-directory: cvc-plugin
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+      - name: Retrieve LSP built for this target
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cvc-lsp-${{ matrix.vsce_target }}
+          path: cvc-plugin/bin/${{ matrix.vsce_target }}
+      - name: Mark Unix LSP executable
+        if: matrix.lsp_binary == 'cvc-lsp'
+        run: chmod +x cvc-plugin/bin/${{ matrix.vsce_target }}/cvc-lsp
+      - name: Package VSIX with fixed VSCE
+        working-directory: cvc-plugin
+        run: npm exec --no -- vsce package --target ${{ matrix.vsce_target }} --no-git-tag-version
+      - name: Upload VSIX
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vsix-${{ matrix.vsce_target }}
+          path: cvc-plugin/*.vsix
+          if-no-files-found: error
+
+  create-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs: [check-release-version, build-binaries, build-extension]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Download binary archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: binaries-*
+          path: release-assets
+          merge-multiple: true
+      - name: Download VSIX archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: vsix-*
+          path: release-assets
+          merge-multiple: true
+      - name: Add standalone license asset
+        run: cp LICENSE release-assets/LICENSE
+      - name: Generate SHA-256 manifest
+        working-directory: release-assets
+        run: sha256sum -- * > SHA256SUMS.txt
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+
+  publish-marketplace:
+    name: Publish VS Code Marketplace extension
+    runs-on: ubuntu-latest
+    needs: [check-release-version, create-release]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Download VSIX archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: vsix-*
+          path: release-assets
+          merge-multiple: true
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: cvc-plugin/package-lock.json
+      - name: Install lockfile-backed VSCE for Marketplace publishing
+        working-directory: cvc-plugin
+        run: npm ci
+      - name: Publish VSIX files to VS Code Marketplace
+        working-directory: cvc-plugin
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          for vsix in ../release-assets/*.vsix; do
+            npm exec --no -- vsce publish --packagePath "$vsix"
+          done
+
+  publish-npm:
+    name: Publish MCP npm wrapper
+    runs-on: ubuntu-latest
+    needs: [check-release-version, create-release]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Publish MCP npm wrapper
+        working-directory: npm/cvc-mcp
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+          npm publish --access public --registry=https://registry.npmjs.org/

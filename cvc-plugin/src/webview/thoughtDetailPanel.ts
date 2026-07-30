@@ -681,7 +681,7 @@ export class ThoughtDetailPanel {
             ? `
         <div class="section">
             <div class="section-title collapsible" onclick="toggleCollapse(this)">
-                <span>&#129504;</span> Chain of Thought
+                <span>&#129504;</span> Exposed Reasoning
             </div>
             <div class="section-content cot collapsible-content">
                 ${thoughtHtml}

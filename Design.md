@@ -2,15 +2,15 @@
 
 ## 1. Executive Summary
 
-**Cognitive Version Control (CVC)** augments Git with a private-by-default record of development intent. Git captures **what** changed and **when**; CVC may retain prompts, context, tool metadata, model-visible reasoning, and responses when a capture source exposes them. CVC does **not** guarantee access to, capture of, or publication of a model's hidden chain-of-thought.
+**Cognitive Version Control (CVC)** augments Git with a private-by-default record of development intent. Git captures **what** changed and **when**; CVC may retain prompts, responses, tool metadata, and integration-exposed or explicitly supplied reasoning/context. CVC does **not** access or claim to record a model's hidden internal reasoning.
 
-The system operates as a "Shadow DAG" (Directed Acyclic Graph), creating a parallel history of reasoning that is tightly coupled with, but distinct from, the Git commit graph.
+The system operates as a "Shadow DAG" (Directed Acyclic Graph), creating a parallel history of captured interaction data that is tightly coupled with, but distinct from, the Git commit graph.
 
 ## 2. Core Philosophy
 
 - **The Artifact vs. The Process:** Code is the artifact; Intelligence is the process. We treat the _process_ as a first-class citizen in version control.
     
-- **The Missing Layer:** Modern development is a dialogue between human intent and AI generation. Losing this dialogue is akin to losing the mathematical proof while keeping only the theorem.
+- **The Missing Layer:** Modern development is a dialogue between human intent and AI generation. Retaining the interaction data an integration exposes or a participant supplies can preserve useful decision context alongside the resulting code.
     
 - **Native Integration:** The system must feel like a natural extension of Git, utilizing similar CLI patterns and storage locations.
     
@@ -21,7 +21,7 @@ The system maintains two intertwined graphs:
 
 1. **The Git Graph:** The standard history of file snapshots (Blobs/Trees/Commits).
     
-2. **The Cognitive Graph:** A history of interaction nodes (Prompts/Reasoning/Context).
+2. **The Cognitive Graph:** A history of interaction nodes (prompts, responses, and available reasoning/context fields).
     
 
 ### 3.1 The Unit of Change: The "Interaction Node"
@@ -36,13 +36,13 @@ A Node consists of:
         
     - _System/Agent:_ Ticket description, Tool output, or Compiler error.
         
-- **System State (The Context):** The precise scope of the codebase exposed to the AI.
+- **System State (The Context):** Context associated with the interaction and made available by the integration. It is not necessarily a complete inventory of everything the model received or used.
     
     - _Explicit Context:_ Files or code regions manually attached by the user.
         
     - _Dynamic Context:_ Files read or discovered by the agent during execution (e.g., via tool use).
         
-- **The Derivation:** A model response and any reasoning content the integration actually exposes. Hidden chain-of-thought is neither assumed nor guaranteed.
+- **The Derivation:** A model response and any reasoning content the integration exposes or a participant explicitly supplies. Hidden internal reasoning is not available to CVC.
     
 - **The Outcome:** A linkage to the resulting Git Commit SHA.
     
@@ -94,7 +94,7 @@ To balance performance with query capability, we utilize a hybrid approach:
 
 **Scenario:** An autonomous agent picks up a GitHub Issue ("Fix Memory Leak"). The agent spends 30 minutes reading files, running profilers, and attempting fixes.
 
-- **With CVC:** The entire agent loop is recorded as a **Conversation**.
+- **With CVC:** Steps that the agent or integration explicitly supplies or exposes can be recorded as a **Conversation**.
     
     - _Node 1:_ Author: `IssueTracker`, Prompt: "Fix issue #42..."
         
@@ -102,14 +102,14 @@ To balance performance with query capability, we utilize a hybrid approach:
         
     - _Node 3:_ Author: `Compiler`, Prompt: `Error: borrow checker failed`
         
-- **Value:** The human developer can review the _agent's debugging strategy_, not just the final code, ensuring the agent didn't just suppress the error without fixing the root cause.
+- **Value:** The human developer can review the available submitted or exposed debugging context, not just the final code. This record can support review, but it is not a complete account of the agent's internal process.
     
 
 ### Story D: The Insightful Review (PR Workflow)
 
 **Scenario:** A reviewer looks at a PR that refactors a critical authentication module. The code looks correct but complex. The reviewer wonders, "Did they consider the race condition in the token refresh?"
 
-- **With CVC:** The reviewer opens the **CVC Reviewer Webapp** (Graphite-style UI). Alongside the code diff, they see the "Cognitive Timeline." They expand the "Thinking" node linked to the auth commit and see the AI explicitly discussing the race condition and the user verifying the fix with a specific test case.
+- **With CVC:** The reviewer opens the **CVC Reviewer Webapp** (Graphite-style UI). Alongside the code diff, they see the "Cognitive Timeline." If a stored response or supplied reasoning field linked to the auth commit discusses the race condition and test case, the reviewer can inspect that available context.
     
 - **Value:** Faster reviews, fewer "Why did you do this?" round-trips, and higher confidence in the merged code.
     
@@ -129,7 +129,7 @@ The interface is designed as a custom git command (`git-cvc`), allowing it to be
 
 - `git cvc log`: Displays the conversation history (DAG) in a pager.
     
-- `git cvc show <node-id>`: Displays the full details of a specific interaction (Prompt + CoT + Diff).
+- `git cvc show <node-id>`: Displays the stored fields of a specific interaction (prompt + integration-exposed or explicitly supplied reasoning + diff, when present).
     
 - `git cvc commit -m "Intent"`: Manually records a cognitive snapshot (though this should ideally be automated via IDE hooks).
     
@@ -170,7 +170,7 @@ CREATE TABLE interactions (
     user_prompt TEXT,    -- The chat message, ticket body, or tool output
     
     model_name TEXT,
-    model_cot TEXT,      -- optional exposed reasoning; hidden CoT is not guaranteed
+    model_cot TEXT,      -- optional integration-exposed or explicitly supplied reasoning
     model_response TEXT, -- Final visible response
     
     FOREIGN KEY(conversation_id) REFERENCES conversations(id),
@@ -351,7 +351,7 @@ To overcome the "Walled Garden" limitations of proprietary AI tools (like GitHub
         
     - **Streaming:** The response is streamed back to the UI and simultaneously logged via `$/cvc/turn/end`.
         
-- **Benefit:** Zero API key friction (reuses Copilot subscription), native UI feel, and guaranteed visibility of the conversation.
+- **Benefit:** Zero additional API-key friction when the existing Copilot subscription is usable, a native UI feel, and visibility into the fields returned through this integration.
     
 
 ### 10.2 The "Trojan Proxy" (Secondary Strategy - Cursor/Zed)
@@ -381,11 +381,11 @@ To overcome the "Walled Garden" limitations of proprietary AI tools (like GitHub
         
     - **Setup:** The Agent is configured with the `cvc-mcp` server.
         
-    - **Prompting:** The System Prompt instructs the Agent: _"After every reasoning step, you MUST call the `commit_thought` tool."_
+    - **Prompting:** The System Prompt asks the Agent to call `commit_thought` after a task step with a concise reasoning/context summary it can explicitly provide.
         
     - **Action:** The Agent calls `commit_thought(reasoning="...", context_summary="...")`.
         
-- **Benefit:** Native integration for autonomous agents (Claude Code, Devin-like loops) that creates structured, high-fidelity logs of the internal reasoning process. Also serves as the primary integration point for modern CLIs (Claude CLI, Copilot CLI).
+- **Benefit:** Native integration for autonomous agents that records structured, integration-exposed or explicitly supplied reasoning/context. It does not obtain hidden internal reasoning. The MCP server also serves as an integration point for compatible CLIs.
     
 
 ### 10.4 The "Process Shim" (Legacy/Closed Box Fallback)
@@ -410,7 +410,7 @@ To overcome the "Walled Garden" limitations of proprietary AI tools (like GitHub
 |**Strategy**|**Ideal Use Case**|**Data Fidelity**|**Setup Friction**|**Notes**|
 |**Native Delegate**|**VS Code / Copilot Sidebar**|High (Structured)|Medium (Plugin)|Uses `vscode.lm` API. Best for standard chat workflow.|
 |**Trojan Proxy**|**Cursor (Composer), Windsurf**|Medium (Parsed)|Low (Config URL)|Essential because Cursor's native AI does not use the extension API.|
-|**MCP Logger**|**Agents (Claude, Devin, CLI)**|**Very High** (Semantic)|Low (Standard)|The future standard. Relies on model obedience.|
+|**MCP Logger**|**Agents (Claude, Devin, CLI)**|Structured (agent-supplied)|Low (Standard)|Records only fields the client or agent supplies.|
 |**Process Shim**|**Legacy / Closed Binaries**|Low (Raw I/O)|Low (Wrapper)|Fallback only.|
 
 ## 11. Workflow & Lifecycle Scenarios
@@ -579,9 +579,9 @@ A visualization layer that sits alongside GitHub/GitLab. It can be a local web v
     
     - It filters the "Bag of Thoughts" for interactions linked to commits within the PR range.
         
-    - It reconstructs the timeline: Code Change -> Prompt -> Reasoning -> Code Change.
+    - It reconstructs a timeline from linked code changes and stored interaction fields, including exposed or explicitly supplied reasoning when present.
         
-- **Value:** Reviewers see the thought process without needing to clone the repo or run special CLI commands.
+- **Value:** Reviewers see the available captured interaction context without needing to clone the repo or run special CLI commands. This is not a view into hidden model reasoning.
     
 
 ### 14.2 The "CVC Bot" (Automated Summarization)

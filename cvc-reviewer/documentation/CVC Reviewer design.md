@@ -2,11 +2,11 @@
 
 ## 1. Executive Summary
 
-The **CVC Reviewer** is a visualization layer for Pull Requests that overlays available CVC interaction data (prompts, context, optional exposed reasoning, and responses) atop standard code diffs. It does not guarantee that a provider's hidden chain-of-thought exists in CVC data.
+The **CVC Reviewer** is a visualization layer for Pull Requests that overlays available CVC interaction data (prompts, context, optional exposed reasoning, and responses) atop standard code diffs. It renders only reasoning that a source supplied and exposed; hidden model reasoning is not available.
 
 **Primary Mandates:**
 
-1. **Alcatraz Security:** Direct-connection architecture. The application must operate without an intermediary backend storing source code or tokens. It communicates directly from the Client (Browser) to the Git Host (GitHub/GitLab).
+1. **Local PAT Security:** In local PAT mode, repository API requests go from the browser directly to GitHub and no CVC-hosted API is required. Hosted mode has a different token flow and must not be described with local-mode guarantees.
     
 2. **Linear-Grade UX:** A "Tool-First" design philosophy focusing on keyboard centricity, sub-100ms latency perception, and information density without clutter.
     
@@ -17,7 +17,7 @@ We reject the "Enterprise Dashboard" aesthetic (Jira, ServiceNow) in favor of **
 
 ### 2.1 Core UX Principles
 
-- **The 100ms Rule:** Every interaction (switching files, expanding thoughts) must resolve in under 100ms. If network data is missing, show Optimistic UI (skeleton loaders are a last resort; stale-while-revalidate is preferred).
+- **The 100ms Target:** Local UI interactions should target a sub-100ms perceived response where practical. Network-backed operations can take longer and must show honest loading or stale-data state.
     
 - **Keyboard is King:** The mouse is a fallback.
     
@@ -31,7 +31,7 @@ We reject the "Enterprise Dashboard" aesthetic (Jira, ServiceNow) in favor of **
     
     - _Scan Mode:_ By default, the timeline shows only "Intent" (User Prompts).
         
-    - _Focus Mode:_ Hovering or selecting a node reveals "Reasoning" (CoT) and "Context" details.
+    - _Focus Mode:_ Hovering or selecting a node reveals available integration-exposed or explicitly supplied reasoning and context details.
         
 - **High-Contrast Typography:** Use a rigorous type scale. Code is `Monospace`; UI is `Inter`/`San Francisco`. Interactive elements are distinct from read-only text not by color alone, but by position and weight.
     
@@ -45,63 +45,45 @@ We reject the "Enterprise Dashboard" aesthetic (Jira, ServiceNow) in favor of **
 3. **No "Save" Buttons:** All state is persisted immediately to local storage or the URL.
     
 
-## 3. Security Architecture: The "Alcatraz" Protocol
+## 3. Security Architecture: Local PAT Mode
 
-To serve clients with sensitive IP, we adopt a **Client-Side Only (Zero-Backend)** architecture. The web application acts purely as a static harness that runs code in the user's browser.
+The default self-contained mode runs the reviewer in the browser without requiring a CVC-hosted API. This is a deployment boundary, not an absolute privacy guarantee: the app makes network requests to GitHub, stores the PAT in browser session storage, and runs within the user's browser, extensions, developer tools, and hosting environment. Optional hosted mode must be evaluated separately.
 
 ### 3.1 Data Flow
 
-- **Traditional SaaS:** `User -> SaaS Server (Stores Token) -> GitHub`. **(REJECTED)**
-    
-- **CVC Alcatraz:** `User Browser (Stores Token in Memory) -> GitHub API`.
-    
-    - **No Intermediary:** Our servers never see the code, the tokens, or the PRs.
-        
-    - **Static Hosting:** The app is just HTML/JS/CSS hosted on a CDN (Vercel/Netlify/Cloudflare Pages).
-        
-    - **Direct API Calls:** All data fetching happens via `fetch()` calls from the user's IP address directly to `api.github.com`.
+- **Local PAT mode:** `User Browser (PAT in session storage) -> api.github.com` for repository requests.
+
+- **Static assets:** HTML, JavaScript, CSS, fonts, and images can be served by origins allowed by the deployment's Content Security Policy.
+
+- **Hosted mode:** A deployment that explicitly enables hosted mode has additional service and credential boundaries; local-PAT statements do not apply to it.
         
 
 ### 3.2 Authentication Strategy
 
-- **Option A: Personal Access Tokens (PAT):**
+- **Current local option: Personal Access Tokens (PAT):**
     
     - _Mechanism:_ User generates a granular PAT (read-only) and pastes it.
         
-    - _Pros:_ Zero infrastructure, maximum trust.
+    - _Trade-off:_ No CVC-hosted API is required, but security still depends on GitHub, the hosting origin, dependencies, the browser profile, extensions, and the user's device.
         
     - _Cons:_ High friction.
         
-- **Option B: The Stateless Gatekeeper (OAuth):**
-    
-    - _Mechanism:_ A single Edge Function (Cloudflare Worker/Vercel) exists _solely_ to exchange the OAuth `code` for an `access_token` using the hidden `client_secret`.
-        
-    - _Security:_ The function is **ephemeral and memory-less**. It receives the code, swaps it, returns the token to the browser, and dies. It creates no logs and writes to no database.
-        
-    - _Pros:_ Low friction (One-click login).
-        
-    - _Cons:_ Requires maintaining one micro-service.
-        
-- **Option C: Local Proxy Mode (Enterprise Gold Standard):**
-    
-    - _Mechanism:_ User runs `cvc ui` in terminal -> spawns `localhost:3000`.
-        
-    - _Pros:_ Bypasses all browser auth; uses local machine's SSH keys/credentials.
+- **Other modes:** Hosted or local-proxy designs have separate threat models and should be documented only against their implemented deployment behavior. They do not inherit local PAT mode's direct-request boundary.
         
 
 ### 3.3 Content Security Policy (CSP)
 
-We enforce a strict CSP header that prevents the browser from sending data anywhere except GitHub.
+The current document CSP restricts resource and connection origins, including GitHub API access and mode-specific self/local/configured endpoints. CSP is defense in depth against some injection and exfiltration paths; it is not proof that a browser, extension, dependency, allowed origin, or compromised hosting environment cannot expose data.
 
 ```
 default-src 'self';
-connect-src 'self' [https://api.github.com](https://api.github.com) http://localhost:3000 [https://auth.cvc.dev](https://auth.cvc.dev);
+connect-src 'self' https://api.github.com http://localhost:3000 <configured-platform-origin>;
 script-src 'self';
 style-src 'self' 'unsafe-inline';
 
 ```
 
-_(Note: `https://auth.cvc.dev` added only for the Token Exchange endpoint)_
+The concrete configured platform origin depends on the deployment mode.
 
 ## 4. Technical Stack
 
@@ -132,7 +114,7 @@ A three-pane layout optimized for wide screens.
 |**Width:** 250px (Collapsible)|**Width:** Flex (Code)|**Width:** 400px (Resizeable)|
 |List of Files in PR|The Code Diff|The "Shadow Timeline"|
 |Tree View|Syntax Highlighted|Interaction Nodes|
-|Status Icons (Reviewed/New)|Line-number linking|CoT & Prompts|
+|Status Icons (Reviewed/New)|Line-number linking|Prompts and available supplied/exposed reasoning|
 
 ### 5.2 The "Shadow Timeline" (Right Pane)
 
@@ -144,11 +126,11 @@ This is the heart of CVC Reviewer. It visualizes the `refs/cvc/main` data linked
         
     - _Model Node:_ Icon + Response Summary.
         
-    - _Optional Data:_ Reasoning is shown only when the source exposed and stored it; hidden chain-of-thought is not assumed.
+    - _Optional Data:_ Reasoning is shown only when the source supplied, exposed, and stored it; hidden model reasoning is not assumed.
         
 - **Reverse Blame (The "Why" Click):**
     
-    - When a user clicks a line of code in the Middle Pane (Diff), the Right Pane auto-scrolls to the specific _Interaction Node_ that generated that line.
+    - When a user clicks a line of code in the Middle Pane (Diff), the Right Pane can auto-scroll to interactions linked to the associated commit. Commit-level linkage does not prove that a specific interaction generated that exact line.
         
     - _Visual Cue:_ A connecting bezier curve line (using SVG overlay) momentarily draws between the code line and the thought node.
         
@@ -185,9 +167,10 @@ data is an error, not permission to display a possibly suppressed interaction.
 
 This is UI/cache suppression only. A tombstone is not physical Git-object deletion, and
 cache eviction cannot clear GitHub responses, browser session storage, developer tools,
-downloads, clones, forks, reflogs, caches, or backups. The current PAT is held in the
-browser session, including session storage; the application has no server-side token
-store, but users remain responsible for their browser environment.
+downloads, clones, forks, reflogs, caches, or backups. In local PAT mode, the PAT is held
+in the browser session, including session storage, and no CVC-hosted token store is
+required. Hosted deployments have a different boundary. Users remain responsible for
+their browser environment.
 
 Immutable cognitive query results may remain in the reviewer's IndexedDB query cache for
 up to 30 days. Tombstone observation removes affected entries from both in-memory and

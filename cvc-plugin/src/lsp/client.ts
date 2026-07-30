@@ -81,7 +81,9 @@ export class VoluteLanguageClient {
       // Volute doesn't target specific file types - it's a general purpose cognitive tracker
       // We use a broad document selector but the server will handle filtering
       documentSelector: [{ scheme: "file" }],
-      outputChannel: this.outputChannel,
+      // vscode-languageclient v10 requires a LogOutputChannel here. Keep the
+      // extension's regular OutputChannel for application messages and let the
+      // client own its dedicated protocol log channel instead.
       initializationOptions: {
         workspaceFolders:
           vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [],

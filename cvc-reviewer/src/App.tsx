@@ -83,10 +83,10 @@ function Dashboard() {
             <p className="text-sm text-muted">Examples:</p>
             <div className="space-y-2">
               <a
-                href="/pr/meirka8/cvc/1"
+                href="/pr/meirka8/volute/1"
                 className="rr-code block rounded-[1.25rem] px-4 py-3 text-sm transition-colors hover:bg-surface"
               >
-                /pr/meirka8/cvc/1
+                /pr/meirka8/volute/1
               </a>
               <a
                 href="/pr/facebook/react/1"

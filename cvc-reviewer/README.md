@@ -2,6 +2,15 @@
 
 The web-based review interface for Cognitive Version Control.
 
+## Operating modes
+
+The default, self-contained mode uses a GitHub Personal Access Token (PAT) in
+the browser and calls GitHub directly. It has no required CVC-hosted API or
+service dependency, so it can be built and run locally with the commands
+below. Hosted reviewer integration is optional and is enabled only when a
+deployment explicitly sets `VITE_HOSTED_MODE=true` and provides
+`VITE_PLATFORM_API_URL`.
+
 ## Setup
 
 ### Prerequisites
@@ -30,6 +39,8 @@ npm install
 # Run dev server
 npm run dev
 ```
+
+For the local PAT mode, do not set the hosted-mode environment variables.
 
 ### Build
 

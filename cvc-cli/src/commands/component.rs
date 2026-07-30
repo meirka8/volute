@@ -20,7 +20,7 @@ struct Release {
 pub async fn list() -> Result<()> {
     println!("Fetching available components...");
     // Mocking the logic for now since we don't have a real release history yet.
-    // In production, this would hit: https://api.github.com/repos/meirka8/cvc/releases/latest
+    // In production, this would hit: https://api.github.com/repos/meirka8/volute/releases/latest
     println!("Available components (from latest release):");
     println!(" - cvc-mcp (Agent Protocol Server)");
     println!(" - cvc-lsp (Language Server)");
@@ -43,7 +43,7 @@ pub async fn install(name: &str) -> Result<()> {
     println!("Looking for asset: {}", asset_name);
     // Placeholder URL - in real logic we'd fetch the release JSON and find the asset url
     let download_url = format!(
-        "https://github.com/meirka8/cvc/releases/latest/download/{}",
+        "https://github.com/meirka8/volute/releases/latest/download/{}",
         asset_name
     );
 

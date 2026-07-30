@@ -2,17 +2,20 @@
   "name": "cvc",
   "displayName": "Volute CVC",
   "description": "Track AI-assisted coding context alongside code changes. For the VS Code workflow, the extension reads GitHub Copilot chat session files stored locally by VS Code.",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "publisher": "volute",
-  "license": "Proprietary",
+  "license": "Apache-2.0",
   "icon": "resources/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/meirka8/cvc"
+    "url": "git+https://github.com/meirka8/volute.git"
   },
-  "homepage": "https://cvc.dev",
+  "homepage": "https://github.com/meirka8/volute#readme",
+  "bugs": {
+    "url": "https://github.com/meirka8/volute/issues"
+  },
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.91.0"
   },
   "categories": [
     "AI",
@@ -40,7 +43,7 @@
         "volute.lspPath": {
           "type": "string",
           "default": "",
-          "description": "Custom path to the volute-lsp binary. Leave empty to use the bundled or auto-downloaded binary."
+          "description": "Custom path to the cvc-lsp binary. Leave empty to auto-detect from ~/.cvc/bin or PATH."
         },
         "volute.cvcCliPath": {
           "type": "string",
@@ -164,7 +167,7 @@
           {
             "id": "volute.welcome.intro",
             "title": "Welcome to Volute CVC",
-            "description": "Volute CVC keeps the reasoning behind your AI-assisted changes next to the code. In VS Code, passive reading of locally stored GitHub Copilot chat sessions starts only after capture acknowledgement. Captured data is private by default; remote sharing requires separate consent.\n\n[Learn More](https://cvc.dev)",
+            "description": "Volute CVC keeps the reasoning behind your AI-assisted changes next to the code. In VS Code, passive reading of locally stored GitHub Copilot chat sessions starts only after capture acknowledgement. Captured data is private by default; remote sharing requires separate consent.\n\n[Learn More](https://github.com/meirka8/volute#readme)",
             "media": {
               "markdown": "# Git, Augmented\n\nUse GitHub Copilot in VS Code the way you normally do. Volute CVC reads GitHub Copilot chat session files stored locally by VS Code for this workflow, then shows the captured context in the timeline panel."
             }
@@ -188,9 +191,9 @@
           {
             "id": "volute.welcome.commit",
             "title": "Commit, Push, and Review",
-            "description": "When you run `git commit`, pending thoughts attach to that commit. After you push and open a PR, the same history appears in hosted review as the shadow timeline.",
+            "description": "When you run `git commit`, pending thoughts attach to that commit. After you push and open a PR, you can optionally inspect the same history in CVC Reviewer using a local GitHub PAT.",
             "media": {
-              "markdown": "## From Local Thoughts to Hosted Review\n\nThe flow is simple: chat in Copilot, see thoughts in the panel, commit to attach them, then push and open a PR to review the same history beside the diff."
+              "markdown": "## Optional PR Review\n\nThe local extension workflow is complete on its own. If you choose to use CVC Reviewer, it can read the same history beside a PR diff with a GitHub PAT; hosted integrations are optional."
             }
           }
         ]
@@ -210,10 +213,7 @@
   },
   "overrides": {
     "vscode-languageclient": {
-      "minimatch": {
-        ".": "5.1.8",
-        "brace-expansion": "2.1.2"
-      }
+      "minimatch": "10.2.6"
     }
   },
   "devDependencies": {
@@ -225,6 +225,7 @@
     "@typescript-eslint/parser": "^7.0.0",
     "@vscode/test-cli": "^0.0.10",
     "@vscode/test-electron": "^2.4.0",
+    "@vscode/vsce": "3.9.2",
     "esbuild": "^0.21.0",
     "eslint": "^8.57.0",
     "npm-run-all": "^4.1.5",
@@ -233,6 +234,6 @@
   "dependencies": {
     "@vscode/webview-ui-toolkit": "^1.4.0",
     "marked": "^12.0.0",
-    "vscode-languageclient": "^9.0.1"
+    "vscode-languageclient": "^10.1.0"
   }
 }

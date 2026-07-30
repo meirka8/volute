@@ -1,13 +1,35 @@
 services:
   desktop:
-    build: .
+    build:
+      # The repository root is the build context so the extension source is
+      # always present; there is intentionally no uat/extension mount.
+      context: ..
+      dockerfile: uat/Dockerfile
     ports:
       - "127.0.0.1:6080:6080"       # noVNC web UI
-      - "127.0.0.1:5901:5901"       # VNC direct (Remmina)
-    volumes:
-      - ./extension:/workspace/extension:ro   # your ext source, read-only
+    # VNC is only reachable inside the Docker network; noVNC is loopback-only.
     # Notably: NO volume for ~/.vscode or VS Code user data
     # So every restart = clean slate
     tmpfs:
-      - /tmp              # ephemeral temp including vscode-user/ext dirs above
+      - /tmp:uid=1000,gid=1000,mode=1777
+      - /home/dev:uid=1000,gid=1000,mode=0700
     shm_size: '256mb'     # VS Code needs this
+    read_only: true
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    secrets:
+      - vnc_password
+    networks:
+      - uat_private
+
+secrets:
+  vnc_password:
+    file: .vnc-password
+
+networks:
+  uat_private:
+    internal: true

@@ -20,3 +20,10 @@ node_modules
 common_data
 
 .env*
+
+# Locally generated UAT VNC credential
+uat/.vnc-password
+
+# Local AI-assistant configuration and session artifacts
+.opencode/
+/talk.json

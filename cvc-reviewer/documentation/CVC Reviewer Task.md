@@ -15,7 +15,7 @@
 
 ### The "Alcatraz" Security Doctrine
 
-- **No Third-Party Analytics:** Do not install Google Analytics, Mixpanel, or Sentry. The app must be an air-gapped logic layer.
+- **No Third-Party Analytics:** Do not install Google Analytics, Mixpanel, or Sentry. Local PAT mode still requires network access to GitHub and runs in a browser environment; it is not air-gapped.
     
 - **Dependency Diet:** Audit `npm` packages rigorously. Minimize the surface area for supply-chain attacks.
     
@@ -40,11 +40,11 @@
     
     - [ ] Implement `AuthContext`: Manages PAT (Personal Access Token) state.
         
-    - [ ] Implement `StorageService`: Encrypted `sessionStorage` wrapper (clears on close).
+    - [ ] Implement `StorageService`: `sessionStorage` wrapper with obfuscation only. It is not encryption and does not protect a token from same-origin script, XSS, browser extensions, developer tools, or a compromised browser profile.
         
     - [ ] Implement "Stateless Gatekeeper" Client: Logic to exchange OAuth code for Token (calling the external Edge Function).
         
-    - [ ] **Deliverable:** A Login Screen that accepts a PAT, validates it against `api.github.com/user`, and persists it securely in memory.
+    - [ ] **Deliverable:** A Login Screen that accepts a PAT, validates it against `api.github.com/user`, and retains it in browser session storage for local mode, with the limitations disclosed to the user.
         
 - [ ] **Task 1.3: The Data Fetching Layer (Octokit + Query)**
     
@@ -130,7 +130,7 @@
             
         - Prompt Text (Markdown rendering).
             
-    - [ ] Build `ReasoningAccordion`: The collapsible "CoT" view using `framer-motion` for smooth height animation.
+    - [ ] Build `ReasoningAccordion`: A collapsible view for integration-exposed or explicitly supplied reasoning, when present, using `framer-motion` for smooth height animation.
         
     - [ ] **Deliverable:** A scrolling list of interactions on the right side.
         

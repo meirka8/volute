@@ -43,7 +43,7 @@
 
 ### Story 3.1: The Pre-Commit Review ("Am I Tracking?")
 
-> As Sarah, before I run `git commit`, I want to see what thoughts are currently "Floating", so I can be sure my reasoning is attached to this unit of work.
+> As Sarah, before I run `git commit`, I want to see which captured interactions are currently "Floating", so I can review what may be eligible for this unit of work.
 
 - **Scenario:** Sarah finishes a complex feature. She opens the CVC Panel.
     
@@ -51,11 +51,11 @@
     
 - **Action:** She realizes one thought was a random question about lunch (unrelated). She right-clicks and selects "Delete Thought" to exclude it from the permanent record.
     
-- **Result:** She commits the code, and the remaining 4 thoughts are automatically bound.
+- **Result:** She commits the code. Interactions that satisfy the conservative time/file-context linking policy may be bound; unrelated, stale, or disjoint interactions remain floating.
 
 ### Story 3.4: The PR Shadow Timeline
 
-> As Sarah, after a branch is pushed and a pull request is opened, I want to see the same captured thought history beside the diff, so hosted review keeps the full reasoning trail visible.
+> As Sarah, after explicitly sharing and publishing selected interactions for a branch, I want to see the available captured context beside the diff without implying that it contains hidden or complete model reasoning.
 
 - **Scenario:** Devin pushes his branch and opens a PR.
 
@@ -66,7 +66,7 @@
 
 ### Story 3.2: The "After Lunch" Context Refresh
 
-> As Devin, returning from a break, I want to see what I was thinking about 2 hours ago, so I can resume my mental state immediately.
+> As Devin, returning from a break, I want to review the prompts and context CVC captured 2 hours ago, so I can recover useful task context.
 
 - **Scenario:** Devin sits down after lunch. He forgot exactly where he left off.
     
@@ -83,4 +83,4 @@
     
 - **Action:** She looks at the "History" section of the CVC Panel. She expands the commit `feat: add auth`.
     
-- **Result:** She clicks the thought node. A side panel opens showing the full chat transcript. She sees the AI warning about a specific edge case, which explains the code structure.
+- **Result:** She clicks the interaction node. A side panel opens showing the available captured fields. If the stored response contains an AI warning about a specific edge case, it can help explain the code structure.

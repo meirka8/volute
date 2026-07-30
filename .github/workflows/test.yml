@@ -1,0 +1,144 @@
+name: Test OSS components
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Pins resolved from the official action repositories with git ls-remote:
+# actions/checkout@v4: 11d5960a326750d5838078e36cf38b85af677262
+# actions/setup-node@v4: 49933ea5288caeca8642d1e84afbd3f7d6820020
+# dtolnay/rust-toolchain@stable: 4cda84d5c5c54efe2404f9d843567869ab1699d4
+# Swatinem/rust-cache@v2: 42dc69e1aa15d09112580998cf2ef0119e2e91ae
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-quality:
+    name: Rust format and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: . -> target
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  rust-test:
+    name: Rust workspace tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: . -> target
+      - name: Run workspace tests
+        # test_parse_vscode_session depends on volatile VS Code session fixtures
+        # and is deliberately skipped until it can be made deterministic.
+        run: cargo test --workspace --verbose -- --skip test_parse_vscode_session
+
+  rust-windows:
+    name: Rust workspace check (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Check all Rust targets
+        run: cargo check --workspace --all-targets
+
+  plugin:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cvc-plugin/package-lock.json
+      - name: Install dependencies
+        working-directory: cvc-plugin
+        run: npm ci
+      - name: Verify lockfile-backed VSCE is available
+        working-directory: cvc-plugin
+        run: npm exec --no -- vsce --version
+      - name: Check types
+        working-directory: cvc-plugin
+        run: npm run check-types
+      - name: Lint
+        working-directory: cvc-plugin
+        run: npm run lint
+      - name: Compile
+        working-directory: cvc-plugin
+        run: npm run compile
+      - name: Run extension tests
+        # VS Code's Electron runner needs an X server on Linux.
+        working-directory: cvc-plugin
+        run: xvfb-run -a npm test
+
+  reviewer:
+    name: Reviewer lint, test, and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cvc-reviewer/package-lock.json
+      - name: Install dependencies
+        working-directory: cvc-reviewer
+        run: npm ci
+      - name: Lint
+        working-directory: cvc-reviewer
+        run: npm run lint
+      - name: Test
+        working-directory: cvc-reviewer
+        run: npm test -- --run
+      - name: Build
+        working-directory: cvc-reviewer
+        run: npm run build
+
+  npm-wrapper:
+    name: MCP npm wrapper package check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Check wrapper syntax
+        working-directory: npm/cvc-mcp
+        run: |
+          node --check bin/cvc-mcp.js
+          node --check bin/cvc.js
+      - name: Run wrapper tests
+        working-directory: npm/cvc-mcp
+        run: npm test
+      - name: Verify package contents without publishing
+        working-directory: npm/cvc-mcp
+        run: npm pack --dry-run

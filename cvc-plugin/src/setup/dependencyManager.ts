@@ -5,9 +5,14 @@ import { findBinary } from "./binaryUtils";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-const SETUP_PAGE_URL = "https://cvc.dev/setup";
-const INSTALL_SCRIPT_URL = "https://cvc.dev/api/install.sh";
-const INSTALL_PS1_URL = "https://cvc.dev/api/install.ps1";
+/**
+ * Installation guidance is intentionally sourced from the public repository.
+ * The published installers place the matching release artifact in the
+ * standard ~/.cvc/bin location.
+ */
+const SETUP_PAGE_URL = "https://github.com/meirka8/volute/releases";
+const RAW_INSTALLER_BASE_URL = "https://raw.githubusercontent.com/meirka8/volute";
+const SEMVER_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 /** How often (ms) to re-prompt after a "Not Now" dismissal — 7 days */
 const REMINDER_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -25,6 +30,63 @@ export interface DependencyStatus {
   cvcCli: { found: boolean; path?: string };
   cvcMcp: { found: boolean; path?: string };
   repoInitialized: boolean;
+}
+
+export interface InstallerUrls {
+  sh: string;
+  ps1: string;
+  releaseTag: string;
+}
+
+type InstallerPlatform = "win32" | "unix";
+
+/**
+ * Return version-pinned public installer URLs for this extension release.
+ *
+ * The package version is treated as untrusted input even though it originates
+ * from extension metadata: validating it before composing the URL prevents a
+ * malformed package from selecting an arbitrary Git revision or URL path.
+ */
+export function getInstallerUrls(version: unknown): InstallerUrls | undefined {
+  if (typeof version !== "string" || !SEMVER_VERSION.test(version)) {
+    return undefined;
+  }
+
+  const releaseTag = `v${version}`;
+  return {
+    sh: `${RAW_INSTALLER_BASE_URL}/${releaseTag}/install.sh`,
+    ps1: `${RAW_INSTALLER_BASE_URL}/${releaseTag}/install.ps1`,
+    releaseTag,
+  };
+}
+
+/**
+ * Build the install command shown in the terminal. The terminal only receives
+ * typed text (`sendText(..., false)`), so the user must explicitly execute it.
+ * The validated extension version pins both the installer source and release.
+ */
+export function createInstallCommand(
+  platform: InstallerPlatform,
+  installerUrls: InstallerUrls,
+): string {
+  if (platform === "win32") {
+    // New-TemporaryFile creates a unique file in the OS temp directory. The
+    // try/finally removes it after both successful and failed installations.
+    return `powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $ErrorActionPreference = 'Stop'; $env:CVC_RELEASE_VERSION = '${installerUrls.releaseTag}'; $tempFile = (New-TemporaryFile).FullName; try { Invoke-WebRequest -Uri '${installerUrls.ps1}' -OutFile $tempFile; & $tempFile } finally { Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue } }"`;
+  }
+
+  return `curl -fsSL '${installerUrls.sh}' | CVC_RELEASE_VERSION='${installerUrls.releaseTag}' sh`;
+}
+
+/**
+ * Build a direct process invocation for `cvc init` without involving a shell.
+ * In particular, a configured executable path is data, never terminal text.
+ */
+export function createCvcInitExecution(
+  cvcBinary: string | undefined,
+  cwd: string | undefined,
+): vscode.ProcessExecution {
+  return new vscode.ProcessExecution(cvcBinary ?? "cvc", ["init"], cwd ? { cwd } : undefined);
 }
 
 // ── Detection ──────────────────────────────────────────────────────────────
@@ -126,7 +188,7 @@ export async function promptForMissingDependencies(
       context,
       DISMISS_KEY_MCP,
       "Enhance your AI agent workflows with the CVC MCP Server. " +
-        "It allows agents (Claude, Cursor, Windsurf) to record their reasoning automatically.",
+        "It allows agents (Claude, Cursor, Windsurf) to submit exposed reasoning when their integration provides it.",
       "Install CVC MCP",
     );
   }
@@ -181,7 +243,7 @@ function promptInstall(
     .showWarningMessage(message, installLabel, "Learn More", "Not Now")
     .then((choice) => {
       if (choice === installLabel) {
-        openInstallTerminal();
+        openInstallTerminal(context);
       } else if (choice === "Learn More") {
         vscode.env.openExternal(vscode.Uri.parse(SETUP_PAGE_URL));
       } else if (choice === "Not Now") {
@@ -203,7 +265,7 @@ function promptOptional(
     .showInformationMessage(message, installLabel, "Learn More", "Not Now")
     .then((choice) => {
       if (choice === installLabel) {
-        openInstallTerminal();
+        openInstallTerminal(context);
       } else if (choice === "Learn More") {
         vscode.env.openExternal(vscode.Uri.parse(SETUP_PAGE_URL));
       } else if (choice === "Not Now") {
@@ -228,9 +290,24 @@ function promptInit(
     .then((choice) => {
       if (choice === "Run cvc init") {
         const cvcBinary = status.cvcCli.path ?? "cvc";
-        const terminal = vscode.window.createTerminal("CVC Init");
-        terminal.show();
-        terminal.sendText(`${cvcBinary} init`);
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        const task = new vscode.Task(
+          { type: "cvc", task: "init" },
+          workspaceFolder ?? vscode.TaskScope.Workspace,
+          "Initialize repository",
+          "CVC",
+          createCvcInitExecution(cvcBinary, workspaceFolder?.uri.fsPath),
+        );
+
+        // ProcessExecution uses spawn-style argument arrays, so a configurable
+        // binary path cannot be parsed as shell syntax or inject extra commands.
+        void vscode.tasks.executeTask(task).then(
+          undefined,
+          (error: unknown) => {
+            const detail = error instanceof Error ? `: ${error.message}` : "";
+            vscode.window.showErrorMessage(`CVC: Failed to start initialization${detail}`);
+          },
+        );
       } else if (choice === "Not Now") {
         recordDismissal(context, DISMISS_KEY_INIT);
       }
@@ -242,18 +319,27 @@ function promptInit(
  * For security reasons, the command is typed into the terminal but NOT 
  * automatically executed (requires the user to press Enter).
  */
-function openInstallTerminal(): void {
+function openInstallTerminal(context: vscode.ExtensionContext): void {
+  const installerUrls = getInstallerUrls(context.extension.packageJSON.version);
+  if (!installerUrls) {
+    vscode.window.showErrorMessage(
+      "CVC: This extension has an invalid version, so a version-pinned installer cannot be selected.",
+    );
+    void vscode.env.openExternal(vscode.Uri.parse(SETUP_PAGE_URL));
+    return;
+  }
+
   const terminal = vscode.window.createTerminal("CVC Install");
   terminal.show();
 
   if (process.platform === "win32") {
     terminal.sendText("# Press Enter to run the CVC installation script");
     terminal.sendText(
-      `powershell -ExecutionPolicy Bypass -Command "& {Invoke-WebRequest -Uri '${INSTALL_PS1_URL}' -OutFile cvc-install.ps1; .\\cvc-install.ps1; Remove-Item cvc-install.ps1}"`,
+      createInstallCommand("win32", installerUrls),
       false // Do not auto-execute
     );
   } else {
     terminal.sendText("# Press Enter to run the CVC installation script");
-    terminal.sendText(`curl -fsSL '${INSTALL_SCRIPT_URL}' | sh`, false); // Do not auto-execute
+    terminal.sendText(createInstallCommand("unix", installerUrls), false); // Do not auto-execute
   }
 }

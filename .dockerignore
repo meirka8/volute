@@ -1,0 +1,12 @@
+.git
+.github
+**/node_modules
+**/dist
+target
+**/*.vsix
+**/.env*
+**/.vnc-password
+**/*.pem
+**/*.key
+**/credentials*
+**/.git-credentials

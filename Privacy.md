@@ -1,8 +1,6 @@
 # CVC Privacy and `.thoughtignore` Reference
 
-This reference documents implemented behavior. The privacy capture/persistence boundary depends on HEL-61.
-
-This documentation-only change requires **no Supabase migration**.
+This reference documents the privacy behavior implemented in this repository. CVC is local-first, not local-only: local capture and remote publication are separate operations with separate consent boundaries.
 
 ## Capture and sharing
 

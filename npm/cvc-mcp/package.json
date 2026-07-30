@@ -1,20 +1,27 @@
 {
   "name": "@volute_cvc/cvc-mcp",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "MCP server for CVC (Cognitive Version Control) for saving and reading git-linked AI work history",
   "bin": {
     "cvc-mcp": "./bin/cvc-mcp.js",
     "cvc": "./bin/cvc.js"
   },
+  "files": [
+    "bin/*.js"
+  ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/*.test.js"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/meirka8/cvc.git"
+    "url": "git+https://github.com/meirka8/volute.git"
+  },
+  "homepage": "https://github.com/meirka8/volute#readme",
+  "bugs": {
+    "url": "https://github.com/meirka8/volute/issues"
   },
   "author": "Volute",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "publishConfig": {
     "access": "public"
   }

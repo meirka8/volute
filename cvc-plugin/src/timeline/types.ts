@@ -201,9 +201,15 @@ export class TimelineTreeItem extends vscode.TreeItem {
     hasResponse: boolean,
   ): string {
     const icons: string[] = [];
-    if (hasPrompt) icons.push("💬");
-    if (hasCot) icons.push("🧠");
-    if (hasResponse) icons.push("🤖");
+    if (hasPrompt) {
+      icons.push("💬");
+    }
+    if (hasCot) {
+      icons.push("🧠");
+    }
+    if (hasResponse) {
+      icons.push("🤖");
+    }
     return icons.join("");
   }
 
@@ -216,9 +222,15 @@ export class TimelineTreeItem extends vscode.TreeItem {
     hasResponse: boolean,
   ): string {
     const labels: string[] = [];
-    if (hasPrompt) labels.push("Prompt");
-    if (hasCot) labels.push("Chain of Thought");
-    if (hasResponse) labels.push("Response");
+    if (hasPrompt) {
+      labels.push("Prompt");
+    }
+    if (hasCot) {
+      labels.push("Exposed Reasoning");
+    }
+    if (hasResponse) {
+      labels.push("Response");
+    }
     return labels.length > 0 ? labels.join(", ") : "Empty";
   }
 
