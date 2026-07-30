@@ -2,12 +2,12 @@
 import { readFileSync } from 'node:fs';
 
 const [tag] = process.argv.slice(2);
-// Build metadata is deliberately excluded: npm and the installers distribute
-// a single, unambiguous release version rather than SemVer build variants.
-const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?$/;
+// Publishing uses npm's latest tag and stable VSCE releases, so accept only
+// exact stable SemVer versions: no prerelease identifiers or build metadata.
+const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 if (!tag || !tag.startsWith('v') || !semver.test(tag.slice(1))) {
-  throw new Error(`Release tag must be v<strict-semver>; received ${JSON.stringify(tag)}.`);
+  throw new Error(`Release tag must be v<MAJOR.MINOR.PATCH> with no prerelease or build metadata; received ${JSON.stringify(tag)}.`);
 }
 
 const expected = tag.slice(1);
