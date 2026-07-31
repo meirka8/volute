@@ -212,23 +212,29 @@
     "test": "npm run compile && vscode-test"
   },
   "overrides": {
-    "vscode-languageclient": {
-      "minimatch": "10.2.6"
+    "micromatch": {
+      "picomatch": "2.3.2"
+    },
+    "@vscode/test-cli": {
+      "mocha": {
+        "serialize-javascript": "7.0.7"
+      }
     }
   },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
     "@types/marked": "^5.0.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.90.0",
-    "@typescript-eslint/eslint-plugin": "^7.0.0",
-    "@typescript-eslint/parser": "^7.0.0",
-    "@vscode/test-cli": "^0.0.10",
+    "@typescript-eslint/eslint-plugin": "^8.65.0",
+    "@typescript-eslint/parser": "^8.65.0",
+    "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^2.4.0",
     "@vscode/vsce": "3.9.2",
-    "esbuild": "^0.21.0",
-    "eslint": "^8.57.0",
-    "npm-run-all": "^4.1.5",
+    "esbuild": "^0.28.1",
+    "eslint": "10.8.0",
+    "npm-run-all2": "8.0.4",
     "typescript": "^5.4.0"
   },
   "dependencies": {
