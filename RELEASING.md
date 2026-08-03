@@ -64,7 +64,7 @@ example, run `npm version X.Y.Z --no-git-tag-version` in `cvc-plugin`); do not c
 the release tag from that command.
 
 Prepare the curated GitHub Release body at `docs/releases/vX.Y.Z.md`. This file is
-mandatory and is used verbatim as the release body; the workflow deliberately does
+mandatory and is used as the release body without generator text transformation; the workflow deliberately does
 not enable GitHub-generated release notes. Write the user-facing summary and breaking
 changes in it, and include an explicit Markdown `Full Changelog` link. For the first
 public GitHub/Apache-2.0 OSS release, link to all commits reachable from the release
@@ -112,8 +112,10 @@ commit must satisfy the DCO requirement in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 `THIRD-PARTY-NOTICES.md` is a checked-in mechanical report for every non-workspace
 crate resolved by `Cargo.lock` and the production dependencies bundled in the VSIX.
-It records package metadata and copies license/copyright/notice files available in
-the locked package sources without replacing an SPDX expression. For the exceptional
+It records package metadata and imports license/copyright/notice files available in
+the locked package sources without replacing an SPDX expression or substantive text;
+for deterministic output it normalizes CRLF to LF, removes trailing horizontal
+whitespace per line, and emits one terminal newline. For the exceptional
 package archives that ship no conventional evidence file, the generator uses only
 the exact matching vendored SPDX canonical text and labels package-supplied
 author/contributor metadata without inferring copyright. Before generating
