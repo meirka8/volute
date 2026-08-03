@@ -142,3 +142,26 @@ jobs:
       - name: Verify package contents without publishing
         working-directory: npm/cvc-mcp
         run: npm pack --dry-run
+
+  third-party-notices:
+    name: Verify third-party notices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cvc-plugin/package-lock.json
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Fetch locked Rust package sources
+        run: cargo fetch --locked
+      - name: Install production extension dependencies without lifecycle scripts
+        working-directory: cvc-plugin
+        run: npm ci --ignore-scripts --omit=dev
+      - name: Verify mechanically generated notices
+        run: |
+          node .github/scripts/generate-third-party-notices.mjs --self-test
+          node .github/scripts/generate-third-party-notices.mjs --check

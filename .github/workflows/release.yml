@@ -12,6 +12,7 @@ on:
 # dtolnay/rust-toolchain@stable: 4cda84d5c5c54efe2404f9d843567869ab1699d4
 # Swatinem/rust-cache@v2: 42dc69e1aa15d09112580998cf2ef0119e2e91ae
 # softprops/action-gh-release@v2: 3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+# actions/attest-build-provenance@v4.1.1: 0f67c3f4856b2e3261c31976d6725780e5e4c373
 permissions:
   contents: read
 
@@ -25,9 +26,47 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # An ancestry check needs all ancestors of both the tag and main.
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cvc-plugin/package-lock.json
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Require the pushed tag to be reachable from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --prune origin '+refs/heads/main:refs/remotes/origin/main'
+          tag_commit="$(git rev-parse --verify --end-of-options "${GITHUB_REF}^{commit}")"
+          git merge-base --is-ancestor "$tag_commit" origin/main || {
+            printf 'Refusing release: %s (%s) is not an ancestor of origin/main.\n' "$GITHUB_REF_NAME" "$tag_commit" >&2
+            exit 1
+          }
+      - name: Require curated release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_notes="docs/releases/${GITHUB_REF_NAME}.md"
+          test -f "$release_notes" || {
+            printf 'Refusing release: missing curated release notes: %s\n' "$release_notes" >&2
+            exit 1
+          }
+          grep -Fq '[Full Changelog](' "$release_notes" || {
+            printf 'Refusing release: %s must include an explicit Full Changelog link.\n' "$release_notes" >&2
+            exit 1
+          }
       - name: Require an exact matching release version
         run: node .github/scripts/check-release-version.mjs "$GITHUB_REF_NAME"
+      - name: Verify third-party notices
+        run: |
+          cargo fetch --locked
+          (cd cvc-plugin && npm ci --ignore-scripts --omit=dev)
+          node .github/scripts/generate-third-party-notices.mjs --self-test
+          node .github/scripts/generate-third-party-notices.mjs --check
 
   build-binaries:
     name: Build ${{ matrix.build }}
@@ -68,11 +107,38 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} -p cvc-cli -p cvc-mcp -p cvc-lsp
       - name: Package Unix binaries
         if: runner.os != 'Windows'
-        run: tar -czf cvc-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release cvc cvc-mcp cvc-lsp -C "$GITHUB_WORKSPACE" LICENSE
+        run: tar -czf cvc-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release cvc cvc-mcp cvc-lsp -C "$GITHUB_WORKSPACE" LICENSE THIRD-PARTY-NOTICES.md
       - name: Package Windows binaries
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target/${{ matrix.target }}/release/cvc.exe,target/${{ matrix.target }}/release/cvc-mcp.exe,target/${{ matrix.target }}/release/cvc-lsp.exe,LICENSE -DestinationPath cvc-${{ matrix.target }}.zip
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/cvc.exe,target/${{ matrix.target }}/release/cvc-mcp.exe,target/${{ matrix.target }}/release/cvc-lsp.exe,LICENSE,THIRD-PARTY-NOTICES.md -DestinationPath cvc-${{ matrix.target }}.zip
+      - name: Verify Unix archive contains third-party notices
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          listing="$(mktemp)"
+          trap 'rm -f "$listing"' EXIT
+          tar -tzf cvc-${{ matrix.target }}.tar.gz > "$listing"
+          test "$(wc -c < "$listing")" -le 1048576
+          test "$(wc -l < "$listing")" -le 128
+          test "$(grep -Fxc 'THIRD-PARTY-NOTICES.md' "$listing")" -eq 1
+      - name: Verify Windows archive contains third-party notices
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead("cvc-${{ matrix.target }}.zip")
+          $listing = [IO.Path]::GetTempFileName()
+          try {
+            if ($archive.Entries.Count -gt 128) { throw 'Binary archive has too many entries.' }
+            [IO.File]::WriteAllLines($listing, [string[]]$archive.Entries.FullName)
+            if ((Get-Item -LiteralPath $listing).Length -gt 1048576) { throw 'Binary archive listing is too large.' }
+            if (@([IO.File]::ReadAllLines($listing) | Where-Object { $_ -ceq 'THIRD-PARTY-NOTICES.md' }).Count -ne 1) { throw 'Expected exactly one THIRD-PARTY-NOTICES.md in the binary archive.' }
+          } finally {
+            $archive.Dispose()
+            Remove-Item -LiteralPath $listing -Force -ErrorAction SilentlyContinue
+          }
       - name: Upload binary archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -125,9 +191,25 @@ jobs:
       - name: Mark Unix LSP executable
         if: matrix.lsp_binary == 'cvc-lsp'
         run: chmod +x cvc-plugin/bin/${{ matrix.vsce_target }}/cvc-lsp
+      - name: Add third-party notices to VSIX root
+        run: cp THIRD-PARTY-NOTICES.md cvc-plugin/THIRD-PARTY-NOTICES.md
       - name: Package VSIX with fixed VSCE
         working-directory: cvc-plugin
         run: npm exec --no -- vsce package --target ${{ matrix.vsce_target }} --no-git-tag-version
+      - name: Verify VSIX contains third-party notices
+        working-directory: cvc-plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          vsix=( *.vsix )
+          test "${#vsix[@]}" -eq 1
+          listing="$(mktemp)"
+          trap 'rm -f "$listing"' EXIT
+          unzip -Z1 "${vsix[0]}" > "$listing"
+          test "$(wc -c < "$listing")" -le 1048576
+          test "$(wc -l < "$listing")" -le 4096
+          test "$(grep -Fxc 'extension/THIRD-PARTY-NOTICES.md' "$listing")" -eq 1
       - name: Upload VSIX
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -141,6 +223,8 @@ jobs:
     needs: [check-release-version, build-binaries, build-extension]
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -157,16 +241,56 @@ jobs:
           pattern: vsix-*
           path: release-assets
           merge-multiple: true
-      - name: Add standalone license asset
-        run: cp LICENSE release-assets/LICENSE
+      - name: Add standalone notices, license, and version-stamped installer assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          release_tag = os.environ["RELEASE_TAG"]
+          if not re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", release_tag):
+              raise SystemExit(f"Refusing unsafe release tag for installer staging: {release_tag!r}")
+          tag_bytes = release_tag.encode("ascii")
+
+          sources = (
+              (Path("install.sh"), b'RELEASE_VERSION="${CVC_RELEASE_VERSION:-latest}"'),
+              (Path("install.ps1"), b'$ReleaseVersion = if ($env:CVC_RELEASE_VERSION) { $env:CVC_RELEASE_VERSION } else { "latest" }'),
+          )
+          staged = []
+          for source, expected_default in sources:
+              contents = source.read_bytes()
+              if contents.count(expected_default) != 1:
+                  raise SystemExit(f"Refusing to stage {source}: expected default must occur exactly once")
+              destination = Path("release-assets") / source.name
+              if destination.exists():
+                  raise SystemExit(f"Refusing to overwrite staged installer: {destination}")
+              replacement = expected_default.replace(b"latest", tag_bytes)
+              staged.append((destination, contents.replace(expected_default, replacement), source.stat().st_mode & 0o777))
+
+          for destination, contents, mode in staged:
+              destination.write_bytes(contents)
+              destination.chmod(mode)
+          PY
+          cp LICENSE release-assets/LICENSE
+          cp THIRD-PARTY-NOTICES.md release-assets/THIRD-PARTY-NOTICES.md
       - name: Generate SHA-256 manifest
         working-directory: release-assets
         run: sha256sum -- * > SHA256SUMS.txt
+      - name: Attest staged release assets
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: release-assets/*
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: release-assets/*
-          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # body_path is the sole release-notes source. Do not combine it with
+          # generate_release_notes: that action prepends generated notes to a body.
+          body_path: docs/releases/${{ github.ref_name }}.md
 
   publish-marketplace:
     name: Publish VS Code Marketplace extension

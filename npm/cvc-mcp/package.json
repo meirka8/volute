@@ -7,9 +7,13 @@
     "cvc": "./bin/cvc.js"
   },
   "files": [
-    "bin/*.js"
+    "bin/*.js",
+    "scripts/stage-third-party-notices.mjs",
+    "THIRD-PARTY-NOTICES.md"
   ],
   "scripts": {
+    "prepack": "node scripts/stage-third-party-notices.mjs stage",
+    "postpack": "node scripts/stage-third-party-notices.mjs cleanup",
     "test": "node --test test/*.test.js"
   },
   "repository": {
