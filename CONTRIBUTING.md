@@ -9,6 +9,14 @@ Thank you for helping improve CVC. By participating, you agree to follow the [Co
 - Keep changes focused and include tests for behavior changes.
 - Do not add captured prompts, credentials, personal data, private repository details, or generated CVC state to a contribution.
 
+## Public issue tracking
+
+GitHub Issues are the canonical record for public Volute OSS work. Use the bug, feature, or improvement form so the right type label (`type: bug`, `type: feature`, or `type: improvement`) is applied. For questions, use a blank issue; maintainers will apply the `question` label during triage. Do not use a public issue for a suspected vulnerability: follow the [public Security Policy contact](https://github.com/meirka8/volute/security/policy) instead.
+
+Maintainers assign the public project fields—Status, Priority, Component, and Initiative—on the [Volute project board](https://github.com/users/meirka8/projects/2). Status describes lifecycle, not a promise of delivery: **Backlog** is recorded for consideration, **Todo** is selected for work, **In Progress** is actively being worked, **In Review** is awaiting review, **Done** is completed, **Duplicate** is tracked elsewhere as the same public work, and **Canceled** will not proceed.
+
+Private hosted-platform implementation is tracked separately and is not mirrored publicly. When work crosses public and private boundaries, public issues are split into self-contained public deliverables; they must not include private links, context, repository details, credentials, captured prompts, personal data, or generated CVC state.
+
 ## Build and test
 
 The Rust workspace requires a current stable Rust toolchain:
