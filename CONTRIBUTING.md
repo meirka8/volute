@@ -17,6 +17,12 @@ Maintainers assign the public project fields—Status, Priority, Component, and 
 
 Private hosted-platform implementation is tracked separately and is not mirrored publicly. When work crosses public and private boundaries, public issues are split into self-contained public deliverables; they must not include private links, context, repository details, credentials, captured prompts, personal data, or generated CVC state.
 
+## Optional CVC self-tracking
+
+Self-tracking is optional and applies only when the CVC MCP server is available and capture has been explicitly acknowledged. During substantial work, agentic contributors should use MCP `commit_thought` to record important decisions, intent, and concise, reviewable rationale. Record only explicit summaries; never request or attempt to capture hidden chain-of-thought or another participant's content without their consent.
+
+The presence of `.thoughtignore` does not enable capture or authorize sharing or auto-push. Keep records private by default, review each selected record before sharing, and use CVC's interactive consent flow before sharing or enabling auto-push. See the [privacy reference](Privacy.md) and [CVC MCP documentation](cvc-mcp/README.md).
+
 ## Build and test
 
 The Rust workspace requires a current stable Rust toolchain:
