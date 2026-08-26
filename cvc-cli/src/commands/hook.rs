@@ -119,7 +119,7 @@ fn observe_pre_push(
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let _ = cvc_core::squash::observe_pre_push_range_with_abort(
-        &repo,
+        repo,
         &store,
         bases[0],
         tips[0].1,
@@ -141,7 +141,7 @@ pub async fn post_merge(_squash: Option<&str>) -> Result<()> {
         let repo = layout.repository();
         let path = layout.db_path();
         let mut store = CvcStore::open_initialized(path)?;
-        cvc_core::squash::scan_for(&repo, &mut store, false, std::time::Duration::from_secs(30))?;
+        cvc_core::squash::scan_for(repo, &mut store, false, std::time::Duration::from_secs(30))?;
         Ok(())
     })();
     if let Err(e) = result {
@@ -189,10 +189,10 @@ pub async fn post_rewrite(mode: &str) -> Result<()> {
         }
         let inbox = dir.join("rewrite-inbox");
         // Validate and durably enqueue current input before touching SQLite.
-        cvc_core::rewrite::validate_initial_delivery(&repo, mode, &raw)?;
+        cvc_core::rewrite::validate_initial_delivery(repo, mode, &raw)?;
         cvc_core::rewrite::persist_inbox(&inbox, mode, &raw)?;
         let mut store = CvcStore::open_initialized(dir.join("index.db"))?;
-        replay_inbox(&repo, &mut store, &inbox)?;
+        replay_inbox(repo, &mut store, &inbox)?;
         Ok(())
     })();
     if let Err(e) = result {
@@ -214,13 +214,13 @@ fn run_post_commit_logic(current_dir: &std::path::Path) -> Result<()> {
     let db_path = cvc_dir.join("index.db");
     let mut store = CvcStore::open_initialized(&db_path)?; // Hook caller still swallows all errors.
 
-    let count = linker::link_current_commit_to_floating_nodes(&repo, &store)?;
+    let count = linker::link_current_commit_to_floating_nodes(repo, &store)?;
 
     if count > 0 {
         println!("CVC: Linked {} thought(s) to this commit.", count);
     }
     let exact =
-        cvc_core::squash::scan_for(&repo, &mut store, true, std::time::Duration::from_secs(5))?;
+        cvc_core::squash::scan_for(repo, &mut store, true, std::time::Duration::from_secs(5))?;
     if exact > 0 {
         println!("CVC: Exactly relinked {exact} squashed thought(s).");
     }
