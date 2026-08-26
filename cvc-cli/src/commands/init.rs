@@ -1,17 +1,16 @@
 use anyhow::{Context, Result};
 use cvc_core::db::CvcStore;
 use cvc_core::hooks::{self, HookAction};
-use cvc_core::privacy::common_git_dir;
-use git2::Repository;
+use cvc_core::repository::RepositoryLayout;
 use std::env;
 use std::fs;
 
 pub async fn run() -> Result<()> {
     let current_dir = env::current_dir().context("Failed to get current directory")?;
-    let repo = Repository::open(&current_dir).map_err(|_| {
+    let layout = RepositoryLayout::discover(&current_dir).map_err(|_| {
         anyhow::anyhow!("Current directory is not a git repository. Run 'git init' first.")
     })?;
-    let git_dir = common_git_dir(&repo);
+    let git_dir = layout.common_git_dir();
 
     let cvc_dir = git_dir.join("cvc");
     if !cvc_dir.exists() {

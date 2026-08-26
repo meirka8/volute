@@ -57,7 +57,7 @@ fn observe_pre_push(
         return Ok(());
     }
     let repo = Repository::open(cwd)?;
-    let cvc = cvc_core::privacy::common_git_dir(&repo).join("cvc");
+    let cvc = cvc_core::repository::common_git_dir(&repo)?.join("cvc");
     if !cvc.exists() {
         return Ok(());
     }
@@ -136,7 +136,7 @@ pub async fn post_merge(_squash: Option<&str>) -> Result<()> {
     let result = (|| -> Result<()> {
         let cwd = env::current_dir()?;
         let repo = Repository::open(&cwd)?;
-        let path = cvc_core::privacy::common_git_dir(&repo).join("cvc/index.db");
+        let path = cvc_core::repository::common_git_dir(&repo)?.join("cvc/index.db");
         let mut store = CvcStore::open_initialized(path)?;
         cvc_core::squash::scan_for(&repo, &mut store, false, std::time::Duration::from_secs(30))?;
         Ok(())
@@ -179,7 +179,7 @@ pub async fn post_rewrite(mode: &str) -> Result<()> {
             .take((cvc_core::rewrite::MAX_REWRITE_BYTES + 1) as u64)
             .read_to_end(&mut raw)?;
         let repo = Repository::open(&cwd)?;
-        let dir = cvc_core::privacy::common_git_dir(&repo).join("cvc");
+        let dir = cvc_core::repository::common_git_dir(&repo)?.join("cvc");
         if !dir.exists() {
             return Ok(());
         }
@@ -199,7 +199,7 @@ pub async fn post_rewrite(mode: &str) -> Result<()> {
 
 fn run_post_commit_logic(current_dir: &std::path::Path) -> Result<()> {
     let repo = Repository::open(current_dir).context("Failed to open git repository")?;
-    let cvc_dir = cvc_core::privacy::common_git_dir(&repo).join("cvc");
+    let cvc_dir = cvc_core::repository::common_git_dir(&repo)?.join("cvc");
     if !cvc_dir.exists() {
         // Not initialized, do nothing
         return Ok(());

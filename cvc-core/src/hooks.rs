@@ -31,7 +31,7 @@ pub struct HookInstallOutcome {
 pub fn install(repo_root: &Path) -> Result<Vec<HookInstallOutcome>> {
     // Resolve through libgit2 so linked worktrees use their common hooks directory.
     let repo = Repository::open(repo_root).context("Failed to open git repository")?;
-    let mut hooks_dir = crate::privacy::common_git_dir(&repo).join("hooks");
+    let mut hooks_dir = crate::repository::common_git_dir(&repo)?.join("hooks");
     if let Ok(config) = repo.config() {
         if let Ok(custom_path) = config.get_string("core.hooksPath") {
             let path_obj = Path::new(&custom_path);

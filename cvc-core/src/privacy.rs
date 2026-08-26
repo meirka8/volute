@@ -87,11 +87,16 @@ pub fn remote_destination(repo: &git2::Repository, remote_name: &str) -> Result<
     })
 }
 
-fn privacy_path(repo: &git2::Repository) -> PathBuf {
-    common_git_dir(repo).join("cvc").join("privacy.json")
+fn privacy_path(repo: &git2::Repository) -> Result<PathBuf> {
+    Ok(crate::repository::common_git_dir(repo)
+        .map_err(|e| PrivacyError::Policy(e.to_string()))?
+        .join("cvc")
+        .join("privacy.json"))
 }
-/// libgit2 0.19 does not expose git_common_dir. Git writes a relative `commondir`
-/// file for linked worktrees; normal repositories simply use `Repository::path()`.
+/// Legacy best-effort common directory helper retained for API compatibility.
+/// New production code must use [`crate::repository::RepositoryLayout`] or its
+/// fallible [`crate::repository::common_git_dir`] helper instead.
+#[deprecated(note = "use cvc_core::repository::RepositoryLayout or common_git_dir")]
 pub fn common_git_dir(repo: &git2::Repository) -> PathBuf {
     let git_dir = repo.path();
     match std::fs::read_to_string(git_dir.join("commondir")) {
@@ -110,7 +115,7 @@ pub fn remote_fingerprint(repo: &git2::Repository, remote_name: &str) -> Result<
     Ok(remote_destination(repo, remote_name)?.fingerprint)
 }
 fn read_privacy(repo: &git2::Repository) -> Result<PrivacyFile> {
-    let path = privacy_path(repo);
+    let path = privacy_path(repo)?;
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(x) => x,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -173,7 +178,7 @@ fn read_privacy(repo: &git2::Repository) -> Result<PrivacyFile> {
     Ok(state)
 }
 fn write_privacy(repo: &git2::Repository, state: &PrivacyFile) -> Result<()> {
-    let path = privacy_path(repo);
+    let path = privacy_path(repo)?;
     let parent = path
         .parent()
         .ok_or_else(|| PrivacyError::Policy("invalid privacy path".into()))?;
@@ -238,7 +243,7 @@ impl Drop for PrivacyLock {
     }
 }
 fn privacy_lock(repo: &git2::Repository) -> Result<PrivacyLock> {
-    let path = privacy_path(repo);
+    let path = privacy_path(repo)?;
     let parent = path
         .parent()
         .ok_or_else(|| PrivacyError::Policy("invalid privacy path".into()))?;
@@ -293,7 +298,7 @@ pub fn destination_operation_lock(
             "invalid destination fingerprint".into(),
         ));
     }
-    let path = privacy_path(repo);
+    let path = privacy_path(repo)?;
     let parent = path
         .parent()
         .ok_or_else(|| PrivacyError::Policy("invalid privacy path".into()))?;

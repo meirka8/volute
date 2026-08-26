@@ -28,8 +28,9 @@ fn remote(repo: &Repository, requested: Option<&str>) -> Result<String> {
 }
 fn open(cwd: &Path) -> Result<(Repository, CvcStore)> {
     let repo = Repository::open(cwd).context("Failed to open git repository")?;
-    let store =
-        CvcStore::open_initialized(cvc_core::privacy::common_git_dir(&repo).join("cvc/index.db"))?;
+    let store = CvcStore::open_initialized(
+        cvc_core::repository::common_git_dir(&repo)?.join("cvc/index.db"),
+    )?;
     Ok((repo, store))
 }
 pub async fn privacy_status(requested: Option<&str>) -> Result<()> {
