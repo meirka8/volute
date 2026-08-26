@@ -49,7 +49,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     if initialized {
         if let Some(layout) = layout.as_ref() {
             let repo = layout.repository();
-            if let Ok(dirty_files) = git::get_dirty_files(&repo) {
+            if let Ok(dirty_files) = git::get_dirty_files(repo) {
                 let dirty_files: Vec<String> = dirty_files
                     .into_iter()
                     .filter(|path| !policy.ignores_path(path))
@@ -57,7 +57,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
                 // Generate temporary ID to associate context
                 let temp_id = InteractionId::new();
 
-                if let Ok(items) = git::snapshot_context(&repo, &temp_id, &dirty_files) {
+                if let Ok(items) = git::snapshot_context(repo, &temp_id, &dirty_files) {
                     context_items = items;
                 }
                 repo_opt = Some(());
