@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use cvc_core::db::CvcStore;
 use cvc_core::linker;
+use cvc_core::repository::RepositoryLayout;
 use git2::Repository;
 use std::env;
 use std::fs;
@@ -56,8 +57,9 @@ fn observe_pre_push(
     if remote.is_empty() || remote_url.is_empty() {
         return Ok(());
     }
-    let repo = Repository::open(cwd)?;
-    let cvc = cvc_core::repository::common_git_dir(&repo)?.join("cvc");
+    let layout = RepositoryLayout::discover(cwd)?;
+    let repo = layout.repository();
+    let cvc = layout.cvc_dir();
     if !cvc.exists() {
         return Ok(());
     }
@@ -135,8 +137,9 @@ pub async fn post_merge(_squash: Option<&str>) -> Result<()> {
     }
     let result = (|| -> Result<()> {
         let cwd = env::current_dir()?;
-        let repo = Repository::open(&cwd)?;
-        let path = cvc_core::repository::common_git_dir(&repo)?.join("cvc/index.db");
+        let layout = RepositoryLayout::discover(&cwd)?;
+        let repo = layout.repository();
+        let path = layout.db_path();
         let mut store = CvcStore::open_initialized(path)?;
         cvc_core::squash::scan_for(&repo, &mut store, false, std::time::Duration::from_secs(30))?;
         Ok(())
@@ -178,8 +181,9 @@ pub async fn post_rewrite(mode: &str) -> Result<()> {
         std::io::stdin()
             .take((cvc_core::rewrite::MAX_REWRITE_BYTES + 1) as u64)
             .read_to_end(&mut raw)?;
-        let repo = Repository::open(&cwd)?;
-        let dir = cvc_core::repository::common_git_dir(&repo)?.join("cvc");
+        let layout = RepositoryLayout::discover(&cwd)?;
+        let repo = layout.repository();
+        let dir = layout.cvc_dir();
         if !dir.exists() {
             return Ok(());
         }
@@ -198,8 +202,10 @@ pub async fn post_rewrite(mode: &str) -> Result<()> {
 }
 
 fn run_post_commit_logic(current_dir: &std::path::Path) -> Result<()> {
-    let repo = Repository::open(current_dir).context("Failed to open git repository")?;
-    let cvc_dir = cvc_core::repository::common_git_dir(&repo)?.join("cvc");
+    let layout =
+        RepositoryLayout::discover(current_dir).context("Failed to discover Git repository")?;
+    let repo = layout.repository();
+    let cvc_dir = layout.cvc_dir();
     if !cvc_dir.exists() {
         // Not initialized, do nothing
         return Ok(());

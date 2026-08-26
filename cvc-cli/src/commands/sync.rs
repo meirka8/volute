@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use cvc_core::repository::RepositoryLayout;
 use cvc_core::{
     db::CvcStore,
     models::{FutureSharePolicy, InteractionId, PublicationState, TombstoneReasonCode},
@@ -27,11 +28,9 @@ fn remote(repo: &Repository, requested: Option<&str>) -> Result<String> {
     })
 }
 fn open(cwd: &Path) -> Result<(Repository, CvcStore)> {
-    let repo = Repository::open(cwd).context("Failed to open git repository")?;
-    let store = CvcStore::open_initialized(
-        cvc_core::repository::common_git_dir(&repo)?.join("cvc/index.db"),
-    )?;
-    Ok((repo, store))
+    let layout = RepositoryLayout::discover(cwd).context("Failed to discover Git repository")?;
+    let store = CvcStore::open_initialized(layout.db_path())?;
+    Ok((layout.into_repository(), store))
 }
 pub async fn privacy_status(requested: Option<&str>) -> Result<()> {
     let (repo, _) = open(&env::current_dir()?)?;

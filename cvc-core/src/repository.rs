@@ -4,7 +4,7 @@
 //! version used by CVC.  Consequently `commondir` is parsed here, once, using
 //! Git's one-line format.  Its target is required to be an existing canonical
 //! directory; a bad `commondir` is never silently treated as a normal repo.
-use git2::Repository;
+use git2::{ErrorCode, Repository};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,8 @@ const MAX_COMMONDIR_BYTES: u64 = 4096;
 
 #[derive(Debug, Error)]
 pub enum RepositoryLayoutError {
+    #[error("current directory is not inside a Git repository")]
+    NotRepository,
     #[error("unable to discover Git repository: {0}")]
     Git(#[from] git2::Error),
     #[error("repository metadata is invalid: {0}")]
@@ -35,7 +37,22 @@ pub struct RepositoryLayout {
 impl RepositoryLayout {
     /// Discovers from a repository root or any existing path below it.
     pub fn discover(path: impl AsRef<Path>) -> Result<Self, RepositoryLayoutError> {
-        let repository = Repository::discover(path)?;
+        let repository = match Repository::discover(path.as_ref()) {
+            Ok(repository) => repository,
+            Err(error) if error.code() == ErrorCode::NotFound => {
+                // A broken gitfile/commondir can make libgit2 report NotFound.
+                // Never mistake recognizable repository metadata for an ordinary
+                // outside-repository invocation, since callers may otherwise
+                // proceed without validating its storage boundary.
+                if has_git_marker(path.as_ref()) {
+                    return Err(RepositoryLayoutError::Metadata(format!(
+                        "Git metadata is present but repository discovery failed: {error}"
+                    )));
+                }
+                return Err(RepositoryLayoutError::NotRepository);
+            }
+            Err(error) => return Err(RepositoryLayoutError::Git(error)),
+        };
         Self::from_repository(repository)
     }
 
@@ -58,6 +75,10 @@ impl RepositoryLayout {
     pub fn repository(&self) -> &Repository {
         &self.repository
     }
+    /// Consumes the layout while retaining the repository validated during discovery.
+    pub fn into_repository(self) -> Repository {
+        self.repository
+    }
     pub fn git_dir(&self) -> &Path {
         &self.git_dir
     }
@@ -79,6 +100,11 @@ impl RepositoryLayout {
     pub fn policy_root(&self) -> Result<&Path, RepositoryLayoutError> {
         self.worktree_root()
     }
+}
+
+fn has_git_marker(path: &Path) -> bool {
+    path.ancestors()
+        .any(|directory| fs::symlink_metadata(directory.join(".git")).is_ok())
 }
 
 /// Fallible compatibility helper for callers that have a `git2::Repository`.

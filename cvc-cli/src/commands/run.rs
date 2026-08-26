@@ -1,9 +1,10 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use cvc_core::db::CvcStore;
-use cvc_core::git::{self, open_repo};
+use cvc_core::git;
 use cvc_core::models::{Author, Interaction, InteractionId};
 use cvc_core::privacy::{CliRunCapture, PreparedPolicy};
+use cvc_core::repository::{RepositoryLayout, RepositoryLayoutError};
 use std::env;
 use std::process::{Command, Stdio};
 use uuid::Uuid;
@@ -12,13 +13,30 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         bail!("No command provided to run.");
     }
 
+    // Keep this separately from the worktree root: `cvc run` intentionally
+    // executes the child where the user invoked it, including nested paths.
     let current_dir = env::current_dir()?;
-    let cvc_dir = current_dir.join(".git").join("cvc");
-    let db_path = cvc_dir.join("index.db");
+    let layout = match RepositoryLayout::discover(&current_dir) {
+        Ok(layout) => {
+            // A bare repository is a layout error for capture, rather than a
+            // non-repository compatibility case.
+            layout.worktree_root()?;
+            Some(layout)
+        }
+        Err(RepositoryLayoutError::NotRepository) => None,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "Failed to discover Git repository: {error}"
+            ))
+        }
+    };
+    let initialized = layout
+        .as_ref()
+        .is_some_and(|layout| layout.cvc_dir().is_dir());
     // Load once before opening the repository or inspecting status/diffs. This
     // exact policy snapshot is later handed to persistence.
-    let policy = if cvc_dir.exists() {
-        PreparedPolicy::load(&current_dir)
+    let policy = if initialized {
+        PreparedPolicy::load(layout.as_ref().unwrap().policy_root()?)
             .map_err(|error| anyhow::anyhow!("CVC capture blocked by .thoughtignore: {error}"))?
     } else {
         PreparedPolicy::built_ins_only()
@@ -28,8 +46,9 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     let mut context_items = Vec::new();
     let mut repo_opt = None;
 
-    if cvc_dir.exists() {
-        if let Ok(repo) = open_repo(&current_dir) {
+    if initialized {
+        if let Some(layout) = layout.as_ref() {
+            let repo = layout.repository();
             if let Ok(dirty_files) = git::get_dirty_files(&repo) {
                 let dirty_files: Vec<String> = dirty_files
                     .into_iter()
@@ -41,7 +60,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
                 if let Ok(items) = git::snapshot_context(&repo, &temp_id, &dirty_files) {
                     context_items = items;
                 }
-                repo_opt = Some(repo);
+                repo_opt = Some(());
             }
         }
     }
@@ -68,7 +87,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     print!("{}", stdout);
     eprint!("{}", stderr); // Pipe stderr back to user
 
-    if !cvc_dir.exists() {
+    if !initialized {
         return Ok(());
     }
 
@@ -81,7 +100,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
 
     if let Some(_repo) = repo_opt {
         // Warn if we can't open store but CVC dir exists
-        match CvcStore::open_initialized(&db_path) {
+        match CvcStore::open_initialized(layout.as_ref().unwrap().db_path()) {
             Ok(store) => {
                 let interaction_id = InteractionId::new();
 
