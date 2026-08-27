@@ -4,7 +4,7 @@
 
 Imported evidence preserves substantive text. For deterministic output only, CRLF is normalized to LF, trailing spaces and tabs are removed from each line, and each evidence text has exactly one terminal newline.
 
-Coverage: 407 Rust packages; 20 production npm packages; 247 unique evidence texts.
+Coverage: 408 Rust packages; 20 production npm packages; 247 unique evidence texts.
 
 ## Package inventory
 
@@ -250,6 +250,7 @@ Coverage: 407 Rust packages; 20 production npm packages; 247 unique evidence tex
 | Rust | rustls-webpki@0.103.13 | ISC | https&#58;//github.com/rustls/webpki |
 | Rust | rustversion@1.0.22 | MIT OR Apache-2.0 | https&#58;//github.com/dtolnay/rustversion |
 | Rust | ryu@1.0.23 | Apache-2.0 OR BSL-1.0 | https&#58;//github.com/dtolnay/ryu |
+| Rust | same-file@1.0.6 | Unlicense/MIT | https&#58;//github.com/BurntSushi/same-file |
 | Rust | schannel@0.1.28 | MIT | https&#58;//github.com/steffengy/schannel-rs |
 | Rust | scopeguard@1.2.0 | MIT OR Apache-2.0 | https&#58;//github.com/bluss/scopeguard |
 | Rust | secret-service@3.1.0 | MIT OR Apache-2.0 | https&#58;//github.com/hwchen/secret-service-rs.git |
@@ -762,6 +763,7 @@ Exact package/file provenance:
 - Rust&#58; aho-corasick@1.1.4 — Unlicense OR MIT — COPYING
 - Rust&#58; byteorder@1.5.0 — Unlicense OR MIT — COPYING
 - Rust&#58; memchr@2.8.0 — Unlicense OR MIT — COPYING
+- Rust&#58; same-file@1.0.6 — Unlicense/MIT — COPYING
 - Rust&#58; termcolor@1.4.1 — Unlicense OR MIT — COPYING
 - Rust&#58; winapi-util@0.1.11 — Unlicense OR MIT — COPYING
 
@@ -13195,6 +13197,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ### Evidence SHA-256: cb3c929a05e6cbc9de9ab06a4c57eeb60ca8c724bef6c138c87d3a577e27aa14
 
 Exact package/file provenance:
+- Rust&#58; same-file@1.0.6 — Unlicense/MIT — LICENSE-MIT
 - Rust&#58; winapi-util@0.1.11 — Unlicense OR MIT — LICENSE-MIT
 
 ```text
