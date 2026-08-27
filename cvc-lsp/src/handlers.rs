@@ -16,17 +16,17 @@ const CAPTURE_NOTICE_VERSION: u32 = 1;
 /// LSP client cannot silently grant capture consent.
 pub async fn handle_privacy_status(state: Arc<AppState>) -> PrivacyStatusResponse {
     task::spawn_blocking(move || {
-        let root = state.root_path.lock().ok().and_then(|path| path.clone());
-        let acknowledged = root
+        let binding = state.binding.lock().ok();
+        let acknowledged = binding
             .as_deref()
-            .and_then(|path| git2::Repository::open(path).ok())
-            .and_then(|repo| cvc_core::privacy::capture_acknowledged(&repo).ok())
+            .and_then(Option::as_ref)
+            .and_then(|binding| cvc_core::privacy::capture_acknowledged(binding.layout.repository()).ok())
             .unwrap_or(false);
 
-        let (sharing_summary, auto_push_enabled) = root
+        let (sharing_summary, auto_push_enabled) = binding
             .as_deref()
-            .and_then(|path| git2::Repository::open(path).ok())
-            .and_then(|repo| cvc_core::privacy::privacy_status(&repo, "origin").ok())
+            .and_then(Option::as_ref)
+            .and_then(|binding| cvc_core::privacy::privacy_status(binding.layout.repository(), "origin").ok())
             .map(|status| {
                 if status.sharing_consented {
                     if status.auto_push {
@@ -119,19 +119,20 @@ pub async fn handle_turn_end(client: &Client, state: Arc<AppState>, params: Turn
     // Offload DB write to background thread
     let result = task::spawn_blocking(move || {
         // Safer lock handling
-        let store_guard = state_clone.store.lock().expect("CVC Store mutex poisoned");
+        let binding = state_clone
+            .binding
+            .lock()
+            .expect("CVC binding mutex poisoned");
 
-        if let Some(store) = store_guard.as_ref() {
-            let policy = state_clone
-                .root_path
-                .lock()
-                .ok()
-                .and_then(|p| p.clone())
-                .map(|root| PreparedPolicy::load(&root))
-                .transpose()
-                .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?
-                .unwrap_or_else(PreparedPolicy::built_ins_only);
-            store.capture_lsp_explicit(LspExplicitCapture::new(
+        if let Some(binding) = binding.as_ref() {
+            let policy = PreparedPolicy::load(
+                binding
+                    .layout
+                    .policy_root()
+                    .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?,
+            )
+            .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?;
+            binding.store.capture_lsp_explicit(LspExplicitCapture::new(
                 Conversation {
                     id: interaction.conversation_id.clone(),
                     title: "Copilot Chat Session".into(),
@@ -188,21 +189,13 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
     let client_clone = client.clone();
 
     let result = task::spawn_blocking(move || {
-        let store_guard = state_clone.store.lock().expect("CVC Store mutex poisoned");
+        let binding = state_clone
+            .binding
+            .lock()
+            .expect("CVC binding mutex poisoned");
 
-        if let Some(store) = store_guard.as_ref() {
-            let root = state_clone.root_path.lock().ok().and_then(|p| p.clone());
-            let repo_root = root.as_deref().ok_or_else(|| {
-                cvc_core::db::DbError::Migration(
-                    "consent-required: repository is unavailable".into(),
-                )
-            })?;
-            let repo = git2::Repository::open(repo_root).map_err(|_| {
-                cvc_core::db::DbError::Migration(
-                    "consent-required: repository is unavailable".into(),
-                )
-            })?;
-            if !cvc_core::privacy::capture_acknowledged(&repo)
+        if let Some(binding) = binding.as_ref() {
+            if !cvc_core::privacy::capture_acknowledged(binding.layout.repository())
                 .map_err(|e| cvc_core::db::DbError::Migration(format!("consent-required: {e}")))?
             {
                 return Err(cvc_core::db::DbError::Migration(
@@ -218,12 +211,13 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
             let base_timestamp = Utc::now()
                 - chrono::Duration::seconds(params.interactions.len().saturating_sub(1) as i64);
             let mut previous_id: Option<InteractionId> = None;
-            let policy = root
-                .as_deref()
-                .map(PreparedPolicy::load)
-                .transpose()
-                .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?
-                .unwrap_or_else(PreparedPolicy::built_ins_only);
+            let policy = PreparedPolicy::load(
+                binding
+                    .layout
+                    .policy_root()
+                    .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?,
+            )
+            .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?;
             let mut captures = Vec::with_capacity(params.interactions.len());
 
             for (i, segment) in params.interactions.iter().enumerate() {
@@ -257,7 +251,9 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
                 ));
                 previous_id = Some(id);
             }
-            store.replace_lsp_passive_capture_batch(&params.source_request_id, captures)
+            binding
+                .store
+                .replace_lsp_passive_capture_batch(&params.source_request_id, captures)
         } else {
             Err(cvc_core::db::DbError::Migration("DB not open".to_string()))
         }
@@ -374,16 +370,18 @@ pub async fn handle_timeline_get(
         .await;
 
     let state_clone = state.clone();
-    let root_path = state.root_path.lock().unwrap().clone();
-
     // Run DB and Git operations in blocking thread
     let result = task::spawn_blocking(move || {
-        let store_guard = state_clone.store.lock().expect("CVC Store mutex poisoned");
+        let binding = state_clone
+            .binding
+            .lock()
+            .expect("CVC binding mutex poisoned");
 
-        if let Some(store) = store_guard.as_ref() {
+        if let Some(binding) = binding.as_ref() {
             // Get pending (floating) interactions
             let pending = if include_unbound {
-                store
+                binding
+                    .store
                     .get_floating_interactions()
                     .unwrap_or_default()
                     .into_iter()
@@ -395,11 +393,14 @@ pub async fn handle_timeline_get(
             };
 
             // Get commits with their linked interactions
-            let mut commits_data = store.get_commits_with_interactions().unwrap_or_default();
+            let mut commits_data = binding
+                .store
+                .get_commits_with_interactions()
+                .unwrap_or_default();
 
             // Filter commits by reachability from HEAD if provided
             filter_commits_by_reachability(
-                root_path.as_deref(),
+                binding.layout.worktree_root().ok(),
                 head_sha.as_deref(),
                 &mut commits_data,
             );
@@ -409,7 +410,8 @@ pub async fn handle_timeline_get(
                 .into_iter()
                 .take(max_items)
                 .map(|(sha, interactions)| {
-                    let (message, timestamp) = get_commit_info(sha.as_str(), root_path.as_deref());
+                    let (message, timestamp) =
+                        get_commit_info(sha.as_str(), binding.layout.worktree_root().ok());
 
                     CommitWithThoughts {
                         sha: sha.as_str().to_string(),
@@ -461,9 +463,12 @@ pub async fn handle_interaction_get(
     let interaction_id = params.id.clone();
 
     let result = task::spawn_blocking(move || {
-        let store_guard = state_clone.store.lock().expect("CVC Store mutex poisoned");
+        let binding = state_clone
+            .binding
+            .lock()
+            .expect("CVC binding mutex poisoned");
 
-        if let Some(store) = store_guard.as_ref() {
+        if let Some(binding) = binding.as_ref() {
             // Parse the interaction ID
             let id: InteractionId = match interaction_id.parse() {
                 Ok(id) => id,
@@ -471,20 +476,25 @@ pub async fn handle_interaction_get(
             };
 
             // Get the interaction
-            let interaction = match store.get_interaction(&id) {
+            let interaction = match binding.store.get_interaction(&id) {
                 Ok(Some(i)) => i,
                 _ => return None,
             };
 
             // Get linked commit if any
-            let linked_commit = store.get_artifact_links(&id).ok().and_then(|links| {
-                links
-                    .first()
-                    .map(|l| l.git_commit_hash.as_str().to_string())
-            });
+            let linked_commit = binding
+                .store
+                .get_artifact_links(&id)
+                .ok()
+                .and_then(|links| {
+                    links
+                        .first()
+                        .map(|l| l.git_commit_hash.as_str().to_string())
+                });
 
             // Get context files
-            let context_files: Vec<ContextFileInfo> = store
+            let context_files: Vec<ContextFileInfo> = binding
+                .store
                 .get_context_items(&id)
                 .unwrap_or_default()
                 .into_iter()
