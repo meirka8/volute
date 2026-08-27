@@ -35,6 +35,12 @@
   "activationEvents": [
     "workspaceContains:.git"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "CVC only runs repository discovery and local tools in trusted workspaces."
+    }
+  },
   "main": "./dist/extension.js",
   "contributes": {
     "configuration": {
@@ -43,17 +49,20 @@
         "volute.lspPath": {
           "type": "string",
           "default": "",
-          "description": "Custom path to the cvc-lsp binary. Leave empty to auto-detect from ~/.cvc/bin or PATH."
+          "description": "Machine-scoped custom path to the cvc-lsp binary. Leave empty to auto-detect from ~/.cvc/bin or PATH.",
+          "scope": "machine"
         },
         "volute.cvcCliPath": {
           "type": "string",
           "default": "",
-          "description": "Custom path to the cvc CLI binary. Leave empty to auto-detect from ~/.cvc/bin or PATH."
+          "description": "Machine-scoped custom path to the cvc CLI binary. Leave empty to auto-detect from ~/.cvc/bin or PATH.",
+          "scope": "machine"
         },
         "volute.cvcMcpPath": {
           "type": "string",
           "default": "",
-          "description": "Custom path to the cvc-mcp binary. Leave empty to auto-detect from ~/.cvc/bin or PATH."
+          "description": "Machine-scoped custom path to the cvc-mcp binary. Leave empty to auto-detect from ~/.cvc/bin or PATH.",
+          "scope": "machine"
         },
         "volute.suppressSetupPrompts": {
           "type": "boolean",
@@ -148,7 +157,7 @@
           {
             "id": "volute.welcome.privacy",
             "title": "Review Local Capture and Sharing",
-            "description": "Passive capture is off until you acknowledge the CLI notice. CVC may capture prompts, responses, exposed reasoning, and tool/context patches from this workspace’s locally stored chat sessions. Data is stored in `.git/cvc/index.db` and is private by default. Sharing through hidden `refs/cvc/main` requires a separate remote-consent/share action. Scrubbing has limits, and content shared through Git may be permanent.\n\n[Acknowledge in Terminal](command:volute.acknowledgePrivacyCapture) · [Refresh Privacy Status](command:volute.refreshPrivacyStatus)",
+            "description": "Passive capture is off until you acknowledge the CLI notice. CVC may capture prompts, responses, exposed reasoning, and tool/context patches from this workspace’s locally stored chat sessions. Data is stored under the Git common directory’s `cvc/index.db` and is private by default. Sharing through hidden `refs/cvc/main` requires a separate remote-consent/share action. Scrubbing has limits, and content shared through Git may be permanent.\n\n[Acknowledge in Terminal](command:volute.acknowledgePrivacyCapture) · [Refresh Privacy Status](command:volute.refreshPrivacyStatus)",
             "media": {
               "markdown": "## Your choice\n\nOpening the terminal does not enable capture. Complete the CLI's exact TTY challenge, then refresh status. CVC does not claim that data can never leave your machine: local capture stays local by default; a separately consented share can publish data to a remote."
             }
@@ -202,14 +211,16 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
-    "compile": "npm run check-types && node esbuild.js",
+    "clean": "node scripts/clean-dist.mjs",
+    "compile": "npm run clean && npm run check-types && node esbuild.js",
     "watch": "npm-run-all -p watch:*",
     "watch:esbuild": "node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
-    "package": "npm run check-types && node esbuild.js --production",
+    "package": "npm run clean && npm run check-types && node esbuild.js --production",
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
-    "test": "npm run compile && vscode-test"
+    "test:unit": "npm run compile && tsc --outDir dist --noEmit false && node --test dist/unit/**/*.test.js",
+    "test": "npm run test:unit && vscode-test"
   },
   "overrides": {
     "micromatch": {
