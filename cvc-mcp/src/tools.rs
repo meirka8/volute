@@ -38,6 +38,10 @@ pub fn list_tools() -> Value {
                         "parent_id": {
                             "type": "string",
                             "description": "Optional explicit parent interaction ID, for branching instead of continuing the default linear per-session chain."
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": "Optional bound worktree path; a different repository or worktree is rejected."
                         }
                     },
                     "required": ["task", "reasoning"]
@@ -82,6 +86,10 @@ pub fn list_tools() -> Value {
                         "file_path": {
                             "type": "string",
                             "description": "Repository-relative path for the file to inspect"
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": "Optional bound worktree path; a different repository or worktree is rejected."
                         }
                     },
                     "required": ["file_path"]
@@ -120,8 +128,8 @@ pub async fn call_tool(params: Value, state: Arc<AppState>) -> Result<Value, Jso
         "commit_thought" => commit_thought(args, state).await,
         "read_history" => read_history(args, state).await,
         "sync_history" => sync_history(args, state).await,
-        "get_context" => get_context(args).await,
-        "setup_cvc" => setup_cvc(args).await,
+        "get_context" => get_context(args, state).await,
+        "setup_cvc" => setup_cvc(args, state).await,
         _ => Err(JsonRpcError {
             code: -32601,
             message: format!("Unknown tool: {}", name),
@@ -131,6 +139,11 @@ pub async fn call_tool(params: Value, state: Arc<AppState>) -> Result<Value, Jso
 }
 
 async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, JsonRpcError> {
+    let layout = bound_layout(&args, &state)?;
+    let policy_root = layout
+        .policy_root()
+        .map_err(repository_mismatch)?
+        .to_owned();
     // New schema fields
     let task = args
         .get("task")
@@ -177,16 +190,11 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
     let session_conversation_id = state.conversation_id.lock().unwrap().clone();
     let session_parent_id = state.last_interaction_id.lock().unwrap().clone();
 
-    let store = state.store.clone();
+    let state_for_store = state.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let store = store
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Failed to lock store"))?;
-
         let conversation_id = explicit_conversation_id
             .or(session_conversation_id)
             .unwrap_or_else(|| "agent-session-default".to_string());
-
         let interaction = Interaction {
             id: InteractionId::new(),
             conversation_id,
@@ -200,26 +208,27 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
             source_request_id: None,
         };
 
-        let policy = PreparedPolicy::load(&std::env::current_dir()?)?;
-        store.capture_mcp(McpCapture::new(
-            Conversation {
-                id: interaction.conversation_id.clone(),
-                title: format!("Session {}", interaction.conversation_id),
-                created_at: Utc::now(),
-            },
-            interaction.clone(),
-            Vec::new(),
-            Vec::new(),
-            policy,
-        ))?;
+        let policy = PreparedPolicy::load(&policy_root)?;
+        state_for_store
+            .revalidate()
+            .map_err(|_| anyhow::anyhow!("repository binding changed"))?;
+        state_for_store.with_store(|store| {
+            Ok(store.capture_mcp(McpCapture::new(
+                Conversation {
+                    id: interaction.conversation_id.clone(),
+                    title: format!("Session {}", interaction.conversation_id),
+                    created_at: Utc::now(),
+                },
+                interaction.clone(),
+                Vec::new(),
+                Vec::new(),
+                policy,
+            ))?)
+        })?;
         Ok::<_, anyhow::Error>(interaction.id)
     })
     .await
-    .map_err(|e| JsonRpcError {
-        code: -32603,
-        message: format!("Internal Error: {}", e),
-        data: None,
-    })?;
+    .map_err(|e| tool_failure("Failed to record thought", e))?;
 
     match res {
         Ok(id) => {
@@ -228,15 +237,12 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
                 "content": [{ "type": "text", "text": format!("Thought recorded. ID: {}", id) }]
             }))
         }
-        Err(e) => Err(JsonRpcError {
-            code: -32603,
-            message: format!("DB Error: {}", e),
-            data: None,
-        }),
+        Err(e) => Err(tool_failure("Failed to record thought", e)),
     }
 }
 
 async fn read_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRpcError> {
+    let _layout = bound_layout_without_cwd(&state)?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let commit = args
         .get("commit")
@@ -244,49 +250,51 @@ async fn read_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRp
         .map(|s| s.to_string());
     let conversation_id = state.conversation_id.lock().unwrap().clone();
 
-    let store = state.store.clone();
+    let state_for_store = state.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let store = store
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Failed to lock store"))?;
-
-        let interactions = if let Some(commit_sha) = commit {
-            // Resuming at a known commit: return exactly what led to it, not a mix
-            // diluted with unrelated recent chatter.
-            store.get_interactions_for_commit(&cvc_core::models::CommitSha::new(commit_sha))?
-        } else {
-            // Recent interactions for the current session's conversation first, then
-            // fill the rest with recent repo-wide interactions, regardless of link
-            // status -- agent memory should survive a commit, not go blank the moment
-            // one lands.
-            let mut recent = match &conversation_id {
-                Some(conv_id) => store.get_recent_interactions_for_conversation(conv_id, limit)?,
-                None => Vec::new(),
-            };
-
-            if recent.len() < limit {
-                let seen: HashSet<_> = recent.iter().map(|i| i.id.clone()).collect();
-                for interaction in store.get_recent_interactions(limit)? {
-                    if recent.len() >= limit {
-                        break;
+        state_for_store
+            .revalidate()
+            .map_err(|_| anyhow::anyhow!("repository binding changed"))?;
+        let interactions = state_for_store.with_store(|store| {
+            Ok(if let Some(commit_sha) = commit {
+                // Resuming at a known commit: return exactly what led to it, not a mix
+                // diluted with unrelated recent chatter.
+                store.get_interactions_for_commit(&cvc_core::models::CommitSha::new(commit_sha))?
+            } else {
+                // Recent interactions for the current session's conversation first, then
+                // fill the rest with recent repo-wide interactions, regardless of link
+                // status -- agent memory should survive a commit, not go blank the moment
+                // one lands.
+                let mut recent = match &conversation_id {
+                    Some(conv_id) => {
+                        store.get_recent_interactions_for_conversation(conv_id, limit)?
                     }
-                    if !seen.contains(&interaction.id) {
-                        recent.push(interaction);
+                    None => Vec::new(),
+                };
+
+                if recent.len() < limit {
+                    let seen: HashSet<_> = recent.iter().map(|i| i.id.clone()).collect();
+                    for interaction in store.get_recent_interactions(limit)? {
+                        if recent.len() >= limit {
+                            break;
+                        }
+                        if !seen.contains(&interaction.id) {
+                            recent.push(interaction);
+                        }
                     }
                 }
-            }
 
-            recent
-        };
+                recent
+            })
+        })?;
+        state_for_store
+            .revalidate()
+            .map_err(|_| anyhow::anyhow!("repository binding changed"))?;
 
         Ok::<_, anyhow::Error>(interactions)
     })
     .await
-    .map_err(|e| JsonRpcError {
-        code: -32603,
-        message: format!("Internal Error: {}", e),
-        data: None,
-    })?;
+    .map_err(|e| tool_failure("History unavailable", e))?;
 
     match res {
         Ok(interactions) => {
@@ -303,29 +311,16 @@ async fn read_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRp
             }
             Ok(json!({ "content": [{ "type": "text", "text": text }] }))
         }
-        Err(e) => Err(JsonRpcError {
-            code: -32603,
-            message: format!("DB Error: {}", e),
-            data: None,
-        }),
+        Err(e) => Err(tool_failure("History unavailable", e)),
     }
 }
 
 async fn sync_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRpcError> {
-    let current_dir = if let Some(cwd) = args.get("cwd").and_then(|v| v.as_str()) {
-        std::path::PathBuf::from(cwd)
-    } else {
-        std::env::current_dir().map_err(|e| JsonRpcError {
-            code: -32603,
-            message: format!("Failed to get current directory: {}", e),
-            data: None,
-        })?
-    };
+    let layout = bound_layout(&args, &state)?;
 
-    let store = state.store.clone();
+    let state_for_store = state.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let repo = cvc_core::git::open_repo(&current_dir)
-            .map_err(|e| anyhow::anyhow!("Failed to open repo: {}", e))?;
+        let repo = layout.into_repository();
 
         let remotes = repo.remotes()?;
         let remote_name = if remotes.iter().any(|r| r == Some("origin")) {
@@ -339,24 +334,28 @@ async fn sync_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRp
                 .ok_or_else(|| anyhow::anyhow!("No git remotes configured for this repository"))?
         };
 
-        let store = store
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Failed to lock store"))?;
-
         let destination = cvc_core::privacy::remote_destination(&repo, &remote_name)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let _operation_lock =
             cvc_core::privacy::destination_operation_lock(&repo, &destination.fingerprint)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        let new_count = cvc_core::sync::fetch_and_pull_destination(&repo, &store, &destination)?;
+        // Network fetch deliberately occurs outside the SQLite mutex.
+        cvc_core::sync::fetch_destination(&repo, &destination)?;
+        // Revalidate after network work and immediately before import/mutation.
+        state_for_store
+            .revalidate()
+            .map_err(|_| anyhow::anyhow!("repository binding changed"))?;
+        let new_count = state_for_store.with_store(|store| {
+            Ok(cvc_core::sync::pull_destination(
+                &repo,
+                store,
+                &destination,
+            )?)
+        })?;
         Ok::<_, anyhow::Error>((remote_name, new_count))
     })
     .await
-    .map_err(|e| JsonRpcError {
-        code: -32603,
-        message: format!("Internal Error: {}", e),
-        data: None,
-    })?;
+    .map_err(|e| tool_failure("Sync failed", e))?;
 
     match res {
         Ok((remote_name, new_count)) => Ok(json!({
@@ -368,15 +367,12 @@ async fn sync_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRp
                 )
             }]
         })),
-        Err(e) => Err(JsonRpcError {
-            code: -32603,
-            message: format!("Sync Error: {}", e),
-            data: None,
-        }),
+        Err(e) => Err(tool_failure("Sync failed", e)),
     }
 }
 
-async fn get_context(args: Value) -> Result<Value, JsonRpcError> {
+async fn get_context(args: Value, state: Arc<AppState>) -> Result<Value, JsonRpcError> {
+    let layout = bound_layout(&args, &state)?;
     let file_path = args
         .get("file_path")
         .and_then(|v| v.as_str())
@@ -388,9 +384,7 @@ async fn get_context(args: Value) -> Result<Value, JsonRpcError> {
         .to_string(); // Own the string
 
     let res = tokio::task::spawn_blocking(move || {
-        // Assume current directory is repo root
-        let repo = cvc_core::git::open_repo(".")
-            .map_err(|e| anyhow::anyhow!("Failed to open repo: {}", e))?;
+        let repo = layout.into_repository();
 
         // We need a dummy interaction ID to call snapshot_context (it links items to it)
         // But here we are just *reading* context, not necessarily saving it yet?
@@ -398,17 +392,19 @@ async fn get_context(args: Value) -> Result<Value, JsonRpcError> {
         // We can ignore it or use a default.
         let interaction_id = InteractionId::new();
 
+        state
+            .revalidate()
+            .map_err(|_| anyhow::anyhow!("repository binding changed"))?;
         let items = cvc_core::git::snapshot_context(&repo, &interaction_id, &[file_path])
             .map_err(|e| anyhow::anyhow!("Failed to snapshot context: {}", e))?;
+        state
+            .revalidate()
+            .map_err(|_| anyhow::anyhow!("repository binding changed"))?;
 
         Ok::<_, anyhow::Error>(items)
     })
     .await
-    .map_err(|e| JsonRpcError {
-        code: -32603,
-        message: format!("Internal Error: {}", e),
-        data: None,
-    })?;
+    .map_err(|e| tool_failure("Context unavailable", e))?;
 
     match res {
         Ok(items) => {
@@ -430,75 +426,95 @@ async fn get_context(args: Value) -> Result<Value, JsonRpcError> {
                 Ok(json!({ "content": [{ "type": "text", "text": "File not found or ignored." }] }))
             }
         }
-        Err(e) => Err(JsonRpcError {
-            code: -32603,
-            message: format!("Git Error: {}", e),
-            data: None,
-        }),
+        Err(e) => Err(tool_failure("Context unavailable", e)),
     }
 }
 
-async fn setup_cvc(args: Value) -> Result<Value, JsonRpcError> {
-    // We allow "cwd" argument for testing purposes, or default to current_dir.
-    let current_dir = if let Some(cwd) = args.get("cwd").and_then(|v| v.as_str()) {
-        std::path::PathBuf::from(cwd)
-    } else {
-        std::env::current_dir().map_err(|e| JsonRpcError {
-            code: -32603,
-            message: format!("Failed to get current directory: {}", e),
-            data: None,
-        })?
-    };
+async fn setup_cvc(args: Value, state: Arc<AppState>) -> Result<Value, JsonRpcError> {
+    let layout = bound_layout(&args, &state)?;
+    let state_for_store = state.clone();
 
     let res = tokio::task::spawn_blocking(move || {
-        // 0. Validate Git Repo
-        // Ensure we are in a valid git repository before doing anything.
-        // We use discovery to find the repo root if we are in a subdir.
-        let repo = cvc_core::git::open_repo(&current_dir)
-            .map_err(|_| anyhow::anyhow!("Current directory is not a git repository. CVC requires a git repository to function."))?;
-
-        // We use the workdir as root for hooks installation
-        let repo_root = repo.workdir().unwrap_or(&current_dir).to_path_buf();
-
-        // 1. Initialize DB (idempotent)
-        let cvc_dir = repo_root.join(".git").join("cvc");
-        let db_path = cvc_dir.join("index.db");
-
-        // Ensure parent dir exists
-        if !cvc_dir.exists() {
-            std::fs::create_dir_all(&cvc_dir)
-                .map_err(|e| anyhow::anyhow!("Failed to create cvc dir: {}", e))?;
-        }
-
-        // Open store and init schema
-        let store = cvc_core::db::CvcStore::open_initialized(&db_path)
-            .map_err(|e| anyhow::anyhow!("Failed to open DB: {}", e))?;
-        store
-            .init()
-            .map_err(|e| anyhow::anyhow!("Failed to init DB schema: {}", e))?;
+        // The state store was opened from this exact common-dir path at startup.
+        // Never open a request-selected database here.
+        state_for_store
+            .revalidate()
+            .map_err(|_| anyhow::anyhow!("repository binding changed"))?;
+        state_for_store.with_store(|store| {
+            store
+                .init()
+                .map_err(|e| anyhow::anyhow!("Failed to init DB schema: {}", e))
+        })?;
 
         // 2. Install Hooks (idempotent)
-        cvc_core::hooks::install(&current_dir)
+        state_for_store
+            .revalidate()
+            .map_err(|_| anyhow::anyhow!("repository binding changed"))?;
+        cvc_core::hooks::install_layout(&layout)
             .map_err(|e| anyhow::anyhow!("Failed to install hooks: {}", e))?;
+        state_for_store
+            .revalidate()
+            .map_err(|_| anyhow::anyhow!("repository binding changed"))?;
 
         Ok::<_, anyhow::Error>(())
     })
     .await
-    .map_err(|e| JsonRpcError {
-        code: -32603,
-        message: format!("Internal Error: {}", e),
-        data: None,
-    })?;
+    .map_err(|e| tool_failure("Setup failed", e))?;
 
     if let Err(e) = res {
-        return Err(JsonRpcError {
-            code: -32603,
-            message: format!("Setup Failed: {}", e),
-            data: None,
-        });
+        return Err(tool_failure("Setup failed", e));
     }
 
     Ok(
         json!({ "content": [{ "type": "text", "text": "CVC initialized and hooks installed successfully." }] }),
     )
+}
+
+/// Resolve an optional legacy cwd only after proving it is the startup
+/// worktree. Omitting it still revalidates the bound root, so metadata changes
+/// after startup fail closed rather than redirecting an operation.
+fn bound_layout(
+    args: &Value,
+    state: &AppState,
+) -> Result<cvc_core::repository::RepositoryLayout, JsonRpcError> {
+    let path = match args.get("cwd") {
+        Some(Value::String(path)) if !path.is_empty() => std::path::PathBuf::from(path),
+        Some(_) => return Err(invalid_cwd()),
+        None => state.repository().policy_root().to_owned(),
+    };
+    state.repository().rediscover(&path)
+}
+
+fn bound_layout_without_cwd(
+    state: &AppState,
+) -> Result<cvc_core::repository::RepositoryLayout, JsonRpcError> {
+    state
+        .repository()
+        .rediscover(state.repository().policy_root())
+}
+
+fn invalid_cwd() -> JsonRpcError {
+    JsonRpcError {
+        code: -32602,
+        message: "Invalid 'cwd' parameter".into(),
+        data: None,
+    }
+}
+
+fn repository_mismatch(_: cvc_core::repository::RepositoryLayoutError) -> JsonRpcError {
+    JsonRpcError {
+        code: -32602,
+        message: "Repository mismatch".into(),
+        data: None,
+    }
+}
+
+fn tool_failure(message: &'static str, error: impl std::fmt::Display) -> JsonRpcError {
+    let _ = error;
+    eprintln!("cvc-mcp: {message}");
+    JsonRpcError {
+        code: -32603,
+        message: message.into(),
+        data: None,
+    }
 }

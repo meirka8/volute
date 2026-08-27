@@ -33,6 +33,14 @@ pub fn install(repo_root: &Path) -> Result<Vec<HookInstallOutcome>> {
     // The latter matters because Git resolves a relative hooksPath from it.
     let layout = crate::repository::RepositoryLayout::discover(repo_root)
         .context("Failed to discover git repository")?;
+    install_layout(&layout)
+}
+
+/// Installs hooks for an already validated layout without rediscovering a
+/// caller-controlled pathname.
+pub fn install_layout(
+    layout: &crate::repository::RepositoryLayout,
+) -> Result<Vec<HookInstallOutcome>> {
     let worktree_root = layout.worktree_root()?;
     let repo = layout.repository();
     let mut hooks_dir = layout.common_git_dir().join("hooks");

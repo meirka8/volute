@@ -2530,6 +2530,15 @@ pub fn fetch_and_pull_destination(
     db: &CvcStore,
     destination: &crate::privacy::RemoteDestination,
 ) -> Result<usize> {
+    fetch_destination(repo, destination)?;
+    pull_destination(repo, db, destination)
+}
+
+/// Fetches the approved CVC ref without touching the local CVC database.
+pub fn fetch_destination(
+    repo: &Repository,
+    destination: &crate::privacy::RemoteDestination,
+) -> Result<()> {
     let ref_name = "refs/cvc/main";
     let remote_tracking_ref = format!("refs/remotes/{}/cvc/main", destination.name);
     let refspec = format!("{}:{}", ref_name, remote_tracking_ref);
@@ -2562,10 +2571,19 @@ pub fn fetch_and_pull_destination(
         remote.fetch(&[&refspec], Some(&mut fetch_opts), None)?;
     }
 
+    Ok(())
+}
+
+/// Imports an already fetched tracking ref into the supplied store.
+pub fn pull_destination(
+    repo: &Repository,
+    db: &CvcStore,
+    destination: &crate::privacy::RemoteDestination,
+) -> Result<usize> {
+    let remote_tracking_ref = format!("refs/remotes/{}/cvc/main", destination.name);
     if repo.find_reference(&remote_tracking_ref).is_err() {
         return Ok(0);
     }
-
     let before_count = db.get_all_interaction_ids()?.len();
     pull_from_ref_for_remote(
         repo,

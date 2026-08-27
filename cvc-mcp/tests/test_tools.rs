@@ -6,7 +6,7 @@ use cvc_mcp::server::{start_session, AppState};
 use cvc_mcp::tools::{call_tool, list_tools};
 use git2::Repository;
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
 
 trait CaptureFixture {
@@ -47,10 +47,14 @@ fn project_fixture_to_ref(repo: &Repository, store: &CvcStore, ref_name: &str, d
 /// alive for as long as `AppState` is used, since dropping it deletes the DB file.
 fn make_state() -> (TempDir, Arc<AppState>) {
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("cvc.db");
-    let store = CvcStore::open(&db_path).unwrap();
-    store.init().unwrap();
-    (dir, Arc::new(AppState::new(Arc::new(Mutex::new(store)))))
+    Repository::init(dir.path()).unwrap();
+    let layout = cvc_core::repository::RepositoryLayout::discover(dir.path()).unwrap();
+    (dir, Arc::new(AppState::open(&layout).unwrap()))
+}
+
+fn fixture_store(root: &std::path::Path) -> CvcStore {
+    let layout = cvc_core::repository::RepositoryLayout::discover(root).unwrap();
+    CvcStore::open(layout.db_path()).unwrap()
 }
 
 #[tokio::test]
@@ -65,7 +69,7 @@ async fn test_list_tools() {
 
 #[tokio::test]
 async fn test_commit_thought() {
-    let (_dir, state) = make_state();
+    let (dir, state) = make_state();
     start_session(&state, "test-client").unwrap();
 
     // The commit_thought input schema (list_tools() above) takes "task", not
@@ -88,10 +92,9 @@ async fn test_commit_thought() {
         .contains("Thought recorded"));
 
     // Verify in DB
-    let interactions = {
-        let store_locked = state.store.lock().unwrap();
-        store_locked.get_floating_interactions().unwrap()
-    };
+    let interactions = fixture_store(dir.path())
+        .get_floating_interactions()
+        .unwrap();
     assert!(!interactions.is_empty());
     assert_eq!(
         interactions[0].model_cot.as_ref().unwrap(),
@@ -130,7 +133,7 @@ async fn test_read_history() {
 async fn test_read_history_includes_linked_interactions() {
     // HEL-62 acceptance criterion: read_history must not go blank the moment an
     // interaction is linked to a commit -- it previously only read floating nodes.
-    let (_dir, state) = make_state();
+    let (dir, state) = make_state();
     start_session(&state, "test-client").unwrap();
 
     let args = json!({
@@ -140,7 +143,7 @@ async fn test_read_history_includes_linked_interactions() {
     call_tool(args, state.clone()).await.unwrap();
 
     {
-        let store = state.store.lock().unwrap();
+        let store = fixture_store(dir.path());
         let interactions = store.get_floating_interactions().unwrap();
         let interaction_id = &interactions[0].id;
         store
@@ -164,7 +167,7 @@ async fn test_read_history_includes_linked_interactions() {
 async fn test_parent_chaining_within_session() {
     // HEL-62 acceptance criterion: two consecutive commit_thought calls in one
     // server process produce chained parent_ids in one conversation.
-    let (_dir, state) = make_state();
+    let (dir, state) = make_state();
     let conversation_id = start_session(&state, "test-client").unwrap();
 
     let first_args = json!({
@@ -179,7 +182,7 @@ async fn test_parent_chaining_within_session() {
     });
     call_tool(second_args, state.clone()).await.unwrap();
 
-    let store = state.store.lock().unwrap();
+    let store = fixture_store(dir.path());
     let interactions = store
         .get_recent_interactions_for_conversation(&conversation_id, 10)
         .unwrap();
@@ -209,14 +212,10 @@ async fn test_distinct_sessions_get_distinct_conversations() {
     // own DB connection, its own session state) sharing the same repo DB file, the
     // way two real cvc-mcp processes on the same repo would.
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("cvc.db");
-
-    let store_a = CvcStore::open(&db_path).unwrap();
-    store_a.init().unwrap();
-    let state_a = Arc::new(AppState::new(Arc::new(Mutex::new(store_a))));
-
-    let store_b = CvcStore::open(&db_path).unwrap();
-    let state_b = Arc::new(AppState::new(Arc::new(Mutex::new(store_b))));
+    Repository::init(dir.path()).unwrap();
+    let layout = cvc_core::repository::RepositoryLayout::discover(dir.path()).unwrap();
+    let state_a = Arc::new(AppState::open(&layout).unwrap());
+    let state_b = Arc::new(AppState::open(&layout).unwrap());
 
     let conv_a = start_session(&state_a, "client-a").unwrap();
     let conv_b = start_session(&state_b, "client-b").unwrap();
@@ -293,9 +292,8 @@ async fn test_sync_history_pulls_from_remote() {
     // Machine B: a fresh clone; the MCP server's state points at its own local DB.
     let local_b_path = temp_dir.path().join("local_b");
     Repository::clone(remote_path.to_str().unwrap(), &local_b_path).unwrap();
-    let store_b = CvcStore::open(local_b_path.join(".git/cvc/index.db")).unwrap();
-    store_b.init().unwrap();
-    let state = Arc::new(AppState::new(Arc::new(Mutex::new(store_b))));
+    let layout_b = cvc_core::repository::RepositoryLayout::discover(&local_b_path).unwrap();
+    let state = Arc::new(AppState::open(&layout_b).unwrap());
 
     let args = json!({
         "name": "sync_history",
@@ -308,8 +306,93 @@ async fn test_sync_history_pulls_from_remote() {
         "unexpected sync_history response: {text}"
     );
 
-    let store = state.store.lock().unwrap();
+    let store = fixture_store(&local_b_path);
     let fetched = store.get_interaction(&inter_a.id).unwrap();
     assert!(fetched.is_some(), "machine B should now have A's thought");
     assert_eq!(fetched.unwrap().user_prompt, "Thought from machine A");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rejects_replaced_database_at_same_path() {
+    let (dir, state) = make_state();
+    let layout = cvc_core::repository::RepositoryLayout::discover(dir.path()).unwrap();
+    let db_path = layout.db_path();
+    let replacement = db_path.with_extension("replaced");
+    std::fs::rename(&db_path, &replacement).unwrap();
+    let replacement_store = CvcStore::open(&db_path).unwrap();
+    replacement_store.init().unwrap();
+
+    let error = call_tool(json!({"name":"read_history", "arguments":{}}), state)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, -32602);
+    assert_eq!(error.message, "Repository mismatch");
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_rejects_symlinked_cvc_storage() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let layout = cvc_core::repository::RepositoryLayout::discover(dir.path()).unwrap();
+    let target = dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    symlink(&target, layout.cvc_dir()).unwrap();
+    assert!(AppState::open(&layout).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_rejects_symlinked_database() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let layout = cvc_core::repository::RepositoryLayout::discover(dir.path()).unwrap();
+    std::fs::create_dir(layout.cvc_dir()).unwrap();
+    let target = dir.path().join("target.db");
+    std::fs::write(&target, "not sqlite").unwrap();
+    symlink(&target, layout.db_path()).unwrap();
+    assert!(AppState::open(&layout).is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejects_symlink_replacement_before_operation() {
+    use std::os::unix::fs::symlink;
+
+    let (dir, state) = make_state();
+    let layout = cvc_core::repository::RepositoryLayout::discover(dir.path()).unwrap();
+    let db_path = layout.db_path();
+    let target = dir.path().join("replacement.db");
+    std::fs::write(&target, "replacement").unwrap();
+    std::fs::remove_file(&db_path).unwrap();
+    symlink(&target, &db_path).unwrap();
+    let error = call_tool(json!({"name":"read_history", "arguments":{}}), state)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, -32602);
+    assert_eq!(error.message, "Repository mismatch");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejects_cvc_directory_symlink_before_operation() {
+    use std::os::unix::fs::symlink;
+
+    let (dir, state) = make_state();
+    let layout = cvc_core::repository::RepositoryLayout::discover(dir.path()).unwrap();
+    let cvc_dir = layout.cvc_dir();
+    std::fs::rename(&cvc_dir, dir.path().join("old-cvc")).unwrap();
+    let target = dir.path().join("replacement-cvc");
+    std::fs::create_dir(&target).unwrap();
+    symlink(&target, &cvc_dir).unwrap();
+    let error = call_tool(json!({"name":"read_history", "arguments":{}}), state)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, -32602);
+    assert_eq!(error.message, "Repository mismatch");
 }
