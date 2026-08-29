@@ -1,5 +1,8 @@
 //! End-to-end stdio tests deliberately use disposable repositories only.
+use chrono::Utc;
 use cvc_core::db::CvcStore;
+use cvc_core::models::{Author, Conversation, Interaction, InteractionId};
+use cvc_core::privacy::{McpCapture, PreparedPolicy};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -31,6 +34,37 @@ fn interaction_count(db_path: &Path) -> usize {
         .get_recent_interactions(100)
         .unwrap()
         .len()
+}
+
+fn project_fixture_to_ref(
+    repo: &git2::Repository,
+    store: &CvcStore,
+    ref_name: &str,
+    destination: &str,
+) {
+    let projection = cvc_core::sync::push_projection_to_ref(repo, store, "", destination).unwrap();
+    let cvc_core::sync::ProjectionResult::Candidate { oid, candidate, .. } = projection else {
+        panic!("fixture expected projection candidate");
+    };
+    repo.reference(ref_name, oid, true, "fixture: remote accepted candidate")
+        .unwrap();
+    drop(candidate);
+}
+
+fn capture_fixture_interaction(store: &CvcStore, interaction: Interaction) {
+    store
+        .capture_mcp(McpCapture::new(
+            Conversation {
+                id: interaction.conversation_id.clone(),
+                title: "fixture".into(),
+                created_at: interaction.timestamp,
+            },
+            interaction,
+            Vec::new(),
+            Vec::new(),
+            PreparedPolicy::built_ins_only(),
+        ))
+        .unwrap();
 }
 
 struct Mcp {
@@ -254,4 +288,127 @@ fn linked_worktree_binds_common_store_policy_and_rejects_other_repositories() {
         .as_deref()
         .unwrap()
         .contains("LINKED_SECRET"));
+}
+
+#[test]
+fn linked_worktree_sync_history_imports_remote_projection_into_common_store() {
+    // Everything, including Git's global configuration and the remote, is local to
+    // this fixture.  The server itself starts below the linked worktree root.
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let remote = temp.path().join("remote.git");
+    std::fs::create_dir(&remote).unwrap();
+    git(&remote, &["init", "--bare", "--initial-branch=main"]);
+
+    let publisher = temp.path().join("publisher");
+    std::fs::create_dir(&publisher).unwrap();
+    git(&publisher, &["init", "-b", "main"]);
+    git(&publisher, &["config", "user.name", "fixture"]);
+    git(
+        &publisher,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    std::fs::write(publisher.join("README"), "fixture\n").unwrap();
+    git(&publisher, &["add", "README"]);
+    git(&publisher, &["commit", "-m", "initial"]);
+    git(
+        &publisher,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&publisher, &["push", "origin", "main"]);
+
+    let publisher_layout = cvc_core::repository::RepositoryLayout::discover(&publisher).unwrap();
+    let publisher_store = CvcStore::open(publisher_layout.db_path()).unwrap();
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "remote-conversation".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "linked remote thought".into(),
+        model_name: None,
+        model_cot: Some("remote reasoning".into()),
+        model_response: None,
+        source_request_id: None,
+    };
+    capture_fixture_interaction(&publisher_store, interaction.clone());
+    let destination =
+        cvc_core::privacy::remote_destination(publisher_layout.repository(), "origin")
+            .unwrap()
+            .fingerprint;
+    publisher_store
+        .share_conversation_for_remote(
+            &interaction.conversation_id,
+            &destination,
+            cvc_core::models::FutureSharePolicy::Private,
+        )
+        .unwrap();
+    project_fixture_to_ref(
+        publisher_layout.repository(),
+        &publisher_store,
+        "refs/cvc/main",
+        &destination,
+    );
+    git(
+        &publisher,
+        &["push", "origin", "refs/cvc/main:refs/cvc/main"],
+    );
+
+    let main = temp.path().join("main");
+    git(
+        temp.path(),
+        &["clone", remote.to_str().unwrap(), main.to_str().unwrap()],
+    );
+    let linked = temp.path().join("linked");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "linked-branch",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let nested = linked.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let other = temp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    git(&other, &["init"]);
+
+    let linked_layout = cvc_core::repository::RepositoryLayout::discover(&nested).unwrap();
+    let main_layout = cvc_core::repository::RepositoryLayout::discover(&main).unwrap();
+    assert_eq!(linked_layout.db_path(), main_layout.db_path());
+    assert!(std::fs::metadata(linked.join(".git")).unwrap().is_file());
+
+    let mut mcp = Mcp::start(&nested, &home);
+    assert!(mcp.request(1, "initialize", json!({}))["result"].is_object());
+    let synced = mcp.request(
+        2,
+        "tools/call",
+        json!({"name":"sync_history", "arguments":{"cwd":linked}}),
+    );
+    assert!(synced["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Pulled 1 new interaction"));
+    let history = mcp.request(
+        3,
+        "tools/call",
+        json!({"name":"read_history", "arguments":{}}),
+    );
+    assert!(history["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("linked remote thought"));
+
+    // The linked server and primary checkout observe one common SQLite store.
+    assert!(CvcStore::open(main_layout.db_path())
+        .unwrap()
+        .get_interaction(&interaction.id)
+        .unwrap()
+        .is_some());
+    assert!(!linked.join(".git").join("cvc").exists());
+    assert!(!other.join(".git/cvc/index.db").exists());
 }
