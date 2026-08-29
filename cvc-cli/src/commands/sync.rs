@@ -12,9 +12,11 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     env,
-    io::{IsTerminal, Write},
+    io::{IsTerminal, Read, Write},
     path::Path,
 };
+
+const MAX_REDACTION_PLAN_BYTES: u64 = 64 * 1024;
 
 fn remote(repo: &Repository, requested: Option<&str>) -> Result<String> {
     if let Some(name) = requested {
@@ -180,6 +182,36 @@ fn write_redaction_plan(path: &Path, plan: &cvc_core::RedactionPlan) -> Result<(
     Ok(())
 }
 
+fn read_redaction_plan(path: &Path) -> Result<cvc_core::RedactionPlan> {
+    let metadata = fs::symlink_metadata(path).context("unable to inspect redaction plan")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("redaction plan must be a regular, non-symlink file");
+    }
+    if metadata.len() > MAX_REDACTION_PLAN_BYTES {
+        bail!("redaction plan exceeds size limit");
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file() || opened_metadata.len() > MAX_REDACTION_PLAN_BYTES {
+        bail!("redaction plan is not a regular file or exceeds size limit");
+    }
+    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_REDACTION_PLAN_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_REDACTION_PLAN_BYTES {
+        bail!("redaction plan exceeds size limit");
+    }
+    serde_json::from_slice(&bytes).context("invalid redaction plan")
+}
+
 pub async fn redact(
     id: &str,
     remote_name: &str,
@@ -245,7 +277,7 @@ pub async fn verify_redaction_plan(path: &Path, remote_name: &str) -> Result<()>
     let (repo, store) = open(&env::current_dir()?)?;
     let destination = privacy::remote_destination(&repo, remote_name)?;
     let _operation_lock = privacy::destination_operation_lock(&repo, &destination.fingerprint)?;
-    let plan: cvc_core::RedactionPlan = serde_json::from_slice(&fs::read(path)?)?;
+    let plan = read_redaction_plan(path)?;
     if plan.destination_fingerprint != destination.fingerprint {
         bail!("plan destination does not match remote");
     }
@@ -421,8 +453,8 @@ pub async fn observe_range(base: &str, tip: &str, requested: Option<&str>) -> Re
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::write_redaction_plan;
-    use cvc_core::{InteractionId, RedactionPlan};
+    use super::{read_redaction_plan, write_redaction_plan, MAX_REDACTION_PLAN_BYTES};
+    use cvc_core::{InteractionId, RedactionPlan, RedactionPlanFields};
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -431,28 +463,48 @@ mod tests {
             std::env::temp_dir().join(format!("cvc-plan-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("plan.json");
-        let plan = RedactionPlan {
-            format: "cvc.redaction-plan/v1".into(),
-            version: 1,
-            repository_fingerprint: "repo".into(),
-            destination_fingerprint: "destination".into(),
-            target_id: InteractionId::new(),
-            expected_remote_tip: None,
-            replacement_commit: "a".repeat(40),
-            temporary_ref: "refs/cvc/candidate-test".into(),
-            removed_nodes: 0,
-            removed_by_commit_entries: 0,
-            removed_link_entries: 0,
-            unrelated_entries_retained: 0,
-            tombstone_oid: "b".repeat(40),
-            created_at: chrono::Utc::now(),
-            warning: "test".into(),
-        };
+        let plan = RedactionPlan::v2(
+            "repo".into(),
+            RedactionPlanFields {
+                destination_fingerprint: "destination".into(),
+                target_id: InteractionId::new(),
+                expected_remote_tip: None,
+                replacement_commit: "a".repeat(40),
+                temporary_ref: "refs/cvc/candidate-test".into(),
+                removed_nodes: 0,
+                removed_by_commit_entries: 0,
+                removed_link_entries: 0,
+                unrelated_entries_retained: 0,
+                tombstone_oid: "b".repeat(40),
+                created_at: chrono::Utc::now(),
+                warning: "test".into(),
+            },
+        );
         write_redaction_plan(&path, &plan).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn redaction_plan_reader_rejects_oversized_and_symlink_inputs() {
+        use std::os::unix::fs::symlink;
+
+        let directory =
+            std::env::temp_dir().join(format!("cvc-plan-read-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let oversized = directory.join("oversized.json");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_REDACTION_PLAN_BYTES + 1).unwrap();
+        assert!(read_redaction_plan(&oversized).is_err());
+
+        let target = directory.join("target.json");
+        std::fs::write(&target, b"{}").unwrap();
+        let link = directory.join("plan.json");
+        symlink(&target, &link).unwrap();
+        assert!(read_redaction_plan(&link).is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

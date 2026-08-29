@@ -5,11 +5,24 @@ use cvc_core::privacy::{McpCapture, PreparedPolicy};
 use cvc_core::sync::{self, SyncNode};
 use git2::{FileMode, ObjectType, Repository, Signature};
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use std::sync::mpsc;
 use std::time::Duration;
 use tempfile::TempDir;
 
 const TEST_DESTINATION: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[test]
+fn historical_redaction_plan_v1_fixture_round_trips_exactly() -> anyhow::Result<()> {
+    let fixture = include_str!("fixtures/redaction-plan-v1.json");
+    let plan: RedactionPlan = serde_json::from_str(fixture)?;
+    let encoded = serde_json::to_string_pretty(&plan)?;
+    assert_eq!(encoded, fixture.trim_end());
+    assert!(!encoded.contains("common_git_dir_fingerprint"));
+    assert_eq!(plan.format, "cvc.redaction-plan/v1");
+    assert_eq!(plan.version, 1);
+    Ok(())
+}
 
 #[test]
 fn pull_rejects_non_utf8_sync_paths() -> anyhow::Result<()> {
@@ -853,6 +866,33 @@ fn v4_tombstone_precedes_nodes_links_and_stale_clone_data() -> anyhow::Result<()
 fn hard_redaction_plan_verifies_applies_locally_and_retains_tombstone() -> anyhow::Result<()> {
     let temp_dir = TempDir::new()?;
     let repo = Repository::init(temp_dir.path())?;
+    let signature = Signature::now("test", "test@example.test")?;
+    let empty_tree = repo.treebuilder(None)?.write()?;
+    repo.commit(
+        Some("refs/heads/main"),
+        &signature,
+        &signature,
+        "initial",
+        &repo.find_tree(empty_tree)?,
+        &[],
+    )?;
+    repo.set_head("refs/heads/main")?;
+    let sibling_path = temp_dir.path().join("sibling");
+    assert!(std::process::Command::new("git")
+        .args([
+            "-C",
+            temp_dir.path().to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "redaction-sibling",
+            sibling_path.to_str().unwrap(),
+        ])
+        .status()?
+        .success());
+    let sibling = Repository::open(&sibling_path)?;
+    assert!(repo.remotes()?.is_empty());
+    assert!(sibling.remotes()?.is_empty());
     let store = CvcStore::open(temp_dir.path().join("store.db"))?;
     let target = Interaction {
         id: InteractionId::new(),
@@ -905,12 +945,73 @@ fn hard_redaction_plan_verifies_applies_locally_and_retains_tombstone() -> anyho
         &target.id,
     )?;
     let plan = candidate.plan.clone();
+    assert_eq!(plan.format, "cvc.redaction-plan/v2");
+    assert_eq!(
+        serde_json::to_string_pretty(&plan)?,
+        serde_json::to_string_pretty(&serde_json::from_str::<RedactionPlan>(
+            &serde_json::to_string_pretty(&plan)?
+        )?)?
+    );
+    let encoded = serde_json::to_string(&plan)?;
+    let duplicate_format = encoded.replacen('{', r#"{"format":"cvc.redaction-plan/v1","#, 1);
+    assert!(
+        serde_json::from_str::<RedactionPlan>(&duplicate_format).is_err(),
+        "duplicate discriminators must not be collapsed by an intermediate map"
+    );
+    let duplicate_version = encoded.replacen("\"version\":2", "\"version\":1,\"version\":2", 1);
+    assert!(serde_json::from_str::<RedactionPlan>(&duplicate_version).is_err());
+    let duplicate_fingerprint = encoded.replacen(
+        "\"repository_fingerprint\":",
+        "\"repository_fingerprint\":\"wrong\",\"repository_fingerprint\":",
+        1,
+    );
+    assert!(serde_json::from_str::<RedactionPlan>(&duplicate_fingerprint).is_err());
+    let mut missing_fingerprint = serde_json::to_value(&plan)?;
+    missing_fingerprint
+        .as_object_mut()
+        .unwrap()
+        .remove("repository_fingerprint");
+    assert!(serde_json::from_value::<RedactionPlan>(missing_fingerprint).is_err());
+    // The historical flat v1 wire shape remains readable and uses exactly its
+    // original lossy active-worktree identity algorithm.
+    let mut legacy_wire = serde_json::to_value(&plan)?;
+    legacy_wire["format"] = serde_json::Value::String("cvc.redaction-plan/v1".into());
+    legacy_wire["version"] = serde_json::Value::from(1);
+    legacy_wire["repository_fingerprint"] = serde_json::Value::String(hex::encode(Sha256::digest(
+        repo.path().to_string_lossy().as_bytes(),
+    )));
+    let legacy: RedactionPlan = serde_json::from_value(legacy_wire.clone())?;
+    assert!(sync::verify_redaction_plan(
+        &repo,
+        &legacy,
+        "refs/remotes/fixture/cvc/main"
+    )?);
+    assert!(
+        sync::verify_redaction_plan(&sibling, &legacy, "refs/remotes/fixture/cvc/main").is_err()
+    );
+    assert!(sync::apply_hard_redaction_locally(&sibling, &legacy).is_err());
+    for (key, value) in [
+        (
+            "unknown_identity_field",
+            serde_json::Value::String("mixed".into()),
+        ),
+        ("version", serde_json::Value::from(3)),
+    ] {
+        let mut invalid = legacy_wire.clone();
+        invalid[key] = value;
+        assert!(serde_json::from_value::<RedactionPlan>(invalid).is_err());
+    }
     assert!(sync::verify_redaction_plan(
         &repo,
         &plan,
         "refs/remotes/fixture/cvc/main"
     )?);
-    sync::apply_hard_redaction_locally(&repo, &plan)?;
+    assert!(sync::verify_redaction_plan(
+        &sibling,
+        &plan,
+        "refs/remotes/fixture/cvc/main"
+    )?);
+    sync::apply_hard_redaction_locally(&sibling, &plan)?;
     let local = repo.find_reference("refs/cvc/main")?.peel_to_commit()?;
     assert_eq!(local.parent_count(), 0);
     let tree = local.tree()?;
@@ -964,9 +1065,9 @@ fn hard_redaction_plan_verifies_applies_locally_and_retains_tombstone() -> anyho
     )?);
     for mut tampered in [
         {
-            let mut p = plan.clone();
-            p.repository_fingerprint = "wrong".into();
-            p
+            let mut wire = serde_json::to_value(&plan)?;
+            wire["repository_fingerprint"] = serde_json::Value::String("wrong".into());
+            serde_json::from_value(wire)?
         },
         {
             let mut p = plan.clone();
@@ -983,7 +1084,9 @@ fn hard_redaction_plan_verifies_applies_locally_and_retains_tombstone() -> anyho
         // Avoid retaining the mutable binding in the assertion loop.
         tampered.warning.clear();
     }
+    let temporary_ref = plan.temporary_ref.clone();
     drop(candidate);
+    assert!(repo.find_reference(&temporary_ref).is_err());
     Ok(())
 }
 

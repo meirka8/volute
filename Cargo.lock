@@ -591,6 +591,7 @@ dependencies = [
  "git2",
  "hex",
  "keyring",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

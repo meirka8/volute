@@ -126,6 +126,12 @@ cvc redact <interaction-uuid> --remote origin --rewrite-plan ./redaction-plan.js
 
 The plan file is written with mode `0600` on Unix. `redact-verify-plan` only checks that the remote tip remains current. `--apply-local` changes **only local** `refs/cvc/main`; neither plan command pushes or force-pushes. `cvc delete-local` creates local suppression only and never propagates. A tombstone is suppression, not physical erasure, and a current-ref replacement is not guaranteed deletion.
 
+Redaction plans created today use v2 identity and are portable only between linked
+worktrees that share the same common Git directory. Historical v1 plans remain
+bound to their original worktree. Neither form implies portability to arbitrary clones.
+Verification accepts only regular, non-symlink plan files up to 64 KiB and rejects
+unknown, duplicate, or mismatched format/version fields before contacting a remote.
+
 The local SQLite cache enables `secure_delete` and, after deletion, attempts a truncating WAL checkpoint and `VACUUM` compaction. This is best effort only: residual filesystem blocks, SSD wear leveling, snapshots, failed-operation WAL remnants, backups, and Git objects may still retain data.
 
 If credentials may have been exposed, rotate them first. Git-host support/removal is best effort; clones, forks, reflogs, caches, backups, and host object retention may retain content. Remote hard rewrite is **NOT implemented** pending an atomic force-with-lease design. Do not use blind force-push commands.

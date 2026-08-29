@@ -1,7 +1,7 @@
 use crate::db::CvcStore;
 use crate::models::{
     ArtifactLink, ContextItem, DerivationEvent, Interaction, RangeEvidence, RedactionPlan,
-    Tombstone, ToolExecution,
+    RedactionPlanFields, Tombstone, ToolExecution,
 };
 use chrono::{Timelike, Utc};
 use git2::{Direction, FileMode, ObjectType, Repository, Tree, TreeBuilder};
@@ -605,10 +605,8 @@ pub fn build_hard_redaction_plan<'repo>(
         &replacement,
         &[],
     )?;
-    let repository_fingerprint =
-        hex::encode(Sha256::digest(repo.path().to_string_lossy().as_bytes()));
     let after = count_tree_entries(repo, &replacement)?;
-    let plan = RedactionPlan { format: "cvc.redaction-plan/v1".into(), version: 1, repository_fingerprint, destination_fingerprint: destination_fingerprint.into(), target_id: target.clone(), expected_remote_tip, replacement_commit: oid.to_string(), temporary_ref: temp_ref.clone(), removed_nodes, removed_by_commit_entries, removed_link_entries, unrelated_entries_retained: after, tombstone_oid: tombstone_oid.to_string(), created_at: Utc::now().with_nanosecond(0).expect("valid"), warning: "Local planning only. Remote history rewrite is unsupported pending atomic force-with-lease transport.".into() };
+    let plan = RedactionPlan::v2(common_git_dir_fingerprint(repo)?, RedactionPlanFields { destination_fingerprint: destination_fingerprint.into(), target_id: target.clone(), expected_remote_tip, replacement_commit: oid.to_string(), temporary_ref: temp_ref.clone(), removed_nodes, removed_by_commit_entries, removed_link_entries, unrelated_entries_retained: after, tombstone_oid: tombstone_oid.to_string(), created_at: Utc::now().with_nanosecond(0).expect("valid"), warning: "Local planning only. Remote history rewrite is unsupported pending atomic force-with-lease transport.".into() });
     let _ = before;
     Ok(RedactionCandidate {
         plan,
@@ -670,9 +668,6 @@ pub fn verify_redaction_plan(
     plan: &RedactionPlan,
     tracking_ref: &str,
 ) -> Result<bool> {
-    if plan.format != "cvc.redaction-plan/v1" || plan.version != 1 {
-        return Err(SyncError::Ref("invalid redaction plan".into()));
-    }
     validate_redaction_replacement(repo, plan)?;
     let current = repo
         .find_reference(tracking_ref)
@@ -732,8 +727,18 @@ pub fn apply_hard_redaction_locally(repo: &Repository, plan: &RedactionPlan) -> 
 /// Validate all locally-verifiable plan invariants before either reporting a
 /// plan current or changing a ref.  This deliberately has no remote transport.
 fn validate_redaction_replacement(repo: &Repository, plan: &RedactionPlan) -> Result<()> {
-    let fingerprint = hex::encode(Sha256::digest(repo.path().to_string_lossy().as_bytes()));
-    if plan.repository_fingerprint != fingerprint
+    let identity_matches = match (plan.format.as_str(), plan.version) {
+        // This is intentionally the historical lossy v1 algorithm. Never use it
+        // for new plans and never upgrade a v1 plan during verification.
+        ("cvc.redaction-plan/v1", 1) => {
+            plan.repository_fingerprint == legacy_worktree_fingerprint(repo)
+        }
+        ("cvc.redaction-plan/v2", 2) => {
+            plan.repository_fingerprint == common_git_dir_fingerprint(repo)?
+        }
+        _ => false,
+    };
+    if !identity_matches
         || plan.destination_fingerprint.len() != 64
         || !plan
             .destination_fingerprint
@@ -807,6 +812,39 @@ fn validate_redaction_replacement(repo: &Repository, plan: &RedactionPlan) -> Re
     }
     assert_no_redacted_event_reference(repo, &tree, &plan.target_id)?;
     Ok(())
+}
+
+fn legacy_worktree_fingerprint(repo: &Repository) -> String {
+    hex::encode(Sha256::digest(repo.path().to_string_lossy().as_bytes()))
+}
+
+/// Domain-separate v2 from all previous path hashes. Unix path bytes are hashed
+/// directly; Windows uses the native UTF-16 code units instead of lossy UTF-8.
+fn common_git_dir_fingerprint(repo: &Repository) -> Result<String> {
+    let path = crate::repository::common_git_dir(repo)
+        .map_err(|error| SyncError::Ref(format!("invalid common Git directory: {error}")))?;
+    let mut hash = Sha256::new();
+    hash.update(b"cvc.redaction-plan/common-git-dir/v2\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hash.update(b"unix-bytes\0");
+        hash.update(path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        hash.update(b"windows-utf16le\0");
+        for unit in path.as_os_str().encode_wide() {
+            hash.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        hash.update(b"fallback-lossy-utf8\0");
+        hash.update(path.to_string_lossy().as_bytes());
+    }
+    Ok(hex::encode(hash.finalize()))
 }
 
 /// Writes the tree layout for `refs/cvc/main` (or any other CVC shadow ref):

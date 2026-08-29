@@ -162,6 +162,9 @@ fn same_path_identity(path: &std::path::Path, expected: &FileIdentity, kind: Exp
 impl AppState {
     /// Opens the sole store permitted for this state from the validated layout.
     pub fn open(layout: &RepositoryLayout) -> anyhow::Result<Self> {
+        // This must precede even calculating CVC storage paths: a bare common
+        // Git directory is not a worktree and startup must leave it untouched.
+        layout.worktree_root()?;
         let db_path = layout.db_path();
         let cvc_dir = layout.cvc_dir();
         let before = storage_snapshot(&cvc_dir, &db_path)?;

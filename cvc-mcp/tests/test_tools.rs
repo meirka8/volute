@@ -52,6 +52,34 @@ fn make_state() -> (TempDir, Arc<AppState>) {
     (dir, Arc::new(AppState::open(&layout).unwrap()))
 }
 
+#[test]
+fn bare_repository_startup_does_not_create_cvc_storage_or_hooks() {
+    let dir = tempdir().unwrap();
+    Repository::init_bare(dir.path()).unwrap();
+    let layout = cvc_core::repository::RepositoryLayout::discover(dir.path()).unwrap();
+    let hooks_before: Vec<_> = std::fs::read_dir(dir.path().join("hooks"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(AppState::open(&layout).is_err());
+    assert!(
+        !layout.cvc_dir().exists(),
+        "bare startup must not create cvc/"
+    );
+    assert!(
+        !layout.db_path().exists(),
+        "bare startup must not reserve index.db"
+    );
+    let hooks_after: Vec<_> = std::fs::read_dir(dir.path().join("hooks"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        hooks_after, hooks_before,
+        "bare startup must not mutate hooks"
+    );
+}
+
 fn fixture_store(root: &std::path::Path) -> CvcStore {
     let layout = cvc_core::repository::RepositoryLayout::discover(root).unwrap();
     CvcStore::open(layout.db_path()).unwrap()
