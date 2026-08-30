@@ -331,3 +331,48 @@ fn failed_hook_install_does_not_initialize_storage_and_can_be_retried() {
     assert!(fixture.main.join(".git/cvc/index.db").is_file());
     assert!(fixture.main.join("fixed-hooks/post-commit").is_file());
 }
+
+#[test]
+fn sibling_worktree_commit_does_not_claim_another_worktrees_capture() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&fixture.main, &["init"]);
+    let db = fixture.main.join(".git/cvc/index.db");
+
+    // Capture a context-free thought from the linked worktree, strictly after
+    // the initial commit so the time window alone would have allowed linking.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    fixture.cvc_ok(&fixture.linked, &["run", "--", "printf", "parallel work"]);
+
+    let links = |db: &Path| -> i64 {
+        Connection::open(db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM artifact_links", [], |row| row.get(0))
+            .unwrap()
+    };
+
+    // A commit in the primary worktree runs the post-commit hook there. Before
+    // origin scoping this temporally claimed the linked worktree's thought.
+    fs::write(fixture.main.join("tracked"), "main change\n").unwrap();
+    fixture.git(&fixture.main, &["add", "tracked"]);
+    fixture.git(&fixture.main, &["commit", "-m", "main change"]);
+    assert_eq!(
+        links(&db),
+        0,
+        "the primary worktree must not claim the linked worktree's capture"
+    );
+
+    // The linked worktree's own commit still links its capture.
+    fs::write(fixture.linked.join("tracked"), "linked change\n").unwrap();
+    fixture.git(&fixture.linked, &["add", "tracked"]);
+    fixture.git(&fixture.linked, &["commit", "-m", "linked change"]);
+    assert_eq!(
+        links(&db),
+        1,
+        "the capturing worktree links its own thought"
+    );
+    let link_type: String = Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT link_type FROM artifact_links", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(link_type, "temporal");
+}

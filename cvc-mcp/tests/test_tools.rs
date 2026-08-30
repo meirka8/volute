@@ -28,6 +28,7 @@ impl CaptureFixture for CvcStore {
             Vec::new(),
             Vec::new(),
             PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))
         .map(|_| ())
     }

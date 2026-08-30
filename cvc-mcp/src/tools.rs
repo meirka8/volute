@@ -144,6 +144,9 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
         .policy_root()
         .map_err(repository_mismatch)?
         .to_owned();
+    // Captured against the bound worktree so a sibling checkout's automatic
+    // linker cannot claim this thought from the shared database.
+    let capture_worktree = layout.worktree_origin().map_err(repository_mismatch)?;
     // New schema fields
     let task = args
         .get("task")
@@ -223,6 +226,7 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
                 Vec::new(),
                 Vec::new(),
                 policy,
+                capture_worktree,
             ))?)
         })?;
         Ok::<_, anyhow::Error>(interaction.id)

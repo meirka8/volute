@@ -132,6 +132,10 @@ pub async fn handle_turn_end(client: &Client, state: Arc<AppState>, params: Turn
                     .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?,
             )
             .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?;
+            let capture_worktree = binding
+                .layout
+                .worktree_origin()
+                .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?;
             binding.store.capture_lsp_explicit(LspExplicitCapture::new(
                 Conversation {
                     id: interaction.conversation_id.clone(),
@@ -142,6 +146,7 @@ pub async fn handle_turn_end(client: &Client, state: Arc<AppState>, params: Turn
                 Vec::new(),
                 Vec::new(),
                 policy,
+                capture_worktree,
             ))
         } else {
             Err(cvc_core::db::DbError::Migration("DB not open".to_string()))
@@ -218,6 +223,10 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
                     .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?,
             )
             .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?;
+            let capture_worktree = binding
+                .layout
+                .worktree_origin()
+                .map_err(|e| cvc_core::db::DbError::Migration(e.to_string()))?;
             let mut captures = Vec::with_capacity(params.interactions.len());
 
             for (i, segment) in params.interactions.iter().enumerate() {
@@ -248,6 +257,7 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
                     Vec::new(),
                     Vec::new(),
                     policy.clone(),
+                    capture_worktree.clone(),
                 ));
                 previous_id = Some(id);
             }

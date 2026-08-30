@@ -821,6 +821,10 @@ pub(crate) struct Capture {
     pub(crate) tool_executions: Vec<ToolExecution>,
     pub(crate) source: CaptureSource,
     pub(crate) policy: PreparedPolicy,
+    /// Worktree-origin fingerprint scoping automatic link eligibility.  Every
+    /// production capture happens in a discovered worktree, so the typed
+    /// constructors require it; only sync imports store no origin.
+    pub(crate) capture_worktree: Option<String>,
 }
 macro_rules! capture_type {
     ($name:ident, $source:expr) => {
@@ -832,6 +836,7 @@ macro_rules! capture_type {
                 context_items: Vec<ContextItem>,
                 tool_executions: Vec<ToolExecution>,
                 policy: PreparedPolicy,
+                capture_worktree: String,
             ) -> Self {
                 Self(Capture {
                     conversation,
@@ -840,6 +845,7 @@ macro_rules! capture_type {
                     tool_executions,
                     source: $source,
                     policy,
+                    capture_worktree: Some(capture_worktree),
                 })
             }
             pub(crate) fn into_capture(self) -> Capture {
@@ -866,6 +872,9 @@ pub(crate) fn sync_import_capture(
         tool_executions,
         source: CaptureSource::SyncImport,
         policy: PreparedPolicy::built_ins_only(),
+        // Imported nodes were not captured by any local worktree. Without an
+        // origin they remain broadly eligible, exactly like legacy rows.
+        capture_worktree: None,
     }
 }
 pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
