@@ -66,6 +66,7 @@ impl CaptureFixture for CvcStore {
             Vec::new(),
             Vec::new(),
             PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))
         .and_then(|_| {
             self.share_conversation_for_remote(
@@ -2361,6 +2362,7 @@ fn test_sync_v2_round_trip() -> anyhow::Result<()> {
         }],
         Vec::new(),
         PreparedPolicy::built_ins_only(),
+        "0".repeat(64),
     ))?;
     store.link_interaction_with_metadata(
         &linked.id,

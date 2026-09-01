@@ -737,6 +737,7 @@ mod plan_tests {
             vec![],
             vec![],
             crate::privacy::PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))?;
         store.link_automatic_interaction_batch_trusted(
             &[(&interaction.id, "generated")],

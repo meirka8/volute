@@ -63,6 +63,7 @@ fn capture_fixture_interaction(store: &CvcStore, interaction: Interaction) {
             Vec::new(),
             Vec::new(),
             PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))
         .unwrap();
 }
@@ -288,6 +289,20 @@ fn linked_worktree_binds_common_store_policy_and_rejects_other_repositories() {
         .as_deref()
         .unwrap()
         .contains("LINKED_SECRET"));
+    // The thought is attributed to the bound linked worktree, so only that
+    // worktree's automatic linker may consider it.
+    let linked_origin = cvc_core::repository::worktree_origin_fingerprint(&linked).unwrap();
+    let scoped = store
+        .get_floating_interactions_for_worktree(&linked_origin)
+        .unwrap();
+    assert_eq!(scoped.len(), 1, "own-worktree scoping sees the capture");
+    assert!(
+        store
+            .get_floating_interactions_for_worktree(&"f".repeat(64))
+            .unwrap()
+            .is_empty(),
+        "a different worktree origin must not see the capture"
+    );
 }
 
 #[test]

@@ -99,6 +99,9 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     };
 
     if let Some(_repo) = repo_opt {
+        // The capture is attributed to the invoking worktree so sibling
+        // checkouts' automatic linkers cannot claim it later.
+        let capture_worktree = layout.as_ref().unwrap().worktree_origin()?;
         // Warn if we can't open store but CVC dir exists
         match CvcStore::open_initialized(layout.as_ref().unwrap().db_path()) {
             Ok(store) => {
@@ -141,6 +144,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
                     final_context_items,
                     Vec::new(),
                     policy,
+                    capture_worktree,
                 )) {
                     eprintln!("CVC Warning: Failed to save interaction: {}", e);
                 }

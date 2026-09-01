@@ -5,6 +5,7 @@
 //! Git's one-line format.  Its target is required to be an existing canonical
 //! directory; a bad `commondir` is never silently treated as a normal repo.
 use git2::{ErrorCode, Repository};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -100,6 +101,41 @@ impl RepositoryLayout {
     pub fn policy_root(&self) -> Result<&Path, RepositoryLayoutError> {
         self.worktree_root()
     }
+    /// Capture-origin fingerprint of this layout's active worktree.
+    pub fn worktree_origin(&self) -> Result<String, RepositoryLayoutError> {
+        worktree_origin_fingerprint(self.worktree_root()?)
+    }
+}
+
+/// Domain-separated fingerprint identifying one active worktree for capture
+/// attribution. It scopes automatic link eligibility in the shared database and
+/// is deliberately local-only: it is never projected into sync wire formats,
+/// and it is not a portable claim about the repository. The path is
+/// canonicalized here so every producer and consumer hashes identical bytes.
+pub fn worktree_origin_fingerprint(worktree_root: &Path) -> Result<String, RepositoryLayoutError> {
+    let canonical = canonical_directory(worktree_root, "worktree root")?;
+    let mut hash = Sha256::new();
+    hash.update(b"cvc.worktree-origin/v1\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hash.update(b"unix-bytes\0");
+        hash.update(canonical.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        hash.update(b"windows-utf16le\0");
+        for unit in canonical.as_os_str().encode_wide() {
+            hash.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        hash.update(b"fallback-lossy-utf8\0");
+        hash.update(canonical.to_string_lossy().as_bytes());
+    }
+    Ok(hex::encode(hash.finalize()))
 }
 
 fn has_git_marker(path: &Path) -> bool {

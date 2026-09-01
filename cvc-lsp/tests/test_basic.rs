@@ -348,12 +348,24 @@ fn linked_detached_worktree_uses_common_store_and_local_policy() {
         !linked.join(".git").join("cvc").exists(),
         "gitfile must not receive CVC storage"
     );
-    let interactions = cvc_core::db::CvcStore::open(main_layout.db_path())
-        .unwrap()
-        .get_floating_interactions()
-        .unwrap();
+    let store = cvc_core::db::CvcStore::open(main_layout.db_path()).unwrap();
+    let interactions = store.get_floating_interactions().unwrap();
     assert_eq!(interactions.len(), 1);
     assert!(!interactions[0].user_prompt.contains("LINKED_PRIVATE_VALUE"));
+    // The capture is attributed to the linked worktree, so the primary
+    // worktree's automatic linker must not see it as eligible.
+    let linked_origin = linked_layout.worktree_origin().unwrap();
+    assert_eq!(
+        store
+            .get_floating_interactions_for_worktree(&linked_origin)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store
+        .get_floating_interactions_for_worktree(&main_layout.worktree_origin().unwrap())
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
