@@ -51,6 +51,9 @@ pub enum SquashError {
 fn repository_identity(repo: &Repository) -> String {
     let mut h = Sha256::new();
     h.update(b"cvc.repository/local/v1\0");
+    // Persisted v1 plans use the legacy path interpretation. Do not change
+    // this without an explicit, versioned format migration.
+    #[allow(deprecated)]
     h.update(
         crate::privacy::common_git_dir(repo)
             .as_os_str()
@@ -576,6 +579,22 @@ pub fn scan_with_abort<F: FnMut() -> bool>(
 mod plan_tests {
     use super::*;
     use git2::Signature;
+
+    #[test]
+    fn repository_identity_retains_v1_path_algorithm() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let mut expected = Sha256::new();
+        expected.update(b"cvc.repository/local/v1\0");
+        #[allow(deprecated)]
+        expected.update(
+            crate::privacy::common_git_dir(&repo)
+                .as_os_str()
+                .as_encoded_bytes(),
+        );
+        assert_eq!(repository_identity(&repo), hex::encode(expected.finalize()));
+    }
+
     fn source(interaction: &InteractionId, id: &str) -> RangeSourceSnapshot {
         RangeSourceSnapshot {
             interaction_id: interaction.clone(),
@@ -718,6 +737,7 @@ mod plan_tests {
             vec![],
             vec![],
             crate::privacy::PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))?;
         store.link_automatic_interaction_batch_trusted(
             &[(&interaction.id, "generated")],

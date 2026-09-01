@@ -1,5 +1,5 @@
 use chrono::{DateTime, Timelike, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::str::FromStr;
@@ -317,11 +317,11 @@ pub struct Tombstone {
 
 /// A non-secret, destination-bound description of a local hard-redaction
 /// candidate.  It is deliberately a plan, never a remote transport command.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RedactionPlan {
     pub format: String,
     pub version: u8,
+    /// v1: legacy active-worktree hash; v2: common-Git-dir identity hash.
     pub repository_fingerprint: String,
     pub destination_fingerprint: String,
     pub target_id: InteractionId,
@@ -336,6 +336,145 @@ pub struct RedactionPlan {
     pub tombstone_oid: String,
     pub created_at: DateTime<Utc>,
     pub warning: String,
+}
+
+impl RedactionPlan {
+    pub fn v2(repository_fingerprint: String, common: RedactionPlanFields) -> Self {
+        Self {
+            format: "cvc.redaction-plan/v2".into(),
+            version: 2,
+            repository_fingerprint,
+            ..common.into_plan()
+        }
+    }
+    pub fn legacy_v1(repository_fingerprint: String, common: RedactionPlanFields) -> Self {
+        Self {
+            format: "cvc.redaction-plan/v1".into(),
+            version: 1,
+            repository_fingerprint,
+            ..common.into_plan()
+        }
+    }
+    pub fn destination_fingerprint(&self) -> &str {
+        &self.destination_fingerprint
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactionPlanFields {
+    pub destination_fingerprint: String,
+    pub target_id: InteractionId,
+    pub expected_remote_tip: Option<String>,
+    pub replacement_commit: String,
+    pub temporary_ref: String,
+    pub removed_nodes: u64,
+    pub removed_by_commit_entries: u64,
+    pub removed_link_entries: u64,
+    pub unrelated_entries_retained: u64,
+    pub tombstone_oid: String,
+    pub created_at: DateTime<Utc>,
+    pub warning: String,
+}
+impl RedactionPlanFields {
+    fn into_plan(self) -> RedactionPlan {
+        RedactionPlan {
+            format: String::new(),
+            version: 0,
+            repository_fingerprint: String::new(),
+            destination_fingerprint: self.destination_fingerprint,
+            target_id: self.target_id,
+            expected_remote_tip: self.expected_remote_tip,
+            replacement_commit: self.replacement_commit,
+            temporary_ref: self.temporary_ref,
+            removed_nodes: self.removed_nodes,
+            removed_by_commit_entries: self.removed_by_commit_entries,
+            removed_link_entries: self.removed_link_entries,
+            unrelated_entries_retained: self.unrelated_entries_retained,
+            tombstone_oid: self.tombstone_oid,
+            created_at: self.created_at,
+            warning: self.warning,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanWire {
+    destination_fingerprint: String,
+    target_id: InteractionId,
+    expected_remote_tip: Option<String>,
+    replacement_commit: String,
+    temporary_ref: String,
+    removed_nodes: u64,
+    removed_by_commit_entries: u64,
+    removed_link_entries: u64,
+    unrelated_entries_retained: u64,
+    tombstone_oid: String,
+    created_at: DateTime<Utc>,
+    warning: String,
+}
+
+// Deserialize the discriminator in the same pass as the payload. Going via a
+// `serde_json::Value` would silently collapse duplicate object keys before the
+// typed structs could reject them, making security-sensitive fields ambiguous.
+#[derive(Deserialize)]
+#[serde(tag = "format")]
+enum PlanEnvelope {
+    #[serde(rename = "cvc.redaction-plan/v1")]
+    V1(V1PlanBody),
+    #[serde(rename = "cvc.redaction-plan/v2")]
+    V2(V2PlanBody),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V1PlanBody {
+    version: u8,
+    repository_fingerprint: String,
+    #[serde(flatten)]
+    common: PlanWire,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V2PlanBody {
+    version: u8,
+    repository_fingerprint: String,
+    #[serde(flatten)]
+    common: PlanWire,
+}
+impl From<PlanWire> for RedactionPlanFields {
+    fn from(x: PlanWire) -> Self {
+        Self {
+            destination_fingerprint: x.destination_fingerprint,
+            target_id: x.target_id,
+            expected_remote_tip: x.expected_remote_tip,
+            replacement_commit: x.replacement_commit,
+            temporary_ref: x.temporary_ref,
+            removed_nodes: x.removed_nodes,
+            removed_by_commit_entries: x.removed_by_commit_entries,
+            removed_link_entries: x.removed_link_entries,
+            unrelated_entries_retained: x.unrelated_entries_retained,
+            tombstone_oid: x.tombstone_oid,
+            created_at: x.created_at,
+            warning: x.warning,
+        }
+    }
+}
+impl<'de> Deserialize<'de> for RedactionPlan {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match PlanEnvelope::deserialize(d)? {
+            PlanEnvelope::V1(p) if p.version == 1 => {
+                Ok(Self::legacy_v1(p.repository_fingerprint, p.common.into()))
+            }
+            PlanEnvelope::V2(p) if p.version == 2 => {
+                Ok(Self::v2(p.repository_fingerprint, p.common.into()))
+            }
+            _ => Err(serde::de::Error::custom(
+                "unsupported or mismatched redaction plan format/version",
+            )),
+        }
+    }
 }
 
 impl Tombstone {

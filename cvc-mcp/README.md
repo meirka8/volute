@@ -35,6 +35,10 @@ Common client locations include workspace `.vscode/mcp.json`, client settings, a
 
 The MCP server does not publish CVC data. Sync import may fetch an already-shared `refs/cvc/main` projection, but importing does not make local captures shared and does not authorize a destination. Use the interactive CLI for acknowledgement, `cvc share ... --remote ...`, and manual or separately enabled auto-push.
 
+## Repository binding and linked worktrees
+
+CVC stores its database, privacy/consent state, locks, and rewrite state under `$(git rev-parse --git-common-dir)/cvc`; linked worktrees therefore share that storage. Normal CVC refs such as `refs/cvc/main` are shared Git refs, not files under `cvc`. Hooks use Git's effective hooks path (`<common-dir>/hooks` by default, or `core.hooksPath`; relative paths are active-worktree-relative). `.thoughtignore`, context, `HEAD`, index, and branch remain local to the active worktree. One MCP server process binds to its active repository/worktree and rejects cross-repository or sibling-worktree cwd targets. Each `commit_thought` additionally records a local-only fingerprint of the bound worktree, and post-commit automatic linking considers only thoughts captured in the committing worktree, so agents running in parallel worktrees cannot claim each other's floating thoughts. This is not multi-repository support and does not change private-by-default capture, sharing consent, or auto-push behavior. CLI, MCP, LSP, and VS Code support linked worktrees; the VS Code extension remains single-folder rather than multi-root.
+
 ## Troubleshooting
 
 Ensure the binary path is executable and that the MCP process starts in the intended Git repository. Run the binary in a terminal and inspect logs if the client cannot start it.

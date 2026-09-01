@@ -66,6 +66,7 @@ interface ChatResponsePart {
 export class ChatSessionWatcher {
   private readonly outputChannel: vscode.OutputChannel;
   private readonly lspClient: VoluteLanguageClient;
+  private readonly workspaceUri: vscode.Uri;
   private watcher: vscode.FileSystemWatcher | undefined;
   private chatSessionsDir: string | undefined;
   private active = false;
@@ -84,9 +85,11 @@ export class ChatSessionWatcher {
   constructor(
     outputChannel: vscode.OutputChannel,
     lspClient: VoluteLanguageClient,
+    workspaceRoot: vscode.WorkspaceFolder,
   ) {
     this.outputChannel = outputChannel;
     this.lspClient = lspClient;
+    this.workspaceUri = workspaceRoot.uri;
   }
 
   /**
@@ -214,16 +217,9 @@ export class ChatSessionWatcher {
       return undefined;
     }
 
-    // Find the workspace storage for the current workspace
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (!workspaceFolders || workspaceFolders.length === 0) {
-      this.outputChannel.appendLine(
-        "ChatSessionWatcher: No workspace folders open",
-      );
-      return undefined;
-    }
-
-    const workspaceUri = workspaceFolders[0].uri.toString();
+    // This is the folder captured when the LSP binding was created. Never
+    // consult the current workspace list after activation.
+    const workspaceUri = this.workspaceUri.toString();
 
     // VS Code uses a hash of the workspace URI for the storage folder name
     // We'll try to find it by checking each folder for a workspace.json that matches

@@ -1,0 +1,17 @@
+{
+  "format": "cvc.redaction-plan/v1",
+  "version": 1,
+  "repository_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "destination_fingerprint": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+  "target_id": "123e4567-e89b-12d3-a456-426614174000",
+  "expected_remote_tip": null,
+  "replacement_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "temporary_ref": "refs/cvc/candidate-redact-fixture",
+  "removed_nodes": 1,
+  "removed_by_commit_entries": 2,
+  "removed_link_entries": 1,
+  "unrelated_entries_retained": 7,
+  "tombstone_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "created_at": "2025-01-02T03:04:05Z",
+  "warning": "Local planning only."
+}

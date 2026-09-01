@@ -1,7 +1,10 @@
 import * as vscode from "vscode";
-import * as path from "path";
-import * as fs from "fs";
 import { findBinary } from "./binaryUtils";
+import {
+  discoverRepositoryInitialization,
+  RepositoryInitialization,
+} from "./repositoryDiscovery";
+import { getMachineBinaryPath } from "./machineSettings";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -30,6 +33,7 @@ export interface DependencyStatus {
   cvcCli: { found: boolean; path?: string };
   cvcMcp: { found: boolean; path?: string };
   repoInitialized: boolean;
+  repositoryState: RepositoryInitialization | "no-workspace";
 }
 
 export interface InstallerUrls {
@@ -96,43 +100,31 @@ export function createCvcInitExecution(
  */
 export async function detectDependencies(
   outputChannel: vscode.OutputChannel,
+  workspaceRoot?: string,
+  gitPath?: string,
 ): Promise<DependencyStatus> {
-  const config = vscode.workspace.getConfiguration("volute");
-
   // Detect each binary (user-configured path → ~/.cvc/bin → PATH)
   const [cvcLspPath, cvcCliPath, cvcMcpPath] = await Promise.all([
-    findBinary("cvc-lsp", config.get<string>("lspPath")),
-    findBinary("cvc", config.get<string>("cvcCliPath")),
-    findBinary("cvc-mcp", config.get<string>("cvcMcpPath")),
+    findBinary("cvc-lsp", getMachineBinaryPath("lspPath", outputChannel)),
+    findBinary("cvc", getMachineBinaryPath("cvcCliPath", outputChannel)),
+    findBinary("cvc-mcp", getMachineBinaryPath("cvcMcpPath", outputChannel)),
   ]);
 
-  // Check repo initialization (.git/cvc/index.db)
-  let repoInitialized = false;
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  if (workspaceFolder) {
-    const dbPath = path.join(
-      workspaceFolder.uri.fsPath,
-      ".git",
-      "cvc",
-      "index.db",
-    );
-    try {
-      await fs.promises.access(dbPath, fs.constants.F_OK);
-      repoInitialized = true;
-    } catch {
-      // not initialized
-    }
-  }
+  const repositoryState = workspaceRoot
+    ? await discoverRepositoryInitialization(workspaceRoot, gitPath)
+    : "no-workspace";
+  const repoInitialized = repositoryState === "initialized";
 
   const status: DependencyStatus = {
     cvcLsp: { found: !!cvcLspPath, path: cvcLspPath },
     cvcCli: { found: !!cvcCliPath, path: cvcCliPath },
     cvcMcp: { found: !!cvcMcpPath, path: cvcMcpPath },
     repoInitialized,
+    repositoryState,
   };
 
   outputChannel.appendLine(
-    `Dependency check: CLI=${status.cvcCli.found}, LSP=${status.cvcLsp.found}, MCP=${status.cvcMcp.found}, Repo initialized=${status.repoInitialized}`,
+    `Dependency check: CLI=${status.cvcCli.found}, LSP=${status.cvcLsp.found}, MCP=${status.cvcMcp.found}, Repository=${status.repositoryState}`,
   );
 
   return status;
@@ -151,7 +143,12 @@ export async function promptForMissingDependencies(
   context: vscode.ExtensionContext,
   status: DependencyStatus,
   outputChannel: vscode.OutputChannel,
+  workspaceRoot?: vscode.WorkspaceFolder,
+  isActive: () => boolean = () => vscode.workspace.isTrusted,
 ): Promise<boolean> {
+  if (!isActive()) {
+    return false;
+  }
   const config = vscode.workspace.getConfiguration("volute");
   if (config.get<boolean>("suppressSetupPrompts", false)) {
     outputChannel.appendLine("Setup prompts suppressed via user setting");
@@ -164,7 +161,7 @@ export async function promptForMissingDependencies(
       context,
       DISMISS_KEY_CLI,
       "CVC CLI is not installed. It is required for CVC to function (init, log, push/pull).",
-      "Install CVC CLI",
+      "Install CVC CLI", isActive,
     );
   }
 
@@ -178,7 +175,7 @@ export async function promptForMissingDependencies(
       context,
       DISMISS_KEY_LSP,
       "CVC Language Server (cvc-lsp) was not found. The extension needs it to function.",
-      "Install CVC",
+      "Install CVC", isActive,
     );
   }
 
@@ -189,18 +186,18 @@ export async function promptForMissingDependencies(
       DISMISS_KEY_MCP,
       "Enhance your AI agent workflows with the CVC MCP Server. " +
         "It allows agents (Claude, Cursor, Windsurf) to submit exposed reasoning when their integration provides it.",
-      "Install CVC MCP",
+      "Install CVC MCP", isActive,
     );
   }
 
   // ── Repo init check ────────────────────────────────────────────────────
   if (
     status.cvcCli.found &&
-    !status.repoInitialized &&
-    vscode.workspace.workspaceFolders?.length &&
+    status.repositoryState === "not-initialized" &&
+    workspaceRoot &&
     shouldPrompt(context, DISMISS_KEY_INIT)
   ) {
-    promptInit(context, status);
+    promptInit(context, status, workspaceRoot, isActive);
   }
 
   return status.cvcCli.found && status.cvcLsp.found;
@@ -238,10 +235,13 @@ function promptInstall(
   dismissKey: string,
   message: string,
   installLabel: string,
+  isActive: () => boolean,
 ): void {
+  if (!isActive()) {return;}
   vscode.window
     .showWarningMessage(message, installLabel, "Learn More", "Not Now")
     .then((choice) => {
+      if (!isActive()) {return;}
       if (choice === installLabel) {
         openInstallTerminal(context);
       } else if (choice === "Learn More") {
@@ -260,10 +260,13 @@ function promptOptional(
   dismissKey: string,
   message: string,
   installLabel: string,
+  isActive: () => boolean,
 ): void {
+  if (!isActive()) {return;}
   vscode.window
     .showInformationMessage(message, installLabel, "Learn More", "Not Now")
     .then((choice) => {
+      if (!isActive()) {return;}
       if (choice === installLabel) {
         openInstallTerminal(context);
       } else if (choice === "Learn More") {
@@ -280,7 +283,10 @@ function promptOptional(
 function promptInit(
   context: vscode.ExtensionContext,
   status: DependencyStatus,
+  workspaceFolder: vscode.WorkspaceFolder,
+  isActive: () => boolean,
 ): void {
+  if (!isActive()) {return;}
   vscode.window
     .showInformationMessage(
       "This repository hasn't been initialized for CVC yet. Would you like to initialize it?",
@@ -288,15 +294,15 @@ function promptInit(
       "Not Now",
     )
     .then((choice) => {
+      if (!isActive()) {return;}
       if (choice === "Run cvc init") {
         const cvcBinary = status.cvcCli.path ?? "cvc";
-        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
         const task = new vscode.Task(
           { type: "cvc", task: "init" },
-          workspaceFolder ?? vscode.TaskScope.Workspace,
+          workspaceFolder,
           "Initialize repository",
           "CVC",
-          createCvcInitExecution(cvcBinary, workspaceFolder?.uri.fsPath),
+          createCvcInitExecution(cvcBinary, workspaceFolder.uri.fsPath),
         );
 
         // ProcessExecution uses spawn-style argument arrays, so a configurable

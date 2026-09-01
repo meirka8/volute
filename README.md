@@ -69,7 +69,9 @@ These are independent project directories; a Rust workspace build does not build
 
 ## Privacy and security
 
-CVC is **local-first**, not local-only. Captures are stored under `.git/cvc/` and are private by default, but explicit sharing/sync can publish selected data through Git. Authentication and component-management commands can also use the network. Review data before publication and restrict access to the repository and its `.git` directory.
+CVC is **local-first**, not local-only. The database, privacy/consent state, locks, and rewrite state are in `$(git rev-parse --git-common-dir)/cvc` and shared by linked worktrees. Normal CVC Git refs such as `refs/cvc/main` are in Git's shared refs namespace, not that directory. Hooks use Git's effective hooks path (`<common-dir>/hooks` by default, or `core.hooksPath`; relative hook paths are active-worktree-relative). `.thoughtignore`, context, `HEAD`, index, and branch state remain local to the active worktree. Captures are private by default, but explicit sharing/sync can publish selected data through Git. Authentication and component-management commands can also use the network. Review data before publication and restrict access to the repository and its Git common directory.
+
+The CLI, MCP server, LSP, and VS Code extension support linked worktrees. The VS Code extension intentionally supports one opened repository folder at a time; multi-root workspaces are not supported. MCP binds to one active repository/worktree and rejects cross-repository or sibling-worktree cwd targets. These boundaries do not change privacy, sharing, or auto-push semantics.
 
 Secret scrubbing and `.thoughtignore` are defense in depth, not guarantees. They can miss credentials, personal data, encoded values, or provider-specific formats. Git publication can be difficult or impossible to erase completely from objects, clones, forks, reflogs, caches, and backups. Rotate exposed credentials first; tombstones and local deletion are suppression mechanisms, not guaranteed physical erasure.
 

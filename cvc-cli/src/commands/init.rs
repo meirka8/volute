@@ -1,30 +1,39 @@
 use anyhow::{Context, Result};
 use cvc_core::db::CvcStore;
 use cvc_core::hooks::{self, HookAction};
-use cvc_core::privacy::common_git_dir;
-use git2::Repository;
+use cvc_core::repository::{RepositoryLayout, RepositoryLayoutError};
 use std::env;
 use std::fs;
 
 pub async fn run() -> Result<()> {
     let current_dir = env::current_dir().context("Failed to get current directory")?;
-    let repo = Repository::open(&current_dir).map_err(|_| {
-        anyhow::anyhow!("Current directory is not a git repository. Run 'git init' first.")
-    })?;
-    let git_dir = common_git_dir(&repo);
+    let layout = match RepositoryLayout::discover(&current_dir) {
+        Ok(layout) => layout,
+        Err(RepositoryLayoutError::NotRepository) => {
+            anyhow::bail!("Current directory is not a git repository. Run 'git init' first.")
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "Failed to resolve Git repository layout: {error}"
+            ))
+        }
+    };
+    // Fail before mutating common storage when discovery found a bare repository.
+    let worktree_root = layout.worktree_root()?;
+    let cvc_dir = layout.cvc_dir();
+    let db_path = layout.db_path();
+    println!("Initializing CVC database at {:?}", db_path);
+    println!("Installing CVC hooks...");
+    // Hooks are advisory and inert without the database. Install and validate
+    // them before creating shared state, so an unusable hooksPath cannot leave
+    // a fresh repository looking initialized. Existing state is never removed
+    // if this step fails or if the later database creation/open fails.
+    let outcomes = hooks::install(worktree_root).context("Failed to install hooks")?;
 
-    let cvc_dir = git_dir.join("cvc");
     if !cvc_dir.exists() {
         fs::create_dir_all(&cvc_dir).context("Failed to create .git/cvc directory")?;
     }
-
-    let db_path = cvc_dir.join("index.db");
-
-    println!("Initializing CVC database at {:?}", db_path);
     let _store = CvcStore::open_initialized(&db_path).context("Failed to open CVC database")?;
-
-    println!("Installing CVC hooks...");
-    let outcomes = hooks::install(&current_dir).context("Failed to install hooks")?;
     for outcome in outcomes {
         match outcome.action {
             HookAction::Created => println!(

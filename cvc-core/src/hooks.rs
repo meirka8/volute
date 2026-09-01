@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use git2::Repository;
+use git2::ErrorCode;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
@@ -29,18 +29,39 @@ pub struct HookInstallOutcome {
 }
 
 pub fn install(repo_root: &Path) -> Result<Vec<HookInstallOutcome>> {
-    // Resolve through libgit2 so linked worktrees use their common hooks directory.
-    let repo = Repository::open(repo_root).context("Failed to open git repository")?;
-    let mut hooks_dir = crate::privacy::common_git_dir(&repo).join("hooks");
-    if let Ok(config) = repo.config() {
-        if let Ok(custom_path) = config.get_string("core.hooksPath") {
-            let path_obj = Path::new(&custom_path);
-            hooks_dir = if path_obj.is_absolute() {
-                path_obj.to_path_buf()
+    // Discovery gives us both common storage and the actual active worktree.
+    // The latter matters because Git resolves a relative hooksPath from it.
+    let layout = crate::repository::RepositoryLayout::discover(repo_root)
+        .context("Failed to discover git repository")?;
+    install_layout(&layout)
+}
+
+/// Installs hooks for an already validated layout without rediscovering a
+/// caller-controlled pathname.
+pub fn install_layout(
+    layout: &crate::repository::RepositoryLayout,
+) -> Result<Vec<HookInstallOutcome>> {
+    let worktree_root = layout.worktree_root()?;
+    let repo = layout.repository();
+    let mut hooks_dir = layout.common_git_dir().join("hooks");
+    let config = repo.config().context("Failed to read Git configuration")?;
+    match config.get_path("core.hooksPath") {
+        Ok(path) => {
+            // libgit2's pathname accessor performs Git's supported `~` and
+            // `%(prefix)` expansion. Keep the resulting path byte-safe until
+            // this explicit validation, then resolve relative paths from the
+            // discovered worktree as Git does.
+            if path.to_str().is_none() {
+                anyhow::bail!("core.hooksPath is not valid UTF-8");
+            }
+            hooks_dir = if path.is_absolute() {
+                path
             } else {
-                repo_root.join(path_obj)
+                worktree_root.join(path)
             };
         }
+        Err(error) if error.code() == ErrorCode::NotFound => {}
+        Err(error) => return Err(error).context("Failed to read core.hooksPath"),
     }
 
     if !hooks_dir.exists() {
