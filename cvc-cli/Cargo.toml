@@ -1,6 +1,6 @@
 [package]
 name = "cvc-cli"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 description = "Command-line interface for Cognitive Version Control"
 license = "Apache-2.0"
@@ -14,7 +14,7 @@ path = "src/main.rs"
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
-cvc-core = { version = "0.4.2", path = "../cvc-core" }
+cvc-core = { version = "0.5.0", path = "../cvc-core" }
 git2 = "0.19"
 uuid = { version = "1.10", features = ["v4"] }
 chrono = "0.4"
