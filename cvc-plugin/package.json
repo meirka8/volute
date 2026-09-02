@@ -2,7 +2,7 @@
   "name": "cvc",
   "displayName": "Volute CVC",
   "description": "Track AI-assisted coding context alongside code changes. For the VS Code workflow, the extension reads GitHub Copilot chat session files stored locally by VS Code.",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "publisher": "volute",
   "license": "Apache-2.0",
   "icon": "resources/icon.png",
