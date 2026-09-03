@@ -2232,7 +2232,7 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
 
 #[test]
 fn test_fetch_and_pull_from_fresh_clone() -> anyhow::Result<()> {
-    // Simulates HEL-57's continuation-of-work scenario: work started on one machine
+    // Simulates the continuation-of-work scenario: work started on one machine
     // (repo_a) is pushed to a shared remote, then a second machine (repo_b, a fresh
     // clone with an empty CVC cache) catches up via `fetch_and_pull` alone -- the
     // same primitive the cvc-mcp `sync_history` tool calls.
@@ -2314,7 +2314,7 @@ fn test_fetch_and_pull_from_fresh_clone() -> anyhow::Result<()> {
 
 #[test]
 fn test_sync_v2_round_trip() -> anyhow::Result<()> {
-    // HEL-65 acceptance criterion: push v2 layout, pull into a fresh clone, DBs equal.
+    // Round-trip requirement for the sharded v2 layout: push it, pull into a fresh clone, DBs equal.
     let temp_dir = TempDir::new()?;
     let repo = Repository::init(temp_dir.path())?;
     let signature = Signature::now("Test User", "test@example.com")?;
@@ -2462,7 +2462,7 @@ fn test_sync_v2_round_trip() -> anyhow::Result<()> {
 
 #[test]
 fn test_pull_from_ref_reads_legacy_v1_layout() -> anyhow::Result<()> {
-    // Repos synced before HEL-65 have a flat `<id>.json` tree with no nodes/,
+    // Repos last synced with the legacy v1 format have a flat `<id>.json` tree with no nodes/,
     // by-commit/, or FORMAT entries at all. pull_from_ref must still read them.
     let temp_dir = TempDir::new()?;
     let repo = Repository::init(temp_dir.path())?;

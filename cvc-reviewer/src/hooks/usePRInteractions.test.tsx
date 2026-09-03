@@ -419,7 +419,7 @@ describe("usePRInteractions", () => {
     mockGetTree.mockImplementation(
       ({ recursive }: { recursive: string }) => {
         if (recursive === "false") {
-          // No by-commit/ entry at all -- this is a pre-HEL-65 repo.
+          // No by-commit/ entry at all -- this is a legacy flat-layout (v1) repo.
           return Promise.resolve({ data: { tree: [] } });
         }
         const tree = Array.from({ length: 250 }, (_, i) => ({

@@ -32,6 +32,25 @@ Repository administrators must configure the following before a release:
    npm Publishing access to **Require two-factor authentication and disallow tokens**,
    revoke obsolete automation tokens, and keep package owners to the minimum needed.
    Do not create a long-lived npm token.
+4. Configure release tag signing on the ceremony machine. Release tags are
+   SSH-signed as the dedicated release identity `Volute Release <dev@cvc.dev>`
+   using the release signing key with fingerprint
+   `SHA256:oToKgqkDyVREuw1bvYIgdQ2ywcrrn2GH1Rqh01iaEig`; verifiers may pin that
+   fingerprint (every SSH signature also embeds its public key). The private
+   key's custody and location are deliberately not documented here. On the
+   machine that will perform the tag ceremony, set repository-local
+   configuration and register the allowed signer:
+
+   ```bash
+   git config gpg.format ssh
+   git config user.signingkey <path-to-release-signing-public-key>
+   git config gpg.ssh.allowedSignersFile ~/.config/git/allowed_signers
+   ```
+
+   The allowed-signers file must contain a line binding the release principal
+   to the key: `dev@cvc.dev <key-type> <release-public-key>`. The tag command
+   in this runbook passes the release identity explicitly with `-c` flags, so
+   the machine's normal commit identity is never changed.
 
 The public repository's OIDC trusted-publishing flow automatically emits npm
 provenance. Accordingly, the workflow deliberately uses `npm publish` without a
@@ -150,6 +169,17 @@ absence is confirmed in the relevant UI or registry response.
 
 ## Create the release tag
 
+First run the signing preflight. It fails fast if the ceremony machine is missing
+the release signing setup from the one-time configuration section — signing
+configuration is per-machine and per-checkout state that does not travel with the
+repository, so verify it before starting rather than discovering it mid-ceremony:
+
+```bash
+test "$(git config --get gpg.format)" = ssh || { echo 'Preflight: gpg.format is not ssh.' >&2; exit 1; }
+ssh-keygen -lf "$(git config --get user.signingkey)" | grep -F 'SHA256:oToKgqkDyVREuw1bvYIgdQ2ywcrrn2GH1Rqh01iaEig' || { echo 'Preflight: user.signingkey is not the release signing key.' >&2; exit 1; }
+grep -q '^dev@cvc.dev ' "$(git config --get gpg.ssh.allowedSignersFile)" || { echo 'Preflight: allowed signers is missing the release principal.' >&2; exit 1; }
+```
+
 After the PR merges, fetch origin, update `main`, and fail unless local `HEAD` is
 exactly `origin/main`. Record its SHA, verify the remote tag is absent, and create a
 signed tag:
@@ -169,7 +199,7 @@ else
   test "$status" -eq 2 || exit "$status" # 2 means no matching remote tag
 fi
 node .github/scripts/check-release-version.mjs vX.Y.Z
-git tag -s vX.Y.Z -m "Release vX.Y.Z"
+git -c user.name='Volute Release' -c user.email='dev@cvc.dev' tag -s vX.Y.Z -m "Release vX.Y.Z"
 git verify-tag vX.Y.Z
 test "$(git rev-parse vX.Y.Z^{})" = "$release_sha" || { printf '%s\n' 'Refusing: tag does not point to the recorded commit.' >&2; exit 1; }
 git push origin refs/tags/vX.Y.Z:refs/tags/vX.Y.Z

@@ -105,7 +105,7 @@ async fn test_commit_thought() {
     // "prompt" -- it's stored as Interaction.user_prompt. See a677759, which
     // renamed the schema from {reasoning, prompt} to {task, reasoning,
     // response, context_summary} but didn't update this test to match, so it
-    // silently broke until HEL-58 wired this suite into CI.
+    // silently broke until this suite was wired into CI.
     let args = json!({
         "name": "commit_thought",
         "arguments": {
@@ -160,7 +160,7 @@ async fn test_read_history() {
 
 #[tokio::test]
 async fn test_read_history_includes_linked_interactions() {
-    // HEL-62 acceptance criterion: read_history must not go blank the moment an
+    // Regression requirement: read_history must not go blank the moment an
     // interaction is linked to a commit -- it previously only read floating nodes.
     let (dir, state) = make_state();
     start_session(&state, "test-client").unwrap();
@@ -194,7 +194,7 @@ async fn test_read_history_includes_linked_interactions() {
 
 #[tokio::test]
 async fn test_parent_chaining_within_session() {
-    // HEL-62 acceptance criterion: two consecutive commit_thought calls in one
+    // Session-identity requirement: two consecutive commit_thought calls in one
     // server process produce chained parent_ids in one conversation.
     let (dir, state) = make_state();
     let conversation_id = start_session(&state, "test-client").unwrap();
@@ -236,7 +236,7 @@ async fn test_parent_chaining_within_session() {
 
 #[tokio::test]
 async fn test_distinct_sessions_get_distinct_conversations() {
-    // HEL-62 acceptance criterion: two concurrent server processes produce two
+    // Session-identity requirement: two concurrent server processes produce two
     // distinct conversations. Simulated here as two independent AppStates (each its
     // own DB connection, its own session state) sharing the same repo DB file, the
     // way two real cvc-mcp processes on the same repo would.
@@ -257,7 +257,7 @@ async fn test_distinct_sessions_get_distinct_conversations() {
 
 #[tokio::test]
 async fn test_sync_history_pulls_from_remote() {
-    // HEL-57 continuation-of-work scenario: a thought recorded and pushed from one
+    // Continuation-of-work scenario: a thought recorded and pushed from one
     // machine/harness should be pullable via the sync_history MCP tool alone, by a
     // second machine that never called commit_thought locally.
     let temp_dir = tempdir().unwrap();
