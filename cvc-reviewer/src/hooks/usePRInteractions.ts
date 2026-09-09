@@ -17,7 +17,7 @@ import {
 const CVC_REF = "cvc/main";
 
 // Format-v1 repos have no by-commit/ index to narrow the fetch with, so the fallback
-// walks the whole tree like before HEL-65 -- but capped, so a large repo can't burn
+// walks the whole tree as the v1 format requires -- but capped, so a large repo can't burn
 // the caller's GitHub rate limit or hang the UI. See the "truncated" result field.
 const LEGACY_FETCH_CAP = 200;
 
