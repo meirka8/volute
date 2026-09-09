@@ -1,0 +1,17 @@
+{
+  "interaction": {
+    "id": "d0cd5d6c-5bdb-494b-b8a0-dffb5f4c88b9",
+    "conversation_id": "claude-fix-27-linker-worktree-affinity",
+    "parent_id": null,
+    "timestamp": "2026-09-01T08:40:46Z",
+    "author": "agent",
+    "user_prompt": "Linear-to-GitHub issue migration for OSS-scoped backlog",
+    "model_name": "agent",
+    "model_cot": "Migrated 8 open Linear issues to GitHub (#31-#38) after reviewing each against current main; excluded all Platform-project issues as private/commercial. Substantive corrections made during migration: the sync-format spec issue was retargeted from designing v2 to documenting the already-shipped v5; the multi-root extension issue's original defect no longer exists (single-folder binding is now deliberate) so it was reframed as multiple per-repo bindings preserving the one-binding invariant; the plugin push/pull controls issue was rescoped inside the consent model (TTY-gated push, new hook-uninstall capability needed); the conversation-ids issue was slimmed to two verified residual placeholders (LSP turn/end default-session, MCP agent-session-default fallback). Two issues not migrated: the worktree hooks bug is fixed by merged PRs 29/30 (public record GitHub #27), and the CI-coverage issue is implemented in test.yml with only a branch-protection toggle remaining. All migrated bodies kept self-contained with no private links per CONTRIBUTING; Linear originals annotated with their GitHub twins.",
+    "model_response": null,
+    "source_request_id": null
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": []
+}

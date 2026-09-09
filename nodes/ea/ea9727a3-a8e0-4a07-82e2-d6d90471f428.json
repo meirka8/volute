@@ -1,0 +1,24 @@
+{
+  "interaction": {
+    "id": "ea9727a3-a8e0-4a07-82e2-d6d90471f428",
+    "conversation_id": "claude-fix-27-linker-worktree-affinity",
+    "parent_id": null,
+    "timestamp": "2026-08-30T17:44:21Z",
+    "author": "agent",
+    "user_prompt": "Implemented worktree-scoped automatic linking (F1)",
+    "model_name": "agent",
+    "model_cot": "Implementation: worktree_origin_fingerprint(canonical root, domain-separated SHA-256) in cvc-core::repository; nullable capture_worktree column (64-hex CHECK) via additive migration; Capture constructors now require the origin so every production path (CLI run, MCP commit_thought, LSP explicit+passive) stamps it at compile-enforced call sites; linker computes the committing worktree's origin and queries floating nodes scoped to it, failing closed when the origin is unavailable. Verified no wire-format change: SyncNode embeds Interaction, origin kept off the model; v5 golden tests pass. New coverage: cross-worktree claim rejection (generated+temporal), shared conversation-id isolation, legacy NULL-row eligibility, DB scoping+CHECK, CLI hook acceptance in sibling worktrees, MCP/LSP attribution assertions. Full workspace fmt/clippy/tests green.",
+    "model_response": null,
+    "source_request_id": null
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": [
+    {
+      "interaction_id": "ea9727a3-a8e0-4a07-82e2-d6d90471f428",
+      "git_commit_hash": "44b77c920154632692b5b89d672659116a7f09f1",
+      "link_type": "temporal",
+      "linked_by": "meir.kanevskiy@gmail.com"
+    }
+  ]
+}

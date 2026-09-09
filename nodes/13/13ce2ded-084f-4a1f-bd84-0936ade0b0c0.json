@@ -1,0 +1,24 @@
+{
+  "interaction": {
+    "id": "13ce2ded-084f-4a1f-bd84-0936ade0b0c0",
+    "conversation_id": "claude-fix-27-linker-worktree-affinity",
+    "parent_id": null,
+    "timestamp": "2026-09-02T18:56:49Z",
+    "author": "agent",
+    "user_prompt": "Prepare v0.5.0 release (linked worktree support)",
+    "model_name": "agent",
+    "model_cot": "Release decision: v0.5.0 (minor bump) because the delta is a user-visible capability plus deliberate behavior changes: linker worktree scoping, bare-repo cvc run refusal, MCP startup binding, extension trust/single-folder requirements. All six version locations bumped plus internal cvc-core dependency specs; Cargo.lock and plugin package-lock regenerated. Full runbook battery green locally: rust fmt/clippy/test/check, plugin including VS Code integration tests on the real display (no xvfb needed), reviewer 37 tests plus build, npm wrapper, third-party notices current (428 packages), version gate matched all 6 manifests. Release body docs/releases/v0.5.0.md documents additive DB migration with mixed-version safety, unchanged v5 wire format, and carries known limitations 39 (range identity across worktrees) and 40 (capture contention) transparently. UAT of the task-terminal consent flow passed (user-verified). Tagging, external registry availability checks, and environment approvals remain with the release authority per RELEASING.md.",
+    "model_response": null,
+    "source_request_id": null
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": [
+    {
+      "interaction_id": "13ce2ded-084f-4a1f-bd84-0936ade0b0c0",
+      "git_commit_hash": "1f2c02e08d00d4c77548b4e65ebaf187ddbb6827",
+      "link_type": "temporal",
+      "linked_by": "meir.kanevskiy@gmail.com"
+    }
+  ]
+}

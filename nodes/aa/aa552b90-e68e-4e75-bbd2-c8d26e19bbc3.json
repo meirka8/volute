@@ -1,0 +1,24 @@
+{
+  "interaction": {
+    "id": "aa552b90-e68e-4e75-bbd2-c8d26e19bbc3",
+    "conversation_id": "claude-fix-27-linker-worktree-affinity",
+    "parent_id": null,
+    "timestamp": "2026-09-03T20:27:55Z",
+    "author": "agent",
+    "user_prompt": "Post-release cleanup: signing preflight docs and tracker-reference removal",
+    "model_name": "agent",
+    "model_cot": "Two decisions from the post-v0.5.0 audit. First, the release signing preflight belongs in public RELEASING.md because the release identity and public key are already public in every signed tag object; the public doc now records the Volute Release identity, the key fingerprint for pin-verification, the required config shape, a fail-fast preflight block before the ceremony, and the -c identity flags on the tag command, while key custody and location stay deliberately undocumented. Second, removed all 12 private-tracker references from the public tree: 11 code comments rewritten as self-contained behavioral statements and one user-facing Reviewer string that leaked a tracker ID. Repo-wide and history-wide sweeps found no other private-context leakage: no secrets, personal paths, or platform references across all 287 commits. New branch convention agreed: cleanup/ prefix for cleanup PRs.",
+    "model_response": null,
+    "source_request_id": null
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": [
+    {
+      "interaction_id": "aa552b90-e68e-4e75-bbd2-c8d26e19bbc3",
+      "git_commit_hash": "15d61c7548682d383879455b24f90201f60c66bc",
+      "link_type": "temporal",
+      "linked_by": "meir.kanevskiy@gmail.com"
+    }
+  ]
+}

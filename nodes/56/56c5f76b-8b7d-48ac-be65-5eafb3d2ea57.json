@@ -1,0 +1,24 @@
+{
+  "interaction": {
+    "id": "56c5f76b-8b7d-48ac-be65-5eafb3d2ea57",
+    "conversation_id": "claude-fix-27-linker-worktree-affinity",
+    "parent_id": null,
+    "timestamp": "2026-08-30T17:31:23Z",
+    "author": "agent",
+    "user_prompt": "Fix F1 from worktree review: automatic linker lacks worktree affinity",
+    "model_name": "agent",
+    "model_cot": "Decision: add a capture-origin fingerprint to interactions and scope automatic link eligibility to the capturing worktree. Origin = SHA-256 over the canonical worktree root path with domain separation (cvc.worktree-origin/v1), stored as a nullable local-only DB column, never projected into sync wire formats. NULL origin (legacy rows) stays eligible from any worktree to preserve pre-upgrade behavior; the time window bounds that exposure. Exact squash/rewrite relinking is deliberately untouched: it is evidence-based, not heuristic. Stacked branch fix/27-linked-worktree-support-dco-concurrent.",
+    "model_response": null,
+    "source_request_id": null
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": [
+    {
+      "interaction_id": "56c5f76b-8b7d-48ac-be65-5eafb3d2ea57",
+      "git_commit_hash": "44b77c920154632692b5b89d672659116a7f09f1",
+      "link_type": "temporal",
+      "linked_by": "meir.kanevskiy@gmail.com"
+    }
+  ]
+}

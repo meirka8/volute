@@ -1,0 +1,17 @@
+{
+  "interaction": {
+    "id": "7c8468dd-8ec8-4a89-965c-715b520c122a",
+    "conversation_id": "claude-fix-27-linker-worktree-affinity",
+    "parent_id": null,
+    "timestamp": "2026-08-30T19:44:31Z",
+    "author": "agent",
+    "user_prompt": "Compatibility review: worktree origin scoping vs HEL-68 (Claude Code harness adapter)",
+    "model_name": "agent",
+    "model_cot": "Conclusion: the capture_worktree design is not merely compatible with HEL-68 but a safety prerequisite for it. Hook-driven ingest is a fresh CLI process discovering from the hook cwd, so a session in a linked worktree stamps that worktree's origin automatically; Claude Code transcripts are already per-worktree-segregated via the workspace slug. Retroactive Stop/SessionEnd batch ingestion into the shared DB would have massively amplified the F1 cross-worktree claiming bug; origin scoping is what makes deterministic batch capture safe in parallel-agent setups. Identified design notes for HEL-68: (1) late ingest vs post-commit linking window means mid-session commits cannot claim earlier turns - prefer PostToolUse incremental ingest for MVP and transcript-derived deterministic commit links (the transcript records the session's own git commits) as the principled fix; (2) absolute binary path in .claude/settings.json conflicts with tracking and with fresh worktrees not inheriting untracked settings.local.json - install must be per-checkout or use a shim; (3) ephemeral/recycled harness worktree paths inherit fingerprints - prefer unique paths per session; (4) fidelity_tier is a portable claim and belongs wire-side eventually, unlike capture_worktree which stays local; (5) SQLite busy-timeout/retry work becomes a prerequisite once every session auto-ingests.",
+    "model_response": null,
+    "source_request_id": null
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": []
+}
