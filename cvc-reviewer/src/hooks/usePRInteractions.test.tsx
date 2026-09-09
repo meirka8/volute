@@ -2,7 +2,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { usePRInteractions, validateTombstoneTree } from "./usePRInteractions";
+import { fetchCanonicalTombstones, usePRInteractions, validateTombstoneTree } from "./usePRInteractions";
+import { EMPTY_TREE_SHA } from "../lib/format5";
 
 const mockAcquireToken = vi.fn();
 vi.mock("../auth/AuthContext", () => ({
@@ -543,5 +544,17 @@ describe("usePRInteractions", () => {
     expect(result.current.data?.interactions).toEqual([]);
     expect(queryClient.getQueryData(["cvc-node", "owner", "repo", "cvc-before", ID_ONE])).toBeUndefined();
     expect(queryClient.getQueryData(["cvc-by-commit", "owner", "repo", "cvc-before", "commit-a"])).toBeUndefined();
+  });
+});
+
+describe("fetchCanonicalTombstones empty-tree guard", () => {
+  it("returns no suppressions for the canonical empty tree without fetching it", async () => {
+    const getTree = vi.fn(async () => {
+      throw new Error("must not fetch the canonical empty tree");
+    });
+    const client = { octokit: { rest: { git: { getTree } } } } as never;
+    const tombstoned = await fetchCanonicalTombstones(client, "owner", "repo", EMPTY_TREE_SHA, "token");
+    expect(tombstoned.size).toBe(0);
+    expect(getTree).not.toHaveBeenCalled();
   });
 });
