@@ -292,3 +292,12 @@ casually change npm trust. If the original artifacts or provenance cannot be pre
 release a new patch version. Document partial publication and repair forward. Public
 package versions and protected tags must not be overwritten; treat GitHub Release
 records/assets as administratively immutable unless Immutable Releases is enabled.
+
+If the release signing key may be compromised, stop all releases immediately. Remove
+or disable the key's authorization through the normal access process — its GitHub
+signing-key registration and any allowed-signers entries — and preserve audit
+evidence without exposing secret material. Establish and authorize a replacement key,
+then update the published fingerprint in this runbook's signing setup through a
+reviewed PR. Investigate every tag and release the key could have signed. Do not
+silently retag or rewrite published history; disclose affected artifacts and repair
+forward.
