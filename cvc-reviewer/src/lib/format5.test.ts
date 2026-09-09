@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { canonicalEventId, canonicalRangeId, fetchFormat5Evidence, readBoundedJson, validEvent, validRange } from "./format5";
+import { EMPTY_TREE_SHA, canonicalEventId, canonicalRangeId, fetchFormat5Evidence, readBoundedJson, validEvent, validRange } from "./format5";
 
 const commit = "a".repeat(40);
 const rangeBody = { format: "cvc.range-evidence/v1" as const, version: 1 as const, repository_identity: "b".repeat(64), object_format: "sha1" as const, base_oid: commit, tip_oid: "c".repeat(40), base_tree_oid: "d".repeat(40), result_tree_oid: "e".repeat(40), commits: [{ commit_oid: commit }], changeset_algorithm: "cvc.changeset/v1" as const, changeset_digest: "f".repeat(64) };
@@ -62,6 +62,21 @@ describe("FORMAT5 wire validation", () => {
     let calls = 0;
     (client as { octokit: { rest: { git: { getTree: () => unknown } } } }).octokit.rest.git.getTree = async () => ({ data: { tree: ++calls === 1 ? [{ path: "aa", type: "tree", sha: "b".repeat(40) }] : [{ path: `${"a".repeat(64)}.json`, type: "blob", sha: "BAD" }] } });
     await expect(fetchFormat5Evidence(client, "owner", "repo", "a".repeat(40), "d".repeat(40), "token")).rejects.toThrow("Invalid or excessive");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("treats the canonical empty tree as empty evidence without fetching it", async () => {
+    // GitHub's trees API 404s the canonical empty tree when the object is not
+    // physically present; a projection with no evidence legitimately points its
+    // required namespaces at it, so it must never be requested.
+    const getTree = vi.fn(async () => {
+      throw new Error("must not fetch the canonical empty tree");
+    });
+    const client = { octokit: { rest: { git: { getTree } } } } as never;
+    vi.stubGlobal("fetch", vi.fn());
+    const evidence = await fetchFormat5Evidence(client, "owner", "repo", EMPTY_TREE_SHA, EMPTY_TREE_SHA, "token");
+    expect(evidence).toEqual({ events: [], ranges: [] });
+    expect(getTree).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
 });

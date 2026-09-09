@@ -9,6 +9,11 @@ const MAX_RANGES = 10_000;
 const MAX_RANGE_COMMITS = 2048;
 const HEX40 = /^[0-9a-f]{40}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
+// Git's canonical empty tree. Its contents are defined by Git rather than
+// stored, and the GitHub trees API 404s it when the object is not physically
+// in the repository's pack — so it must never be fetched. A v5 projection
+// with no evidence legitimately points its required namespaces here.
+export const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export interface DerivationEvent {
@@ -94,6 +99,7 @@ async function readBoundedJsonUnlocked(url: string, token: string, budget: ByteB
 
 async function namespace(client: GithubClient, owner: string, repo: string, rootSha: string, name: "events" | "ranges", token: string, max: number, budget: { bytes: number }, validate: (value: unknown, id: string) => Promise<boolean>) {
   if (!HEX40.test(rootSha)) throw new Error(`Invalid FORMAT5 ${name} root SHA`);
+  if (rootSha === EMPTY_TREE_SHA) return [];
   const { data: root } = await client.octokit.rest.git.getTree({ owner, repo, tree_sha: rootSha, recursive: "false" });
   if (root.truncated) throw new Error(`FORMAT5 ${name} tree is truncated`);
   const result: unknown[] = [];

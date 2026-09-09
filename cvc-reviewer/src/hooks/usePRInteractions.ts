@@ -4,7 +4,7 @@ import { createGithubClient, type GithubClient } from "../api/github";
 import { CommitRanger } from "../lib/CommitRanger";
 import { InteractionMapper } from "../lib/InteractionMapper";
 import { purgeCognitiveCache } from "../lib/cognitiveCache";
-import { eventLink, fetchFormat5Evidence, readBoundedJson, type DerivationEvent } from "../lib/format5";
+import { EMPTY_TREE_SHA, eventLink, fetchFormat5Evidence, readBoundedJson, type DerivationEvent } from "../lib/format5";
 import {
   normalizeInteraction,
   mergeArtifactLinks,
@@ -270,6 +270,11 @@ export async function fetchCanonicalTombstones(
   tombstonesTreeSha: string,
   token: string,
 ): Promise<Set<string>> {
+  // An empty tombstones tree means no suppressions; the canonical empty tree
+  // must not be fetched (see EMPTY_TREE_SHA).
+  if (tombstonesTreeSha === EMPTY_TREE_SHA) {
+    return new Set();
+  }
   const { data: tombstoneRoot } = await client.octokit.rest.git.getTree({
     owner,
     repo,
