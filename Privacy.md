@@ -2,6 +2,19 @@
 
 This reference documents the privacy behavior implemented in this repository. CVC is local-first, not local-only: local capture and remote publication are separate operations with separate consent boundaries.
 
+## How your data moves
+
+Four verbs, four boundaries — worth internalizing before the detailed reference below:
+
+1. **Capture** writes an interaction into the local SQLite database immediately, as the conversation happens. Content is scrubbed on the way in and is private by default. It exists nowhere in Git: `git push` cannot transport it, and a clone does not receive it.
+2. **Link** — the automatic post-commit hook — records which commit a thought belongs to. Linking is provenance bookkeeping inside the local database; it has no effect on visibility or sharing.
+3. **Share** records consent marks in the local database: *these turns of this conversation are authorized for this exact destination fingerprint.* Nothing is exported, and nothing touches Git. New conversations are never auto-shared; each is a fresh, deliberate decision.
+4. **Push** — `cvc push --manual` with its interactive challenge, or a destination whose auto-push was separately acknowledged — is the only step that creates Git objects. It fetches the destination's current CVC ref as a baseline, projects shared-but-unpublished content into `refs/cvc/main`, and pushes that one ref. A thought that is never shared, or shared but never pushed, never becomes a Git object at all.
+
+On another machine, `cvc pull` fetches the ref and imports it into that machine's local cache; receiving content grants no authority for any destination.
+
+The consequence to hold onto: Git objects are the durable, hard-to-erase form of this data, and they are minted only at the moment of authorized publication — behind the last human gate. Everything before that point is locally deletable database state.
+
 ## Capture and sharing
 
 Every production aggregate capture is prepared and scrubbed before its SQLite transaction. Captures are private by default. Passive VS Code capture additionally requires the repository-local interactive capture acknowledgement. Sharing, consent, auto-push, publication state, and remote tombstone authority are destination-specific local state; they are not synced as general permission grants. Derived links and FORMAT5 derivation evidence never create, broaden, or imply share consent.
