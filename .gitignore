@@ -27,3 +27,4 @@ uat/.vnc-password
 # Local AI-assistant configuration and session artifacts
 .opencode/
 /talk.json
+/CLAUDE.md
