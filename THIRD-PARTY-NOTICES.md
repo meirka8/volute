@@ -227,7 +227,7 @@ Coverage: 408 Rust packages; 20 production npm packages; 247 unique evidence tex
 | Rust | quote@1.0.44 | MIT OR Apache-2.0 | https&#58;//github.com/dtolnay/quote |
 | Rust | r-efi@5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | https&#58;//github.com/r-efi/r-efi |
 | Rust | rand@0.10.2 | MIT OR Apache-2.0 | https&#58;//github.com/rust-random/rand |
-| Rust | rand@0.8.5 | MIT OR Apache-2.0 | https&#58;//github.com/rust-random/rand |
+| Rust | rand@0.8.7 | MIT OR Apache-2.0 | https&#58;//github.com/rust-random/rand |
 | Rust | rand_chacha@0.3.1 | MIT OR Apache-2.0 | https&#58;//github.com/rust-random/rand |
 | Rust | rand_core@0.10.1 | MIT OR Apache-2.0 | https&#58;//github.com/rust-random/rand_core |
 | Rust | rand_core@0.6.4 | MIT OR Apache-2.0 | https&#58;//github.com/rust-random/rand |
@@ -2770,7 +2770,7 @@ SOFTWARE.
 
 Exact package/file provenance:
 - Rust&#58; rand@0.10.2 — MIT OR Apache-2.0 — LICENSE-MIT
-- Rust&#58; rand@0.8.5 — MIT OR Apache-2.0 — LICENSE-MIT
+- Rust&#58; rand@0.8.7 — MIT OR Apache-2.0 — LICENSE-MIT
 - Rust&#58; rand_chacha@0.3.1 — MIT OR Apache-2.0 — LICENSE-MIT
 - Rust&#58; rand_core@0.6.4 — MIT OR Apache-2.0 — LICENSE-MIT
 
@@ -4211,7 +4211,7 @@ DEALINGS IN THE SOFTWARE.
 
 Exact package/file provenance:
 - Rust&#58; rand@0.10.2 — MIT OR Apache-2.0 — LICENSE-APACHE
-- Rust&#58; rand@0.8.5 — MIT OR Apache-2.0 — LICENSE-APACHE
+- Rust&#58; rand@0.8.7 — MIT OR Apache-2.0 — LICENSE-APACHE
 
 ```text
                               Apache License
@@ -9807,7 +9807,7 @@ SOFTWARE.
 
 Exact package/file provenance:
 - Rust&#58; rand@0.10.2 — MIT OR Apache-2.0 — COPYRIGHT
-- Rust&#58; rand@0.8.5 — MIT OR Apache-2.0 — COPYRIGHT
+- Rust&#58; rand@0.8.7 — MIT OR Apache-2.0 — COPYRIGHT
 - Rust&#58; rand_chacha@0.3.1 — MIT OR Apache-2.0 — COPYRIGHT
 - Rust&#58; rand_core@0.6.4 — MIT OR Apache-2.0 — COPYRIGHT
 - Rust&#58; rand_pcg@0.10.2 — MIT OR Apache-2.0 — COPYRIGHT
