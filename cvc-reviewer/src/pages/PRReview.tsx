@@ -45,7 +45,7 @@ export function PRReviewPage() {
   // Fetch PR data
   const { data: prData, isLoading: isPRLoading, error: prError } = usePR(owner, repo, prNumber);
 
-  // Fetch CVC history scoped to this PR's commits (HEL-65: previously downloaded the
+  // Fetch CVC history scoped to this PR's commits (previously the reviewer downloaded the
   // entire cognitive history on every PR view and filtered client-side).
   const {
     data: prInteractionsResult,
@@ -270,7 +270,7 @@ export function PRReviewPage() {
             isLoading={isLoading}
             notice={
               prInteractionsResult?.truncated
-                ? "Showing partial history: this repository predates PR-scoped sync (HEL-65). Push again with an updated cvc-core to restore full, fast history."
+                ? "Showing partial history: this repository predates PR-scoped sync. Push again with an updated cvc-core to restore full, fast history."
                 : undefined
             }
           />
