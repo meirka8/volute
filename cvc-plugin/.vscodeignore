@@ -7,6 +7,7 @@ src/**
 node_modules/**
 .gitignore
 .eslintrc.json
+eslint.config.mjs
 tsconfig.json
 esbuild.js
 **/*.map

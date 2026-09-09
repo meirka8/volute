@@ -1,9 +1,74 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
+use tower_lsp::lsp_types::Url;
+
+struct TestRepo {
+    _temp: TempDir,
+    home: PathBuf,
+    root: PathBuf,
+}
+
+fn isolated_command(program: &str, home: &Path) -> Command {
+    let mut command = Command::new(program);
+    // Do not inherit host Git/CVC configuration, templates, or Git path overrides.
+    command.env_clear();
+    command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    command.env("HOME", home);
+    command.env("XDG_CONFIG_HOME", home.join("config"));
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+    command.env("GIT_CONFIG_GLOBAL", home.join("empty.gitconfig"));
+    command.env("GIT_TEMPLATE_DIR", home.join("templates"));
+    command
+}
+
+fn git(repo: &TestRepo, dir: &Path, args: &[&str]) {
+    let status = isolated_command("git", &repo.home)
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn test_repo(name: &str) -> TestRepo {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let root = temp.path().join(name);
+    std::fs::create_dir_all(home.join("templates")).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let repo = TestRepo {
+        _temp: temp,
+        home,
+        root,
+    };
+    git(&repo, &repo.root, &["init"]);
+    git(
+        &repo,
+        &repo.root,
+        &["config", "user.email", "lsp@example.invalid"],
+    );
+    git(&repo, &repo.root, &["config", "user.name", "LSP test"]);
+    std::fs::write(repo.root.join("tracked"), "one\n").unwrap();
+    git(&repo, &repo.root, &["add", "tracked"]);
+    git(&repo, &repo.root, &["commit", "-m", "initial"]);
+    repo
+}
+
+fn lsp_command(repo: &TestRepo, root: &Path) -> Command {
+    let mut command = isolated_command(env!("CARGO_BIN_EXE_cvc-lsp"), &repo.home);
+    command
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
 
 /// Read one LSP-framed message: headers up to the blank line, then exactly
 /// `Content-Length` body bytes. Returns `None` on EOF or a malformed frame.
@@ -74,11 +139,9 @@ fn wait_for(
 
 #[test]
 fn test_lsp_turn_lifecycle() {
+    let repo = test_repo("repo with ünicode space");
     let mut child = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_cvc-lsp"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+        lsp_command(&repo, &repo.root)
             .spawn()
             .expect("Failed to spawn cvc-lsp"),
     );
@@ -111,7 +174,7 @@ fn test_lsp_turn_lifecycle() {
             "method": "initialize",
             "params": {
                 "capabilities": {},
-                "rootUri": null,
+                "rootUri": Url::from_directory_path(&repo.root).unwrap(),
                 "processId": null
             }
         }),
@@ -203,4 +266,140 @@ fn test_lsp_turn_lifecycle() {
         "turn/end did not save the interaction: {:?}",
         completion["params"]["message"]
     );
+    let layout = cvc_core::repository::RepositoryLayout::discover(&repo.root).unwrap();
+    assert!(layout.db_path().exists());
+    assert_eq!(
+        cvc_core::db::CvcStore::open(layout.db_path())
+            .unwrap()
+            .get_floating_interactions()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn linked_detached_worktree_uses_common_store_and_local_policy() {
+    let repo = test_repo("main");
+    let linked = repo.root.parent().unwrap().join("linked worktree ü");
+    git(
+        &repo,
+        &repo.root,
+        &["worktree", "add", "--detach", linked.to_str().unwrap()],
+    );
+    let nested = linked.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    // This must be read from the linked worktree, not common Git storage or main.
+    std::fs::write(
+        linked.join(".thoughtignore"),
+        "literal:LINKED_PRIVATE_VALUE\n",
+    )
+    .unwrap();
+
+    let mut child = ChildGuard(lsp_command(&repo, &nested).spawn().unwrap());
+    let mut stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Some(msg) = read_message(&mut reader) {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+    send(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "capabilities":{}, "rootUri": Url::from_directory_path(&nested).unwrap(), "processId":null
+        }}),
+    );
+    let initialized = wait_for(&rx, Duration::from_secs(5), |m| {
+        m.get("id") == Some(&json!(1))
+    });
+    assert!(initialized.get("result").is_some(), "{initialized:?}");
+    send(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","method":"$/cvc/turn/start","params":{
+            "id":"linked-turn", "prompt":"LINKED_PRIVATE_VALUE", "author":"human"
+        }}),
+    );
+    send(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","method":"$/cvc/turn/end","params":{
+            "id":"linked-turn", "response":"saved", "model":"test"
+        }}),
+    );
+    let completion = wait_for(&rx, Duration::from_secs(5), |m| {
+        m.get("method") == Some(&json!("window/logMessage"))
+            && m["params"]["message"]
+                .as_str()
+                .is_some_and(|s| s.contains("Interaction saved to DB"))
+    });
+    assert!(completion["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("saved"));
+
+    let main_layout = cvc_core::repository::RepositoryLayout::discover(&repo.root).unwrap();
+    let linked_layout = cvc_core::repository::RepositoryLayout::discover(&nested).unwrap();
+    assert_eq!(main_layout.db_path(), linked_layout.db_path());
+    assert!(
+        !linked.join(".git").join("cvc").exists(),
+        "gitfile must not receive CVC storage"
+    );
+    let store = cvc_core::db::CvcStore::open(main_layout.db_path()).unwrap();
+    let interactions = store.get_floating_interactions().unwrap();
+    assert_eq!(interactions.len(), 1);
+    assert!(!interactions[0].user_prompt.contains("LINKED_PRIVATE_VALUE"));
+    // The capture is attributed to the linked worktree, so the primary
+    // worktree's automatic linker must not see it as eligible.
+    let linked_origin = linked_layout.worktree_origin().unwrap();
+    assert_eq!(
+        store
+            .get_floating_interactions_for_worktree(&linked_origin)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store
+        .get_floating_interactions_for_worktree(&main_layout.worktree_origin().unwrap())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn cross_repository_reinitialize_is_rejected_without_creating_a_store() {
+    let first = test_repo("first");
+    let second = test_repo("second");
+    let mut child = ChildGuard(lsp_command(&first, &first.root).spawn().unwrap());
+    let mut stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Some(msg) = read_message(&mut reader) {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+    for (id, root) in [(1, &first.root), (2, &second.root)] {
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":{
+                "capabilities":{}, "rootUri": Url::from_directory_path(root).unwrap(), "processId":null
+            }}),
+        );
+        let response = wait_for(&rx, Duration::from_secs(5), |m| {
+            m.get("id") == Some(&json!(id))
+        });
+        if id == 1 {
+            assert!(response.get("result").is_some());
+        } else {
+            assert!(response.get("error").is_some());
+        }
+    }
+    let second_layout = cvc_core::repository::RepositoryLayout::discover(&second.root).unwrap();
+    assert!(!second_layout.cvc_dir().exists());
 }

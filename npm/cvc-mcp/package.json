@@ -1,15 +1,19 @@
 {
   "name": "@volute_cvc/cvc-mcp",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "MCP server for CVC (Cognitive Version Control) for saving and reading git-linked AI work history",
   "bin": {
     "cvc-mcp": "./bin/cvc-mcp.js",
     "cvc": "./bin/cvc.js"
   },
   "files": [
-    "bin/*.js"
+    "bin/*.js",
+    "scripts/stage-third-party-notices.mjs",
+    "THIRD-PARTY-NOTICES.md"
   ],
   "scripts": {
+    "prepack": "node scripts/stage-third-party-notices.mjs stage",
+    "postpack": "node scripts/stage-third-party-notices.mjs cleanup",
     "test": "node --test test/*.test.js"
   },
   "repository": {

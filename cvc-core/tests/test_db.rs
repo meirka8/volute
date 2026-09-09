@@ -25,6 +25,7 @@ impl CaptureFixture for CvcStore {
             Vec::new(),
             Vec::new(),
             PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))
         .map(|_| ())
     }
@@ -327,5 +328,83 @@ fn automatic_link_conflicts_converge_only_when_compatible() -> anyhow::Result<()
         )
         .is_err());
     assert!(store.get_artifact_links(&would_be_inserted)?.is_empty());
+    Ok(())
+}
+
+fn capture_with_worktree(
+    store: &CvcStore,
+    conversation: &str,
+    capture_worktree: String,
+) -> anyhow::Result<InteractionId> {
+    let id = InteractionId::new();
+    store.capture_mcp(McpCapture::new(
+        Conversation {
+            id: conversation.into(),
+            title: "worktree fixture".into(),
+            created_at: Utc::now(),
+        },
+        Interaction {
+            id: id.clone(),
+            conversation_id: conversation.into(),
+            parent_id: None,
+            timestamp: Utc::now(),
+            author: Author::Agent,
+            user_prompt: "scoped".into(),
+            model_name: None,
+            model_cot: None,
+            model_response: None,
+            source_request_id: None,
+        },
+        Vec::new(),
+        Vec::new(),
+        PreparedPolicy::built_ins_only(),
+        capture_worktree,
+    ))?;
+    Ok(id)
+}
+
+#[test]
+fn floating_query_scopes_to_capture_worktree_and_keeps_legacy_rows() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("index.db");
+    let store = CvcStore::open(&path)?;
+    store.init()?;
+    let mine = capture_with_worktree(&store, "mine", "a".repeat(64))?;
+    let sibling = capture_with_worktree(&store, "sibling", "b".repeat(64))?;
+    let legacy = capture_with_worktree(&store, "legacy", "c".repeat(64))?;
+    Connection::open(&path)?.execute(
+        "UPDATE interactions SET capture_worktree=NULL WHERE id=?1",
+        [legacy.as_str()],
+    )?;
+
+    let scoped: Vec<_> = store
+        .get_floating_interactions_for_worktree(&"a".repeat(64))?
+        .into_iter()
+        .map(|interaction| interaction.id)
+        .collect();
+    assert!(scoped.contains(&mine));
+    assert!(scoped.contains(&legacy), "legacy rows stay eligible");
+    assert!(
+        !scoped.contains(&sibling),
+        "another worktree's rows are excluded"
+    );
+    // The unscoped query keeps returning every floating node for status views.
+    assert_eq!(store.get_floating_interactions()?.len(), 3);
+
+    // The stored value is exactly the fingerprint the capture supplied, and
+    // malformed origins are rejected by the schema itself.
+    let connection = Connection::open(&path)?;
+    let stored: String = connection.query_row(
+        "SELECT capture_worktree FROM interactions WHERE id=?1",
+        [mine.as_str()],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored, "a".repeat(64));
+    assert!(connection
+        .execute(
+            "UPDATE interactions SET capture_worktree='not-hex' WHERE id=?1",
+            [mine.as_str()],
+        )
+        .is_err());
     Ok(())
 }

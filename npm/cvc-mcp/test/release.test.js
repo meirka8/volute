@@ -43,6 +43,25 @@ test('requires exactly one matching checksum entry', () => {
   assert.throws(() => checksumForAsset(`${hash}  ${asset}\n${hash}  ${asset}\n`, asset), /one valid checksum/);
 });
 
+test('npm tarball stages the generated third-party notices then cleans up', { skip: process.platform === 'win32' }, () => {
+  const packageRoot = path.resolve(__dirname, '..');
+  const staged = path.join(packageRoot, 'THIRD-PARTY-NOTICES.md');
+  let filename;
+  assert.equal(fs.existsSync(staged), false);
+  const result = spawnSync('npm', ['pack', '--json'], { cwd: packageRoot, encoding: 'utf8' });
+  try {
+    assert.equal(result.status, 0, result.stderr);
+    const manifest = JSON.parse(result.stdout);
+    [{ filename }] = Array.isArray(manifest) ? manifest : Object.values(manifest);
+    const listing = spawnSync('tar', ['-tzf', filename], { cwd: packageRoot, encoding: 'utf8' });
+    assert.equal(listing.status, 0, listing.stderr);
+    assert.equal(listing.stdout.split('\n').filter(name => name === 'package/THIRD-PARTY-NOTICES.md').length, 1);
+  } finally {
+    if (typeof filename === 'string') fs.rmSync(path.join(packageRoot, filename), { force: true });
+    assert.equal(fs.existsSync(staged), false);
+  }
+});
+
 test('Unix extraction materializes only the requested regular member', { skip: process.platform === 'win32' }, () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cvc-release-test-'));
   try {

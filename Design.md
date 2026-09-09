@@ -53,7 +53,7 @@ A Node consists of:
 
 To balance performance with query capability, we utilize a hybrid approach:
 
-- **Database:** SQLite (`.git/cvc/index.db`) for the graph structure, metadata, and relational queries.
+- **Database:** SQLite in the common Git directory's `cvc/` directory (`<common-git-dir>/cvc/index.db`) for the graph structure, metadata, and relational queries. This private CVC state is shared by linked worktrees; `.thoughtignore` and context resolution remain local to the active worktree.
     
 - **Context Deduplication (The Git Link):** To avoid data bloat, we do **not** duplicate file content in SQLite if it already exists in Git.
     
@@ -120,7 +120,7 @@ The interface is designed as a custom git command (`git-cvc`), allowing it to be
 
 ### Initialization & Configuration
 
-- `git cvc init`: Initializes the SQLite database in `.git/cvc/`.
+- `git cvc init`: Initializes the SQLite database in the common Git directory's `cvc/` directory.
     
 - `git cvc status`: Shows the current divergence between the Git HEAD and the Cognitive HEAD.
     
@@ -431,6 +431,7 @@ To ensure data integrity without disrupting the developer's flow, CVC employs an
 The connection between the Cognitive Graph and Git Graph is considered only after a standard `git commit`, normally through the `post-commit` hook. The hook is fail-safe: a linker error is reported as a warning and never fails the Git commit.
 
 - **Policy and eligibility:** `LinkPolicy` considers floating nodes only when their timestamp is strictly after `max(first-parent commit time, now - link window)`. The first-parent time prevents a later commit from claiming earlier work; when there is no parent, the window bound is used. `cvc.linkWindow` accepts `0..=2592000` seconds (30 days), defaulting to `86400`; missing, malformed, negative, overflowing, or over-max values safely fall back to the default. `0` deliberately disables automatic linking. Nodes more than five minutes in the future are excluded; a first-parent timestamp beyond that skew fails closed and produces no automatic links.
+- **Worktree affinity:** Every production capture records a local-only fingerprint of its canonical active worktree root (`capture_worktree`). Automatic linking considers only nodes captured in the committing worktree, plus legacy and sync-imported rows that carry no origin; parallel linked worktrees sharing the common database therefore cannot claim each other's floating thoughts, either temporally or through a shared conversation id. The fingerprint is never projected into sync wire formats, and a worktree whose origin cannot be computed produces no automatic links. Exact `rewrite_exact`/`squash_exact` relinking is evidence-based and deliberately unaffected.
 - **Changed paths:** The linker compares the commit tree with its first parent (or an empty tree for a root commit), considering both old and new paths so renames and deletions can overlap. A node with explicit file context qualifies only when a normalized context path overlaps a changed path.
 - **Binding:** One eligible overlapping node qualifies its conversation, and all eligible nodes in that conversation receive a `generated` link. An eligible node with no explicit context items can receive a lower-confidence `temporal` link instead. The complete automatic decision is persisted atomically, so a failure cannot half-bind a conversation. `linked_by` records the configured repository signature email as linking-identity attribution; it is not an author-based eligibility filter. Conflicting automatic link type or provenance fails rather than silently overwriting an existing record.
 - **No weak heuristics:** Automatic linking never infers provenance from author, commit message, file-set similarity, or a `CVC-Session` trailer; that trailer is not implemented.

@@ -423,6 +423,12 @@ impl CvcStore {
             if !columns.iter().any(|c| c == "scrubber_version") {
                 self.conn.execute_batch("ALTER TABLE interactions ADD COLUMN scrubber_version INTEGER NOT NULL DEFAULT 0 CHECK(scrubber_version BETWEEN 0 AND 1); ")?;
             }
+            // Local-only worktree-origin fingerprint scoping automatic link
+            // eligibility. NULL marks legacy and imported rows, which stay
+            // eligible from any worktree. Never project this column.
+            if !columns.iter().any(|c| c == "capture_worktree") {
+                self.conn.execute_batch("ALTER TABLE interactions ADD COLUMN capture_worktree TEXT CHECK(capture_worktree IS NULL OR (length(capture_worktree)=64 AND capture_worktree NOT GLOB '*[^0-9a-f]*')); ")?;
+            }
             self.conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_interactions_visibility ON interactions(visibility); CREATE INDEX IF NOT EXISTS idx_interactions_source_request ON interactions(source_request_id);")?;
             self.conn.execute_batch("CREATE TABLE IF NOT EXISTS conversation_share_policy (conversation_id TEXT PRIMARY KEY, future_shared INTEGER NOT NULL CHECK(future_shared IN (0,1))); CREATE TABLE IF NOT EXISTS conversation_shares (conversation_id TEXT NOT NULL, remote_fingerprint TEXT NOT NULL, share_future INTEGER NOT NULL CHECK(share_future IN (0,1)), PRIMARY KEY(conversation_id,remote_fingerprint)); CREATE TABLE IF NOT EXISTS interaction_shares (interaction_id TEXT NOT NULL, remote_fingerprint TEXT NOT NULL, PRIMARY KEY(interaction_id, remote_fingerprint)); CREATE INDEX IF NOT EXISTS idx_interaction_shares_remote ON interaction_shares(remote_fingerprint); CREATE TABLE IF NOT EXISTS publications (interaction_id TEXT NOT NULL, remote_fingerprint TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','published','unknown')), updated_at INTEGER NOT NULL, PRIMARY KEY(interaction_id, remote_fingerprint)); CREATE INDEX IF NOT EXISTS idx_publications_remote_state ON publications(remote_fingerprint,state);")?;
             // v4.1: tombstone authority is destination scoped.  A received
@@ -832,7 +838,7 @@ impl CvcStore {
             .unwrap_or_default()
             .replace('"', "");
         let visibility = "private";
-        tx.execute("INSERT INTO interactions (id,conversation_id,parent_id,timestamp,author,user_prompt,model_name,model_cot,model_response,source_request_id,visibility,capture_source,scrubber_version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1)", params![i.id.to_string(),i.conversation_id,parent,i.timestamp.timestamp(),author,i.user_prompt,i.model_name,i.model_cot,i.model_response,i.source_request_id,visibility,source])?;
+        tx.execute("INSERT INTO interactions (id,conversation_id,parent_id,timestamp,author,user_prompt,model_name,model_cot,model_response,source_request_id,visibility,capture_source,scrubber_version,capture_worktree) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13)", params![i.id.to_string(),i.conversation_id,parent,i.timestamp.timestamp(),author,i.user_prompt,i.model_name,i.model_cot,i.model_response,i.source_request_id,visibility,source,capture.capture_worktree])?;
         tx.execute("INSERT OR IGNORE INTO interaction_shares(interaction_id,remote_fingerprint) SELECT ?1,remote_fingerprint FROM conversation_shares WHERE conversation_id=?2 AND share_future=1", params![i.id.to_string(), i.conversation_id])?;
         for x in &capture.context_items {
             tx.execute("INSERT INTO context_items (interaction_id,file_path,git_blob_sha,dirty_patch,start_line,end_line) VALUES (?1,?2,?3,?4,?5,?6)",params![i.id.to_string(),x.file_path,x.git_blob_sha,x.dirty_patch,x.start_line,x.end_line])?;
@@ -1179,16 +1185,32 @@ impl CvcStore {
     // --- Floating Nodes ---
 
     pub fn get_floating_interactions(&self) -> Result<Vec<Interaction>> {
+        self.floating_interactions(None)
+    }
+
+    /// Floating nodes that automatic linking may consider from one active
+    /// worktree: rows captured in that worktree plus legacy/imported rows with
+    /// no recorded origin. Nodes captured by a sibling worktree are excluded so
+    /// parallel checkouts cannot claim each other's pending thoughts.
+    pub fn get_floating_interactions_for_worktree(
+        &self,
+        capture_worktree: &str,
+    ) -> Result<Vec<Interaction>> {
+        self.floating_interactions(Some(capture_worktree))
+    }
+
+    fn floating_interactions(&self, capture_worktree: Option<&str>) -> Result<Vec<Interaction>> {
         // Interactions that are NOT in artifact_links
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.conversation_id, i.parent_id, i.timestamp, i.author, i.user_prompt,
                     i.model_name, i.model_cot, i.model_response, i.source_request_id
              FROM interactions i
              LEFT JOIN artifact_links al ON i.id = al.interaction_id
-             WHERE al.interaction_id IS NULL",
+             WHERE al.interaction_id IS NULL
+               AND (?1 IS NULL OR i.capture_worktree IS NULL OR i.capture_worktree = ?1)",
         )?;
 
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![capture_worktree], |row| {
             let parent_id_str: Option<String> = row.get(2)?;
             let timestamp: i64 = row.get(3)?;
             let author_str: String = row.get(4)?;
@@ -2526,6 +2548,7 @@ mod trusted_api_tests {
                 Vec::new(),
                 Vec::new(),
                 PreparedPolicy::built_ins_only(),
+                "0".repeat(64),
             ))?;
             let mut source = DerivationEvent {
                 event_id: String::new(),

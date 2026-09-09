@@ -1,0 +1,92 @@
+name: Bug report
+description: Report a reproducible problem in Volute or CVC.
+title: "bug: "
+labels:
+  - "type: bug"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve Volute. For a suspected vulnerability, do not open a public issue. Report it privately through the [Security Policy](https://github.com/meirka8/volute/security/policy).
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+      description: Describe the expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: List the smallest safe steps, commands, and inputs needed to reproduce the problem.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Volute/CVC version
+      placeholder: "For example: 0.4.2"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: "For example: Ubuntu 24.04, x86_64"
+    validations:
+      required: true
+  - type: input
+    id: git-version
+    attributes:
+      label: Git version
+      placeholder: "For example: git version 2.45.2"
+    validations:
+      required: true
+  - type: input
+    id: integration-version
+    attributes:
+      label: Relevant editor or integration version
+      description: Include an editor, extension, MCP client, or other integration if applicable; otherwise write N/A.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or output
+      description: Remove credentials, captured prompts, personal data, private repository details, and generated CVC state before sharing.
+      render: text
+    validations:
+      required: false
+  - type: dropdown
+    id: component
+    attributes:
+      label: Suggested component
+      options:
+        - Core
+        - CLI
+        - MCP Server
+        - Language Server
+        - VS Code Extension
+        - Reviewer
+        - Repository / Cross-component
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed credentials, captured prompts, personal data, private repository details, and generated CVC state. This is not a vulnerability report.
+          required: true

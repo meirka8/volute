@@ -68,11 +68,18 @@ fn write_file(repo: &Repository, path: &str, content: &str) -> anyhow::Result<()
 }
 
 fn add_interaction(
+    repo: &Repository,
     store: &CvcStore,
     conversation_id: &str,
     timestamp: chrono::DateTime<Utc>,
     context_path: Option<&str>,
 ) -> anyhow::Result<InteractionId> {
+    // Fixtures capture with the fixture repository's real origin so the linker
+    // under test treats them as this worktree's own thoughts.
+    let capture_worktree = cvc_core::repository::worktree_origin_fingerprint(
+        repo.workdir()
+            .ok_or_else(|| anyhow::anyhow!("missing workdir"))?,
+    )?;
     let id = InteractionId::new();
     let interaction = Interaction {
         id: id.clone(),
@@ -109,6 +116,7 @@ fn add_interaction(
         context_items,
         Vec::new(),
         PreparedPolicy::built_ins_only(),
+        capture_worktree,
     ))?;
     Ok(id)
 }
@@ -133,6 +141,7 @@ fn setup() -> anyhow::Result<(TempDir, Repository, CvcStore)> {
 fn stale_unrelated_chat_is_not_linked() -> anyhow::Result<()> {
     let (_temp_dir, repo, store) = setup()?;
     let stale = add_interaction(
+        &repo,
         &store,
         "stale",
         Utc::now() - Duration::hours(25),
@@ -153,6 +162,7 @@ fn interaction_at_parent_timestamp_is_excluded_by_strict_lower_bound() -> anyhow
     let (_temp_dir, repo, store) = setup()?;
     let parent_time = repo.head()?.peel_to_commit()?.time().seconds();
     let at_parent = add_interaction(
+        &repo,
         &store,
         "at-parent-boundary",
         chrono::DateTime::from_timestamp(parent_time, 0).unwrap(),
@@ -172,8 +182,8 @@ fn interaction_at_parent_timestamp_is_excluded_by_strict_lower_bound() -> anyhow
 #[test]
 fn partial_commit_links_only_the_staged_files_conversation() -> anyhow::Result<()> {
     let (_temp_dir, repo, store) = setup()?;
-    let committed = add_interaction(&store, "committed", Utc::now(), Some("committed.rs"))?;
-    let disjoint = add_interaction(&store, "disjoint", Utc::now(), Some("other.rs"))?;
+    let committed = add_interaction(&repo, &store, "committed", Utc::now(), Some("committed.rs"))?;
+    let disjoint = add_interaction(&repo, &store, "disjoint", Utc::now(), Some("other.rs"))?;
     // Deliberately leave this edit unstaged. The commit helper stages only the
     // requested file, so the diff used by the linker must exclude other.rs.
     write_file(&repo, "other.rs", "unstaged")?;
@@ -202,7 +212,7 @@ fn partial_commit_links_only_the_staged_files_conversation() -> anyhow::Result<(
 #[test]
 fn no_context_node_uses_temporal_link() -> anyhow::Result<()> {
     let (_temp_dir, repo, store) = setup()?;
-    let node = add_interaction(&store, "no-context", Utc::now(), None)?;
+    let node = add_interaction(&repo, &store, "no-context", Utc::now(), None)?;
     commit_files(&repo, &[("committed.rs", "new")], "change committed")?;
 
     assert_eq!(
@@ -218,10 +228,10 @@ fn no_context_node_uses_temporal_link() -> anyhow::Result<()> {
 #[test]
 fn qualifying_conversation_links_all_its_in_window_nodes() -> anyhow::Result<()> {
     let (_temp_dir, repo, store) = setup()?;
-    let overlapping = add_interaction(&store, "cohesive", Utc::now(), Some("committed.rs"))?;
+    let overlapping = add_interaction(&repo, &store, "cohesive", Utc::now(), Some("committed.rs"))?;
     // This node has deliberately disjoint explicit context: cohesion, rather
     // than temporal fallback, must bind it after its conversation qualifies.
-    let companion = add_interaction(&store, "cohesive", Utc::now(), Some("other.rs"))?;
+    let companion = add_interaction(&repo, &store, "cohesive", Utc::now(), Some("other.rs"))?;
     commit_files(&repo, &[("committed.rs", "new")], "change committed")?;
 
     assert_eq!(
@@ -245,7 +255,7 @@ fn root_commit_links_overlapping_context() -> anyhow::Result<()> {
     let repo = Repository::init(temp_dir.path())?;
     let store = CvcStore::open(temp_dir.path().join("cvc.db"))?;
     store.init()?;
-    let node = add_interaction(&store, "root", Utc::now(), Some("new.rs"))?;
+    let node = add_interaction(&repo, &store, "root", Utc::now(), Some("new.rs"))?;
 
     commit_files(&repo, &[("new.rs", "new")], "root commit")?;
 
@@ -290,7 +300,7 @@ fn link_window_uses_default_for_missing_or_invalid_configuration() -> anyhow::Re
 #[test]
 fn zero_window_disables_automatic_linking() -> anyhow::Result<()> {
     let (_temp_dir, repo, store) = setup()?;
-    let node = add_interaction(&store, "disabled", Utc::now(), None)?;
+    let node = add_interaction(&repo, &store, "disabled", Utc::now(), None)?;
     let mut config = repo.config()?;
     config.set_str("cvc.linkWindow", "0")?;
     commit_files(&repo, &[("committed.rs", "new")], "disabled")?;
@@ -305,12 +315,142 @@ fn zero_window_disables_automatic_linking() -> anyhow::Result<()> {
 #[test]
 fn future_interaction_beyond_clock_skew_is_not_linked() -> anyhow::Result<()> {
     let (_temp_dir, repo, store) = setup()?;
-    let node = add_interaction(&store, "future", Utc::now() + Duration::minutes(6), None)?;
+    let node = add_interaction(
+        &repo,
+        &store,
+        "future",
+        Utc::now() + Duration::minutes(6),
+        None,
+    )?;
     commit_files(&repo, &[("committed.rs", "new")], "future")?;
     assert_eq!(
         linker::link_current_commit_to_floating_nodes(&repo, &store)?,
         0
     );
     assert!(store.get_artifact_links(&node)?.is_empty());
+    Ok(())
+}
+
+/// Initializes a primary repository plus a linked worktree that share one
+/// store, mirroring parallel agents working in sibling checkouts.
+fn setup_with_linked_worktree() -> anyhow::Result<(TempDir, Repository, Repository, CvcStore)> {
+    let temp_dir = TempDir::new()?;
+    let main_path = temp_dir.path().join("main");
+    fs::create_dir(&main_path)?;
+    let repo = Repository::init(&main_path)?;
+    let mut config = repo.config()?;
+    config.set_str("user.name", "Configured Linker")?;
+    config.set_str("user.email", "linker@example.com")?;
+    commit_files(
+        &repo,
+        &[("committed.rs", "old"), ("other.rs", "old")],
+        "initial",
+    )?;
+    let linked_path = temp_dir.path().join("linked");
+    repo.worktree("linked", &linked_path, None)?;
+    let linked_repo = Repository::open(&linked_path)?;
+    let store = CvcStore::open(temp_dir.path().join("cvc.db"))?;
+    store.init()?;
+    Ok((temp_dir, repo, linked_repo, store))
+}
+
+#[test]
+fn sibling_worktree_commit_cannot_claim_another_worktrees_thoughts() -> anyhow::Result<()> {
+    let (_temp_dir, repo, linked_repo, store) = setup_with_linked_worktree()?;
+    // Both captures belong to the primary worktree: one overlaps the changed
+    // path (generated candidate), one has no context (temporal candidate).
+    let overlapping =
+        add_interaction(&repo, &store, "main-work", Utc::now(), Some("committed.rs"))?;
+    let context_free = add_interaction(&repo, &store, "main-notes", Utc::now(), None)?;
+
+    // The linked worktree commits an overlapping change inside the window.
+    // Without origin scoping both nodes would be claimed here.
+    commit_files(&linked_repo, &[("committed.rs", "linked change")], "linked")?;
+    assert_eq!(
+        linker::link_current_commit_to_floating_nodes(&linked_repo, &store)?,
+        0,
+        "a sibling worktree must not claim another worktree's floating thoughts"
+    );
+    assert!(store.get_artifact_links(&overlapping)?.is_empty());
+    assert!(store.get_artifact_links(&context_free)?.is_empty());
+
+    // The capturing worktree's own commit still links both nodes.
+    commit_files(&repo, &[("committed.rs", "main change")], "main")?;
+    assert_eq!(
+        linker::link_current_commit_to_floating_nodes(&repo, &store)?,
+        2
+    );
+    assert_eq!(
+        store.get_artifact_links(&overlapping)?[0].link_type,
+        "generated"
+    );
+    assert_eq!(
+        store.get_artifact_links(&context_free)?[0].link_type,
+        "temporal"
+    );
+    Ok(())
+}
+
+#[test]
+fn shared_conversation_id_does_not_leak_generated_links_across_worktrees() -> anyhow::Result<()> {
+    let (_temp_dir, repo, linked_repo, store) = setup_with_linked_worktree()?;
+    // Both agents use the same conversation id (e.g. the MCP default session).
+    // The linked worktree's own overlapping node must not qualify the primary
+    // worktree's node in that conversation for a generated link.
+    let linked_origin = cvc_core::repository::worktree_origin_fingerprint(
+        linked_repo
+            .workdir()
+            .ok_or_else(|| anyhow::anyhow!("missing workdir"))?,
+    )?;
+    let main_node = add_interaction(&repo, &store, "agent-session-default", Utc::now(), None)?;
+    let linked_node = add_interaction(
+        &linked_repo,
+        &store,
+        "agent-session-default",
+        Utc::now(),
+        Some("committed.rs"),
+    )?;
+    commit_files(&linked_repo, &[("committed.rs", "linked change")], "linked")?;
+    assert_eq!(
+        linker::link_current_commit_to_floating_nodes(&linked_repo, &store)?,
+        1,
+        "only the linked worktree's own node is eligible"
+    );
+    let links = store.get_artifact_links(&linked_node)?;
+    assert_eq!(links[0].link_type, "generated");
+    assert!(store.get_artifact_links(&main_node)?.is_empty());
+    // Sanity: the two worktrees have distinct origins.
+    let main_origin = cvc_core::repository::worktree_origin_fingerprint(
+        repo.workdir()
+            .ok_or_else(|| anyhow::anyhow!("missing workdir"))?,
+    )?;
+    assert_ne!(main_origin, linked_origin);
+    Ok(())
+}
+
+#[test]
+fn legacy_rows_without_an_origin_stay_linkable_from_any_worktree() -> anyhow::Result<()> {
+    let (temp_dir, repo, linked_repo, store) = setup_with_linked_worktree()?;
+    // A pre-upgrade row has no capture origin. Timestamp it slightly ahead so
+    // second-granular commit times cannot tie with the strict lower bound.
+    let legacy = add_interaction(
+        &repo,
+        &store,
+        "legacy",
+        Utc::now() + Duration::seconds(1),
+        None,
+    )?;
+    rusqlite::Connection::open(temp_dir.path().join("cvc.db"))?.execute(
+        "UPDATE interactions SET capture_worktree=NULL WHERE id=?1",
+        [legacy.as_str()],
+    )?;
+    commit_files(&linked_repo, &[("committed.rs", "linked change")], "linked")?;
+    assert_eq!(
+        linker::link_current_commit_to_floating_nodes(&linked_repo, &store)?,
+        1,
+        "legacy rows keep their historical any-worktree eligibility"
+    );
+    assert_eq!(store.get_artifact_links(&legacy)?[0].link_type, "temporal");
+    let _ = repo;
     Ok(())
 }

@@ -32,6 +32,25 @@ Repository administrators must configure the following before a release:
    npm Publishing access to **Require two-factor authentication and disallow tokens**,
    revoke obsolete automation tokens, and keep package owners to the minimum needed.
    Do not create a long-lived npm token.
+4. Configure release tag signing on the ceremony machine. Release tags are
+   SSH-signed as the dedicated release identity `Volute Release <dev@cvc.dev>`
+   using the release signing key with fingerprint
+   `SHA256:oToKgqkDyVREuw1bvYIgdQ2ywcrrn2GH1Rqh01iaEig`; verifiers may pin that
+   fingerprint (every SSH signature also embeds its public key). The private
+   key's custody and location are deliberately not documented here. On the
+   machine that will perform the tag ceremony, set repository-local
+   configuration and register the allowed signer:
+
+   ```bash
+   git config gpg.format ssh
+   git config user.signingkey <path-to-release-signing-public-key>
+   git config gpg.ssh.allowedSignersFile ~/.config/git/allowed_signers
+   ```
+
+   The allowed-signers file must contain a line binding the release principal
+   to the key: `dev@cvc.dev <key-type> <release-public-key>`. The tag command
+   in this runbook passes the release identity explicitly with `-c` flags, so
+   the machine's normal commit identity is never changed.
 
 The public repository's OIDC trusted-publishing flow automatically emits npm
 provenance. Accordingly, the workflow deliberately uses `npm publish` without a
@@ -63,6 +82,21 @@ version-published. Use the package manager to preserve lockfile consistency (for
 example, run `npm version X.Y.Z --no-git-tag-version` in `cvc-plugin`); do not create
 the release tag from that command.
 
+Prepare the curated GitHub Release body at `docs/releases/vX.Y.Z.md`. This file is
+mandatory and is used as the release body without generator text transformation; the workflow deliberately does
+not enable GitHub-generated release notes. Write the user-facing summary and breaking
+changes in it, and include an explicit Markdown `Full Changelog` link. For the first
+public GitHub/Apache-2.0 OSS release, link to all commits reachable from the release
+tag, for example:
+
+```markdown
+[Full Changelog](https://github.com/meirka8/volute/commits/v0.4.2)
+```
+
+For later releases, use the explicit comparison range, for example
+`https://github.com/meirka8/volute/compare/v0.4.2...vX.Y.Z`. Review this file as part
+of the release PR and include it in the signed release-preparation commit.
+
 Run the same relevant checks used by the repository workflows from the repository
 root. The directory changes below are intentional:
 
@@ -75,6 +109,7 @@ cargo check --workspace --all-targets
 (cd cvc-plugin && npm ci && npm exec --no -- vsce --version && npm run check-types && npm run lint && npm run compile && xvfb-run -a npm test)
 (cd cvc-reviewer && npm ci && npm run lint && npm test -- --run && npm run build)
 (cd npm/cvc-mcp && node --check bin/cvc-mcp.js && node --check bin/cvc.js && npm test && npm pack --dry-run)
+node .github/scripts/generate-third-party-notices.mjs --check
 node .github/scripts/check-release-version.mjs vX.Y.Z
 ```
 
@@ -84,13 +119,44 @@ Inspect the resulting diff, including both lockfiles. Commit with DCO sign-off, 
 the branch, and open a PR to `main`:
 
 ```bash
-git add cvc-core/Cargo.toml cvc-cli/Cargo.toml cvc-lsp/Cargo.toml cvc-mcp/Cargo.toml Cargo.lock cvc-plugin/package.json cvc-plugin/package-lock.json npm/cvc-mcp/package.json
+git add cvc-core/Cargo.toml cvc-cli/Cargo.toml cvc-lsp/Cargo.toml cvc-mcp/Cargo.toml Cargo.lock cvc-plugin/package.json cvc-plugin/package-lock.json npm/cvc-mcp/package.json docs/releases/vX.Y.Z.md
 git commit -s -m "chore: release vX.Y.Z"
 git push origin release/vX.Y.Z
 ```
 
 Obtain required review and passing PR CI before merging. Every release-preparation
 commit must satisfy the DCO requirement in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Third-party notices
+
+`THIRD-PARTY-NOTICES.md` is a checked-in mechanical report for every non-workspace
+crate resolved by `Cargo.lock` and the production dependencies bundled in the VSIX.
+It records package metadata and imports license/copyright/notice files available in
+the locked package sources without replacing an SPDX expression or substantive text;
+for deterministic output it normalizes CRLF to LF, removes trailing horizontal
+whitespace per line, and emits one terminal newline. For the exceptional
+package archives that ship no conventional evidence file, the generator uses only
+the exact matching vendored SPDX canonical text and labels package-supplied
+author/contributor metadata without inferring copyright. Before generating
+or checking it locally, fetch the exact crate sources and install only production
+extension packages without lifecycle scripts:
+
+```bash
+cargo fetch --locked
+(cd cvc-plugin && npm ci --ignore-scripts --omit=dev)
+node .github/scripts/generate-third-party-notices.mjs
+node .github/scripts/generate-third-party-notices.mjs --check
+```
+
+The notice CI job uses the same prerequisites and fails if an installed production
+package lacks an SPDX license field or differs from the lockfile. Review any new or
+changed license expression and source evidence as part of the release PR; this
+mechanical inventory is not legal advice.
+
+The stable required-check name is **Verify third-party notices**. Repository
+administrators must add that check to the GitHub branch/ruleset required checks as
+an external pre-merge and pre-release action; changing this workflow alone cannot
+enforce a GitHub ruleset.
 
 ## Confirm external version availability
 
@@ -102,6 +168,17 @@ ambiguous, or cannot be authenticated for inspection, fail closed: do not tag un
 absence is confirmed in the relevant UI or registry response.
 
 ## Create the release tag
+
+First run the signing preflight. It fails fast if the ceremony machine is missing
+the release signing setup from the one-time configuration section — signing
+configuration is per-machine and per-checkout state that does not travel with the
+repository, so verify it before starting rather than discovering it mid-ceremony:
+
+```bash
+test "$(git config --get gpg.format)" = ssh || { echo 'Preflight: gpg.format is not ssh.' >&2; exit 1; }
+ssh-keygen -lf "$(git config --get user.signingkey)" | grep -F 'SHA256:oToKgqkDyVREuw1bvYIgdQ2ywcrrn2GH1Rqh01iaEig' || { echo 'Preflight: user.signingkey is not the release signing key.' >&2; exit 1; }
+grep -q '^dev@cvc.dev ' "$(git config --get gpg.ssh.allowedSignersFile)" || { echo 'Preflight: allowed signers is missing the release principal.' >&2; exit 1; }
+```
 
 After the PR merges, fetch origin, update `main`, and fail unless local `HEAD` is
 exactly `origin/main`. Record its SHA, verify the remote tag is absent, and create a
@@ -122,7 +199,7 @@ else
   test "$status" -eq 2 || exit "$status" # 2 means no matching remote tag
 fi
 node .github/scripts/check-release-version.mjs vX.Y.Z
-git tag -s vX.Y.Z -m "Release vX.Y.Z"
+git -c user.name='Volute Release' -c user.email='dev@cvc.dev' tag -s vX.Y.Z -m "Release vX.Y.Z"
 git verify-tag vX.Y.Z
 test "$(git rev-parse vX.Y.Z^{})" = "$release_sha" || { printf '%s\n' 'Refusing: tag does not point to the recorded commit.' >&2; exit 1; }
 git push origin refs/tags/vX.Y.Z:refs/tags/vX.Y.Z
@@ -134,10 +211,28 @@ external version is already present, stop and investigate rather than reusing it
 
 ## What the tag workflow does
 
-`release.yml` first runs the version gate. It then builds four binary targets
-(Linux x64, macOS x64, macOS ARM64, and Windows x64), packages four target-specific
-VSIX files, and creates the GitHub Release. That release contains the binary archives,
-four VSIX assets, `LICENSE`, and `SHA256SUMS.txt`.
+`release.yml` first runs the version gate. It checks out full history, fetches
+`origin/main` explicitly, resolves the pushed tag to its commit, and refuses to
+continue unless that commit is an ancestor of `origin/main`. It also refuses to run
+without `docs/releases/vX.Y.Z.md`. These checks run before any build or publication.
+It then builds four binary targets (Linux x64, macOS x64, macOS ARM64, and Windows
+x64), packages four target-specific VSIX files, and creates the GitHub Release using
+that versioned notes file as its curated body.
+
+The release contains the binary archives, four VSIX assets, `LICENSE`,
+`THIRD-PARTY-NOTICES.md`, `install.sh`, `install.ps1`, and `SHA256SUMS.txt`.
+Every native archive, VSIX, and npm launcher tarball contains
+`THIRD-PARTY-NOTICES.md`. The launcher stages an exact temporary copy during
+`npm pack`/`npm publish` and removes it afterward; its package test verifies the
+tarball entry and cleanup. `uninstall.sh` and
+`uninstall.ps1` are not
+released until they have been separately hardened. The workflow stages release-only
+copies of the installers with their default `CVC_RELEASE_VERSION` set to the exact
+release tag; users can still explicitly override it with `CVC_RELEASE_VERSION`.
+The scripts and license are staged before `SHA256SUMS.txt` is made, so the manifest
+covers every downloadable installer script as well as the archives.
+Before the GitHub Release is created, the workflow publishes GitHub build provenance
+attestations for every staged release asset, including that manifest.
 
 Only after the GitHub Release succeeds do the isolated `publish-marketplace` and
 `publish-npm` jobs run through `vscode-marketplace` and `npm-publish`, respectively.
@@ -153,9 +248,23 @@ compatible draft-to-publish workflow.
 
 After all jobs complete, verify:
 
-- GitHub Release assets include `LICENSE` and `SHA256SUMS.txt`; verify each downloaded
-  installer/archive against that checksum file, then perform the applicable installer
-  smoke test.
+- GitHub Release assets include `LICENSE`, `THIRD-PARTY-NOTICES.md`, `install.sh`, `install.ps1`, and
+  `SHA256SUMS.txt`; verify each downloaded installer script and archive against that
+  checksum file, then perform the applicable installer smoke test.
+- Verify GitHub build provenance for every downloaded release asset (including
+  `LICENSE`, the two installer scripts, and `SHA256SUMS.txt`) with:
+
+  ```bash
+  gh attestation verify <path> --repo meirka8/volute
+  ```
+
+  SHA-256 checksums compare a downloaded asset to the digest in the published
+  manifest. For provenance, GitHub Actions uses the workflow job's OIDC identity to
+  obtain a short-lived Sigstore signing certificate and publishes a signed SLSA build
+  provenance statement that binds the asset digest to this repository and workflow
+  run. `gh attestation verify` validates that signature, identity, and digest using
+  the GitHub/Sigstore trust model. Use both checks; neither removes the need to trust
+  the repository, its workflow, and their configured GitHub protections.
 - npm shows `@volute_cvc/cvc-mcp@X.Y.Z` with Apache-2.0 license, the `meirka8/volute`
   repository metadata, and provenance; inspect the actual npm tarball to confirm it
   includes `LICENSE`. Only then, in an isolated disposable environment, run a launcher
@@ -163,10 +272,11 @@ After all jobs complete, verify:
 - The VS Code Marketplace shows Apache-2.0 and all four target variants for publisher
   `volute` at the expected version.
 
-For the first public release, the expected version is `v0.4.2`. Existing npm `0.4.1`
-metadata is immutable and reflects the old `UNLICENSED` license and old repository
-metadata. `v0.4.2` will carry Apache-2.0, a bundled license, and Volute repository
-metadata. After `0.4.2` is available, deprecate npm `0.4.1` with a message such as:
+For the first public GitHub/Apache-2.0 OSS release, the expected version is `v0.4.2`.
+Existing npm `0.4.1` metadata is immutable and reflects the old `UNLICENSED` license
+and old repository metadata. `v0.4.2` will carry Apache-2.0, a bundled license, and
+Volute repository metadata. After `0.4.2` is available, deprecate npm `0.4.1` with a
+message such as:
 `Pre-open-source build; unlicensed. Use >=0.4.2 (Apache-2.0).`
 
 ## Incidents and rollback

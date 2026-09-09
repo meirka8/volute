@@ -1,11 +1,17 @@
 use cvc_core::db::CvcStore;
+use cvc_core::repository::RepositoryLayout;
 use dashmap::DashMap;
-use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// The server deliberately has one repository/worktree binding.  Multi-root
+/// workspaces need separate stores and policy contexts and are not supported.
+pub struct BoundRepository {
+    pub layout: RepositoryLayout,
+    pub store: CvcStore,
+}
+
 pub struct AppState {
-    pub store: Mutex<Option<CvcStore>>,
-    pub root_path: Mutex<Option<PathBuf>>,
+    pub binding: Mutex<Option<BoundRepository>>,
     // Map of Turn ID -> Prompt
     pub pending_turns: DashMap<String, String>,
 }
@@ -13,8 +19,7 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         Self {
-            store: Mutex::new(None),
-            root_path: Mutex::new(None),
+            binding: Mutex::new(None),
             pending_turns: DashMap::new(),
         }
     }

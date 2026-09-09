@@ -1,18 +1,21 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cvc_core::db::CvcStore;
+use cvc_core::repository::RepositoryLayout;
 use std::env;
 
 pub async fn run() -> Result<()> {
     let current_dir = env::current_dir()?;
-    let cvc_dir = current_dir.join(".git").join("cvc");
+    let layout =
+        RepositoryLayout::discover(&current_dir).context("Failed to discover Git repository")?;
+    let _worktree_root = layout.worktree_root()?;
+    let cvc_dir = layout.cvc_dir();
 
     if !cvc_dir.exists() {
         println!("CVC is not initialized.");
         return Ok(());
     }
 
-    let db_path = cvc_dir.join("index.db");
-    let store = CvcStore::open_initialized(&db_path)?;
+    let store = CvcStore::open_initialized(layout.db_path())?;
 
     // Simplistic log: Get all IDs and show them.
     let ids = store.get_all_interaction_ids()?;

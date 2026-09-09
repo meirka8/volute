@@ -64,6 +64,7 @@ fn interaction_named(
         vec![],
         vec![],
         PreparedPolicy::built_ins_only(),
+        "0".repeat(64),
     ))?;
     store.link_interaction(&id, &CommitSha::new(commit_oid.to_string()), "generated")?;
     let key = format!("legacy:{id}:{commit_oid}");

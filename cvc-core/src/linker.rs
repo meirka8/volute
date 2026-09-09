@@ -64,6 +64,8 @@ pub enum LinkerError {
     Git2(#[from] git2::Error),
     #[error("Clock arithmetic error: {0}")]
     Clock(String),
+    #[error("worktree origin unavailable: {0}")]
+    Origin(String),
 }
 
 pub type Result<T> = std::result::Result<T, LinkerError>;
@@ -99,8 +101,18 @@ pub fn link_current_commit_with_policy(
         .ok()
         .and_then(|signature| signature.email().map(str::to_owned));
 
+    // The shared database serves every linked worktree, so eligibility must be
+    // scoped to nodes this worktree captured (legacy rows without an origin
+    // stay eligible). Without an origin there is no linking: claiming another
+    // active checkout's pending thoughts is worse than leaving them floating.
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| LinkerError::Origin("bare repository has no worktree".into()))?;
+    let capture_worktree = crate::repository::worktree_origin_fingerprint(workdir)
+        .map_err(|error| LinkerError::Origin(error.to_string()))?;
+
     let eligible: Vec<Interaction> = db
-        .get_floating_interactions()?
+        .get_floating_interactions_for_worktree(&capture_worktree)?
         .into_iter()
         .filter(|node| node.timestamp > lower_bound && node.timestamp <= upper_bound)
         .collect();

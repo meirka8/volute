@@ -1,3 +1,4 @@
+use cvc_mcp::server::AppState;
 use cvc_mcp::tools;
 use serde_json::json;
 use std::process::Command;
@@ -7,28 +8,30 @@ use tempfile::tempdir;
 async fn test_setup_cvc_integration() {
     let dir = tempdir().unwrap();
     let repo_path = dir.path();
+    let home = repo_path.join("home");
+    std::fs::create_dir(&home).unwrap();
 
     // 1. Initialize git repo
-    Command::new("git")
+    let output = Command::new("git")
         .arg("init")
         .current_dir(repo_path)
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", home.join("global-config"))
+        .env("GIT_TEMPLATE_DIR", "")
         .output()
         .expect("Failed to init git repo");
+    assert!(output.status.success(), "git init failed: {output:?}");
 
     // 2. Call setup_cvc with explicit cwd
     let args = json!({
         "cwd": repo_path.to_str().unwrap()
     });
 
-    // Create a dummy store for call_tool compatibility
-    let dummy_db = repo_path.join("dummy_mcp.db");
-    // We create the dummy DB file so CvcStore::open doesn't fail
-    // CvcStore::open uses SQLite open which creates file if missing.
-
-    let store = std::sync::Arc::new(std::sync::Mutex::new(
-        cvc_core::db::CvcStore::open(&dummy_db).unwrap(),
-    ));
-    let state = std::sync::Arc::new(cvc_mcp::server::AppState::new(store));
+    let layout = cvc_core::repository::RepositoryLayout::discover(repo_path).unwrap();
+    let state = std::sync::Arc::new(AppState::open(&layout).unwrap());
 
     let res = tools::call_tool(
         json!({

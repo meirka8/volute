@@ -62,6 +62,7 @@ fn persist(store: &CvcStore, interaction: &Interaction) -> anyhow::Result<()> {
         Vec::new(),
         Vec::new(),
         PreparedPolicy::built_ins_only(),
+        "0".repeat(64),
     ))?;
     Ok(())
 }

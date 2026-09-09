@@ -127,6 +127,7 @@ fn aggregate_uses_the_supplied_policy_snapshot() {
             }],
             Vec::new(),
             policy,
+            "0".repeat(64),
         ))
         .unwrap();
     assert!(store.get_context_items(&id).unwrap().is_empty());
@@ -156,6 +157,7 @@ fn malformed_policy_aborts_before_aggregate_write() {
             Vec::new(),
             Vec::new(),
             PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))
         .unwrap();
     assert!(store.get_interaction(&id).unwrap().is_some());
@@ -194,6 +196,7 @@ fn sharing_is_atomic_and_projection_never_includes_private_peers() {
                 Vec::new(),
                 Vec::new(),
                 PreparedPolicy::built_ins_only(),
+                "0".repeat(64),
             ))
             .unwrap();
     }
@@ -224,6 +227,7 @@ fn sharing_is_atomic_and_projection_never_includes_private_peers() {
             Vec::new(),
             Vec::new(),
             PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))
         .unwrap();
     assert_eq!(
@@ -255,6 +259,7 @@ fn sharing_one_destination_never_authorizes_another() {
             Vec::new(),
             Vec::new(),
             PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))
         .unwrap();
     store
@@ -289,6 +294,7 @@ fn pulled_publication_does_not_grant_sharing_to_another_remote() {
             Vec::new(),
             Vec::new(),
             PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))
         .unwrap();
     let source_fingerprint = privacy_status(&repo, "source").unwrap().remote_fingerprint;
@@ -411,6 +417,7 @@ fn aws_pair_is_absent_from_all_captured_fields_db_wal_and_projection() {
                 status: ToolStatus::Success,
             }],
             PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))
         .unwrap();
     store
@@ -469,6 +476,7 @@ fn share_snapshot_race_rejects_new_turn_without_sharing_it() {
             vec![],
             vec![],
             PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))
         .unwrap();
     let snapshot = store.share_snapshot("race").unwrap();
@@ -484,6 +492,7 @@ fn share_snapshot_race_rejects_new_turn_without_sharing_it() {
             vec![],
             vec![],
             PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
         ))
         .unwrap();
     assert!(store

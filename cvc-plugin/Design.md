@@ -53,7 +53,7 @@ A Node consists of:
 
 To balance performance with query capability, we utilize a hybrid approach:
 
-- **Database:** SQLite (`.git/cvc/index.db`) for the graph structure, metadata, and relational queries.
+- **Database:** SQLite in the common Git directory's `cvc/` directory (`<common-git-dir>/cvc/index.db`) for the graph structure, metadata, and relational queries. This private CVC state is shared by linked worktrees; `.thoughtignore` and context resolution remain local to the active worktree.
     
 - **Context Deduplication (The Git Link):** To avoid data bloat, we do **not** duplicate file content in SQLite if it already exists in Git.
     
@@ -120,7 +120,7 @@ The interface is designed as a custom git command (`git-cvc`), allowing it to be
 
 ### Initialization & Configuration
 
-- `git cvc init`: Initializes the SQLite database in `.git/cvc/`.
+- `git cvc init`: Initializes the SQLite database in the common Git directory's `cvc/` directory.
     
 - `git cvc status`: Shows the current divergence between the Git HEAD and the Cognitive HEAD.
     

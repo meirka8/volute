@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use cvc_core::db::CvcStore;
 use cvc_core::linker;
+use cvc_core::repository::RepositoryLayout;
 use git2::Repository;
 use std::env;
 use std::fs;
@@ -56,8 +57,9 @@ fn observe_pre_push(
     if remote.is_empty() || remote_url.is_empty() {
         return Ok(());
     }
-    let repo = Repository::open(cwd)?;
-    let cvc = cvc_core::privacy::common_git_dir(&repo).join("cvc");
+    let layout = RepositoryLayout::discover(cwd)?;
+    let repo = layout.repository();
+    let cvc = layout.cvc_dir();
     if !cvc.exists() {
         return Ok(());
     }
@@ -117,7 +119,7 @@ fn observe_pre_push(
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let _ = cvc_core::squash::observe_pre_push_range_with_abort(
-        &repo,
+        repo,
         &store,
         bases[0],
         tips[0].1,
@@ -135,10 +137,11 @@ pub async fn post_merge(_squash: Option<&str>) -> Result<()> {
     }
     let result = (|| -> Result<()> {
         let cwd = env::current_dir()?;
-        let repo = Repository::open(&cwd)?;
-        let path = cvc_core::privacy::common_git_dir(&repo).join("cvc/index.db");
+        let layout = RepositoryLayout::discover(&cwd)?;
+        let repo = layout.repository();
+        let path = layout.db_path();
         let mut store = CvcStore::open_initialized(path)?;
-        cvc_core::squash::scan_for(&repo, &mut store, false, std::time::Duration::from_secs(30))?;
+        cvc_core::squash::scan_for(repo, &mut store, false, std::time::Duration::from_secs(30))?;
         Ok(())
     })();
     if let Err(e) = result {
@@ -178,17 +181,18 @@ pub async fn post_rewrite(mode: &str) -> Result<()> {
         std::io::stdin()
             .take((cvc_core::rewrite::MAX_REWRITE_BYTES + 1) as u64)
             .read_to_end(&mut raw)?;
-        let repo = Repository::open(&cwd)?;
-        let dir = cvc_core::privacy::common_git_dir(&repo).join("cvc");
+        let layout = RepositoryLayout::discover(&cwd)?;
+        let repo = layout.repository();
+        let dir = layout.cvc_dir();
         if !dir.exists() {
             return Ok(());
         }
         let inbox = dir.join("rewrite-inbox");
         // Validate and durably enqueue current input before touching SQLite.
-        cvc_core::rewrite::validate_initial_delivery(&repo, mode, &raw)?;
+        cvc_core::rewrite::validate_initial_delivery(repo, mode, &raw)?;
         cvc_core::rewrite::persist_inbox(&inbox, mode, &raw)?;
         let mut store = CvcStore::open_initialized(dir.join("index.db"))?;
-        replay_inbox(&repo, &mut store, &inbox)?;
+        replay_inbox(repo, &mut store, &inbox)?;
         Ok(())
     })();
     if let Err(e) = result {
@@ -198,8 +202,10 @@ pub async fn post_rewrite(mode: &str) -> Result<()> {
 }
 
 fn run_post_commit_logic(current_dir: &std::path::Path) -> Result<()> {
-    let repo = Repository::open(current_dir).context("Failed to open git repository")?;
-    let cvc_dir = cvc_core::privacy::common_git_dir(&repo).join("cvc");
+    let layout =
+        RepositoryLayout::discover(current_dir).context("Failed to discover Git repository")?;
+    let repo = layout.repository();
+    let cvc_dir = layout.cvc_dir();
     if !cvc_dir.exists() {
         // Not initialized, do nothing
         return Ok(());
@@ -208,13 +214,13 @@ fn run_post_commit_logic(current_dir: &std::path::Path) -> Result<()> {
     let db_path = cvc_dir.join("index.db");
     let mut store = CvcStore::open_initialized(&db_path)?; // Hook caller still swallows all errors.
 
-    let count = linker::link_current_commit_to_floating_nodes(&repo, &store)?;
+    let count = linker::link_current_commit_to_floating_nodes(repo, &store)?;
 
     if count > 0 {
         println!("CVC: Linked {} thought(s) to this commit.", count);
     }
     let exact =
-        cvc_core::squash::scan_for(&repo, &mut store, true, std::time::Duration::from_secs(5))?;
+        cvc_core::squash::scan_for(repo, &mut store, true, std::time::Duration::from_secs(5))?;
     if exact > 0 {
         println!("CVC: Exactly relinked {exact} squashed thought(s).");
     }
