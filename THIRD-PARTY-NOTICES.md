@@ -114,7 +114,7 @@ Coverage: 408 Rust packages; 20 production npm packages; 247 unique evidence tex
 | Rust | getrandom@0.2.17 | MIT OR Apache-2.0 | https&#58;//github.com/rust-random/getrandom |
 | Rust | getrandom@0.3.4 | MIT OR Apache-2.0 | https&#58;//github.com/rust-random/getrandom |
 | Rust | getrandom@0.4.1 | MIT OR Apache-2.0 | https&#58;//github.com/rust-random/getrandom |
-| Rust | git2@0.19.0 | MIT OR Apache-2.0 | https&#58;//github.com/rust-lang/git2-rs |
+| Rust | git2@0.20.4 | MIT OR Apache-2.0 | https&#58;//github.com/rust-lang/git2-rs |
 | Rust | h2@0.4.13 | MIT | https&#58;//github.com/hyperium/h2 |
 | Rust | hashbrown@0.14.5 | MIT OR Apache-2.0 | https&#58;//github.com/rust-lang/hashbrown |
 | Rust | hashbrown@0.15.5 | MIT OR Apache-2.0 | https&#58;//github.com/rust-lang/hashbrown |
@@ -162,7 +162,7 @@ Coverage: 408 Rust packages; 20 production npm packages; 247 unique evidence tex
 | Rust | lazy_static@1.5.0 | MIT OR Apache-2.0 | https&#58;//github.com/rust-lang-nursery/lazy-static.rs |
 | Rust | leb128fmt@0.1.0 | MIT OR Apache-2.0 | https&#58;//github.com/bluk/leb128fmt |
 | Rust | libc@0.2.181 | MIT OR Apache-2.0 | https&#58;//github.com/rust-lang/libc |
-| Rust | libgit2-sys@0.17.0+1.8.1 | MIT OR Apache-2.0 | https&#58;//github.com/rust-lang/git2-rs |
+| Rust | libgit2-sys@0.18.8+1.9.7 | MIT OR Apache-2.0 | https&#58;//github.com/rust-lang/git2-rs |
 | Rust | libredox@0.1.12 | MIT | https&#58;//gitlab.redox-os.org/redox-os/libredox.git |
 | Rust | libsqlite3-sys@0.30.1 | MIT | https&#58;//github.com/rusqlite/rusqlite |
 | Rust | libssh2-sys@0.3.1 | MIT OR Apache-2.0 | https&#58;//github.com/alexcrichton/ssh2-rs |
@@ -4451,11 +4451,11 @@ Exact package/file provenance:
 - Rust&#58; cfg-if@1.0.4 — MIT OR Apache-2.0 — LICENSE-MIT
 - Rust&#58; filetime@0.2.27 — MIT/Apache-2.0 — LICENSE-MIT
 - Rust&#58; find-msvc-tools@0.1.9 — MIT OR Apache-2.0 — LICENSE-MIT
-- Rust&#58; git2@0.19.0 — MIT OR Apache-2.0 — LICENSE-MIT
+- Rust&#58; git2@0.20.4 — MIT OR Apache-2.0 — LICENSE-MIT
 - Rust&#58; id-arena@2.3.0 — MIT/Apache-2.0 — LICENSE-MIT
 - Rust&#58; jobserver@0.1.34 — MIT OR Apache-2.0 — LICENSE-MIT
 - Rust&#58; js-sys@0.3.85 — MIT OR Apache-2.0 — LICENSE-MIT
-- Rust&#58; libgit2-sys@0.17.0+1.8.1 — MIT OR Apache-2.0 — LICENSE-MIT
+- Rust&#58; libgit2-sys@0.18.8+1.9.7 — MIT OR Apache-2.0 — LICENSE-MIT
 - Rust&#58; libssh2-sys@0.3.1 — MIT OR Apache-2.0 — LICENSE-MIT
 - Rust&#58; openssl-probe@0.1.6 — MIT/Apache-2.0 — LICENSE-MIT
 - Rust&#58; openssl-sys@0.9.117 — MIT — LICENSE-MIT
@@ -10439,7 +10439,7 @@ Exact package/file provenance:
 - Rust&#58; fs2@0.4.3 — MIT/Apache-2.0 — LICENSE-APACHE
 - Rust&#58; futures-lite@1.13.0 — Apache-2.0 OR MIT — LICENSE-APACHE
 - Rust&#58; futures-lite@2.6.1 — Apache-2.0 OR MIT — LICENSE-APACHE
-- Rust&#58; git2@0.19.0 — MIT OR Apache-2.0 — LICENSE-APACHE
+- Rust&#58; git2@0.20.4 — MIT OR Apache-2.0 — LICENSE-APACHE
 - Rust&#58; hashbrown@0.14.5 — MIT OR Apache-2.0 — LICENSE-APACHE
 - Rust&#58; hashbrown@0.15.5 — MIT OR Apache-2.0 — LICENSE-APACHE
 - Rust&#58; hashbrown@0.16.1 — MIT OR Apache-2.0 — LICENSE-APACHE
@@ -10458,7 +10458,7 @@ Exact package/file provenance:
 - Rust&#58; js-sys@0.3.85 — MIT OR Apache-2.0 — LICENSE-APACHE
 - Rust&#58; lazy_static@1.5.0 — MIT OR Apache-2.0 — LICENSE-APACHE
 - Rust&#58; leb128fmt@0.1.0 — MIT OR Apache-2.0 — LICENSE-APACHE
-- Rust&#58; libgit2-sys@0.17.0+1.8.1 — MIT OR Apache-2.0 — LICENSE-APACHE
+- Rust&#58; libgit2-sys@0.18.8+1.9.7 — MIT OR Apache-2.0 — LICENSE-APACHE
 - Rust&#58; libssh2-sys@0.3.1 — MIT OR Apache-2.0 — LICENSE-APACHE
 - Rust&#58; libz-sys@1.1.23 — MIT OR Apache-2.0 — LICENSE-APACHE
 - Rust&#58; linux-raw-sys@0.11.0 — Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT — LICENSE-APACHE
