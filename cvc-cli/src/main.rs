@@ -33,9 +33,16 @@ enum Commands {
         #[command(subcommand)]
         command: PrivacyCommands,
     },
-    /// Share a conversation explicitly
+    /// List conversations with activity and per-destination share state
+    Conversations {
+        #[arg(long)]
+        remote: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Share a conversation explicitly; with no id, pick one interactively
     Share {
-        conversation_id: String,
+        conversation_id: Option<String>,
         #[arg(long)]
         remote: Option<String>,
         #[arg(long)]
@@ -179,12 +186,18 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 commands::sync::reconcile(remote.as_deref()).await?
             }
         },
+        Commands::Conversations { remote, limit } => {
+            commands::conversations::run(remote.as_deref(), limit).await?
+        }
         Commands::Share {
             conversation_id,
             remote,
             future,
             push,
-        } => commands::sync::share(&conversation_id, future, push, remote.as_deref()).await?,
+        } => {
+            commands::sync::share(conversation_id.as_deref(), future, push, remote.as_deref())
+                .await?
+        }
         Commands::Unshare {
             conversation_id,
             remote,

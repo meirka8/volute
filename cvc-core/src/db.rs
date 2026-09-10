@@ -276,6 +276,21 @@ pub struct CleanupReport {
     pub wal_bytes: u64,
 }
 
+/// Read-only per-conversation activity summary for local display. The share
+/// and publication fields are scoped to one destination fingerprint and are
+/// informational only; they grant nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationSummary {
+    pub id: String,
+    pub title: String,
+    pub thoughts: i64,
+    pub linked: i64,
+    pub first_activity: i64,
+    pub last_activity: i64,
+    pub shared: bool,
+    pub published: i64,
+}
+
 impl CvcStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open_initialized(path)
@@ -2096,6 +2111,48 @@ impl CvcStore {
         }
         transaction.commit()?;
         Ok(inserts)
+    }
+
+    /// Per-conversation activity and, when a destination fingerprint is given,
+    /// its share/publication state — the read-only view behind
+    /// `cvc conversations` and the interactive share picker. Most recent
+    /// activity first.
+    pub fn list_conversation_summaries(
+        &self,
+        destination_fingerprint: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConversationSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.title,
+                    COUNT(i.id),
+                    COALESCE(SUM(EXISTS(SELECT 1 FROM artifact_links a WHERE a.interaction_id = i.id)), 0),
+                    COALESCE(MIN(i.timestamp), c.created_at),
+                    COALESCE(MAX(i.timestamp), c.created_at),
+                    EXISTS(SELECT 1 FROM conversation_shares s WHERE s.conversation_id = c.id AND s.remote_fingerprint = ?1),
+                    COALESCE(SUM(EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state = 'published')), 0)
+             FROM conversations c
+             LEFT JOIN interactions i ON i.conversation_id = c.id
+             GROUP BY c.id, c.title
+             ORDER BY COALESCE(MAX(i.timestamp), c.created_at) DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![destination_fingerprint, limit as i64], |row| {
+            Ok(ConversationSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                thoughts: row.get(2)?,
+                linked: row.get(3)?,
+                first_activity: row.get(4)?,
+                last_activity: row.get(5)?,
+                shared: row.get(6)?,
+                published: row.get(7)?,
+            })
+        })?;
+        let mut summaries = Vec::new();
+        for summary in rows {
+            summaries.push(summary?);
+        }
+        Ok(summaries)
     }
 
     pub fn get_all_interaction_ids(&self) -> Result<Vec<InteractionId>> {
