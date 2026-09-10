@@ -408,3 +408,53 @@ fn floating_query_scopes_to_capture_worktree_and_keeps_legacy_rows() -> anyhow::
         .is_err());
     Ok(())
 }
+
+#[test]
+fn conversation_summaries_report_activity_and_destination_state() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("index.db");
+    let store = CvcStore::open(&path)?;
+    store.init()?;
+    let fingerprint = "7".repeat(64);
+
+    // Older conversation: two thoughts, one linked, shared and published.
+    let older_first = capture_with_worktree(&store, "older", "a".repeat(64))?;
+    let older_second = capture_with_worktree(&store, "older", "a".repeat(64))?;
+    store.link_interaction(&older_first, &CommitSha::new("c".repeat(40)), "generated")?;
+    let snapshot = store.share_snapshot("older")?;
+    store.share_exact_snapshot("older", &fingerprint, &snapshot, FutureSharePolicy::Private)?;
+    let connection = Connection::open(&path)?;
+    connection.execute(
+        "INSERT INTO publications(interaction_id, remote_fingerprint, state, updated_at) VALUES(?1, ?2, 'published', 0)",
+        rusqlite::params![older_first.as_str(), fingerprint.as_str()],
+    )?;
+    // Newer conversation: one thought, unshared.
+    let newer = capture_with_worktree(&store, "newer", "b".repeat(64))?;
+    connection.execute(
+        "UPDATE interactions SET timestamp = timestamp + 100 WHERE id = ?1",
+        [newer.as_str()],
+    )?;
+
+    let summaries = store.list_conversation_summaries(Some(&fingerprint), 10)?;
+    assert_eq!(
+        summaries.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        vec!["newer", "older"],
+        "most recent activity first"
+    );
+    let older = &summaries[1];
+    assert_eq!((older.thoughts, older.linked, older.published), (2, 1, 1));
+    assert!(older.shared);
+    assert!(older.first_activity <= older.last_activity);
+    let newer_summary = &summaries[0];
+    assert_eq!((newer_summary.thoughts, newer_summary.linked), (1, 0));
+    assert!(!newer_summary.shared);
+    assert_eq!(newer_summary.published, 0);
+
+    // Without a destination, share state is uniformly absent.
+    let neutral = store.list_conversation_summaries(None, 10)?;
+    assert!(neutral.iter().all(|s| !s.shared && s.published == 0));
+    // The limit caps the newest slice.
+    assert_eq!(store.list_conversation_summaries(None, 1)?.len(), 1);
+    let _ = older_second;
+    Ok(())
+}

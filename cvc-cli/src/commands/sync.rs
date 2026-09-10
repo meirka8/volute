@@ -59,6 +59,59 @@ pub async fn acknowledge_sharing(requested: Option<&str>) -> Result<()> {
     privacy::acknowledge_sharing_destination(&repo, &destination)?;
     Ok(())
 }
+const SUMMARY_SCAN_LIMIT: usize = 10_000;
+
+/// Interactive selection over conversations not yet shared for this
+/// destination. TTY-only by construction — non-interactive callers must name
+/// a conversation explicitly — so this adds no path around the typed
+/// challenge that still follows. Returns `None` when the user aborts.
+fn pick_unshared_conversation(
+    store: &CvcStore,
+    remote_name: &str,
+    fingerprint: &str,
+) -> Result<Option<String>> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!(
+            "a conversation id is required in non-interactive use; run `cvc conversations` to list them, or run `cvc share` from a terminal for an interactive picker"
+        );
+    }
+    let candidates: Vec<_> = store
+        .list_conversation_summaries(Some(fingerprint), SUMMARY_SCAN_LIMIT)?
+        .into_iter()
+        .filter(|summary| !summary.shared && summary.thoughts > 0)
+        .collect();
+    if candidates.is_empty() {
+        println!("No unshared conversations for remote '{remote_name}'.");
+        return Ok(None);
+    }
+    println!("Unshared conversations for remote '{remote_name}' (most recent first):");
+    for (index, summary) in candidates.iter().enumerate() {
+        println!(
+            "{:>3}. {}",
+            index + 1,
+            crate::commands::conversations::render_line(summary, true)
+        );
+    }
+    print!(
+        "Share which conversation? [1-{}, blank to abort]: ",
+        candidates.len()
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim();
+    if answer.is_empty() {
+        println!("Aborted; nothing was shared.");
+        return Ok(None);
+    }
+    let choice: usize = answer
+        .parse()
+        .ok()
+        .filter(|n| (1..=candidates.len()).contains(n))
+        .ok_or_else(|| anyhow::anyhow!("invalid selection '{answer}'; nothing was shared"))?;
+    Ok(Some(candidates[choice - 1].id.clone()))
+}
+
 fn typed_acknowledgement(challenge: &str) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("acknowledgement requires an interactive TTY");
@@ -94,13 +147,43 @@ pub async fn set_auto_push(value: &str, requested: Option<&str>) -> Result<()> {
     );
     Ok(())
 }
-pub async fn share(id: &str, future: bool, push: bool, requested: Option<&str>) -> Result<()> {
+pub async fn share(
+    id: Option<&str>,
+    future: bool,
+    push: bool,
+    requested: Option<&str>,
+) -> Result<()> {
     let cwd = env::current_dir()?;
     let (repo, store) = open(&cwd)?;
     // Sharing must never silently select a different authority. Its sole
     // implicit destination is origin; an explicit --remote is authoritative.
     let name = requested.unwrap_or("origin");
     let destination = privacy::remote_destination(&repo, name)?;
+    let picked;
+    let id = match id {
+        Some(id) => id,
+        // The picker adds no non-interactive path: selection and the existing
+        // typed challenge both require the same TTY.
+        None => {
+            picked = pick_unshared_conversation(&store, name, &destination.fingerprint)?;
+            match &picked {
+                Some(id) => id.as_str(),
+                None => return Ok(()),
+            }
+        }
+    };
+    // Make the consent legible: title and activity range alongside the
+    // snapshot count already embedded in the challenge below.
+    if let Some(summary) = store
+        .list_conversation_summaries(Some(&destination.fingerprint), SUMMARY_SCAN_LIMIT)?
+        .into_iter()
+        .find(|summary| summary.id == id)
+    {
+        println!(
+            "Sharing conversation for remote '{name}':\n{}",
+            crate::commands::conversations::render_line(&summary, true)
+        );
+    }
     let ids = store.share_snapshot(id)?;
     let closure = ids.iter().map(|x| x.as_str()).collect::<String>();
     let token = hex::encode(Sha256::digest(closure.as_bytes()));

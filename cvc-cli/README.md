@@ -14,9 +14,12 @@ cargo install --path cvc-cli
 cvc init
 cvc status
 cvc log
+cvc conversations
 cvc run -- <command> [args...]
 cvc pull
 ```
+
+`conversations` lists conversations most-recent-first with thought/linked counts and, for the selected (or `origin`) remote, their share and publication state — it is the read-only view that answers "what would I be sharing?".
 
 `init` creates the local SQLite cache and installs advisory `post-commit`, `pre-push`, `post-merge`, and `post-rewrite` hooks (respecting `core.hooksPath`). `run` records its command and output as a private floating interaction. The post-commit linker may associate recent eligible interactions with a commit, but it does not share them. Configure its conservative window with `git config cvc.linkWindow <seconds>` (`0..=2592000`, default `86400`; `0` disables automatic linking). Automatic linking uses only the documented time/file-context policy—not author, message, or file-set similarity heuristics; `CVC-Session` trailers are not implemented. Captures additionally record a local-only fingerprint of their active worktree, and automatic linking considers only thoughts captured in the committing worktree (legacy rows without a recorded origin remain broadly eligible); parallel linked worktrees cannot claim each other's floating thoughts. Thoughts captured in a worktree that is later removed stay floating rather than being linked elsewhere.
 
@@ -83,6 +86,8 @@ cvc share <conversation-id> --remote origin
 cvc share <conversation-id> --remote origin --future
 cvc unshare <conversation-id> --remote origin
 ```
+
+Discover conversation ids with `cvc conversations`, or run `cvc share` with no id from a terminal for an interactive picker over the destination's unshared conversations. The picker is TTY-only and feeds the same typed challenge, so non-interactive callers must always name a conversation explicitly; before the challenge, `share` prints the conversation's title, counts, and activity range so the consent is legible.
 
 `share` requires the displayed TTY challenge, which includes the destination fingerprint and snapshot count. `unshare` makes only unpublished turns private; it cannot recall content already published.
 
