@@ -817,9 +817,15 @@ impl CvcStore {
 
     /// The only production capture write boundary. Policy/scrubbing completes before
     /// the transaction starts; conversations, nodes and children commit together.
+    ///
+    /// The transaction begins `IMMEDIATE` on purpose: a deferred transaction
+    /// that reads (the tombstone check) before writing cannot use the busy
+    /// timeout when it upgrades to a write lock (SQLite refuses to wait there
+    /// to avoid deadlock), so a concurrent writer would make the capture fail
+    /// instantly instead of waiting its 250 ms.
     fn capture(&self, capture: Capture) -> Result<InteractionId> {
         let capture = privacy::prepare(capture).map_err(|e| DbError::Migration(e.to_string()))?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if Self::is_tombstoned_tx(&tx, &capture.interaction.id)? {
             return Err(DbError::Migration("interaction is tombstoned".into()));
         }
@@ -873,7 +879,9 @@ impl CvcStore {
             .map(privacy::prepare)
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| DbError::Migration(e.to_string()))?;
-        let tx = self.conn.unchecked_transaction()?;
+        // Immediate for the same reason as `capture`: this transaction reads
+        // before it writes.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let ids: Vec<String> = {
             let mut stmt = tx.prepare("SELECT id FROM interactions WHERE source_request_id=?1")?;
             let ids = stmt
