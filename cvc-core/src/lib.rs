@@ -1,4 +1,5 @@
 pub mod changeset;
+pub mod claude_code;
 pub mod db;
 pub mod git;
 pub mod models;

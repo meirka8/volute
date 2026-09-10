@@ -1,5 +1,6 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 mod commands;
 
@@ -81,6 +82,16 @@ enum Commands {
         #[command(subcommand)]
         command: RelinkCommands,
     },
+    /// Manage agent-harness capture hooks in this checkout
+    Harness {
+        #[command(subcommand)]
+        command: HarnessCommands,
+    },
+    /// Record an agent-harness session transcript as local private capture
+    Ingest {
+        #[command(subcommand)]
+        command: IngestCommands,
+    },
     /// Internal hook commands
     Hook {
         #[command(subcommand)]
@@ -102,6 +113,41 @@ enum Commands {
     Auth {
         #[command(subcommand)]
         command: AuthCommands,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum HarnessKind {
+    /// Claude Code (Anthropic's CLI agent)
+    ClaudeCode,
+}
+
+#[derive(Subcommand)]
+enum HarnessCommands {
+    /// Install lifecycle hooks in this checkout's local harness settings
+    Install {
+        harness: HarnessKind,
+        /// Absolute path of the cvc binary the hooks run (default: this executable)
+        #[arg(long)]
+        binary: Option<PathBuf>,
+    },
+    /// Remove the hook entries installed by `cvc harness install`
+    Uninstall { harness: HarnessKind },
+}
+
+#[derive(Subcommand)]
+enum IngestCommands {
+    /// Ingest a Claude Code JSONL session transcript
+    ClaudeCode {
+        /// Transcript file (~/.claude/projects/<workspace>/<session>.jsonl)
+        #[arg(long, conflicts_with = "hook")]
+        transcript: Option<PathBuf>,
+        /// Session id; defaults to the transcript file name
+        #[arg(long, requires = "transcript")]
+        session: Option<String>,
+        /// Read the hook payload Claude Code delivers on stdin
+        #[arg(long)]
+        hook: bool,
     },
 }
 
@@ -158,6 +204,22 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Commands::Pull => {
             commands::sync::pull().await?;
         }
+        Commands::Harness { command } => match command {
+            HarnessCommands::Install {
+                harness: HarnessKind::ClaudeCode,
+                binary,
+            } => commands::harness::install_claude_code(binary).await?,
+            HarnessCommands::Uninstall {
+                harness: HarnessKind::ClaudeCode,
+            } => commands::harness::uninstall_claude_code().await?,
+        },
+        Commands::Ingest { command } => match command {
+            IngestCommands::ClaudeCode {
+                transcript,
+                session,
+                hook,
+            } => commands::ingest::claude_code(transcript, session, hook).await?,
+        },
         Commands::Hook { command } => match command {
             HookCommands::PostCommit => {
                 commands::hook::post_commit().await?;
@@ -285,6 +347,46 @@ mod hook_cli_tests {
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
         }
+    }
+
+    #[test]
+    fn clap_accepts_harness_and_ingest_shapes() {
+        for args in [
+            vec!["cvc", "harness", "install", "claude-code"],
+            vec![
+                "cvc",
+                "harness",
+                "install",
+                "claude-code",
+                "--binary",
+                "/opt/cvc/bin/cvc",
+            ],
+            vec!["cvc", "harness", "uninstall", "claude-code"],
+            vec!["cvc", "ingest", "claude-code", "--hook"],
+            vec!["cvc", "ingest", "claude-code", "--transcript", "s.jsonl"],
+            vec![
+                "cvc",
+                "ingest",
+                "claude-code",
+                "--transcript",
+                "s.jsonl",
+                "--session",
+                "s",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
+        }
+        // Hook mode and an explicit transcript are different entry points.
+        assert!(Cli::try_parse_from([
+            "cvc",
+            "ingest",
+            "claude-code",
+            "--hook",
+            "--transcript",
+            "s.jsonl"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["cvc", "harness", "install", "cursor"]).is_err());
     }
 }
 
