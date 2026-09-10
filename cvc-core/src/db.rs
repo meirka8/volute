@@ -11,6 +11,7 @@ use rusqlite::{
 };
 use sha2::Digest;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -291,6 +292,41 @@ pub struct ConversationSummary {
     pub published: i64,
 }
 
+/// Where an agent-harness transcript ingest resumes for one session. Purely a
+/// read optimization: captures carry deterministic ids, so a lost or stale
+/// cursor only costs a re-read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HarnessIngestCursor {
+    pub transcript_path: String,
+    pub byte_offset: u64,
+    pub updated_at: i64,
+}
+
+pub struct HarnessCursorUpdate<'a> {
+    pub harness: &'a str,
+    pub session_id: &'a str,
+    pub transcript_path: &'a str,
+    pub byte_offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HarnessBatchOutcome {
+    pub inserted: usize,
+    /// Captures skipped because their id is locally tombstoned or was recorded
+    /// concurrently.
+    pub suppressed: usize,
+}
+
+/// Maximum time a harness ingest waits for a busy shared database. Ingests are
+/// not Git hooks: they may wait, but never indefinitely.
+const HARNESS_WRITE_RETRY_BUDGET: Duration = Duration::from_secs(5);
+
+/// Widens the `capture_source` CHECK once for databases created before the
+/// Claude Code adapter. SQLite cannot alter a CHECK in place, so the table is
+/// rebuilt with the same columns and its rows copied verbatim; the widened
+/// constraint is a superset, so older binaries keep working on the result.
+const WIDEN_CAPTURE_SOURCE_SQL: &str = "BEGIN IMMEDIATE; CREATE TABLE interactions_cvc_rebuild (id TEXT PRIMARY KEY, conversation_id TEXT, parent_id TEXT, timestamp INTEGER, author TEXT, user_prompt TEXT, model_name TEXT, model_cot TEXT, model_response TEXT, source_request_id TEXT, visibility TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('private','shared')), capture_source TEXT NOT NULL DEFAULT 'legacy' CHECK(capture_source IN ('mcp','vscode_passive','vscode_explicit','cli_run','sync_import','legacy','claude_code')), scrubber_version INTEGER NOT NULL DEFAULT 0 CHECK(scrubber_version BETWEEN 0 AND 1), capture_worktree TEXT CHECK(capture_worktree IS NULL OR (length(capture_worktree)=64 AND capture_worktree NOT GLOB '*[^0-9a-f]*')), FOREIGN KEY(conversation_id) REFERENCES conversations(id), FOREIGN KEY(parent_id) REFERENCES interactions(id)); INSERT INTO interactions_cvc_rebuild (id,conversation_id,parent_id,timestamp,author,user_prompt,model_name,model_cot,model_response,source_request_id,visibility,capture_source,scrubber_version,capture_worktree) SELECT id,conversation_id,parent_id,timestamp,author,user_prompt,model_name,model_cot,model_response,source_request_id,visibility,capture_source,scrubber_version,capture_worktree FROM interactions; DROP TABLE interactions; ALTER TABLE interactions_cvc_rebuild RENAME TO interactions; CREATE INDEX IF NOT EXISTS idx_interactions_conversation_id ON interactions(conversation_id); CREATE INDEX IF NOT EXISTS idx_interactions_source_request_id ON interactions(source_request_id); CREATE INDEX IF NOT EXISTS idx_interactions_visibility ON interactions(visibility); CREATE INDEX IF NOT EXISTS idx_interactions_source_request ON interactions(source_request_id); INSERT INTO cvc_internal_migrations(name) VALUES('capture-source-claude-code/v1'); COMMIT;";
+
 impl CvcStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open_initialized(path)
@@ -433,7 +469,7 @@ impl CvcStore {
                 self.conn.execute_batch("ALTER TABLE interactions ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('private','shared')); ")?;
             }
             if !columns.iter().any(|c| c == "capture_source") {
-                self.conn.execute_batch("ALTER TABLE interactions ADD COLUMN capture_source TEXT NOT NULL DEFAULT 'legacy' CHECK(capture_source IN ('mcp','vscode_passive','vscode_explicit','cli_run','sync_import','legacy')); ")?;
+                self.conn.execute_batch("ALTER TABLE interactions ADD COLUMN capture_source TEXT NOT NULL DEFAULT 'legacy' CHECK(capture_source IN ('mcp','vscode_passive','vscode_explicit','cli_run','sync_import','legacy','claude_code')); ")?;
             }
             if !columns.iter().any(|c| c == "scrubber_version") {
                 self.conn.execute_batch("ALTER TABLE interactions ADD COLUMN scrubber_version INTEGER NOT NULL DEFAULT 0 CHECK(scrubber_version BETWEEN 0 AND 1); ")?;
@@ -446,6 +482,8 @@ impl CvcStore {
             }
             self.conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_interactions_visibility ON interactions(visibility); CREATE INDEX IF NOT EXISTS idx_interactions_source_request ON interactions(source_request_id);")?;
             self.conn.execute_batch("CREATE TABLE IF NOT EXISTS conversation_share_policy (conversation_id TEXT PRIMARY KEY, future_shared INTEGER NOT NULL CHECK(future_shared IN (0,1))); CREATE TABLE IF NOT EXISTS conversation_shares (conversation_id TEXT NOT NULL, remote_fingerprint TEXT NOT NULL, share_future INTEGER NOT NULL CHECK(share_future IN (0,1)), PRIMARY KEY(conversation_id,remote_fingerprint)); CREATE TABLE IF NOT EXISTS interaction_shares (interaction_id TEXT NOT NULL, remote_fingerprint TEXT NOT NULL, PRIMARY KEY(interaction_id, remote_fingerprint)); CREATE INDEX IF NOT EXISTS idx_interaction_shares_remote ON interaction_shares(remote_fingerprint); CREATE TABLE IF NOT EXISTS publications (interaction_id TEXT NOT NULL, remote_fingerprint TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','published','unknown')), updated_at INTEGER NOT NULL, PRIMARY KEY(interaction_id, remote_fingerprint)); CREATE INDEX IF NOT EXISTS idx_publications_remote_state ON publications(remote_fingerprint,state);")?;
+            // Agent-harness ingest cursors: one per harness and session.
+            self.conn.execute_batch("CREATE TABLE IF NOT EXISTS harness_ingest_cursors (harness TEXT NOT NULL, session_id TEXT NOT NULL, transcript_path TEXT NOT NULL, byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0), updated_at INTEGER NOT NULL, PRIMARY KEY(harness, session_id));")?;
             // v4.1: tombstone authority is destination scoped.  A received
             // suppression from A must never authorize projection to B.
             let tombstone_columns: Vec<String> = self
@@ -524,8 +562,47 @@ impl CvcStore {
             }
         }
 
+        self.widen_capture_source_constraint()?;
         self.normalize_artifact_links_schema()?;
 
+        Ok(())
+    }
+
+    /// Runs the one-time `capture_source` CHECK widening when the stored table
+    /// definition still lacks the Claude Code provenance value. Databases whose
+    /// column was created by this version already carry the widened text and
+    /// only record the marker.
+    fn widen_capture_source_constraint(&self) -> Result<()> {
+        let migrated: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cvc_internal_migrations WHERE name='capture-source-claude-code/v1')",
+            [],
+            |row| row.get(0),
+        )?;
+        if migrated {
+            return Ok(());
+        }
+        let table_sql: String = self.conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='interactions'",
+            [],
+            |row| row.get(0),
+        )?;
+        if table_sql.contains("'claude_code'") {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO cvc_internal_migrations(name) VALUES('capture-source-claude-code/v1')",
+                [],
+            )?;
+            return Ok(());
+        }
+        // Foreign-key enforcement must be off around a table rebuild (it is a
+        // no-op inside a transaction), and it is restored whatever happens.
+        self.conn.pragma_update(None, "foreign_keys", "OFF")?;
+        let rebuilt = self.conn.execute_batch(WIDEN_CAPTURE_SOURCE_SQL);
+        if rebuilt.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        let restored = self.conn.pragma_update(None, "foreign_keys", "ON");
+        rebuilt?;
+        restored?;
         Ok(())
     }
 
@@ -830,6 +907,121 @@ impl CvcStore {
             self.compact_after_deletion()?;
         }
         Ok(())
+    }
+
+    pub fn interaction_exists(&self, id: &InteractionId) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM interactions WHERE id=?1",
+                params![id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn harness_ingest_cursor(
+        &self,
+        harness: &str,
+        session_id: &str,
+    ) -> Result<Option<HarnessIngestCursor>> {
+        self.conn
+            .query_row(
+                "SELECT transcript_path, byte_offset, updated_at FROM harness_ingest_cursors WHERE harness=?1 AND session_id=?2",
+                params![harness, session_id],
+                |row| {
+                    Ok(HarnessIngestCursor {
+                        transcript_path: row.get(0)?,
+                        byte_offset: row.get::<_, i64>(1)?.max(0) as u64,
+                        updated_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    /// Claude Code transcript ingest: every capture is prepared before SQLite
+    /// is touched, then the new captures and the advanced cursor commit in one
+    /// immediate transaction. Ids are deterministic per response, so a capture
+    /// that already exists or is locally tombstoned is skipped, never replaced:
+    /// replacing would drop the commit links an earlier ingest has earned.
+    pub fn capture_claude_code_batch(
+        &self,
+        captures: Vec<crate::privacy::ClaudeCodeCapture>,
+        cursor: HarnessCursorUpdate<'_>,
+    ) -> Result<HarnessBatchOutcome> {
+        let prepared: Vec<Capture> = captures
+            .into_iter()
+            .map(|capture| privacy::prepare(capture.into_capture()))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| DbError::Migration(e.to_string()))?;
+        let byte_offset = i64::try_from(cursor.byte_offset)
+            .map_err(|_| DbError::Migration("harness cursor offset overflows".into()))?;
+        self.with_immediate_write_retry(|tx| {
+            let mut outcome = HarnessBatchOutcome::default();
+            for capture in &prepared {
+                let id = &capture.interaction.id;
+                let exists = tx
+                    .query_row(
+                        "SELECT 1 FROM interactions WHERE id=?1",
+                        params![id.as_str()],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if exists || Self::is_tombstoned_tx(tx, id)? {
+                    outcome.suppressed += 1;
+                    continue;
+                }
+                Self::insert_capture(tx, capture)?;
+                outcome.inserted += 1;
+            }
+            tx.execute(
+                "INSERT INTO harness_ingest_cursors(harness,session_id,transcript_path,byte_offset,updated_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(harness,session_id) DO UPDATE SET transcript_path=excluded.transcript_path, byte_offset=excluded.byte_offset, updated_at=excluded.updated_at",
+                params![
+                    cursor.harness,
+                    cursor.session_id,
+                    cursor.transcript_path,
+                    byte_offset,
+                    Utc::now().timestamp()
+                ],
+            )?;
+            Ok(outcome)
+        })
+    }
+
+    /// Runs `body` inside an immediate transaction, retrying with backoff while
+    /// another process holds the write lock, up to a bounded budget. The short
+    /// connection-level busy timeout stays as it is because Git hooks must not
+    /// wait; harness ingests may.
+    fn with_immediate_write_retry<T>(
+        &self,
+        mut body: impl FnMut(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let deadline = Instant::now() + HARNESS_WRITE_RETRY_BUDGET;
+        let mut delay = Duration::from_millis(50);
+        loop {
+            let attempt = (|| {
+                let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+                let value = body(&tx)?;
+                tx.commit()?;
+                Ok(value)
+            })();
+            match attempt {
+                Err(DbError::Sqlite(rusqlite::Error::SqliteFailure(error, _)))
+                    if matches!(
+                        error.code,
+                        ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+                    ) && Instant::now() + delay < deadline =>
+                {
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_millis(800));
+                }
+                other => return other,
+            }
+        }
     }
 
     fn insert_capture(tx: &Transaction<'_>, capture: &Capture) -> Result<InteractionId> {

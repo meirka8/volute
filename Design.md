@@ -403,7 +403,24 @@ To overcome the "Walled Garden" limitations of proprietary AI tools (like GitHub
 - **Benefit:** Ensures coverage for "dumb" or proprietary tools that lack MCP or API config, at the cost of lower data fidelity.
     
 
-### 10.5 Strategy Selection Matrix
+### 10.5 The "Harness Adapter" (Agent Transcripts - Claude Code)
+
+- **Concept:** Capture from an agent harness's own on-disk session transcript, driven by the harness's documented lifecycle hooks, so recording is infrastructure rather than model obedience.
+    
+- **Mechanism:**
+    
+    - **Setup:** `cvc harness install claude-code` writes `PostToolUse`, `Stop`, and `SessionEnd` hook entries into the checkout-local `.claude/settings.local.json` with the absolute path of the `cvc` binary (a hook environment cannot be assumed to have `cvc` on `PATH`) and keeps that file out of Git. The install is per checkout.
+        
+    - **Ingestion:** Each hook runs `cvc ingest claude-code --hook`: a fresh process that discovers the repository from the hook's working directory, reads the JSONL transcript from a per-session byte cursor stored in the local database, and records every closed assistant response (all entries of one API request) as one interaction. The stimulus (human prompt or tool results) becomes `user_prompt`, exposed thinking becomes `model_cot`, text becomes `model_response`, `tool_use` blocks become tool executions carrying the status of their `tool_result`, and in-worktree Read/Edit/Write paths become context items. A response is closed when all of its tool results are present, when the conversation has visibly moved on, or on `Stop`/`SessionEnd`.
+        
+    - **Identity:** Interaction ids are derived deterministically from the session id and request id, so ingestion is idempotent and never replaces rows (replacing would drop links already earned). The conversation id is the Claude Code session id; a compaction boundary's logical parent keeps the chain continuous.
+        
+    - **Pinning:** The parser is pinned to transcript major version 2 and fails loudly, writing nothing, on unknown message shapes; bookkeeping entry types that carry no message are skipped.
+        
+- **Benefit:** Complete, threaded session capture at transcript fidelity with zero model cooperation. Near-real-time `PostToolUse` ingestion is what lets a mid-session commit's post-commit linker see the reasoning that preceded it (§11.2): a response recorded only after the commit it produced is permanently excluded by the first-parent bound, which is why transcript-derived deterministic commit links remain a planned follow-up.
+    
+
+### 10.6 Strategy Selection Matrix
 
 |   |   |   |   |   |
 |---|---|---|---|---|
@@ -411,6 +428,7 @@ To overcome the "Walled Garden" limitations of proprietary AI tools (like GitHub
 |**Native Delegate**|**VS Code / Copilot Sidebar**|High (Structured)|Medium (Plugin)|Uses `vscode.lm` API. Best for standard chat workflow.|
 |**Trojan Proxy**|**Cursor (Composer), Windsurf**|Medium (Parsed)|Low (Config URL)|Essential because Cursor's native AI does not use the extension API.|
 |**MCP Logger**|**Agents (Claude, Devin, CLI)**|Structured (agent-supplied)|Low (Standard)|Records only fields the client or agent supplies.|
+|**Harness Adapter**|**Claude Code sessions**|High (Verbatim transcript)|Low (One install per checkout)|Deterministic; hook-driven; no model cooperation required.|
 |**Process Shim**|**Legacy / Closed Binaries**|Low (Raw I/O)|Low (Wrapper)|Fallback only.|
 
 ## 11. Workflow & Lifecycle Scenarios
@@ -445,6 +463,8 @@ The connection between the Cognitive Graph and Git Graph is considered only afte
 - **Thread Stickiness:** In VS Code, subsequent messages in the same chat thread typically retain the context of the participant.
     
 - **Session Boundary:** A "Conversation" (DB table) maps 1:1 with a VS Code Chat Session ID. If the user clears the chat or starts a new thread, a new Conversation ID is generated.
+    
+- **Harness Sessions:** A Claude Code session id is likewise its Conversation ID. Hook-driven ingestion keeps appending to that conversation across compaction, and each ingested response's parent is the previous response in the transcript's own chain.
     
 
 ## 12. Collaboration & Remote Sync (The Shadow Ref)

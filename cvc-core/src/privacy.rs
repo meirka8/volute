@@ -858,6 +858,7 @@ capture_type!(McpCapture, CaptureSource::Mcp);
 capture_type!(CliRunCapture, CaptureSource::CliRun);
 capture_type!(LspPassiveCapture, CaptureSource::VscodePassive);
 capture_type!(LspExplicitCapture, CaptureSource::VscodeExplicit);
+capture_type!(ClaudeCodeCapture, CaptureSource::ClaudeCode);
 
 pub(crate) fn sync_import_capture(
     conversation: Conversation,
@@ -979,7 +980,7 @@ pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
     Ok(capture)
 }
 
-fn is_safe_identifier(value: &str) -> bool {
+pub(crate) fn is_safe_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
         && value
