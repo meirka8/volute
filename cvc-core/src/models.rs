@@ -505,6 +505,11 @@ impl InteractionId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Wraps an identity derived deterministically by an adapter.
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
 }
 
 impl Default for InteractionId {
@@ -605,6 +610,8 @@ pub(crate) enum CaptureSource {
     VscodeExplicit,
     CliRun,
     SyncImport,
+    /// Hook-driven ingestion of Claude Code session transcripts.
+    ClaudeCode,
     #[default]
     Legacy,
 }

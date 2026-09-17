@@ -44,6 +44,27 @@ With `--remote`, the command requires the displayed `I AUTHORIZE RANGE <base> <t
 
 `post-rewrite` accepts only Git's exact `amend` (one old/new pair) and `rebase` pair stream. It validates and writes recoverable input to `$(git rev-parse --git-common-dir)/cvc/rewrite-inbox` before replaying it; permanent malformed entries are quarantined and retryable entries remain for later replay. It derives only from locally observed source provenance—never author/message/file-set heuristics—and does not guarantee a relink if the range, source evidence, or required Git objects are absent. `post-commit` scans its branch cursor; `post-merge` and `cvc pull` pull first and then run a longer pending squash scan. All hook failures are warnings and never fail the Git operation.
 
+## Agent harness capture (Claude Code)
+
+Claude Code writes every session to a local JSONL transcript and runs documented lifecycle hooks. CVC turns that into deterministic capture: the hooks call `cvc`, which reads the transcript incrementally and records each completed assistant response as a private thought, with no cooperation needed from the model. This is first-party local capture; it is unrelated to sync ingestion (`cvc pull`), which imports another machine's already-shared projection.
+
+```bash
+cvc harness install claude-code
+cvc harness uninstall claude-code
+```
+
+`install` writes `PostToolUse`, `Stop`, and `SessionEnd` hook entries into this checkout's `.claude/settings.local.json`, using the absolute path of the running `cvc` binary (override with `--binary <absolute path>`), and ensures that file is excluded from Git through the repository's `info/exclude`: a machine-specific path must never be committed. The install is per checkout, so a fresh linked worktree needs its own `cvc harness install`. It requires an initialized repository and the capture acknowledgement described below, and refuses to install hooks that would only report `consent-required`. Claude Code picks the entries up when it next reloads its settings; if a running session does not, start a new session.
+
+Each hook runs `cvc ingest claude-code --hook`, which reads Claude Code's JSON payload from stdin, discovers the repository from the payload's working directory, and ingests the transcript from the session's stored cursor. Hook runs are silent on success. A transcript this version does not understand (another major version, or an unknown message shape) fails loudly with a non-zero status that Claude Code shows in the session without blocking it; CVC never returns the blocking status, and a failed run writes nothing. `PostToolUse` keeps ingestion near-real-time so a commit made mid-session can still link the reasoning that preceded it; `Stop` and `SessionEnd` close the final response of a turn or session. Subagent hook invocations are ignored, and subagent transcripts are not ingested.
+
+Record a finished session, or one that ran before the hooks were installed, explicitly:
+
+```bash
+cvc ingest claude-code --transcript ~/.claude/projects/<workspace>/<session>.jsonl
+```
+
+Ingestion is idempotent: every assistant response has a deterministic id within its session, so re-running never duplicates or replaces a thought, and never disturbs commit links it has already earned. One thought is recorded per assistant response: the prompt or tool results it reacted to become the prompt, its exposed thinking becomes `model_cot`, its text becomes the response, and its tool calls become tool executions carrying the status of their results. Paths the session read or edited inside the worktree become file context, subject to `.thoughtignore` `path:` rules; tool output is rendered into the following thought's prompt with bounded size. The conversation id is the Claude Code session id, so `cvc conversations` and `cvc share` work on it directly. Captures follow the usual boundaries: private by default, scrubbed on the way in, shared only per conversation and destination, and attributed to the worktree the hook ran in, so parallel checkouts cannot claim each other's thoughts.
+
 ## Privacy acknowledgement and destination consent
 
 Inspect the local status for the selected remote (or the default remote):
@@ -52,7 +73,7 @@ Inspect the local status for the selected remote (or the default remote):
 cvc privacy status --remote origin
 ```
 
-Passive VS Code collection is disabled until the repository owner completes:
+Passive collection (VS Code chat-session watching and Claude Code transcript ingestion, including its hook-driven form) is disabled until the repository owner completes:
 
 ```bash
 cvc privacy acknowledge-capture
@@ -75,7 +96,7 @@ cvc privacy set-auto-push on --remote origin
 cvc privacy set-auto-push off --remote origin
 ```
 
-Non-interactive input is rejected for acknowledgements. This intentionally prevents scripts, IDEs, and MCP clients from silently granting capture, sharing, or auto-push consent.
+Non-interactive input is rejected for acknowledgements. This intentionally prevents scripts, IDEs, and MCP clients from silently granting capture, sharing, or auto-push consent. The answer is read from the controlling terminal itself, and anything already queued on it (a paste, type-ahead, or a line left over from a preceding challenge in the same command) is discarded when the prompt appears, so a challenge can only be satisfied by input typed after it was displayed.
 
 ## Share and publish
 
@@ -90,6 +111,8 @@ cvc unshare <conversation-id> --remote origin
 Discover conversation ids with `cvc conversations`, or run `cvc share` with no id from a terminal for an interactive picker over the destination's unshared conversations. The picker is TTY-only and feeds the same typed challenge, so non-interactive callers must always name a conversation explicitly; before the challenge, `share` prints the conversation's title, counts, and activity range so the consent is legible.
 
 `share` requires the displayed TTY challenge, which includes the destination fingerprint and snapshot count. `unshare` makes only unpublished turns private; it cannot recall content already published.
+
+`cvc share <conversation-id> --remote origin --push` publishes the snapshot in the same command. Where auto-push was acknowledged for that destination, the share challenge is the only one: that standing grant already covers publication, exactly as it does for hooks and a bare `cvc push`. Without it, the `I PUBLISH` challenge follows, and declining it leaves the turns shared but unpublished.
 
 Publish selected shared content manually:
 
