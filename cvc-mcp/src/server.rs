@@ -44,8 +44,24 @@ struct BindingIdentities {
     db_path: FileIdentity,
 }
 
+/// Filesystem identity of a bound path.
+///
+/// On Unix this is derived from `lstat` and never from opening the file:
+/// POSIX advisory locks belong to the process, and closing *any* descriptor
+/// for a file releases every lock the process holds on it. The store's SQLite
+/// connection keeps a shared lock on `index.db` for its whole life in WAL
+/// mode, and that lock is what stops another process from checkpointing and
+/// unlinking the WAL when it closes. Opening the database path here (as
+/// `same_file::Handle` does) dropped that lock and stranded every later write
+/// in an unlinked WAL. Windows locks are per handle, so the opening handle
+/// stays safe there.
 #[derive(Debug, PartialEq, Eq)]
 struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
     handle: same_file::Handle,
 }
 
@@ -69,10 +85,22 @@ fn file_identity(path: &std::path::Path, expected: ExpectedType) -> std::io::Res
         }
         Ok(())
     }
-    validate(&std::fs::symlink_metadata(path)?, expected)?;
-    let handle = same_file::Handle::from_path(path)?;
-    validate(&std::fs::symlink_metadata(path)?, expected)?;
-    Ok(FileIdentity { handle })
+    let metadata = std::fs::symlink_metadata(path)?;
+    validate(&metadata, expected)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let handle = same_file::Handle::from_path(path)?;
+        validate(&std::fs::symlink_metadata(path)?, expected)?;
+        Ok(FileIdentity { handle })
+    }
 }
 
 impl RepositoryBinding {
