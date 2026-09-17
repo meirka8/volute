@@ -29,6 +29,19 @@ describe("FORMAT5 wire validation", () => {
     expect(await canonicalRangeId(range)).toBe(range_id);
     expect(await validEvent({ ...event, event_id }, event_id)).toBe(true);
     expect(await validRange({ ...range, range_id }, range_id)).toBe(true);
+    // The v2 vector differs from the v1 one only in format and version.
+    const range_v2 = { ...range, format: "cvc.range-evidence/v2" as const, version: 2 as const };
+    const range_v2_id = "883f7816cbe01fca8538335525af80e5ea663a7bd87543c8187d9276fc0af4d6";
+    expect(await canonicalRangeId(range_v2)).toBe(range_v2_id);
+    expect(await validRange({ ...range_v2, range_id: range_v2_id }, range_v2_id)).toBe(true);
+  });
+
+  it("refuses range bodies whose format and version disagree", async () => {
+    for (const [format, version] of [["cvc.range-evidence/v1", 2], ["cvc.range-evidence/v2", 1], ["cvc.range-evidence/v3", 3]] as const) {
+      const body = { ...rangeBody, format, version } as unknown as Parameters<typeof canonicalRangeId>[0];
+      const range_id = await canonicalRangeId(body);
+      expect(await validRange({ ...body, range_id }, range_id)).toBe(false);
+    }
   });
 
   it("accepts Rust-compatible length-prefixed range and rewrite event IDs", async () => {
