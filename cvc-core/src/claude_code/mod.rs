@@ -16,6 +16,7 @@
 //! * [`settings`] installs and removes the hook entries in the checkout-local
 //!   Claude Code settings file.
 pub mod ingest;
+pub mod links;
 pub mod settings;
 pub mod transcript;
 

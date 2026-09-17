@@ -45,14 +45,21 @@ pub async fn claude_code(
         IngestMode::Final,
     )?;
     println!(
-        "CVC: Claude Code session {}: {} new thought(s), {} already recorded, {} pending; cursor at byte {} of {}",
+        "CVC: Claude Code session {}: {} new thought(s), {} already recorded, {} pending, {} linked to session commits; cursor at byte {} of {}",
         report.session_id,
         report.inserted,
         report.already_present,
         report.pending_responses,
+        report.linked_from_commits,
         report.cursor,
         report.transcript_len
     );
+    if report.subagent_sessions > 0 {
+        println!(
+            "  plus {} subagent session(s): {} new thought(s), {} linked to commits",
+            report.subagent_sessions, report.subagent_inserted, report.subagent_linked
+        );
+    }
     Ok(())
 }
 

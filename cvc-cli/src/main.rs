@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 mod commands;
+mod tty;
 
 #[derive(Parser)]
 #[command(name = "cvc")]
