@@ -1,7 +1,9 @@
 pub mod auth;
 pub mod component;
 pub mod conversations;
+pub mod harness;
 pub mod hook;
+pub mod ingest;
 pub mod init;
 pub mod log;
 pub mod run;
