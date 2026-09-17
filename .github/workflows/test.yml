@@ -165,3 +165,5 @@ jobs:
         run: |
           node .github/scripts/generate-third-party-notices.mjs --self-test
           node .github/scripts/generate-third-party-notices.mjs --check
+      - name: Self-test the convergent Marketplace publish script
+        run: node .github/scripts/publish-vsix-convergent.mjs --self-test

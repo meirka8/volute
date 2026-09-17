@@ -300,3 +300,163 @@ fn malformed_commondir_contents_and_types_fail_closed() {
         assert!(cvc_core::repository::common_git_dir(&repo).is_err());
     }
 }
+
+#[test]
+fn missing_commondir_with_unusable_gitdir_marker_fails_closed() {
+    let (_temp, home, main) = repository();
+    let linked = main.parent().unwrap().join("linked");
+    git(
+        &home,
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "broken-pair",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let repo = git2::Repository::open(&linked).unwrap();
+    let admin_dir = repo.path().to_owned();
+    let gitdir_marker = admin_dir.join("gitdir");
+    fs::remove_file(admin_dir.join("commondir")).unwrap();
+
+    // Each variant leaves a `gitdir` marker that the reciprocal-pair check
+    // rejects. An ordinary git directory has no such file, so its presence is
+    // enough on its own: resolution must not fall back to treating this
+    // administrative directory as a standalone repository.
+    let valid_marker = fs::read(&gitdir_marker).unwrap();
+    for (name, contents) in [
+        (
+            "broken back-reference",
+            b"../does-not-exist/.git\n".to_vec(),
+        ),
+        ("multi-line", b"a\nb\n".to_vec()),
+        ("empty", b"\n".to_vec()),
+        ("not UTF-8", b"\xff\n".to_vec()),
+        ("oversized", vec![b'a'; 4097]),
+    ] {
+        fs::write(&gitdir_marker, contents).unwrap();
+        assert!(
+            cvc_core::repository::common_git_dir(&repo).is_err(),
+            "{name} gitdir marker beside a missing commondir must fail closed"
+        );
+    }
+
+    // A marker whose target is valid but whose worktree gitfile is unreadable
+    // is likewise not proof, and likewise must not fail open.
+    fs::write(&gitdir_marker, &valid_marker).unwrap();
+    fs::remove_file(linked.join(".git")).unwrap();
+    assert!(cvc_core::repository::common_git_dir(&repo).is_err());
+
+    fs::remove_file(&gitdir_marker).unwrap();
+    fs::create_dir(&gitdir_marker).unwrap();
+    assert!(cvc_core::repository::common_git_dir(&repo).is_err());
+    fs::remove_dir(&gitdir_marker).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink("../../..", &gitdir_marker).unwrap();
+        assert!(cvc_core::repository::common_git_dir(&repo).is_err());
+    }
+
+    assert!(!admin_dir.join("cvc").exists());
+}
+
+#[test]
+fn stray_gitdir_marker_in_a_normal_repository_fails_closed() {
+    // Git writes `gitdir` only into a linked worktree's administrative
+    // directory, never into an ordinary one. Finding it where `commondir` is
+    // absent means the layout is not what it appears to be, so refuse it rather
+    // than resolving shared storage from a directory of unknown role.
+    let (_temp, _home, main) = repository();
+    let repo = git2::Repository::open(&main).unwrap();
+    assert_eq!(
+        cvc_core::repository::common_git_dir(&repo).unwrap(),
+        fs::canonicalize(main.join(".git")).unwrap()
+    );
+    fs::write(repo.path().join("gitdir"), "../.git\n").unwrap();
+    assert!(cvc_core::repository::common_git_dir(&repo).is_err());
+}
+
+#[test]
+fn resolution_agrees_with_libgit2_commondir_on_well_formed_layouts() {
+    // `RepositoryLayout` parses `commondir` itself rather than calling
+    // `Repository::commondir()`. Wherever the metadata is sound the two must
+    // not disagree: the resolved directory feeds repository identity, storage
+    // paths, and the MCP binding checks.
+    let (_temp, home, main) = repository();
+    let linked = main.parent().unwrap().join("linked");
+    let second = main.parent().unwrap().join("second");
+    git(
+        &home,
+        &main,
+        &["worktree", "add", "-b", "agrees", linked.to_str().unwrap()],
+    );
+    git(
+        &home,
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agrees-too",
+            second.to_str().unwrap(),
+        ],
+    );
+    let bare = main.parent().unwrap().join("bare.git");
+    fs::create_dir(&bare).unwrap();
+    git(&home, &bare, &["init", "--bare"]);
+
+    for root in [&main, &linked, &second, &bare] {
+        let repo = git2::Repository::open(root).unwrap();
+        assert_eq!(
+            cvc_core::repository::common_git_dir(&repo).unwrap(),
+            fs::canonicalize(repo.commondir()).unwrap(),
+            "resolution diverged from libgit2 for {}",
+            root.display()
+        );
+    }
+}
+
+#[test]
+fn libgit2_commondir_divergence_is_deliberate() {
+    let (_temp, home, main) = repository();
+    let linked = main.parent().unwrap().join("linked");
+    git(
+        &home,
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "diverges",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let main_git_dir = fs::canonicalize(main.join(".git")).unwrap();
+
+    // libgit2 resolves the common directory at open time and caches it, so a
+    // marker removed afterwards leaves a stale answer that still points at a
+    // real directory. Parsing at resolution time is what turns this into a
+    // refusal, which is why `Repository::commondir()` is not adopted here.
+    let repo = git2::Repository::open(&linked).unwrap();
+    fs::remove_file(repo.path().join("commondir")).unwrap();
+    assert_eq!(fs::canonicalize(repo.commondir()).unwrap(), main_git_dir);
+    assert!(cvc_core::repository::common_git_dir(&repo).is_err());
+
+    // libgit2 also trims the marker without bounding its size. The size cap is
+    // ours, and it is enforced even on a marker libgit2 reads without complaint
+    // from a repository it opens successfully.
+    let mut padded = b"../..".to_vec();
+    padded.resize(padded.len() + 5000, b' ');
+    padded.push(b'\n');
+    fs::write(repo.path().join("commondir"), &padded).unwrap();
+    let reopened = git2::Repository::open(&linked).unwrap();
+    assert_eq!(
+        fs::canonicalize(reopened.commondir()).unwrap(),
+        main_git_dir
+    );
+    assert!(cvc_core::repository::common_git_dir(&reopened).is_err());
+}
