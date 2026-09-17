@@ -112,6 +112,8 @@ Discover conversation ids with `cvc conversations`, or run `cvc share` with no i
 
 `share` requires the displayed TTY challenge, which includes the destination fingerprint and snapshot count. `unshare` makes only unpublished turns private; it cannot recall content already published.
 
+`cvc share <conversation-id> --remote origin --push` publishes the snapshot in the same command. Where auto-push was acknowledged for that destination, the share challenge is the only one: that standing grant already covers publication, exactly as it does for hooks and a bare `cvc push`. Without it, the `I PUBLISH` challenge follows, and declining it leaves the turns shared but unpublished.
+
 Publish selected shared content manually:
 
 ```bash

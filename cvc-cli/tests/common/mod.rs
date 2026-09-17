@@ -114,6 +114,14 @@ impl Fixture {
         destination
     }
 
+    /// Acknowledges auto-push for `origin` directly through the library.
+    /// Requires sharing consent.
+    pub fn enable_auto_push(&self) {
+        let repo = self.open_repo();
+        let destination = cvc_core::privacy::remote_destination(&repo, "origin").unwrap();
+        cvc_core::privacy::set_auto_push_destination(&repo, &destination, true).unwrap();
+    }
+
     /// The id of the single `cvc run` conversation captured so far.
     pub fn only_run_conversation_id(&self) -> String {
         let listing = self.cvc_ok(&["conversations"]);
@@ -251,7 +259,7 @@ impl PtySession {
 }
 
 /// Every challenge string prompted so far, in display order.
-fn challenges(output: &str) -> Vec<String> {
+pub fn challenges(output: &str) -> Vec<String> {
     const LEAD: &str = "Type exactly '";
     const TRAIL: &str = "' to continue: ";
     output

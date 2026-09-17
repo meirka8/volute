@@ -218,7 +218,12 @@ pub async fn share(
         if future { "shared" } else { "private" }
     );
     if push {
-        push_destination(&repo, &store, &destination, false)?;
+        push_destination(
+            &repo,
+            &store,
+            &destination,
+            PublicationTrigger::BundledWithShare,
+        )?;
     }
     Ok(())
 }
@@ -387,7 +392,12 @@ pub async fn push(requested: Option<&str>, manual: bool) -> Result<()> {
     // Bare push is intentionally safe for legacy hook lines.  Humans must opt in
     // to manual publication; hooks use `auto_push` below.
     let destination = privacy::remote_destination(&repo, &name)?;
-    push_destination(&repo, &store, &destination, !manual)
+    let trigger = if manual {
+        PublicationTrigger::Manual
+    } else {
+        PublicationTrigger::Hook
+    };
+    push_destination(&repo, &store, &destination, trigger)
 }
 pub async fn auto_push_remote(cwd: &Path, requested: Option<&str>) -> Result<()> {
     let (repo, store) = open(cwd)?;
@@ -398,13 +408,51 @@ pub async fn auto_push_remote(cwd: &Path, requested: Option<&str>) -> Result<()>
         eprintln!("CVC: auto publication disabled for '{}'.", name);
         return Ok(());
     }
-    push_destination(&repo, &store, &destination, true)
+    push_destination(&repo, &store, &destination, PublicationTrigger::Hook)
 }
+
+/// Why a publication is being attempted. Each trigger settles two decisions
+/// inside `push_destination` that used to be one `automatic` boolean at every
+/// call site: whether the destination's standing auto-push grant gates the
+/// push at all, and whether a human must answer the `I PUBLISH` challenge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationTrigger {
+    /// `cvc hook pre-push`, and a bare `cvc push` (kept inert for legacy hook
+    /// lines): publishes only where auto-push was acknowledged, never prompts.
+    Hook,
+    /// `cvc push --manual`: a human opts in to this publication through the
+    /// challenge, whatever the auto-push setting.
+    Manual,
+    /// `cvc share --push`: the human has just answered `I SHARE` for this
+    /// destination in the same command. A destination with auto-push
+    /// acknowledged is its standing consent to publish, so no second
+    /// challenge is demanded; without it, `I PUBLISH` still follows.
+    BundledWithShare,
+}
+
+impl PublicationTrigger {
+    /// Whether a destination without an auto-push grant is skipped silently.
+    /// Only automatic paths are; a human-initiated publication proceeds to
+    /// the challenge instead.
+    fn skips_without_auto_push(self) -> bool {
+        matches!(self, Self::Hook)
+    }
+
+    /// Whether the `I PUBLISH` challenge must be answered before pushing.
+    fn requires_challenge(self, auto_push: bool) -> bool {
+        match self {
+            Self::Hook => false,
+            Self::Manual => true,
+            Self::BundledWithShare => !auto_push,
+        }
+    }
+}
+
 fn push_destination(
     repo: &Repository,
     store: &CvcStore,
     destination: &privacy::RemoteDestination,
-    automatic: bool,
+    trigger: PublicationTrigger,
 ) -> Result<()> {
     let _operation_lock = privacy::destination_operation_lock(repo, &destination.fingerprint)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -413,7 +461,7 @@ fn push_destination(
     if !status.sharing_consented {
         bail!("sharing consent is required for remote '{}'; run cvc privacy acknowledge-sharing --remote {}", destination.name, destination.name);
     }
-    if automatic && !status.auto_push {
+    if trigger.skips_without_auto_push() && !status.auto_push {
         return Ok(());
     }
     reconcile_destination(repo, store, destination)?;
@@ -445,7 +493,7 @@ fn push_destination(
             ids,
         } => (oid, candidate, ids),
     };
-    if !automatic {
+    if trigger.requires_challenge(status.auto_push) {
         typed_acknowledgement(&format!(
             "I PUBLISH {} {} {}",
             destination.fingerprint,
@@ -597,5 +645,44 @@ mod tests {
         symlink(&target, &link).unwrap();
         assert!(read_redaction_plan(&link).is_err());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod publication_trigger_tests {
+    use super::PublicationTrigger::{self, *};
+
+    /// (trigger, auto_push) -> (skipped without a grant, challenge required).
+    const TABLE: &[(PublicationTrigger, bool, bool, bool)] = &[
+        (Hook, true, false, false),
+        (Hook, false, true, false),
+        (Manual, true, false, true),
+        (Manual, false, false, true),
+        (BundledWithShare, true, false, false),
+        (BundledWithShare, false, false, true),
+    ];
+
+    #[test]
+    fn triggers_decide_gating_and_challenge_independently() {
+        for &(trigger, auto_push, skipped, challenged) in TABLE {
+            assert_eq!(
+                trigger.skips_without_auto_push() && !auto_push,
+                skipped,
+                "{trigger:?} auto_push={auto_push}"
+            );
+            assert_eq!(
+                trigger.requires_challenge(auto_push),
+                challenged,
+                "{trigger:?} auto_push={auto_push}"
+            );
+        }
+    }
+
+    #[test]
+    fn share_push_without_auto_push_prompts_rather_than_publishing_nothing() {
+        // The trap from the issue: threading `!auto_push` through the old
+        // `automatic` flag would have hit the silent early return here.
+        assert!(!BundledWithShare.skips_without_auto_push());
+        assert!(BundledWithShare.requires_challenge(false));
     }
 }
