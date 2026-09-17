@@ -4,6 +4,7 @@
 //! closed responses in that window, skips the ones already recorded (by their
 //! deterministic ids), and commits the new captures together with the advanced
 //! cursor in one transaction. A run that fails changes nothing.
+use super::links;
 use super::transcript::{self, ParsedLine, PlanInput, TranscriptError, HARNESS};
 use crate::db::{CvcStore, DbError, HarnessCursorUpdate};
 use crate::models::{Conversation, Interaction, InteractionId};
@@ -57,6 +58,9 @@ pub struct IngestReport {
     pub inserted: usize,
     pub already_present: usize,
     pub pending_responses: usize,
+    /// Floating responses linked to a commit the session created, by exact
+    /// transcript evidence rather than the time-window linker.
+    pub linked_from_commits: usize,
     pub cursor: u64,
     pub transcript_len: u64,
 }
@@ -153,7 +157,15 @@ pub fn ingest(
     let mut captures = Vec::new();
     let mut batch_ids: HashSet<InteractionId> = HashSet::new();
     let mut already_present = 0usize;
+    let mut commit_bearing: Vec<links::CommitBearingResponse> = Vec::new();
     for planned in plan.interactions {
+        if !planned.commit_candidates.is_empty() {
+            commit_bearing.push(links::CommitBearingResponse {
+                interaction_id: planned.id.clone(),
+                timestamp: planned.timestamp,
+                candidates: planned.commit_candidates.clone(),
+            });
+        }
         if store.interaction_exists(&planned.id)? {
             already_present += 1;
             continue;
@@ -198,11 +210,30 @@ pub fn ingest(
             byte_offset: plan.cursor_offset,
         },
     )?;
+
+    // Rescue the responses the time-window linker cannot reach: those that
+    // created a commit and the reasoning before them. Attribution records who
+    // linked, matching the linker, not the historical commit author.
+    let linked_by = layout
+        .repository()
+        .signature()
+        .ok()
+        .and_then(|signature| signature.email().map(str::to_owned));
+    let linked_from_commits = links::link_transcript_commits(
+        layout.repository(),
+        store,
+        &session,
+        &capture_worktree,
+        &commit_bearing,
+        linked_by.as_deref(),
+    )?;
+
     Ok(IngestReport {
         session_id: session,
         inserted: outcome.inserted,
         already_present: already_present + outcome.suppressed,
         pending_responses: plan.pending_responses,
+        linked_from_commits,
         cursor: plan.cursor_offset,
         transcript_len,
     })

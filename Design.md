@@ -417,7 +417,7 @@ To overcome the "Walled Garden" limitations of proprietary AI tools (like GitHub
         
     - **Pinning:** The parser is pinned to transcript major version 2 and fails loudly, writing nothing, on unknown message shapes; bookkeeping entry types that carry no message are skipped.
         
-- **Benefit:** Complete, threaded session capture at transcript fidelity with zero model cooperation. Near-real-time `PostToolUse` ingestion is what lets a mid-session commit's post-commit linker see the reasoning that preceded it (§11.2): a response recorded only after the commit it produced is permanently excluded by the first-parent bound, which is why transcript-derived deterministic commit links remain a planned follow-up.
+- **Benefit:** Complete, threaded session capture at transcript fidelity with zero model cooperation. Near-real-time `PostToolUse` ingestion lets a mid-session commit's post-commit linker see the reasoning that preceded it (§11.2). The one response the first-parent bound would still exclude — the one that *ran* `git commit`, written before the commit exists — is rescued directly from the transcript: ingest reads the commit the session's own Git tool call created, verifies the SHA against the repository (existence and a plausible time), and links that response and the still-floating reasoning since the previous commit to it as `generated`, segmented per commit and idempotent across re-ingests. This is exact, locally observed evidence, not the cross-session timing heuristic the linker is forbidden to use; it is recorded through the existing `generated` relation, so the wire format is unchanged. Subagent transcripts are not yet ingested.
     
 
 ### 10.6 Strategy Selection Matrix
