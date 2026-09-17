@@ -285,8 +285,14 @@ Before a tag is pushed, stop, fix the release PR, and repeat review and validati
 For a failed external job, first use **Re-run failed jobs** on the original workflow
 while its artifacts remain available. Never republish a successful channel.
 
-Marketplace publishing can partially publish target variants. Inspect the Marketplace
-channel; publish only missing targets through a reviewed, channel-specific recovery.
+Marketplace publishing is convergent: the publish step queries the Marketplace for the
+targets already live at the release version, publishes only the missing ones, retries
+transient gallery timeouts (re-checking liveness before each retry, since a timed-out
+upload can succeed server-side), and fails only if a target is still missing, naming
+it. **Re-run failed jobs** is therefore the complete recovery for a partial
+publication while the run's artifacts remain available. Only if a rerun still reports
+targets missing, publish exactly those targets through a reviewed, channel-specific
+recovery.
 For npm, preserve the Trusted Publisher workflow identity (`release.yml`); do not
 casually change npm trust. If the original artifacts or provenance cannot be preserved,
 release a new patch version. Document partial publication and repair forward. Public

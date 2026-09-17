@@ -75,6 +75,90 @@ fn interaction_named(
     Ok(id)
 }
 
+/// Adds a linked worktree with the real `git`, whose `commondir` is the
+/// relative `../..` that libgit2's own worktree API does not write. That
+/// relative marker is exactly what made the v1 identity differ per worktree,
+/// so a git2-created worktree cannot stand in for one here.
+fn git_worktree_add(repo_dir: &std::path::Path, home: &std::path::Path, path: &std::path::Path) {
+    std::fs::create_dir_all(home).unwrap();
+    let status = std::process::Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "--detach",
+            path.to_str().unwrap(),
+            "HEAD",
+        ])
+        .current_dir(repo_dir)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", home.join("empty.gitconfig"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "git worktree add failed: {status}");
+}
+
+/// A repository's identity must not depend on which of its worktrees is
+/// looking, or the same range observed twice persists twice and exact relink
+/// is silently blocked for it forever.
+#[test]
+fn one_range_observed_from_two_worktrees_converges_on_one_record() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let main = temp.path().join("main");
+    std::fs::create_dir(&main)?;
+    let repo = Repository::init(&main)?;
+    let db_path = temp.path().join("index.db");
+    let store = CvcStore::open(&db_path)?;
+    let base_tree = tree(&repo, &[("a", b"base", FileMode::Blob.into())])?;
+    let base = commit(&repo, Some("refs/heads/main"), None, &base_tree, "base")?;
+    repo.set_head("refs/heads/main")?;
+    let feature_tree = tree(&repo, &[("a", b"feature", FileMode::Blob.into())])?;
+    let feature = commit(
+        &repo,
+        Some("refs/heads/feature"),
+        Some(base),
+        &feature_tree,
+        "feature",
+    )?;
+    interaction(&store, &db_path, feature)?;
+
+    let linked_path = temp.path().join("linked");
+    git_worktree_add(&main, &temp.path().join("home"), &linked_path);
+    let linked = Repository::open(&linked_path)?;
+    let marker = std::fs::read_to_string(linked.path().join("commondir"))?;
+    assert_eq!(marker.trim(), "../..", "git writes a relative commondir");
+
+    let primary = squash::observe_explicit_range(
+        &repo,
+        &store,
+        base,
+        feature,
+        Some("refs/heads/feature"),
+        None,
+        None,
+    )?;
+    let secondary = squash::observe_explicit_range(
+        &linked,
+        &store,
+        base,
+        feature,
+        Some("refs/heads/feature"),
+        None,
+        None,
+    )?;
+    assert_eq!(primary.repository_identity, secondary.repository_identity);
+    assert_eq!(primary.range_id, secondary.range_id);
+    assert_eq!(primary.format, "cvc.range-evidence/v2");
+    assert_eq!(primary.version, 2);
+    let records: i64 = rusqlite::Connection::open(&db_path)?.query_row(
+        "SELECT COUNT(*) FROM range_evidence",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(records, 1, "one range must persist as one record");
+    Ok(())
+}
+
 #[test]
 fn exact_squash_attaches_source_and_ambiguity_or_change_is_noop() -> anyhow::Result<()> {
     for case in ["exact", "duplicate_observation", "changed", "delayed"] {

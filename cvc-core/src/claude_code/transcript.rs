@@ -193,6 +193,7 @@ pub fn parse_window(
     bytes: &[u8],
     base: u64,
     expected_session: &str,
+    include_sidechain: bool,
 ) -> Result<Window, TranscriptError> {
     let mut window = Window::default();
     let mut cursor = 0usize;
@@ -201,14 +202,22 @@ pub fn parse_window(
         match rest.iter().position(|b| *b == b'\n') {
             Some(newline) => {
                 let line = &rest[..newline];
-                window
-                    .lines
-                    .push(parse_line(line, base + cursor as u64, expected_session)?);
+                window.lines.push(parse_line(
+                    line,
+                    base + cursor as u64,
+                    expected_session,
+                    include_sidechain,
+                )?);
                 cursor += newline + 1;
                 window.consumed = cursor as u64;
             }
             None => {
-                match parse_line(rest, base + cursor as u64, expected_session) {
+                match parse_line(
+                    rest,
+                    base + cursor as u64,
+                    expected_session,
+                    include_sidechain,
+                ) {
                     Ok(parsed) => {
                         window.lines.push(parsed);
                         window.consumed = bytes.len() as u64;
@@ -226,10 +235,16 @@ pub fn parse_window(
 }
 
 /// Parses one transcript line located at `offset`.
+///
+/// `include_sidechain` selects the file being read: the main session transcript
+/// (`false`) skips sidechain entries, which belong to subagents recorded in
+/// their own files; a subagent transcript (`true`) is made entirely of sidechain
+/// entries and keeps them.
 pub fn parse_line(
     line: &[u8],
     offset: u64,
     expected_session: &str,
+    include_sidechain: bool,
 ) -> Result<ParsedLine, TranscriptError> {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.iter().all(|b| b.is_ascii_whitespace()) {
@@ -252,7 +267,7 @@ pub fn parse_line(
             });
         }
     }
-    if raw.is_sidechain.unwrap_or(false) {
+    if raw.is_sidechain.unwrap_or(false) && !include_sidechain {
         // Subagent side chains are recorded in their own transcript files;
         // main-transcript sidechain entries predate that layout and are not
         // part of this session's chain.
@@ -610,6 +625,11 @@ pub struct PlannedInteraction {
     pub model_response: Option<String>,
     pub tool_executions: Vec<ToolExecution>,
     pub context_items: Vec<ContextItem>,
+    /// Commit references named by a successful `git commit`/`git merge` tool
+    /// result in this response. Raw candidate strings (short or full hex); the
+    /// ingest step resolves and verifies each against the repository before
+    /// linking, so a spurious token is harmless.
+    pub commit_candidates: Vec<String>,
     /// Byte offset of the response's first entry.
     pub first_offset: u64,
 }
@@ -814,6 +834,7 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
         let mut budget = MAX_TOOL_ARGUMENTS_TOTAL_BYTES;
         let mut tool_executions = Vec::with_capacity(tool_uses.len());
         let mut context_items: Vec<ContextItem> = Vec::new();
+        let mut commit_candidates: Vec<String> = Vec::new();
         for (tool_id, name, tool_input) in &tool_uses {
             let status = match results.get(tool_id) {
                 Some(result) if !result.is_error => ToolStatus::Success,
@@ -821,6 +842,16 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
                 // session ended) are both failures from the model's view.
                 _ => ToolStatus::Failure,
             };
+            if status == ToolStatus::Success {
+                if let Some(result) = results.get(tool_id) {
+                    for candidate in commit_candidates_from_tool(name, tool_input, &result.content)
+                    {
+                        if !commit_candidates.contains(&candidate) {
+                            commit_candidates.push(candidate);
+                        }
+                    }
+                }
+            }
             tool_executions.push(ToolExecution {
                 id: None,
                 interaction_id: id.clone(),
@@ -859,10 +890,74 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
             model_response,
             tool_executions,
             context_items,
+            commit_candidates,
             first_offset: entries[first].offset,
         });
     }
     plan
+}
+
+/// Commit references a successful Git tool call reported. Only commit-creating
+/// subcommands are considered, and only their own output is scanned, so an
+/// unrelated hash mentioned in a diff or log is not mistaken for a new commit;
+/// the ingest step still resolves and time-checks every candidate against the
+/// repository, so a false positive here cannot create a link.
+fn commit_candidates_from_tool(tool_name: &str, input: &Value, result: &str) -> Vec<String> {
+    if tool_name != "Bash" {
+        return Vec::new();
+    }
+    let Some(command) = input.get("command").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    if !creates_commit(command) {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    // `git commit`/`git merge` print `[<branch> <short-sha>] <subject>`; the
+    // bracketed short SHA is the reliable signal.
+    let bytes = result.as_bytes();
+    let mut index = 0;
+    while let Some(open) = result[index..].find('[') {
+        let start = index + open + 1;
+        if let Some(close_rel) = result[start..].find(']') {
+            let inside = &result[start..start + close_rel];
+            if let Some((_, token)) = inside.rsplit_once(' ') {
+                if is_hex_token(token) {
+                    candidates.push(token.to_ascii_lowercase());
+                }
+            }
+            index = start + close_rel + 1;
+        } else {
+            break;
+        }
+    }
+    // Also accept a bare full-length SHA line, as `git rev-parse HEAD` prints.
+    let _ = bytes;
+    for token in result.split(|c: char| !c.is_ascii_hexdigit()) {
+        if token.len() == 40 && is_hex_token(token) {
+            let lowered = token.to_ascii_lowercase();
+            if !candidates.contains(&lowered) {
+                candidates.push(lowered);
+            }
+        }
+    }
+    candidates
+}
+
+fn creates_commit(command: &str) -> bool {
+    // A crude but sufficient scan: the command mentions git and a
+    // commit-producing verb. Verification against the repo is the real gate.
+    let normalized = command.to_ascii_lowercase();
+    normalized.contains("git")
+        && (normalized.contains("commit")
+            || normalized.contains("merge")
+            || normalized.contains("cherry-pick")
+            || normalized.contains("revert")
+            || normalized.contains("rev-parse"))
+}
+
+fn is_hex_token(token: &str) -> bool {
+    (7..=40).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn render_stimuli(stimuli: &[Stimulus<'_>], tool_names: &HashMap<&str, &str>) -> (String, Author) {
@@ -1095,6 +1190,38 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.as_str().len(), 36);
+    }
+
+    #[test]
+    fn commit_candidates_only_from_committing_git_commands() {
+        let commit = serde_json::json!({"command": "git commit -am work"});
+        let candidates = commit_candidates_from_tool(
+            "Bash",
+            &commit,
+            "[main 1a2b3c4] work\n 1 file changed, 2 insertions(+)",
+        );
+        assert_eq!(candidates, vec!["1a2b3c4".to_string()]);
+
+        let revparse = serde_json::json!({"command": "git rev-parse HEAD"});
+        let full = "a".repeat(40);
+        assert_eq!(
+            commit_candidates_from_tool("Bash", &revparse, &full),
+            vec![full.clone()]
+        );
+
+        // A non-committing git command contributes nothing, even if its output
+        // is full of hashes (a log, a diff).
+        let log = serde_json::json!({"command": "git log --oneline"});
+        assert!(commit_candidates_from_tool("Bash", &log, "1a2b3c4 old\n5d6e7f8 older").is_empty());
+        // A non-Bash tool contributes nothing.
+        assert!(commit_candidates_from_tool("Read", &commit, "[main 1a2b3c4] work").is_empty());
+        // No spurious short token from ordinary prose.
+        assert!(commit_candidates_from_tool(
+            "Bash",
+            &commit,
+            "nothing bracketed or hex-shaped here"
+        )
+        .is_empty());
     }
 
     #[test]

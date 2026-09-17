@@ -78,7 +78,7 @@ impl Fixture {
 }
 
 fn parse(content: &str, session: &str) -> Result<transcript::Window, TranscriptError> {
-    transcript::parse_window(content.as_bytes(), 0, session)
+    transcript::parse_window(content.as_bytes(), 0, session, false)
 }
 
 #[test]
@@ -692,7 +692,7 @@ fn real_transcript_dry_run() {
         .unwrap_or_else(|_| std::env::current_dir().unwrap());
     let worktree = fs::canonicalize(worktree).unwrap();
     let bytes = fs::read(&path).unwrap();
-    let window = transcript::parse_window(&bytes, 0, &session).unwrap();
+    let window = transcript::parse_window(&bytes, 0, &session, false).unwrap();
     let entries = window
         .lines
         .iter()
