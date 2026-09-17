@@ -831,7 +831,28 @@ impl CvcStore {
         }
         let id = Self::insert_capture(&tx, &capture)?;
         tx.commit()?;
+        self.ensure_wal_visible()?;
         Ok(id)
+    }
+
+    /// A WAL-mode connection's committed writes reach other processes only
+    /// through the `-wal` file it appends to. If that file was unlinked under
+    /// this connection (a foreign close that wrongly believed it was the last
+    /// connection, or an operator's `rm`), the write that just succeeded lives
+    /// in a file nobody else can open, so it is reported as a failure instead
+    /// of a success.
+    fn ensure_wal_visible(&self) -> Result<()> {
+        if self.path == Path::new(":memory:") {
+            return Ok(());
+        }
+        let wal = PathBuf::from(format!("{}-wal", self.path.display()));
+        match std::fs::symlink_metadata(&wal) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(DbError::Migration(
+                "the SQLite WAL file was removed under this connection; its writes are not visible to other processes, restart this process".into(),
+            )),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn capture_mcp(&self, capture: crate::privacy::McpCapture) -> Result<InteractionId> {
@@ -914,6 +935,7 @@ impl CvcStore {
         if !ids.is_empty() {
             self.compact_after_deletion()?;
         }
+        self.ensure_wal_visible()?;
         Ok(())
     }
 
@@ -967,7 +989,7 @@ impl CvcStore {
             .map_err(|e| DbError::Migration(e.to_string()))?;
         let byte_offset = i64::try_from(cursor.byte_offset)
             .map_err(|_| DbError::Migration("harness cursor offset overflows".into()))?;
-        self.with_immediate_write_retry(|tx| {
+        let outcome = self.with_immediate_write_retry(|tx| {
             let mut outcome = HarnessBatchOutcome::default();
             for capture in &prepared {
                 let id = &capture.interaction.id;
@@ -997,7 +1019,9 @@ impl CvcStore {
                 ],
             )?;
             Ok(outcome)
-        })
+        })?;
+        self.ensure_wal_visible()?;
+        Ok(outcome)
     }
 
     /// Runs `body` inside an immediate transaction, retrying with backoff while
