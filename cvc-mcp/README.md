@@ -42,3 +42,5 @@ CVC stores its database, privacy/consent state, locks, and rewrite state under `
 ## Troubleshooting
 
 Ensure the binary path is executable and that the MCP process starts in the intended Git repository. Run the binary in a terminal and inspect logs if the client cannot start it.
+
+If `commit_thought` reports success but `cvc status` or a Git hook never sees the thought, the server's SQLite write-ahead log was removed underneath it (versions before 0.7.0 could lose the lock that prevents this whenever a CLI command ran in the same repository). The server now reports such a write as a failure instead of a success; restart the MCP server to recover.
