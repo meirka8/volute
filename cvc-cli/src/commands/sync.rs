@@ -112,15 +112,23 @@ fn pick_unshared_conversation(
     Ok(Some(candidates[choice - 1].id.clone()))
 }
 
+/// Consent gate: the human must type `challenge` verbatim after seeing it.
+///
+/// The answer is read from the controlling terminal itself, not from the
+/// process-global stdin, and whatever was queued before the prompt is
+/// discarded first. Stdin is a shared buffered reader, so an earlier
+/// `read_line` (the picker, or a preceding challenge in the same command) may
+/// already hold the next line; answering from that would let type-ahead or a
+/// paste satisfy a challenge that was never displayed. See `crate::tty`.
 fn typed_acknowledgement(challenge: &str) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("acknowledgement requires an interactive TTY");
     }
-    print!("Type exactly '{challenge}' to continue: ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    if answer.trim_end_matches(['\r', '\n']) != challenge {
+    let mut terminal = crate::tty::Terminal::open()
+        .context("acknowledgement requires access to the controlling terminal")?;
+    terminal.discard_pending_input()?;
+    let answer = terminal.prompt_line(&format!("Type exactly '{challenge}' to continue: "))?;
+    if answer != challenge {
         bail!("acknowledgement challenge did not match");
     }
     Ok(())

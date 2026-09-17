@@ -96,7 +96,7 @@ cvc privacy set-auto-push on --remote origin
 cvc privacy set-auto-push off --remote origin
 ```
 
-Non-interactive input is rejected for acknowledgements. This intentionally prevents scripts, IDEs, and MCP clients from silently granting capture, sharing, or auto-push consent.
+Non-interactive input is rejected for acknowledgements. This intentionally prevents scripts, IDEs, and MCP clients from silently granting capture, sharing, or auto-push consent. The answer is read from the controlling terminal itself, and anything already queued on it (a paste, type-ahead, or a line left over from a preceding challenge in the same command) is discarded when the prompt appears, so a challenge can only be satisfied by input typed after it was displayed.
 
 ## Share and publish
 
