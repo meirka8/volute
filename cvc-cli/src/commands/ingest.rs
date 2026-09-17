@@ -54,6 +54,12 @@ pub async fn claude_code(
         report.cursor,
         report.transcript_len
     );
+    if report.subagent_sessions > 0 {
+        println!(
+            "  plus {} subagent session(s): {} new thought(s), {} linked to commits",
+            report.subagent_sessions, report.subagent_inserted, report.subagent_linked
+        );
+    }
     Ok(())
 }
 

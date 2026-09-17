@@ -193,6 +193,7 @@ pub fn parse_window(
     bytes: &[u8],
     base: u64,
     expected_session: &str,
+    include_sidechain: bool,
 ) -> Result<Window, TranscriptError> {
     let mut window = Window::default();
     let mut cursor = 0usize;
@@ -201,14 +202,22 @@ pub fn parse_window(
         match rest.iter().position(|b| *b == b'\n') {
             Some(newline) => {
                 let line = &rest[..newline];
-                window
-                    .lines
-                    .push(parse_line(line, base + cursor as u64, expected_session)?);
+                window.lines.push(parse_line(
+                    line,
+                    base + cursor as u64,
+                    expected_session,
+                    include_sidechain,
+                )?);
                 cursor += newline + 1;
                 window.consumed = cursor as u64;
             }
             None => {
-                match parse_line(rest, base + cursor as u64, expected_session) {
+                match parse_line(
+                    rest,
+                    base + cursor as u64,
+                    expected_session,
+                    include_sidechain,
+                ) {
                     Ok(parsed) => {
                         window.lines.push(parsed);
                         window.consumed = bytes.len() as u64;
@@ -226,10 +235,16 @@ pub fn parse_window(
 }
 
 /// Parses one transcript line located at `offset`.
+///
+/// `include_sidechain` selects the file being read: the main session transcript
+/// (`false`) skips sidechain entries, which belong to subagents recorded in
+/// their own files; a subagent transcript (`true`) is made entirely of sidechain
+/// entries and keeps them.
 pub fn parse_line(
     line: &[u8],
     offset: u64,
     expected_session: &str,
+    include_sidechain: bool,
 ) -> Result<ParsedLine, TranscriptError> {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.iter().all(|b| b.is_ascii_whitespace()) {
@@ -252,7 +267,7 @@ pub fn parse_line(
             });
         }
     }
-    if raw.is_sidechain.unwrap_or(false) {
+    if raw.is_sidechain.unwrap_or(false) && !include_sidechain {
         // Subagent side chains are recorded in their own transcript files;
         // main-transcript sidechain entries predate that layout and are not
         // part of this session's chain.
