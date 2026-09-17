@@ -379,3 +379,84 @@ fn stray_gitdir_marker_in_a_normal_repository_fails_closed() {
     fs::write(repo.path().join("gitdir"), "../.git\n").unwrap();
     assert!(cvc_core::repository::common_git_dir(&repo).is_err());
 }
+
+#[test]
+fn resolution_agrees_with_libgit2_commondir_on_well_formed_layouts() {
+    // `RepositoryLayout` parses `commondir` itself rather than calling
+    // `Repository::commondir()`. Wherever the metadata is sound the two must
+    // not disagree: the resolved directory feeds repository identity, storage
+    // paths, and the MCP binding checks.
+    let (_temp, home, main) = repository();
+    let linked = main.parent().unwrap().join("linked");
+    let second = main.parent().unwrap().join("second");
+    git(
+        &home,
+        &main,
+        &["worktree", "add", "-b", "agrees", linked.to_str().unwrap()],
+    );
+    git(
+        &home,
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agrees-too",
+            second.to_str().unwrap(),
+        ],
+    );
+    let bare = main.parent().unwrap().join("bare.git");
+    fs::create_dir(&bare).unwrap();
+    git(&home, &bare, &["init", "--bare"]);
+
+    for root in [&main, &linked, &second, &bare] {
+        let repo = git2::Repository::open(root).unwrap();
+        assert_eq!(
+            cvc_core::repository::common_git_dir(&repo).unwrap(),
+            fs::canonicalize(repo.commondir()).unwrap(),
+            "resolution diverged from libgit2 for {}",
+            root.display()
+        );
+    }
+}
+
+#[test]
+fn libgit2_commondir_divergence_is_deliberate() {
+    let (_temp, home, main) = repository();
+    let linked = main.parent().unwrap().join("linked");
+    git(
+        &home,
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "diverges",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let main_git_dir = fs::canonicalize(main.join(".git")).unwrap();
+
+    // libgit2 resolves the common directory at open time and caches it, so a
+    // marker removed afterwards leaves a stale answer that still points at a
+    // real directory. Parsing at resolution time is what turns this into a
+    // refusal, which is why `Repository::commondir()` is not adopted here.
+    let repo = git2::Repository::open(&linked).unwrap();
+    fs::remove_file(repo.path().join("commondir")).unwrap();
+    assert_eq!(fs::canonicalize(repo.commondir()).unwrap(), main_git_dir);
+    assert!(cvc_core::repository::common_git_dir(&repo).is_err());
+
+    // libgit2 also trims the marker without bounding its size. The size cap is
+    // ours, and it is enforced even on a marker libgit2 reads without complaint
+    // from a repository it opens successfully.
+    let mut padded = b"../..".to_vec();
+    padded.resize(padded.len() + 5000, b' ');
+    padded.push(b'\n');
+    fs::write(repo.path().join("commondir"), &padded).unwrap();
+    let reopened = git2::Repository::open(&linked).unwrap();
+    assert_eq!(
+        fs::canonicalize(reopened.commondir()).unwrap(),
+        main_git_dir
+    );
+    assert!(cvc_core::repository::common_git_dir(&reopened).is_err());
+}

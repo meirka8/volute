@@ -1,9 +1,27 @@
 //! Authoritative, fail-closed Git repository layout discovery.
 //!
-//! libgit2 exposes the active git directory but not `git_common_dir` in the
-//! version used by CVC.  Consequently `commondir` is parsed here, once, using
-//! Git's one-line format.  Its target is required to be an existing canonical
-//! directory; a bad `commondir` is never silently treated as a normal repo.
+//! `commondir` is parsed here, once, using Git's one-line format, rather than
+//! taken from `git2::Repository::commondir()`.  That API does exist as of git2
+//! 0.20; keeping the parser is now a deliberate choice, not a workaround, for
+//! two reasons that outlive the API gap:
+//!
+//! * libgit2 resolves the common directory when a repository is *opened* and
+//!   caches it.  [`RepositoryLayout::from_repository`] accepts an already-open
+//!   repository, so a `commondir` deleted or corrupted after that point would
+//!   still resolve to its stale value — failing open on exactly the corner this
+//!   module exists to refuse.  Parsing at resolution time re-reads the marker,
+//!   and re-checks it after opening to catch replacement races.
+//! * libgit2 is more permissive about the marker itself: it accepts, among
+//!   others, an arbitrarily large whitespace-padded file that the size cap here
+//!   rejects, and it has no notion of the reciprocal `gitdir` check that
+//!   catches a linked worktree's administrative directory whose `commondir` is
+//!   missing.
+//!
+//! The two resolutions agree on every well-formed layout and diverge only where
+//! this module deliberately fails closed; `tests/test_repository_layout.rs`
+//! pins both halves of that claim.  The target is required to be an existing
+//! canonical directory; a bad `commondir` is never silently treated as a normal
+//! repo.
 use git2::{ErrorCode, Repository};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
