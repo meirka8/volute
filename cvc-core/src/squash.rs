@@ -44,15 +44,23 @@ pub enum SquashError {
     Changeset(#[from] changeset::ChangesetError),
     #[error("invalid range: {0}")]
     Invalid(&'static str),
+    #[error("repository layout: {0}")]
+    Layout(#[from] crate::repository::RepositoryLayoutError),
     #[error("squash operation deadline exceeded")]
     Deadline,
 }
 
-fn repository_identity(repo: &Repository) -> String {
+/// The historical identity: a hash of the *uninterpreted* legacy common
+/// directory, which for a linked worktree is the unnormalized
+/// `<main>/.git/worktrees/<name>/../..` rather than `<main>/.git`. It
+/// therefore names one worktree, not one repository, and is retained only to
+/// document the bytes that persisted v1 evidence committed to. Nothing
+/// recomputes it: stored identities are never compared against a live
+/// repository, so no v1 record needs it to stay verifiable.
+#[cfg(test)]
+fn repository_identity_v1(repo: &Repository) -> String {
     let mut h = Sha256::new();
     h.update(b"cvc.repository/local/v1\0");
-    // Persisted v1 plans use the legacy path interpretation. Do not change
-    // this without an explicit, versioned format migration.
     #[allow(deprecated)]
     h.update(
         crate::privacy::common_git_dir(repo)
@@ -60,6 +68,40 @@ fn repository_identity(repo: &Repository) -> String {
             .as_encoded_bytes(),
     );
     hex::encode(h.finalize())
+}
+
+/// Identity for v2 range evidence: the canonical common Git directory, so
+/// every linked worktree of one repository hashes identical bytes and one
+/// range observed from several worktrees converges on a single record.
+///
+/// The path is canonicalized here rather than trusted to arrive canonical,
+/// and it is domain-separated from every other path hash. Unix path bytes are
+/// hashed directly; Windows uses native UTF-16 code units instead of lossy
+/// UTF-8.
+fn repository_identity_v2(repo: &Repository) -> Result<String, SquashError> {
+    let path = crate::repository::common_git_dir(repo)?;
+    let mut h = Sha256::new();
+    h.update(b"cvc.repository/common-git-dir/v2\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        h.update(b"unix-bytes\0");
+        h.update(path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        h.update(b"windows-utf16le\0");
+        for unit in path.as_os_str().encode_wide() {
+            h.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        h.update(b"fallback-lossy-utf8\0");
+        h.update(path.to_string_lossy().as_bytes());
+    }
+    Ok(hex::encode(h.finalize()))
 }
 fn source_id(snapshot: &SourceSnapshot) -> String {
     match snapshot {
@@ -376,9 +418,9 @@ pub(crate) fn observe_range_with_abort<F: FnMut() -> bool>(
     sources.dedup_by(|a, b| a.interaction_id == b.interaction_id && a.source_id == b.source_id);
     let mut range = RangeEvidence {
         range_id: String::new(),
-        format: "cvc.range-evidence/v1".into(),
-        version: 1,
-        repository_identity: repository_identity(repo),
+        format: "cvc.range-evidence/v2".into(),
+        version: 2,
+        repository_identity: repository_identity_v2(repo)?,
         object_format: "sha1".into(),
         base_oid: CommitSha::new(base.to_string()),
         tip_oid: CommitSha::new(tip.to_string()),
@@ -408,6 +450,58 @@ pub(crate) fn observe_range_with_abort<F: FnMut() -> bool>(
         authorized_remote,
     )?;
     Ok(range)
+}
+
+/// The substantive claim one range makes about history. The body's naming
+/// fields -- its ID, format, version and repository identity -- are
+/// deliberately excluded, because two records that agree on everything here
+/// describe the same range however they were named.
+fn range_claim(range: &RangeEvidence) -> (&str, &str, &str, &str, &str, &str, &str, Vec<&str>) {
+    (
+        range.object_format.as_str(),
+        range.base_oid.as_str(),
+        range.tip_oid.as_str(),
+        range.base_tree_oid.as_str(),
+        range.result_tree_oid.as_str(),
+        range.changeset_algorithm.as_str(),
+        range.changeset_digest.as_str(),
+        range
+            .commits
+            .iter()
+            .map(|member| member.commit_oid.as_str())
+            .collect(),
+    )
+}
+
+/// Choose the single range a squash candidate may relink to, or refuse.
+///
+/// Before v2 identities, one range observed from two linked worktrees
+/// persisted as two records under different IDs. They make an identical claim
+/// about history and differ only in which worktree observed it, so for relink
+/// purposes they are one range -- otherwise an exact relink stays silently
+/// blocked forever in exactly the shared-worktree setups CVC supports. The
+/// record carrying the most sources wins, so healing an already-duplicated
+/// store recovers as much provenance as possible, with the lowest ID breaking
+/// ties deterministically.
+///
+/// Records that disagree on the claim are genuinely different ranges that
+/// happen to share a changeset digest. Those stay ambiguous and are refused,
+/// leaving the target floating rather than guessing its provenance.
+fn select_relink_range(
+    matches: Vec<(RangeEvidence, Vec<RangeSourceSnapshot>)>,
+) -> Option<(RangeEvidence, Vec<RangeSourceSnapshot>)> {
+    let claim = range_claim(&matches.first()?.0);
+    if matches.iter().any(|(range, _)| range_claim(range) != claim) {
+        return None;
+    }
+    matches
+        .into_iter()
+        .max_by(|(left, left_sources), (right, right_sources)| {
+            left_sources
+                .len()
+                .cmp(&right_sources.len())
+                .then_with(|| right.range_id.cmp(&left.range_id))
+        })
 }
 
 fn branch_key(repo: &Repository) -> Result<(String, String), SquashError> {
@@ -541,13 +635,10 @@ pub fn scan_with_abort<F: FnMut() -> bool>(
             &mut abort,
         )?;
         let matches = store.trusted_ranges_for_changeset(fp.algorithm, &fp.digest)?;
-        if matches.len() != 1 {
-            continue;
-        }
-        let (range, _) = matches
-            .into_iter()
-            .next()
-            .ok_or(SquashError::Invalid("range vanished"))?;
+        let range = match select_relink_range(matches) {
+            Some((range, _)) => range,
+            None => continue,
+        };
         if range.commits.iter().any(|m| {
             Oid::from_str(m.commit_oid.as_str())
                 .ok()
@@ -592,7 +683,22 @@ mod plan_tests {
                 .as_os_str()
                 .as_encoded_bytes(),
         );
-        assert_eq!(repository_identity(&repo), hex::encode(expected.finalize()));
+        assert_eq!(
+            repository_identity_v1(&repo),
+            hex::encode(expected.finalize())
+        );
+    }
+
+    #[test]
+    fn repository_identity_v2_is_domain_separated_from_v1() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        // The primary checkout is the one place the two algorithms see the
+        // same directory, so it is where an accidental collision would show.
+        assert_ne!(
+            repository_identity_v2(&repo).unwrap(),
+            repository_identity_v1(&repo)
+        );
     }
 
     fn source(interaction: &InteractionId, id: &str) -> RangeSourceSnapshot {
@@ -803,6 +909,163 @@ mod plan_tests {
             |row| row.get(0),
         )?;
         assert_eq!(events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn relink_selection_unifies_worktree_duplicates_and_refuses_real_ambiguity() {
+        let a = InteractionId::new();
+        let b = InteractionId::new();
+        let mut first = range();
+        first.range_id = first.canonical_id();
+        // The same range as the pre-fix code recorded it from a second
+        // worktree: one claim about history, two repository identities.
+        let mut second = first.clone();
+        second.repository_identity = "f".repeat(64);
+        second.range_id = second.canonical_id();
+        assert_ne!(first.range_id, second.range_id);
+        let picked = select_relink_range(vec![
+            (first.clone(), vec![source(&a, "a1")]),
+            (second.clone(), vec![source(&a, "a1"), source(&b, "b1")]),
+        ])
+        .expect("worktree duplicates describe one range");
+        // The richer record wins, so healing recovers every source observed.
+        assert_eq!(picked.0.range_id, second.range_id);
+        assert_eq!(picked.1.len(), 2);
+
+        // A tie is broken by the lowest ID rather than by arrival order.
+        let lowest = std::cmp::min(&first.range_id, &second.range_id).clone();
+        for order in [
+            vec![
+                (first.clone(), vec![source(&a, "a1")]),
+                (second.clone(), vec![source(&a, "a1")]),
+            ],
+            vec![
+                (second.clone(), vec![source(&a, "a1")]),
+                (first.clone(), vec![source(&a, "a1")]),
+            ],
+        ] {
+            assert_eq!(select_relink_range(order).unwrap().0.range_id, lowest);
+        }
+
+        // Two genuinely different ranges that collide on a changeset digest
+        // stay ambiguous: the target keeps floating rather than being guessed.
+        let mut other = first.clone();
+        other.tip_oid = CommitSha::new("9".repeat(40));
+        other.range_id = other.canonical_id();
+        assert!(select_relink_range(vec![
+            (first, vec![source(&a, "a1")]),
+            (other, vec![source(&a, "a1")]),
+        ])
+        .is_none());
+        assert!(select_relink_range(vec![]).is_none());
+    }
+
+    #[test]
+    fn a_range_duplicated_by_the_v1_identity_still_relinks_exactly() -> anyhow::Result<()> {
+        fn commit(
+            repo: &Repository,
+            reference: Option<&str>,
+            parent: Option<Oid>,
+            body: &[u8],
+        ) -> anyhow::Result<Oid> {
+            let mut builder = repo.treebuilder(None)?;
+            builder.insert("a", repo.blob(body)?, git2::FileMode::Blob.into())?;
+            let tree = repo.find_tree(builder.write()?)?;
+            let sig = Signature::now("test", "test@example.test")?;
+            let parent = parent.map(|oid| repo.find_commit(oid)).transpose()?;
+            let parents: Vec<_> = parent.iter().collect();
+            Ok(repo.commit(reference, &sig, &sig, "test", &tree, &parents)?)
+        }
+        let temp = tempfile::TempDir::new()?;
+        let repo = Repository::init(temp.path())?;
+        let db_path = temp.path().join("index.db");
+        let mut store = CvcStore::open(&db_path)?;
+        let base = commit(&repo, Some("refs/heads/main"), None, b"base")?;
+        let feature = commit(&repo, Some("refs/heads/feature"), Some(base), b"feature")?;
+        let interaction = Interaction {
+            id: InteractionId::new(),
+            conversation_id: "duplicate".into(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            author: Author::Human,
+            user_prompt: "duplicate".into(),
+            model_name: None,
+            model_cot: None,
+            model_response: None,
+            source_request_id: None,
+        };
+        store.capture_mcp(crate::privacy::McpCapture::new(
+            Conversation {
+                id: "duplicate".into(),
+                title: "duplicate".into(),
+                created_at: interaction.timestamp,
+            },
+            interaction.clone(),
+            vec![],
+            vec![],
+            crate::privacy::PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
+        ))?;
+        store.link_automatic_interaction_batch_trusted(
+            &[(&interaction.id, "generated")],
+            &CommitSha::new(feature.to_string()),
+            None,
+        )?;
+        let range = observe_explicit_range(
+            &repo,
+            &store,
+            base,
+            feature,
+            Some("refs/heads/feature"),
+            None,
+            None,
+        )?;
+
+        // Reconstruct the record a second worktree persisted before this fix:
+        // an identical claim under the per-worktree v1 identity.
+        let sha = CommitSha::new(feature.to_string());
+        let mut sources = Vec::new();
+        for owner in store.get_interactions_for_commit(&sha)? {
+            for snapshot in store.rewrite_source_snapshots(&owner.id, &sha)? {
+                sources.push(RangeSourceSnapshot {
+                    interaction_id: owner.id.clone(),
+                    source_id: source_id(&snapshot),
+                    snapshot,
+                });
+            }
+        }
+        assert!(!sources.is_empty());
+        let mut legacy = range.clone();
+        legacy.format = "cvc.range-evidence/v1".into();
+        legacy.version = 1;
+        legacy.repository_identity = repository_identity_v1(&repo);
+        legacy.range_id = legacy.canonical_id();
+        assert_ne!(legacy.range_id, range.range_id);
+        store.observe_range(
+            &legacy,
+            &sources,
+            RangeObservationOrigin::PrePush,
+            "pre-push:origin:refs/heads/feature",
+            Some("refs/heads/feature"),
+            None,
+            None,
+        )?;
+
+        let target = commit(&repo, None, Some(base), b"feature")?;
+        repo.reference("refs/heads/main", target, true, "test")?;
+        repo.set_head("refs/heads/main")?;
+        let linked = scan_with_abort(&repo, &mut store, true, || false)?;
+        assert!(
+            linked > 0,
+            "two observations of one range must not block exact relink"
+        );
+        let events: i64 = rusqlite::Connection::open(&db_path)?.query_row(
+            "SELECT COUNT(*) FROM derivation_events WHERE relation='squash_exact' AND target_commit=?1",
+            [target.to_string()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(events, 1);
         Ok(())
     }
 }

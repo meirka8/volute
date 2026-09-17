@@ -15,6 +15,9 @@ const HEX64 = /^[0-9a-f]{64}$/;
 // with no evidence legitimately points its required namespaces here.
 export const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+// Accepted range bodies, as exact format/version pairs. Both are hashed
+// inputs of the canonical ID, so a mismatched pair can never verify.
+const RANGE_BODIES = [["cvc.range-evidence/v1", 1], ["cvc.range-evidence/v2", 2]] as const;
 
 export interface DerivationEvent {
   event_id: string; interaction_id: string; target_commit: string;
@@ -24,7 +27,8 @@ export interface DerivationEvent {
   source_event_ids: string[]; old_oid?: string | null; new_oid?: string | null;
   range_id?: string | null; linked_by?: string | null;
 }
-export interface RangeEvidence { range_id: string; format: "cvc.range-evidence/v1"; version: 1; repository_identity: string; object_format: "sha1"; base_oid: string; tip_oid: string; base_tree_oid: string; result_tree_oid: string; commits: { commit_oid: string }[]; changeset_algorithm: "cvc.changeset/v1"; changeset_digest: string }
+/** v1 identities name one worktree, v2 one repository; both bodies are otherwise identical and are verified the same way. */
+export interface RangeEvidence { range_id: string; format: "cvc.range-evidence/v1" | "cvc.range-evidence/v2"; version: 1 | 2; repository_identity: string; object_format: "sha1"; base_oid: string; tip_oid: string; base_tree_oid: string; result_tree_oid: string; commits: { commit_oid: string }[]; changeset_algorithm: "cvc.changeset/v1"; changeset_digest: string }
 
 type TreeEntry = { path?: string; type?: string; sha?: string; size?: number };
 const encoder = new TextEncoder();
@@ -52,7 +56,7 @@ const oidOrNull = (x: unknown) => x == null || typeof x === "string" && HEX40.te
 export async function validRange(value: unknown, pathId: string): Promise<boolean> {
   if (!exactKeys(value, ["range_id", "format", "version", "repository_identity", "object_format", "base_oid", "tip_oid", "base_tree_oid", "result_tree_oid", "commits", "changeset_algorithm", "changeset_digest"])) return false;
   const r = value as RangeEvidence;
-  if (r.range_id !== pathId || !HEX64.test(pathId) || r.format !== "cvc.range-evidence/v1" || r.version !== 1 || r.object_format !== "sha1" || !HEX64.test(r.repository_identity) || ![r.base_oid, r.tip_oid, r.base_tree_oid, r.result_tree_oid].every((x) => HEX40.test(x)) || r.changeset_algorithm !== "cvc.changeset/v1" || !HEX64.test(r.changeset_digest) || !Array.isArray(r.commits) || !r.commits.length || r.commits.length > MAX_RANGE_COMMITS) return false;
+  if (r.range_id !== pathId || !HEX64.test(pathId) || !RANGE_BODIES.some(([format, version]) => r.format === format && r.version === version) || r.object_format !== "sha1" || !HEX64.test(r.repository_identity) || ![r.base_oid, r.tip_oid, r.base_tree_oid, r.result_tree_oid].every((x) => HEX40.test(x)) || r.changeset_algorithm !== "cvc.changeset/v1" || !HEX64.test(r.changeset_digest) || !Array.isArray(r.commits) || !r.commits.length || r.commits.length > MAX_RANGE_COMMITS) return false;
   const seen = new Set<string>();
   if (!r.commits.every((m) => exactKeys(m, ["commit_oid"]) && HEX40.test(m.commit_oid) && !seen.has(m.commit_oid) && !!seen.add(m.commit_oid))) return false;
   return r.range_id === await canonicalRangeId(r);

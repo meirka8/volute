@@ -28,6 +28,9 @@ pub struct RangeEvidence {
     pub range_id: String,
     pub format: String,
     pub version: u8,
+    /// v1: legacy hash of the uninterpreted active git directory, which
+    /// differs per linked worktree; v2: hash of the canonical common Git
+    /// directory, identical from every worktree of one repository.
     pub repository_identity: String,
     pub object_format: String,
     pub base_oid: CommitSha,
@@ -49,6 +52,9 @@ pub struct RangeSourceSnapshot {
 }
 
 impl RangeEvidence {
+    /// One tagged encoding serves every body version: `format` and `version`
+    /// are hashed inputs, so a v1 and a v2 body can never share an ID even
+    /// when every other field is equal.
     pub fn canonical_id(&self) -> String {
         let mut h = Sha256::new();
         h.update(b"cvc.range-evidence/canonical/v1\0");
@@ -92,8 +98,10 @@ impl RangeEvidence {
                 .range_id
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-            && self.format == "cvc.range-evidence/v1"
-            && self.version == 1
+            && matches!(
+                (self.format.as_str(), self.version),
+                ("cvc.range-evidence/v1", 1) | ("cvc.range-evidence/v2", 2)
+            )
             && self.object_format == "sha1"
             && self.repository_identity.len() == 64
             && self

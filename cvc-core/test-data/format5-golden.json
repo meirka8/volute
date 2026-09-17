@@ -34,5 +34,23 @@
     ],
     "changeset_algorithm": "cvc.changeset/v1",
     "changeset_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "range_v2": {
+    "range_id": "883f7816cbe01fca8538335525af80e5ea663a7bd87543c8187d9276fc0af4d6",
+    "format": "cvc.range-evidence/v2",
+    "version": 2,
+    "repository_identity": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "object_format": "sha1",
+    "base_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tip_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "base_tree_oid": "dddddddddddddddddddddddddddddddddddddddd",
+    "result_tree_oid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "commits": [
+      {
+        "commit_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ],
+    "changeset_algorithm": "cvc.changeset/v1",
+    "changeset_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
   }
 }
