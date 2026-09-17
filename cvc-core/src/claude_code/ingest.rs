@@ -63,9 +63,27 @@ pub struct IngestReport {
     pub linked_from_commits: usize,
     pub cursor: u64,
     pub transcript_len: u64,
+    /// Subagent (Agent tool) transcripts ingested alongside this session, each
+    /// its own conversation. Their inserts and links are summed here.
+    pub subagent_sessions: usize,
+    pub subagent_inserted: usize,
+    pub subagent_linked: usize,
 }
 
-/// Ingests `transcript_path` for the worktree described by `layout`.
+/// One transcript file to ingest: the file, the session id every entry must
+/// carry, and the conversation id under which its interactions are stored.
+/// For the main session these coincide; a subagent file carries the parent
+/// session id but is stored under its own per-agent conversation.
+struct Target<'a> {
+    transcript_path: &'a Path,
+    file_session: &'a str,
+    conversation_id: &'a str,
+    include_sidechain: bool,
+    title_override: Option<String>,
+}
+
+/// Ingests `transcript_path` for the worktree described by `layout`, then any
+/// subagent transcripts stored beside it.
 ///
 /// `session_id` defaults to the transcript's file stem, which is how Claude
 /// Code names session files; every entry must agree with it. The policy is the
@@ -91,16 +109,70 @@ pub fn ingest(
         return Err(IngestError::InvalidSession(session));
     }
 
-    let metadata = fs::symlink_metadata(transcript_path)?;
+    let mut report = ingest_target(
+        layout,
+        store,
+        policy,
+        &Target {
+            transcript_path,
+            file_session: &session,
+            conversation_id: &session,
+            include_sidechain: false,
+            title_override: None,
+        },
+        mode,
+    )?;
+
+    // Subagents run inside the same session and worktree; Claude Code stores
+    // each in `<session>/subagents/agent-<id>.jsonl` beside the main file. Each
+    // becomes its own conversation, keyed off the parent session so it never
+    // collides with the parent or another agent.
+    for subagent in discover_subagents(transcript_path)? {
+        let conversation_id = format!("{session}:{}", subagent.agent_stem);
+        if !privacy::is_safe_identifier(&conversation_id) {
+            continue;
+        }
+        let target_report = ingest_target(
+            layout,
+            store,
+            policy,
+            &Target {
+                transcript_path: &subagent.path,
+                file_session: &session,
+                conversation_id: &conversation_id,
+                include_sidechain: true,
+                title_override: subagent.title,
+            },
+            mode,
+        )?;
+        report.subagent_sessions += 1;
+        report.subagent_inserted += target_report.inserted;
+        report.subagent_linked += target_report.linked_from_commits;
+    }
+
+    Ok(report)
+}
+
+/// Ingests one transcript file into one conversation.
+fn ingest_target(
+    layout: &RepositoryLayout,
+    store: &CvcStore,
+    policy: &PreparedPolicy,
+    target: &Target<'_>,
+    mode: IngestMode,
+) -> Result<IngestReport, IngestError> {
+    let metadata = fs::symlink_metadata(target.transcript_path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(IngestError::NotRegularFile(transcript_path.to_path_buf()));
+        return Err(IngestError::NotRegularFile(
+            target.transcript_path.to_path_buf(),
+        ));
     }
     let worktree_root = layout.worktree_root()?.to_path_buf();
     let capture_worktree = layout.worktree_origin()?;
 
-    let mut file = fs::File::open(transcript_path)?;
+    let mut file = fs::File::open(target.transcript_path)?;
     let mut offset = store
-        .harness_ingest_cursor(HARNESS, &session)?
+        .harness_ingest_cursor(HARNESS, target.conversation_id)?
         .map(|cursor| cursor.byte_offset)
         .unwrap_or(0);
     if !cursor_is_consistent(&mut file, offset, metadata.len())? {
@@ -118,23 +190,29 @@ pub fn ingest(
     }
     let transcript_len = offset + bytes.len() as u64;
 
-    let window = transcript::parse_window(&bytes, offset, &session)?;
+    let window = transcript::parse_window(
+        &bytes,
+        offset,
+        target.file_session,
+        target.include_sidechain,
+    )?;
     let path_aliases = path_aliases(&window.lines, &worktree_root);
     let plan = transcript::plan(
         &window.lines,
         offset,
         &PlanInput {
-            session_id: &session,
+            session_id: target.conversation_id,
             worktree_root: &worktree_root,
             path_aliases: &path_aliases,
             final_mode: mode == IngestMode::Final,
         },
     );
 
-    let existing = store.get_conversation(&session)?;
-    let title = plan
-        .title
+    let existing = store.get_conversation(target.conversation_id)?;
+    let title = target
+        .title_override
         .clone()
+        .or_else(|| plan.title.clone())
         .or_else(|| {
             existing
                 .as_ref()
@@ -149,7 +227,7 @@ pub fn ingest(
         .or_else(|| plan.interactions.first().map(|planned| planned.timestamp))
         .unwrap_or_else(Utc::now);
     let conversation = Conversation {
-        id: session.clone(),
+        id: target.conversation_id.to_owned(),
         title,
         created_at,
     };
@@ -180,7 +258,7 @@ pub fn ingest(
         };
         let interaction = Interaction {
             id: planned.id.clone(),
-            conversation_id: session.clone(),
+            conversation_id: target.conversation_id.to_owned(),
             parent_id,
             timestamp: planned.timestamp,
             author: planned.author,
@@ -205,8 +283,8 @@ pub fn ingest(
         captures,
         HarnessCursorUpdate {
             harness: HARNESS,
-            session_id: &session,
-            transcript_path: &transcript_path.to_string_lossy(),
+            session_id: target.conversation_id,
+            transcript_path: &target.transcript_path.to_string_lossy(),
             byte_offset: plan.cursor_offset,
         },
     )?;
@@ -222,21 +300,87 @@ pub fn ingest(
     let linked_from_commits = links::link_transcript_commits(
         layout.repository(),
         store,
-        &session,
+        target.conversation_id,
         &capture_worktree,
         &commit_bearing,
         linked_by.as_deref(),
     )?;
 
     Ok(IngestReport {
-        session_id: session,
+        session_id: target.conversation_id.to_owned(),
         inserted: outcome.inserted,
         already_present: already_present + outcome.suppressed,
         pending_responses: plan.pending_responses,
         linked_from_commits,
         cursor: plan.cursor_offset,
         transcript_len,
+        subagent_sessions: 0,
+        subagent_inserted: 0,
+        subagent_linked: 0,
     })
+}
+
+/// A subagent transcript discovered beside the main session file.
+struct Subagent {
+    path: PathBuf,
+    /// The file stem, e.g. `agent-a0bd78e0`, used to form the conversation id.
+    agent_stem: String,
+    /// Title from the sibling `.meta.json`, if present.
+    title: Option<String>,
+}
+
+/// Finds `<session>/subagents/agent-*.jsonl` beside `<session>.jsonl`. A missing
+/// directory yields nothing; symlinks and non-files are ignored.
+fn discover_subagents(transcript_path: &Path) -> Result<Vec<Subagent>, IngestError> {
+    let directory = transcript_path.with_extension("").join("subagents");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut subagents = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+            || !stem.starts_with("agent-")
+        {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        let title = subagent_title(&path.with_extension("meta.json"));
+        subagents.push(Subagent {
+            path: path.clone(),
+            agent_stem: stem.to_owned(),
+            title,
+        });
+    }
+    // Deterministic order so cursors and logs are stable.
+    subagents.sort_by(|a, b| a.agent_stem.cmp(&b.agent_stem));
+    Ok(subagents)
+}
+
+/// A short title from a subagent's `.meta.json` (`agentType`: `description`).
+fn subagent_title(meta_path: &Path) -> Option<String> {
+    let text = fs::read_to_string(meta_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let agent_type = value.get("agentType").and_then(|v| v.as_str());
+    let description = value.get("description").and_then(|v| v.as_str());
+    let combined = match (agent_type, description) {
+        (Some(kind), Some(desc)) if !desc.trim().is_empty() => format!("{kind}: {desc}"),
+        (Some(kind), _) => format!("subagent ({kind})"),
+        (None, Some(desc)) if !desc.trim().is_empty() => desc.to_owned(),
+        _ => return None,
+    };
+    Some(derive_title(&combined).unwrap_or(combined))
 }
 
 /// The stored cursor is trusted only when it still lands on a line boundary
