@@ -296,6 +296,8 @@ jobs:
     name: Publish VS Code Marketplace extension
     runs-on: ubuntu-latest
     environment: vscode-marketplace
+    # Bounded retries with backoff can legitimately take a while under gallery latency.
+    timeout-minutes: 45
     needs: [check-release-version, create-release]
     permissions:
       contents: read
@@ -318,14 +320,15 @@ jobs:
       - name: Install lockfile-backed VSCE for Marketplace publishing
         working-directory: cvc-plugin
         run: npm ci
+      # Convergent: skips targets already live at this version, retries
+      # transient gallery timeouts (re-checking liveness first), and fails only
+      # if a target is still missing, so "Re-run failed jobs" completes a
+      # partial publication instead of tripping over "version exists".
       - name: Publish VSIX files to VS Code Marketplace
         working-directory: cvc-plugin
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
-        run: |
-          for vsix in ../release-assets/*.vsix; do
-            npm exec --no -- vsce publish --packagePath "$vsix"
-          done
+        run: node ../.github/scripts/publish-vsix-convergent.mjs --version "${GITHUB_REF_NAME#v}" --dir ../release-assets
 
   publish-npm:
     name: Publish MCP npm wrapper

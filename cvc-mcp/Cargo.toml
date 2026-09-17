@@ -20,6 +20,10 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4"] }
+
+# Only where file locks are per handle; on Unix the binding identity must not
+# open the database file at all (see server.rs FileIdentity).
+[target.'cfg(not(unix))'.dependencies]
 same-file = "1.0"
 
 [dev-dependencies]

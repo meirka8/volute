@@ -342,9 +342,13 @@ impl CvcStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "secure_delete", "ON")?;
-        // Hooks must fail quickly and leave their durable inbox for a later CVC
-        // invocation rather than holding up Git's rewrite machinery.
-        conn.busy_timeout(std::time::Duration::from_millis(250))?;
+        // Every writing transaction in this store begins IMMEDIATE, so this is
+        // the longest any process waits for another writer before giving up.
+        // Two seconds covers a sibling process's startup migrations and a
+        // hook-driven batch on a slow disk while staying well under what a
+        // Git hook may reasonably take; the rewrite inbox still classifies
+        // and retries permanent-versus-retryable failures on its own.
+        conn.busy_timeout(std::time::Duration::from_millis(2000))?;
         enforce_store_permissions(path)?;
 
         let store = Self {
@@ -365,7 +369,7 @@ impl CvcStore {
         remote: &str,
         reason: TombstoneReasonCode,
     ) -> Result<Tombstone> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let reason_text = match reason {
             TombstoneReasonCode::UserRequested => "user_requested",
             TombstoneReasonCode::Security => "security",
@@ -607,7 +611,7 @@ impl CvcStore {
     }
 
     fn normalize_artifact_links_schema(&self) -> Result<()> {
-        let transaction = self.conn.unchecked_transaction()?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let columns: Vec<(String, String, bool, Option<String>)> = transaction
             .prepare("PRAGMA table_info(artifact_links)")?
             .query_map([], |row| {
@@ -724,7 +728,7 @@ impl CvcStore {
                 capture.conversation.id = capture.interaction.conversation_id.clone();
             }
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         // The complete, already validated pull is one commit: suppression,
         // detachment/deletion, sanitized imports, links and publication proof.
         Self::apply_tombstones_tx(&tx, tombstones, "sync", remote_fingerprint)?;
@@ -831,7 +835,28 @@ impl CvcStore {
         }
         let id = Self::insert_capture(&tx, &capture)?;
         tx.commit()?;
+        self.ensure_wal_visible()?;
         Ok(id)
+    }
+
+    /// A WAL-mode connection's committed writes reach other processes only
+    /// through the `-wal` file it appends to. If that file was unlinked under
+    /// this connection (a foreign close that wrongly believed it was the last
+    /// connection, or an operator's `rm`), the write that just succeeded lives
+    /// in a file nobody else can open, so it is reported as a failure instead
+    /// of a success.
+    fn ensure_wal_visible(&self) -> Result<()> {
+        if self.path == Path::new(":memory:") {
+            return Ok(());
+        }
+        let wal = PathBuf::from(format!("{}-wal", self.path.display()));
+        match std::fs::symlink_metadata(&wal) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(DbError::Migration(
+                "the SQLite WAL file was removed under this connection; its writes are not visible to other processes, restart this process".into(),
+            )),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn capture_mcp(&self, capture: crate::privacy::McpCapture) -> Result<InteractionId> {
@@ -914,6 +939,7 @@ impl CvcStore {
         if !ids.is_empty() {
             self.compact_after_deletion()?;
         }
+        self.ensure_wal_visible()?;
         Ok(())
     }
 
@@ -967,7 +993,7 @@ impl CvcStore {
             .map_err(|e| DbError::Migration(e.to_string()))?;
         let byte_offset = i64::try_from(cursor.byte_offset)
             .map_err(|_| DbError::Migration("harness cursor offset overflows".into()))?;
-        self.with_immediate_write_retry(|tx| {
+        let outcome = self.with_immediate_write_retry(|tx| {
             let mut outcome = HarnessBatchOutcome::default();
             for capture in &prepared {
                 let id = &capture.interaction.id;
@@ -997,7 +1023,9 @@ impl CvcStore {
                 ],
             )?;
             Ok(outcome)
-        })
+        })?;
+        self.ensure_wal_visible()?;
+        Ok(outcome)
     }
 
     /// Runs `body` inside an immediate transaction, retrying with backoff while
@@ -1148,7 +1176,7 @@ impl CvcStore {
         source: &str,
         remote: Option<&str>,
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         Self::apply_tombstones_tx(&tx, tombstones, source, remote)?;
         tx.commit()?;
         if !tombstones.is_empty() {
@@ -1677,7 +1705,7 @@ impl CvcStore {
         id: &InteractionId,
         commit: &CommitSha,
     ) -> Result<Vec<SourceSnapshot>> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let id_text = id.to_string();
         let result = Self::source_snapshots_tx(&tx, Some((&id_text, commit.as_str())))?;
         tx.commit()?;
@@ -1703,7 +1731,7 @@ impl CvcStore {
         let payload =
             serde_json::to_string(range).map_err(|e| DbError::Migration(e.to_string()))?;
         let digest = hex::encode(sha2::Sha256::digest(payload.as_bytes()));
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         match tx.execute("INSERT INTO range_evidence(range_id,payload,payload_digest,changeset_algorithm,changeset_digest) VALUES(?1,?2,?3,?4,?5)",params![range.range_id,payload,digest,range.changeset_algorithm,range.changeset_digest]) {
             Ok(_)=>{}, Err(rusqlite::Error::SqliteFailure(e,_)) if is_unique_constraint(&e)=>{
                 let old:(String,String)=tx.query_row("SELECT payload,payload_digest FROM range_evidence WHERE range_id=?1",params![range.range_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
@@ -1843,7 +1871,7 @@ impl CvcStore {
         new_cursor: &str,
         targets: &[(String, String, bool)],
     ) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let old:Option<String>=tx.query_row("SELECT last_tip FROM branch_scan_cursors WHERE worktree_key=?1 AND symbolic_ref=?2",params![worktree,symbolic_ref],|r|r.get(0)).optional()?;
         if old.as_deref() != expected_cursor {
             return Ok(false);
@@ -2077,7 +2105,7 @@ impl CvcStore {
         expected: Option<&str>,
         tip: &str,
     ) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let old:Option<String>=tx.query_row("SELECT last_tip FROM branch_scan_cursors WHERE worktree_key=?1 AND symbolic_ref=?2",params![worktree,symbolic_ref],|r|r.get(0)).optional()?;
         if old.as_deref() != expected {
             return Ok(false);
@@ -2175,7 +2203,7 @@ impl CvcStore {
             .map(privacy::scrub)
             .transpose()
             .map_err(|e| DbError::InvalidLink(e.to_string()))?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT OR IGNORE INTO artifact_links (interaction_id, git_commit_hash, link_type, linked_by) VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -2248,7 +2276,7 @@ impl CvcStore {
             .map_err(|e| DbError::InvalidLink(e.to_string()))?;
         let linked_by = linked_by.as_deref();
 
-        let transaction = self.conn.unchecked_transaction()?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let mut inserts = 0;
         for (interaction_id, link_type) in links {
             match transaction.execute(
@@ -2382,7 +2410,7 @@ impl CvcStore {
         remote: &str,
         future: FutureSharePolicy,
     ) -> Result<usize> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let count = tx.execute(
             "UPDATE interactions SET visibility='shared' WHERE conversation_id=?1",
             params![conversation_id],
@@ -2418,7 +2446,7 @@ impl CvcStore {
         ids: &[InteractionId],
         future: FutureSharePolicy,
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let actual: i64 = tx.query_row(
             "SELECT COUNT(*) FROM interactions WHERE conversation_id=?1",
             params![conversation_id],
@@ -2451,7 +2479,7 @@ impl CvcStore {
         conversation_id: &str,
         remote: &str,
     ) -> Result<usize> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let blocked: i64 = tx.query_row("SELECT COUNT(*) FROM publications p JOIN interactions i ON i.id=p.interaction_id WHERE i.conversation_id=?1 AND p.remote_fingerprint=?2 AND p.state IN ('pending','published','unknown')", params![conversation_id, remote], |r| r.get(0))?;
         if blocked != 0 {
             return Err(DbError::Migration(
@@ -2491,7 +2519,7 @@ impl CvcStore {
             PublicationState::Published => "published",
             PublicationState::Unknown => "unknown",
         };
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         for id in ids {
             tx.execute("INSERT INTO publications(interaction_id,remote_fingerprint,state,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(interaction_id,remote_fingerprint) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at", params![id.to_string(), remote, value, Utc::now().timestamp()])?;
         }
@@ -2518,7 +2546,7 @@ impl CvcStore {
     /// Absence is only accepted after the caller successfully fetched/listed the
     /// exact destination baseline.
     pub fn clear_uncertain_publications(&self, ids: &[InteractionId], remote: &str) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         for id in ids {
             tx.execute("DELETE FROM publications WHERE interaction_id=?1 AND remote_fingerprint=?2 AND state IN ('pending','unknown')", params![id.to_string(),remote])?;
         }
