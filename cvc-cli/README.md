@@ -96,7 +96,7 @@ cvc privacy set-auto-push on --remote origin
 cvc privacy set-auto-push off --remote origin
 ```
 
-Non-interactive input is rejected for acknowledgements. This intentionally prevents scripts, IDEs, and MCP clients from silently granting capture, sharing, or auto-push consent.
+Non-interactive input is rejected for acknowledgements. This intentionally prevents scripts, IDEs, and MCP clients from silently granting capture, sharing, or auto-push consent. The answer is read from the controlling terminal itself, and anything already queued on it (a paste, type-ahead, or a line left over from a preceding challenge in the same command) is discarded when the prompt appears, so a challenge can only be satisfied by input typed after it was displayed.
 
 ## Share and publish
 
@@ -111,6 +111,8 @@ cvc unshare <conversation-id> --remote origin
 Discover conversation ids with `cvc conversations`, or run `cvc share` with no id from a terminal for an interactive picker over the destination's unshared conversations. The picker is TTY-only and feeds the same typed challenge, so non-interactive callers must always name a conversation explicitly; before the challenge, `share` prints the conversation's title, counts, and activity range so the consent is legible.
 
 `share` requires the displayed TTY challenge, which includes the destination fingerprint and snapshot count. `unshare` makes only unpublished turns private; it cannot recall content already published.
+
+`cvc share <conversation-id> --remote origin --push` publishes the snapshot in the same command. Where auto-push was acknowledged for that destination, the share challenge is the only one: that standing grant already covers publication, exactly as it does for hooks and a bare `cvc push`. Without it, the `I PUBLISH` challenge follows, and declining it leaves the turns shared but unpublished.
 
 Publish selected shared content manually:
 

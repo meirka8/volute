@@ -1,9 +1,27 @@
 //! Authoritative, fail-closed Git repository layout discovery.
 //!
-//! libgit2 exposes the active git directory but not `git_common_dir` in the
-//! version used by CVC.  Consequently `commondir` is parsed here, once, using
-//! Git's one-line format.  Its target is required to be an existing canonical
-//! directory; a bad `commondir` is never silently treated as a normal repo.
+//! `commondir` is parsed here, once, using Git's one-line format, rather than
+//! taken from `git2::Repository::commondir()`.  That API does exist as of git2
+//! 0.20; keeping the parser is now a deliberate choice, not a workaround, for
+//! two reasons that outlive the API gap:
+//!
+//! * libgit2 resolves the common directory when a repository is *opened* and
+//!   caches it.  [`RepositoryLayout::from_repository`] accepts an already-open
+//!   repository, so a `commondir` deleted or corrupted after that point would
+//!   still resolve to its stale value — failing open on exactly the corner this
+//!   module exists to refuse.  Parsing at resolution time re-reads the marker,
+//!   and re-checks it after opening to catch replacement races.
+//! * libgit2 is more permissive about the marker itself: it accepts, among
+//!   others, an arbitrarily large whitespace-padded file that the size cap here
+//!   rejects, and it has no notion of the reciprocal `gitdir` check that
+//!   catches a linked worktree's administrative directory whose `commondir` is
+//!   missing.
+//!
+//! The two resolutions agree on every well-formed layout and diverge only where
+//! this module deliberately fails closed; `tests/test_repository_layout.rs`
+//! pins both halves of that claim.  The target is required to be an existing
+//! canonical directory; a bad `commondir` is never silently treated as a normal
+//! repo.
 use git2::{ErrorCode, Repository};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -165,12 +183,19 @@ fn common_dir(git_dir: &Path) -> Result<PathBuf, RepositoryLayoutError> {
     let metadata = match fs::symlink_metadata(&marker) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if is_linked_worktree_admin_dir(git_dir)? {
-                return Err(RepositoryLayoutError::Metadata(
+            // An ordinary git directory has no `gitdir` file at all, so the
+            // marker's mere presence -- valid or not -- is sufficient evidence
+            // of a broken linked-worktree layout. Refuse it rather than placing
+            // private storage inside `<main>/.git/worktrees/<name>`.
+            return match gitdir_marker(git_dir)? {
+                GitdirMarker::Absent => Ok(git_dir.to_owned()),
+                GitdirMarker::ReciprocalPair => Err(RepositoryLayoutError::Metadata(
                     "linked-worktree commondir is missing".into(),
-                ));
-            }
-            return Ok(git_dir.to_owned());
+                )),
+                GitdirMarker::Unusable => Err(RepositoryLayoutError::Metadata(
+                    "commondir is missing beside an unusable linked-worktree gitdir marker".into(),
+                )),
+            };
         }
         Err(e) => return Err(RepositoryLayoutError::Metadata(format!("commondir: {e}"))),
     };
@@ -226,25 +251,41 @@ fn common_dir(git_dir: &Path) -> Result<PathBuf, RepositoryLayoutError> {
     canonical_directory(&target, "commondir target")
 }
 
+/// What a git directory's `gitdir` marker says about it. Neither submodule
+/// administrative directories nor ordinary repositories contain this file, so
+/// anything but [`GitdirMarker::Absent`] means the directory belongs to a
+/// linked worktree -- soundly or otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitdirMarker {
+    /// No `gitdir` file: an ordinary repository, bare repository, or submodule.
+    Absent,
+    /// `gitdir` and the worktree gitfile it names point back at each other.
+    ReciprocalPair,
+    /// Present but unusable as proof: symlinked, oversized, not a regular file,
+    /// unreadable, malformed, or with a back-reference that does not resolve to
+    /// this directory. Still evidence of a linked worktree, merely a broken one.
+    Unusable,
+}
+
 /// A linked worktree's administrative directory contains `gitdir`, pointing
-/// back to the worktree's `.git` *gitfile*. Validate both sides before using it
-/// as evidence; ordinary repositories do not have this reciprocal pair.
-fn is_linked_worktree_admin_dir(git_dir: &Path) -> Result<bool, RepositoryLayoutError> {
+/// back to the worktree's `.git` *gitfile*. Validate both sides before reporting
+/// a reciprocal pair; ordinary repositories do not have this pair.
+fn gitdir_marker(git_dir: &Path) -> Result<GitdirMarker, RepositoryLayoutError> {
     let marker = git_dir.join("gitdir");
     let metadata = match fs::symlink_metadata(&marker) {
         Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(GitdirMarker::Absent),
         Err(e) => return Err(RepositoryLayoutError::Metadata(format!("gitdir: {e}"))),
     };
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() > MAX_COMMONDIR_BYTES
     {
-        return Ok(false);
+        return Ok(GitdirMarker::Unusable);
     }
     let worktree_gitfile = match one_line_file(&marker) {
         Ok(value) => value,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(GitdirMarker::Unusable),
     };
     let worktree_gitfile = if worktree_gitfile.is_absolute() {
         worktree_gitfile
@@ -259,15 +300,15 @@ fn is_linked_worktree_admin_dir(git_dir: &Path) -> Result<bool, RepositoryLayout
         {
             meta
         }
-        _ => return Ok(false),
+        _ => return Ok(GitdirMarker::Unusable),
     };
     let _ = meta;
     let contents = match one_line_file(&worktree_gitfile) {
         Ok(value) => value,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(GitdirMarker::Unusable),
     };
     let Some(back_reference) = contents.to_str().and_then(|v| v.strip_prefix("gitdir: ")) else {
-        return Ok(false);
+        return Ok(GitdirMarker::Unusable);
     };
     let back_reference = Path::new(back_reference);
     let back_reference = if back_reference.is_absolute() {
@@ -278,7 +319,11 @@ fn is_linked_worktree_admin_dir(git_dir: &Path) -> Result<bool, RepositoryLayout
             .unwrap_or(git_dir)
             .join(back_reference)
     };
-    Ok(fs::canonicalize(back_reference).ok().as_deref() == Some(git_dir))
+    if fs::canonicalize(back_reference).ok().as_deref() == Some(git_dir) {
+        Ok(GitdirMarker::ReciprocalPair)
+    } else {
+        Ok(GitdirMarker::Unusable)
+    }
 }
 
 fn one_line_file(path: &Path) -> Result<PathBuf, RepositoryLayoutError> {
