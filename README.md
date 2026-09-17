@@ -41,13 +41,17 @@ cvc run -- <command> [args...]
 cvc log
 ```
 
-To capture Claude Code sessions automatically, install its lifecycle hooks in the checkout (after acknowledging local capture):
+### Capture Claude Code sessions
 
-```bash
-cvc harness install claude-code
-```
+CVC records each Claude Code session from the transcript Claude Code writes, through its own lifecycle hooks, with no cooperation from the model. From a Git working tree with `cvc` installed:
 
-See [`cvc-cli/README.md`](cvc-cli/README.md) for sharing, consent, linking, redaction, and Claude Code capture commands, and [`cvc-mcp/README.md`](cvc-mcp/README.md) for MCP configuration.
+1. `cvc init` — create the local cache and the advisory Git hooks.
+2. `cvc privacy acknowledge-capture` — the one-time local capture acknowledgement. It is an interactive typed challenge, and passive capture stays off until it is granted.
+3. `cvc harness install claude-code` — write the capture hooks into this checkout's `.claude/settings.local.json`, using the absolute path of the `cvc` you just ran.
+4. Start a *new* Claude Code session. A session already running does not pick up the new hooks.
+5. Work as usual, then `cvc conversations` to see the captured sessions and `cvc log` for detail.
+
+Step 3 is per checkout: run it again in each linked worktree. See [`cvc-cli/README.md`](cvc-cli/README.md) for sharing, consent, linking, and redaction, and [`cvc-mcp/README.md`](cvc-mcp/README.md) for MCP configuration.
 
 ## Build and test from source
 
