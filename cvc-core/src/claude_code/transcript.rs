@@ -11,9 +11,17 @@
 //!
 //! * an entry's `version` is missing, unparsable, or of another major version;
 //! * a `user` or `assistant` entry lacks its identity fields or its `message`;
-//! * a message carries a content block type this parser does not understand,
-//!   because silently dropping it would misrepresent what the model saw or
-//!   said.
+//! * a message's content is neither text nor a list of typed blocks, or a
+//!   block lacks the fields its type requires.
+//!
+//! A block whose *type* alone is unfamiliar does not fail the transcript.
+//! Claude Code adds block types within a major version (`fallback`, a
+//! model-switch marker, appeared in 2.1.x), and refusing a whole session over
+//! one of them loses everything the session recorded, which misrepresents far
+//! more than an omission would. Such a block is kept as a bracketed
+//! placeholder naming its type, never its content, and counted so the ingest
+//! report can say what was not recorded. `fallback` carries no conversation
+//! content and is skipped outright.
 //!
 //! Entry types that carry no conversation content (session bookkeeping such as
 //! `queue-operation` or `last-prompt`) are skipped by design: an unknown entry
@@ -149,6 +157,8 @@ pub struct UserMessage {
     pub tool_results: Vec<ToolResultBlock>,
     pub meta: bool,
     pub compact_summary: bool,
+    /// Block types kept in `texts` as placeholders, for reporting.
+    pub unrecorded: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +184,8 @@ pub enum AssistantBlock {
         name: String,
         input: Value,
     },
+    /// A block of a type this parser does not record: the type name only.
+    Unrecorded(String),
 }
 
 /// The complete lines of one read of the transcript from a cursor onward.
@@ -465,10 +477,8 @@ fn parse_user_content(
                     "image" => message.texts.push("[image]".to_owned()),
                     "document" => message.texts.push("[document]".to_owned()),
                     other => {
-                        return Err(malformed(
-                            offset,
-                            format!("unknown user content block type {other:?}"),
-                        ))
+                        message.texts.push(format!("[{other}]"));
+                        message.unrecorded.push(other.to_owned());
                     }
                 }
             }
@@ -535,6 +545,10 @@ fn parse_assistant_content(
                     )),
                     // Redacted reasoning carries no readable content by design.
                     "redacted_thinking" => {}
+                    // A mid-session model switch, recorded by Claude Code 2.1.x
+                    // as an entry of the same request whose only block names
+                    // the models involved: bookkeeping, not conversation.
+                    "fallback" => {}
                     "tool_use" | "server_tool_use" => {
                         let id = block
                             .get("id")
@@ -562,12 +576,9 @@ fn parse_assistant_content(
                     | "code_execution_tool_result" => {
                         blocks.push(AssistantBlock::Text(format!("[{block_type}]")))
                     }
-                    other => {
-                        return Err(malformed(
-                            offset,
-                            format!("unknown assistant content block type {other:?}"),
-                        ))
-                    }
+                    // Kept as a placeholder naming the type, never its content;
+                    // the planner reports it. See the module docs.
+                    other => blocks.push(AssistantBlock::Unrecorded(other.to_owned())),
                 }
             }
         }
@@ -630,6 +641,10 @@ pub struct PlannedInteraction {
     /// ingest step resolves and verifies each against the repository before
     /// linking, so a spurious token is harmless.
     pub commit_candidates: Vec<String>,
+    /// Content block types this parser does not record, in the order met
+    /// across the stimulus and the response; each is present in the captured
+    /// text as a bracketed placeholder naming the type.
+    pub unrecorded_blocks: Vec<String>,
     /// Byte offset of the response's first entry.
     pub first_offset: u64,
 }
@@ -788,8 +803,12 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
         }
         stimulus_positions.reverse();
         let mut stimuli = Vec::new();
+        // Block types this parser does not record are visible in the text as
+        // placeholders and reported by name, so an omission is never silent.
+        let mut unrecorded_blocks: Vec<String> = Vec::new();
         for position in stimulus_positions {
             if let Payload::User(message) = &entries[position].payload {
+                unrecorded_blocks.extend(message.unrecorded.iter().cloned());
                 for text in &message.texts {
                     if message.compact_summary {
                         stimuli.push(Stimulus::CompactSummary(text));
@@ -811,6 +830,19 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
         let parent_id =
             parent_group.map(|index| derived_interaction_id(input.session_id, &groups[index].key));
 
+        let placeholders: Vec<String> = group
+            .positions
+            .iter()
+            .flat_map(|position| match &entries[*position].payload {
+                Payload::Assistant(message) => message.blocks.as_slice(),
+                _ => &[],
+            })
+            .filter_map(|block| match block {
+                AssistantBlock::Unrecorded(kind) => Some(format!("[{kind}]")),
+                _ => None,
+            })
+            .collect();
+        let mut next_placeholder = placeholders.iter();
         let mut texts = Vec::new();
         let mut thoughts = Vec::new();
         let mut model_name = None;
@@ -824,6 +856,12 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
                         AssistantBlock::Text(text) => texts.push(text.as_str()),
                         AssistantBlock::Thinking(text) => thoughts.push(text.as_str()),
                         AssistantBlock::ToolUse { .. } => {}
+                        AssistantBlock::Unrecorded(kind) => {
+                            unrecorded_blocks.push(kind.clone());
+                            if let Some(placeholder) = next_placeholder.next() {
+                                texts.push(placeholder.as_str());
+                            }
+                        }
                     }
                 }
             }
@@ -891,6 +929,7 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
             tool_executions,
             context_items,
             commit_candidates,
+            unrecorded_blocks,
             first_offset: entries[first].offset,
         });
     }
@@ -1190,6 +1229,31 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.as_str().len(), 36);
+    }
+
+    #[test]
+    fn unknown_block_types_become_placeholders_and_fallback_is_skipped() {
+        let assistant = serde_json::json!([
+            {"type": "fallback", "from": {"model": "a"}, "to": {"model": "b"}},
+            {"type": "text", "text": "hello"},
+            {"type": "mystery", "payload": "never recorded"}
+        ]);
+        let blocks = parse_assistant_content(&assistant, 0).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], AssistantBlock::Text(text) if text == "hello"));
+        assert!(matches!(&blocks[1], AssistantBlock::Unrecorded(kind) if kind == "mystery"));
+
+        let user = serde_json::json!([
+            {"type": "text", "text": "hi"},
+            {"type": "mystery", "payload": "never recorded"}
+        ]);
+        let message = parse_user_content(&user, 0, false, false).unwrap();
+        assert_eq!(message.texts, vec!["hi".to_owned(), "[mystery]".to_owned()]);
+        assert_eq!(message.unrecorded, vec!["mystery".to_owned()]);
+
+        // A block without a type, or content of an unknown shape, still fails.
+        assert!(parse_assistant_content(&serde_json::json!([{"text": "x"}]), 0).is_err());
+        assert!(parse_user_content(&serde_json::json!(42), 0, false, false).is_err());
     }
 
     #[test]

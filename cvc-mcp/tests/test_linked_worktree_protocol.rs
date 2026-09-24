@@ -170,7 +170,13 @@ fn linked_worktree_binds_common_store_policy_and_rejects_other_repositories() {
     git(&other, &["init"]);
 
     let mut mcp = Mcp::start(&nested, &home);
-    assert!(mcp.request(1, "initialize", json!({}))["result"].is_object());
+    let initialized = mcp.request(1, "initialize", json!({}));
+    assert!(initialized["result"].is_object());
+    // Clients see the released version, not a placeholder.
+    assert_eq!(
+        initialized["result"]["serverInfo"]["version"],
+        json!(env!("CARGO_PKG_VERSION"))
+    );
     let setup = mcp.request(2, "tools/call", json!({"name":"setup_cvc", "arguments":{}}));
     assert!(setup["result"]["content"].is_array());
     let thought = mcp.request(
