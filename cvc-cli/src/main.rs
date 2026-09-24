@@ -172,7 +172,20 @@ fn main() -> std::process::ExitCode {
     let args: Vec<_> = std::env::args_os().collect();
     let advisory_hook = args.get(1).is_some_and(|arg| arg == "hook");
     let result = (|| -> Result<()> {
-        let cli = Cli::try_parse_from(&args)?;
+        let cli = match Cli::try_parse_from(&args) {
+            Ok(cli) => cli,
+            // `--help` and `--version` are successful output, not failures:
+            // clap prints them to stdout and exits 0.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+            {
+                error.exit()
+            }
+            Err(error) => return Err(error.into()),
+        };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
