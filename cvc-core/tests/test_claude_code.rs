@@ -240,10 +240,35 @@ fn parser_fails_loudly_on_unknown_shapes_and_other_sessions() {
     let fixture = Fixture::new();
     let content = fixture.render(BASIC);
 
+    // A block whose type alone is unfamiliar is kept as a placeholder naming
+    // the type, never its content, and reported; the transcript still parses.
+    let baseline = transcript::plan(
+        &parse(&content, BASIC_SESSION).unwrap().lines,
+        0,
+        &fixture.plan_input(true),
+    );
     let unknown_block = content.replace("\"type\":\"thinking\"", "\"type\":\"mystery\"");
-    match parse(&unknown_block, BASIC_SESSION) {
+    let window = parse(&unknown_block, BASIC_SESSION).unwrap();
+    let plan = transcript::plan(&window.lines, 0, &fixture.plan_input(true));
+    assert_eq!(plan.interactions.len(), baseline.interactions.len());
+    let first = &plan.interactions[0];
+    assert_eq!(first.unrecorded_blocks, vec!["mystery".to_owned()]);
+    let response = first.model_response.as_deref().unwrap_or_default();
+    assert!(response.contains("[mystery]"), "{response}");
+    assert!(
+        !response.contains("read lib.rs"),
+        "block content must not be recorded: {response}"
+    );
+    assert!(first.model_cot.is_none());
+    assert!(plan.interactions[1..]
+        .iter()
+        .all(|planned| planned.unrecorded_blocks.is_empty()));
+
+    // A block without a type is an unknown shape and still fails.
+    let untyped_block = content.replacen("\"type\":\"thinking\"", "\"kind\":\"thinking\"", 1);
+    match parse(&untyped_block, BASIC_SESSION) {
         Err(TranscriptError::Malformed { reason, .. }) => {
-            assert!(reason.contains("mystery"), "{reason}")
+            assert!(reason.contains("no type"), "{reason}")
         }
         other => panic!("expected malformed, got {other:?}"),
     }
@@ -436,13 +461,99 @@ fn ingest_is_incremental_idempotent_and_policy_filtered() {
 }
 
 #[test]
+fn fallback_marker_adds_nothing_to_its_response() {
+    let fixture = Fixture::new();
+    let content = fixture.render(BASIC);
+    let baseline = transcript::plan(
+        &parse(&content, BASIC_SESSION).unwrap().lines,
+        0,
+        &fixture.plan_input(true),
+    );
+    // Claude Code records a model switch as an assistant entry of the same
+    // request whose only block is a `fallback` marker.
+    let marker = fixture.render(&format!(
+        "{{\"parentUuid\":\"a1\",\"isSidechain\":false,\"message\":{{\"model\":\"claude-fixture-1\",\"id\":\"msg_A0\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"fallback\",\"from\":{{\"model\":\"claude-fixture-0\"}},\"to\":{{\"model\":\"claude-fixture-1\"}}}}],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}},\"requestId\":\"req_A\",\"type\":\"assistant\",\"uuid\":\"s0\",\"timestamp\":\"2026-09-10T10:00:00.900Z\",\"userType\":\"external\",\"entrypoint\":\"cli\",\"cwd\":\"__WORKTREE__\",\"sessionId\":\"{BASIC_SESSION}\",\"version\":\"2.1.260\",\"gitBranch\":\"main\"}}\n"
+    ));
+    let first_response = content.find("\"uuid\":\"s1\"").unwrap();
+    let line_start = content[..first_response]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let with_marker = format!(
+        "{}{}{}",
+        &content[..line_start],
+        marker,
+        &content[line_start..]
+    );
+
+    let window = parse(&with_marker, BASIC_SESSION).unwrap();
+    let plan = transcript::plan(&window.lines, 0, &fixture.plan_input(true));
+    assert_eq!(plan.interactions.len(), baseline.interactions.len());
+    let (marked, expected) = (&plan.interactions[0], &baseline.interactions[0]);
+    assert_eq!(marked.id, expected.id);
+    assert_eq!(marked.model_response, expected.model_response);
+    assert_eq!(marked.model_cot, expected.model_cot);
+    assert_eq!(marked.tool_executions.len(), expected.tool_executions.len());
+    assert_eq!(marked.model_name.as_deref(), Some("claude-fixture-1"));
+    assert!(marked.unrecorded_blocks.is_empty());
+}
+
+#[test]
+fn ingest_keeps_placeholders_and_reports_unrecorded_blocks() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let policy = fixture.policy();
+    let content = fixture
+        .render(BASIC)
+        .replace("\"type\":\"thinking\"", "\"type\":\"mystery\"");
+    let path = fixture.write_transcript(&format!("{BASIC_SESSION}.jsonl"), &content);
+    let report = ingest(
+        &fixture.layout,
+        &store,
+        &policy,
+        &path,
+        None,
+        IngestMode::Final,
+    )
+    .unwrap();
+    assert!(report.inserted > 0);
+    assert_eq!(report.unrecorded_blocks, 1);
+    assert_eq!(report.unrecorded_block_types, vec!["mystery".to_owned()]);
+
+    let conn = rusqlite::Connection::open(fixture.layout.db_path()).unwrap();
+    let response: String = conn
+        .query_row(
+            "SELECT model_response FROM interactions WHERE conversation_id = ?1 \
+             ORDER BY timestamp ASC LIMIT 1",
+            [BASIC_SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(response.contains("[mystery]"), "{response}");
+    assert!(!response.contains("read lib.rs"), "{response}");
+
+    // Thoughts already recorded are not reported again.
+    let again = ingest(
+        &fixture.layout,
+        &store,
+        &policy,
+        &path,
+        None,
+        IngestMode::Final,
+    )
+    .unwrap();
+    assert_eq!(again.inserted, 0);
+    assert_eq!(again.unrecorded_blocks, 0);
+    assert!(again.unrecorded_block_types.is_empty());
+}
+
+#[test]
 fn ingest_rejects_bad_transcripts_without_writing() {
     let fixture = Fixture::new();
     let store = fixture.store();
     let policy = fixture.policy();
     let broken = fixture
         .render(BASIC)
-        .replace("\"type\":\"thinking\"", "\"type\":\"mystery\"");
+        .replace("\"type\":\"thinking\"", "\"kind\":\"thinking\"");
     let path = fixture.write_transcript(&format!("{BASIC_SESSION}.jsonl"), &broken);
     let error = ingest(
         &fixture.layout,

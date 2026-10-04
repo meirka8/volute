@@ -81,6 +81,59 @@ async function showPrivacyNotice(): Promise<void> {
   // "Not now" intentionally leaves passive capture disabled without recording a choice.
 }
 
+/**
+ * Start the language client and the views that depend on it, unless one is
+ * already running. Called at activation and again from Check Setup, so a CLI
+ * installed after activation is picked up without a window reload.
+ */
+async function ensureLanguageClient(
+  context: vscode.ExtensionContext,
+  outputChannel: vscode.OutputChannel,
+): Promise<boolean> {
+  if (client) {
+    return true;
+  }
+  const workspaceRoot = boundWorkspaceRoot;
+  const token = bindingToken;
+  if (!workspaceRoot || !token?.isActive() || !vscode.workspace.isTrusted) {
+    return false;
+  }
+  const localClient = new VoluteLanguageClient(context, outputChannel, workspaceRoot);
+  client = localClient;
+  try {
+    await localClient.start(() => token.isActive() && vscode.workspace.isTrusted);
+    if (!token.isActive() || !vscode.workspace.isTrusted) {
+      await localClient.stop();
+      if (client === localClient) {client = undefined;}
+      return false;
+    }
+    outputChannel.appendLine("Volute Language Server started successfully");
+  } catch {
+    await localClient.stop();
+    if (client === localClient) {client = undefined;}
+    outputChannel.appendLine("Failed to start Volute Language Server");
+    vscode.window.showErrorMessage(
+      "Volute CVC: Failed to start language server. See the output channel for status.",
+    );
+    return false;
+  }
+
+  // The Cognitive Timeline tree view is only functional with the LSP.
+  timelineProvider = new TimelineTreeProvider(outputChannel, localClient);
+  const treeView = vscode.window.createTreeView("volute.timeline", {
+    treeDataProvider: timelineProvider,
+    showCollapseAll: true,
+  });
+  context.subscriptions.push(treeView);
+  context.subscriptions.push(
+    localClient.onTimelineRefresh(() => {
+      timelineProvider?.refresh();
+    }),
+  );
+  timelineProvider.refresh();
+  return true;
+}
+
 export async function activate(
   context: vscode.ExtensionContext,
 ): Promise<void> {
@@ -139,45 +192,10 @@ export async function activate(
 
   // ── Initialize and start the LSP client (only if LSP binary exists) ────
   if (status.cvcLsp.found && workspaceRoot && bindingToken.isActive()) {
-    const localClient = new VoluteLanguageClient(context, outputChannel, workspaceRoot);
-    client = localClient;
-
-    try {
-      await localClient.start(() => bindingToken?.isActive() === true && vscode.workspace.isTrusted);
-      if (!bindingToken.isActive() || !vscode.workspace.isTrusted) {
-        await localClient.stop();
-        if (client === localClient) {client = undefined;}
-        return;
-      }
-      outputChannel.appendLine("Volute Language Server started successfully");
-    } catch (error) {
-      await localClient.stop();
-      if (client === localClient) {client = undefined;}
-      outputChannel.appendLine("Failed to start Volute Language Server");
-      vscode.window.showErrorMessage(
-        "Volute CVC: Failed to start language server. See the output channel for status.",
-      );
+    await ensureLanguageClient(context, outputChannel);
+    if (!bindingToken.isActive() || !vscode.workspace.isTrusted) {
+      return;
     }
-  }
-
-  // Register the Cognitive Timeline tree view (only fully functional with LSP)
-  if (client) {
-    timelineProvider = new TimelineTreeProvider(outputChannel, client);
-    const treeView = vscode.window.createTreeView("volute.timeline", {
-      treeDataProvider: timelineProvider,
-      showCollapseAll: true,
-  });
-  context.subscriptions.push(treeView);
-
-    // Register for timeline refresh notifications from server
-    context.subscriptions.push(
-      client.onTimelineRefresh(() => {
-        timelineProvider?.refresh();
-      }),
-    );
-
-    // Initial timeline load
-    timelineProvider.refresh();
   }
 
   // Register commands
@@ -227,8 +245,9 @@ export async function activate(
       if (!repositoryActionsAvailable() || !boundWorkspaceRoot) {
         return;
       }
-      runCvcTask("Acknowledge Privacy", ["privacy", "acknowledge-capture"]);
-      vscode.window.showInformationMessage("Complete the terminal challenge, then run ‘CVC: Refresh Privacy Status’." );
+      if (runCvcTask("Acknowledge Privacy", ["privacy", "acknowledge-capture"])) {
+        vscode.window.showInformationMessage("Complete the terminal challenge, then run ‘Volute: Refresh Privacy Status’.");
+      }
     }),
 
     vscode.commands.registerCommand("volute.shareRemote", async () => {
@@ -262,6 +281,9 @@ export async function activate(
         outputChannel.appendLine("Volute Language Server restarted");
         // Refresh timeline after server restart
         timelineProvider?.refresh();
+      } else {
+        // No client yet (the server binary was missing at activation): try now.
+        await ensureLanguageClient(context, outputChannel);
       }
     }),
 
@@ -305,13 +327,23 @@ export async function activate(
       if (!bindingToken?.isActive()) { return; }
       const freshStatus = await detectDependencies(outputChannel, boundWorkspaceRoot.uri.fsPath, gitPath);
       if (!bindingToken?.isActive() || !vscode.workspace.isTrusted) { return; }
+      // A CLI installed after activation is picked up here, so the consent
+      // and share commands work without a window reload.
+      cvcBinary = freshStatus.cvcCli.path;
       await promptForMissingDependencies(context, freshStatus, outputChannel, boundWorkspaceRoot, () => bindingToken?.isActive() === true && vscode.workspace.isTrusted);
 
       if (freshStatus.cvcCli.found && freshStatus.cvcLsp.found) {
-        if (!bindingToken?.isActive() || !vscode.workspace.isTrusted) { return; }
+        const wasRunning = client !== undefined;
+        const running = await ensureLanguageClient(context, outputChannel);
+        if (!bindingToken?.isActive() || !vscode.workspace.isTrusted || !running) { return; }
         vscode.window.showInformationMessage(
           "Volute CVC: All required components are installed! ✓",
         );
+        if (!wasRunning) {
+          // The server just came up: continue with the privacy status and,
+          // if capture is not yet acknowledged, the acknowledgement notice.
+          await vscode.commands.executeCommand("volute.refreshPrivacyStatus");
+        }
       }
     }),
   );
@@ -324,15 +356,25 @@ export async function activate(
   context.subscriptions.push(outputChannel);
 }
 
-/** Quote user input for the integrated shell without changing its value. */
-function runCvcTask(name: string, args: string[]): void {
-  if (!repositoryActionsAvailable() || !boundWorkspaceRoot || !cvcBinary || !path.isAbsolute(cvcBinary)) {
-    return;
+/**
+ * Run the CLI as a VS Code task and report whether it was started. An
+ * unresolved CLI is told to the user instead of being a silent no-op.
+ */
+function runCvcTask(name: string, args: string[]): boolean {
+  if (!repositoryActionsAvailable() || !boundWorkspaceRoot) {
+    return false;
+  }
+  if (!cvcBinary || !path.isAbsolute(cvcBinary)) {
+    void vscode.window.showWarningMessage(
+      "Volute CVC: the cvc CLI could not be resolved. Install it or set volute.cvcCliPath, then run ‘Volute: Check Setup’.",
+    );
+    return false;
   }
   const token = bindingToken;
-  if (!token?.isActive()) {return;}
+  if (!token?.isActive()) {return false;}
   const task = new vscode.Task({ type: "cvc", task: name }, boundWorkspaceRoot, name, "CVC", new vscode.ProcessExecution(cvcBinary, args, { cwd: boundWorkspaceRoot.uri.fsPath }));
   void vscode.tasks.executeTask(task);
+  return true;
 }
 
 export async function deactivate(): Promise<void> {

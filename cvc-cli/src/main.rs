@@ -105,16 +105,6 @@ enum Commands {
     },
     /// View the interaction log
     Log,
-    /// Manage CVC components (lsp, mcp)
-    Component {
-        #[command(subcommand)]
-        command: ComponentCommands,
-    },
-    /// Manage authentication
-    Auth {
-        #[command(subcommand)]
-        command: AuthCommands,
-    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -172,7 +162,20 @@ fn main() -> std::process::ExitCode {
     let args: Vec<_> = std::env::args_os().collect();
     let advisory_hook = args.get(1).is_some_and(|arg| arg == "hook");
     let result = (|| -> Result<()> {
-        let cli = Cli::try_parse_from(&args)?;
+        let cli = match Cli::try_parse_from(&args) {
+            Ok(cli) => cli,
+            // `--help` and `--version` are successful output, not failures:
+            // clap prints them to stdout and exits 0.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+            {
+                error.exit()
+            }
+            Err(error) => return Err(error.into()),
+        };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -288,15 +291,6 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Commands::Log => {
             commands::log::run().await?;
         }
-        Commands::Component { command } => match command {
-            ComponentCommands::List => commands::component::list().await?,
-            ComponentCommands::Install { name } => commands::component::install(&name).await?,
-            ComponentCommands::Update { name } => commands::component::update(&name).await?,
-        },
-        Commands::Auth { command } => match command {
-            AuthCommands::Login => commands::auth::login().await?,
-            AuthCommands::Status => commands::auth::status().await?,
-        },
     }
 
     Ok(())
@@ -389,22 +383,12 @@ mod hook_cli_tests {
         .is_err());
         assert!(Cli::try_parse_from(["cvc", "harness", "install", "cursor"]).is_err());
     }
-}
 
-#[derive(Subcommand)]
-enum ComponentCommands {
-    /// List available components
-    List,
-    /// Install a component
-    Install { name: String },
-    /// Update a component
-    Update { name: String },
-}
-
-#[derive(Subcommand)]
-enum AuthCommands {
-    /// Log in to CVC Config
-    Login,
-    /// Check authentication status
-    Status,
+    #[test]
+    fn stubbed_subcommands_no_longer_exist() {
+        // `component` and `auth` only ever simulated success.
+        assert!(Cli::try_parse_from(["cvc", "component", "list"]).is_err());
+        assert!(Cli::try_parse_from(["cvc", "component", "install", "mcp"]).is_err());
+        assert!(Cli::try_parse_from(["cvc", "auth", "login"]).is_err());
+    }
 }
