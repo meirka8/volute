@@ -102,6 +102,7 @@ struct RawEntry {
     request_id: Option<String>,
     subtype: Option<String>,
     custom_title: Option<String>,
+    ai_title: Option<String>,
     summary: Option<String>,
     cwd: Option<String>,
     is_sidechain: Option<bool>,
@@ -116,10 +117,19 @@ struct RawEntry {
 pub enum ParsedLine {
     /// A chain entry (message or chain-only bookkeeping) with a uuid.
     Entry(Entry),
-    /// A session title update (`custom-title` or legacy `summary`).
-    Title(String),
+    /// A session title update: one the user set (`custom-title`) or one
+    /// Claude Code generated (`ai-title`, or the legacy `summary`).
+    Title { text: String, source: TitleSource },
     /// Bookkeeping with no conversation content, or a sidechain entry.
     Skipped,
+}
+
+/// Where a session title came from. A title the user set outranks a
+/// generated one wherever the two appear in a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleSource {
+    Custom,
+    Generated,
 }
 
 #[derive(Debug, Clone)]
@@ -288,19 +298,12 @@ pub fn parse_line(
     match kind {
         "user" | "assistant" => {}
         "custom-title" => {
-            return Ok(match raw.custom_title.as_deref().map(str::trim) {
-                Some(title) if !title.is_empty() && title != PLACEHOLDER_TITLE => {
-                    ParsedLine::Title(title.to_owned())
-                }
-                _ => ParsedLine::Skipped,
-            });
+            return Ok(title_line(raw.custom_title.as_deref(), TitleSource::Custom));
         }
-        "summary" => {
-            return Ok(match raw.summary.as_deref().map(str::trim) {
-                Some(title) if !title.is_empty() => ParsedLine::Title(title.to_owned()),
-                _ => ParsedLine::Skipped,
-            });
-        }
+        // Claude Code 2.1.289 records its generated title under its own entry
+        // type; earlier 2.1.x wrote it as `custom-title`.
+        "ai-title" => return Ok(title_line(raw.ai_title.as_deref(), TitleSource::Generated)),
+        "summary" => return Ok(title_line(raw.summary.as_deref(), TitleSource::Generated)),
         _ => {
             // Chain-only entries are tracked when they can be chained; any
             // other entry type is tolerated only if it carries no message.
@@ -431,6 +434,18 @@ fn check_version(version: Option<&str>, offset: u64) -> Result<(), TranscriptErr
         });
     }
     Ok(())
+}
+
+/// A title entry's payload as a parsed line; empty or placeholder titles are
+/// bookkeeping and skipped.
+fn title_line(raw: Option<&str>, source: TitleSource) -> ParsedLine {
+    match raw.map(str::trim) {
+        Some(title) if !title.is_empty() && title != PLACEHOLDER_TITLE => ParsedLine::Title {
+            text: title.to_owned(),
+            source,
+        },
+        _ => ParsedLine::Skipped,
+    }
 }
 
 fn parse_user_content(
@@ -683,10 +698,17 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
             _ => None,
         })
         .collect();
-    let title = lines.iter().rev().find_map(|line| match line {
-        ParsedLine::Title(title) => Some(bounded_text(title, MAX_TITLE_BYTES)),
-        _ => None,
-    });
+    // The latest title of the highest-ranking source in the window: a title
+    // the user set wins over one Claude Code generated.
+    let latest_title = |wanted: TitleSource| {
+        lines.iter().rev().find_map(|line| match line {
+            ParsedLine::Title { text, source } if *source == wanted => {
+                Some(bounded_text(text, MAX_TITLE_BYTES))
+            }
+            _ => None,
+        })
+    };
+    let title = latest_title(TitleSource::Custom).or_else(|| latest_title(TitleSource::Generated));
     let mut by_uuid: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
     for (position, entry) in entries.iter().enumerate() {
         by_uuid.entry(entry.uuid.as_str()).or_insert(position);
