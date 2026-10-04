@@ -297,7 +297,7 @@ fn hook_mode_is_quiet_incremental_and_never_blocking() {
     // response, which is where the stored cursor resumes.
     fixture.write_transcript(&full.replace(
         "\"type\":\"text\",\"text\":\"All set.\"",
-        "\"type\":\"mystery\",\"text\":\"All set.\"",
+        "\"kind\":\"text\",\"text\":\"All set.\"",
     ));
     let output = fixture.cvc_with_stdin(
         &["ingest", "claude-code", "--hook"],
@@ -305,7 +305,7 @@ fn hook_mode_is_quiet_incremental_and_never_blocking() {
     );
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("mystery"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no type"));
     assert_eq!(fixture.interaction_count(), 7);
 
     // Garbage on stdin is also a plain failure.

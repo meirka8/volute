@@ -40,6 +40,14 @@ pub async fn install_claude_code(binary: Option<PathBuf>) -> Result<()> {
         ExcludeAction::AlreadyIgnored => {}
     }
     println!("This install is per checkout: run it again in each linked worktree you use.");
+    if matches!(
+        outcome.action,
+        InstallAction::Created | InstallAction::Updated
+    ) {
+        println!(
+            "Claude Code applies these hooks to new sessions: restart Claude Code or start a new session, then run `cvc conversations` to see what was captured."
+        );
+    }
     Ok(())
 }
 
