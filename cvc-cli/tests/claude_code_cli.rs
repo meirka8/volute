@@ -313,3 +313,30 @@ fn hook_mode_is_quiet_incremental_and_never_blocking() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
 }
+
+/// Public issue 102: the post-commit hook names the commit it ran for, so an
+/// agent's quiet commit still leaves exact evidence in its tool output. With
+/// nothing linked and no harness installed it stays silent, as before.
+#[test]
+fn post_commit_hook_names_the_commit_when_the_harness_is_installed() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    let silent = fixture.cvc_ok(&["hook", "post-commit"]);
+    assert!(silent.is_empty(), "{silent}");
+
+    fixture.acknowledge_capture();
+    fixture.cvc_ok(&["harness", "install", "claude-code"]);
+    let named = fixture.cvc_ok(&["hook", "post-commit"]);
+    let head = git2::Repository::open(&fixture.repo)
+        .unwrap()
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    assert_eq!(
+        named.trim(),
+        format!("CVC: Linked 0 thought(s) to commit {}.", &head[..12])
+    );
+}

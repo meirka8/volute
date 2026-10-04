@@ -99,11 +99,10 @@ fn at(secs: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-/// A response that thinks, then a response that commits, referencing the real
-/// SHA in the commit tool result. Responses are stamped just before the commit
-/// time, and the closing response just after it.
-fn transcript(root: &str, sha: &str, commit_time: i64) -> String {
-    let short = &sha[..7];
+/// A response that thinks, then a response that runs `command`, whose tool
+/// result is `result`. Responses are stamped just before the commit time, and
+/// the closing response just after it.
+fn transcript_with(root: &str, commit_time: i64, command: &str, result: &str) -> String {
     let w = root;
     let (t_prompt, t_a, t_b, t_result, t_c) = (
         at(commit_time - 4),
@@ -112,20 +111,34 @@ fn transcript(root: &str, sha: &str, commit_time: i64) -> String {
         at(commit_time - 1),
         at(commit_time + 1),
     );
+    // JSON string literals, quotes included, so heredocs and newlines survive.
+    let command = serde_json::to_string(command).unwrap();
+    let result = serde_json::to_string(result).unwrap();
     [
         // parent-less human prompt
         format!(r#"{{"parentUuid":null,"isSidechain":false,"type":"user","message":{{"role":"user","content":"Add a feature and commit it"}},"uuid":"u1","timestamp":"{t_prompt}","sessionId":"{SESSION}","version":"2.1.260","cwd":"{w}"}}"#),
         // response A: reasoning only (the kind the linker would strand — no context, precedes the commit)
         format!(r#"{{"parentUuid":"u1","isSidechain":false,"requestId":"req_A","type":"assistant","message":{{"model":"m","id":"a","type":"message","role":"assistant","content":[{{"type":"thinking","thinking":"I will design the feature first.","signature":"s"}}],"stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":1,"output_tokens":1}}}},"uuid":"s1","timestamp":"{t_a}","sessionId":"{SESSION}","version":"2.1.260","cwd":"{w}"}}"#),
-        // response B: runs git commit
-        format!(r#"{{"parentUuid":"s1","isSidechain":false,"requestId":"req_B","type":"assistant","message":{{"model":"m","id":"b","type":"message","role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"git commit -am feature"}}}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{{"input_tokens":1,"output_tokens":1}}}},"uuid":"s2","timestamp":"{t_b}","sessionId":"{SESSION}","version":"2.1.260","cwd":"{w}"}}"#),
-        // tool result carrying the real short SHA
-        format!(r#"{{"parentUuid":"s2","isSidechain":false,"type":"user","message":{{"role":"user","content":[{{"tool_use_id":"t1","type":"tool_result","content":"[main {short}] feature\n 1 file changed","is_error":false}}]}},"uuid":"u2","timestamp":"{t_result}","sessionId":"{SESSION}","version":"2.1.260","cwd":"{w}"}}"#),
+        // response B: runs the committing command
+        format!(r#"{{"parentUuid":"s1","isSidechain":false,"requestId":"req_B","type":"assistant","message":{{"model":"m","id":"b","type":"message","role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":{command}}}}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{{"input_tokens":1,"output_tokens":1}}}},"uuid":"s2","timestamp":"{t_b}","sessionId":"{SESSION}","version":"2.1.260","cwd":"{w}"}}"#),
+        // the command's recorded output
+        format!(r#"{{"parentUuid":"s2","isSidechain":false,"type":"user","message":{{"role":"user","content":[{{"tool_use_id":"t1","type":"tool_result","content":{result},"is_error":false}}]}},"uuid":"u2","timestamp":"{t_result}","sessionId":"{SESSION}","version":"2.1.260","cwd":"{w}"}}"#),
         // response C: closes the session
         format!(r#"{{"parentUuid":"u2","isSidechain":false,"requestId":"req_C","type":"assistant","message":{{"model":"m","id":"c","type":"message","role":"assistant","content":[{{"type":"text","text":"Committed."}}],"stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":1,"output_tokens":1}}}},"uuid":"s3","timestamp":"{t_c}","sessionId":"{SESSION}","version":"2.1.260","cwd":"{w}"}}"#),
     ]
     .join("\n")
         + "\n"
+}
+
+/// The common case: `git commit` prints its `[branch short-sha]` summary.
+fn transcript(root: &str, sha: &str, commit_time: i64) -> String {
+    let short = &sha[..7];
+    transcript_with(
+        root,
+        commit_time,
+        "git commit -am feature",
+        &format!("[main {short}] feature\n 1 file changed"),
+    )
 }
 
 fn links_to(store: &CvcStore, response_key: &str, sha: &str) -> bool {
@@ -189,6 +202,53 @@ fn an_unresolvable_or_stale_hash_creates_no_link() {
     assert_eq!(report.linked_from_commits, 0, "{report:?}");
     let committing = cvc_core::claude_code::transcript::derived_interaction_id(SESSION, "req_B");
     assert!(store.get_artifact_links(&committing).unwrap().is_empty());
+}
+
+/// Public issue 102: `git commit -q` prints no summary line. The hash still
+/// reaches the recorded output at the start of a `git log --oneline` line,
+/// and an older entry that does not resolve is ignored (a real older commit
+/// is rejected by the time check the same way).
+#[test]
+fn quiet_commit_links_from_a_log_line_and_ignores_unresolvable_hashes() {
+    let fixture = Fixture::new();
+    let (sha, commit_time) = fixture.commit("q.rs", "fn q() {}\n", "quiet");
+    let short = &sha[..7];
+    let path = fixture.write_transcript(&transcript_with(
+        fixture.root.to_str().unwrap(),
+        commit_time,
+        "git add -A && git commit -q -F - <<'EOF'\nquiet\nEOF\ngit log --oneline -2",
+        &format!("{short} quiet\n0123456 older work"),
+    ));
+    let store = fixture.store();
+    let report = fixture.ingest(&path, &store);
+    assert_eq!(report.inserted, 3, "{report:?}");
+    assert!(report.linked_from_commits >= 2, "{report:?}");
+    assert!(
+        links_to(&store, "req_B", &sha),
+        "committing response linked"
+    );
+    assert!(links_to(&store, "req_A", &sha), "prior reasoning linked");
+    let closing = cvc_core::claude_code::transcript::derived_interaction_id(SESSION, "req_C");
+    assert!(store.get_artifact_links(&closing).unwrap().is_empty());
+}
+
+/// Public issue 102: with nothing else in the output, the line CVC's own
+/// post-commit hook printed into it is enough.
+#[test]
+fn quiet_commit_links_from_the_hook_line_alone() {
+    let fixture = Fixture::new();
+    let (sha, commit_time) = fixture.commit("h.rs", "fn h() {}\n", "hooked");
+    let path = fixture.write_transcript(&transcript_with(
+        fixture.root.to_str().unwrap(),
+        commit_time,
+        "git commit -q -m hooked",
+        &format!("CVC: Linked 1 thought(s) to commit {}.", &sha[..12]),
+    ));
+    let store = fixture.store();
+    let report = fixture.ingest(&path, &store);
+    assert!(report.linked_from_commits >= 2, "{report:?}");
+    assert!(links_to(&store, "req_B", &sha));
+    assert!(links_to(&store, "req_A", &sha));
 }
 
 #[test]
