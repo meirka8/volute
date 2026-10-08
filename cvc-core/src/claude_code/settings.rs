@@ -233,6 +233,35 @@ pub fn uninstall(layout: &RepositoryLayout) -> Result<UninstallOutcome> {
     })
 }
 
+/// Whether this checkout's settings file carries CVC's hook entries, which is
+/// to say whether Claude Code sessions here are being ingested. Read-only; a
+/// missing, unreadable, or refused settings file reads as not installed.
+pub fn installed(layout: &RepositoryLayout) -> bool {
+    let Ok(settings_path) = settings_path(layout) else {
+        return false;
+    };
+    let Ok(settings) = read_settings(&settings_path) else {
+        return false;
+    };
+    settings
+        .get("hooks")
+        .and_then(Value::as_object)
+        .is_some_and(|hooks| {
+            hooks
+                .values()
+                .filter_map(Value::as_array)
+                .flatten()
+                .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|command| command.contains(HOOK_SIGNATURE))
+                })
+        })
+}
+
 fn read_settings(path: &Path) -> Result<Map<String, Value>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,

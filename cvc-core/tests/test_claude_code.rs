@@ -20,6 +20,8 @@ use tempfile::TempDir;
 
 const BASIC: &str = include_str!("fixtures/claude-code/v2.1.260/basic.jsonl");
 const MINIMAL_219: &str = include_str!("fixtures/claude-code/v2.1.219/minimal.jsonl");
+const TITLED_289: &str = include_str!("fixtures/claude-code/v2.1.289/titled.jsonl");
+const TITLED_289_SESSION: &str = "9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43";
 const BASIC_SESSION: &str = "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60";
 
 struct Fixture {
@@ -324,6 +326,51 @@ fn earlier_minor_version_fixture_parses() {
     assert_eq!(plan.interactions[0].author, Author::Human);
     assert_eq!(plan.interactions[0].user_prompt, "Say hello");
     assert_eq!(plan.title.as_deref(), Some("Hello exchange"));
+}
+
+/// Public issue 101: Claude Code 2.1.289 records its generated session title
+/// as an `ai-title` entry (and adds `permission-mode` bookkeeping). The
+/// generated title names the conversation, and a title the user set outranks
+/// it wherever the two appear.
+#[test]
+fn generated_titles_and_bookkeeping_entries_of_2_1_289_are_understood() {
+    let fixture = Fixture::new();
+    let content = fixture.render(TITLED_289);
+    let window = parse(&content, TITLED_289_SESSION).unwrap();
+    let plan = transcript::plan(&window.lines, 0, &fixture.plan_input(true));
+    assert_eq!(plan.title.as_deref(), Some("Roadmap bug sweep"));
+    assert_eq!(plan.pending_responses, 0);
+    assert_eq!(plan.interactions.len(), 2);
+    // The quiet commit's hash is found in the hook's line and at the start of
+    // the `git log --oneline` lines (public issue 102).
+    assert_eq!(
+        plan.interactions[0].commit_candidates,
+        vec![
+            "0123456789ab".to_string(),
+            "0123456".to_string(),
+            "fedcba9".to_string()
+        ]
+    );
+
+    let custom = format!(
+        "{{\"type\":\"custom-title\",\"customTitle\":\"My own name\",\"sessionId\":\"{TITLED_289_SESSION}\"}}\n"
+    );
+    // Set after the generated title...
+    let renamed_later = format!("{content}{custom}");
+    let plan = transcript::plan(
+        &parse(&renamed_later, TITLED_289_SESSION).unwrap().lines,
+        0,
+        &fixture.plan_input(true),
+    );
+    assert_eq!(plan.title.as_deref(), Some("My own name"));
+    // ...or before it, with generated titles still arriving afterwards.
+    let renamed_first = format!("{custom}{content}");
+    let plan = transcript::plan(
+        &parse(&renamed_first, TITLED_289_SESSION).unwrap().lines,
+        0,
+        &fixture.plan_input(true),
+    );
+    assert_eq!(plan.title.as_deref(), Some("My own name"));
 }
 
 #[test]

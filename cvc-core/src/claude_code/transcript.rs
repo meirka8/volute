@@ -102,6 +102,7 @@ struct RawEntry {
     request_id: Option<String>,
     subtype: Option<String>,
     custom_title: Option<String>,
+    ai_title: Option<String>,
     summary: Option<String>,
     cwd: Option<String>,
     is_sidechain: Option<bool>,
@@ -116,10 +117,19 @@ struct RawEntry {
 pub enum ParsedLine {
     /// A chain entry (message or chain-only bookkeeping) with a uuid.
     Entry(Entry),
-    /// A session title update (`custom-title` or legacy `summary`).
-    Title(String),
+    /// A session title update: one the user set (`custom-title`) or one
+    /// Claude Code generated (`ai-title`, or the legacy `summary`).
+    Title { text: String, source: TitleSource },
     /// Bookkeeping with no conversation content, or a sidechain entry.
     Skipped,
+}
+
+/// Where a session title came from. A title the user set outranks a
+/// generated one wherever the two appear in a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleSource {
+    Custom,
+    Generated,
 }
 
 #[derive(Debug, Clone)]
@@ -288,19 +298,12 @@ pub fn parse_line(
     match kind {
         "user" | "assistant" => {}
         "custom-title" => {
-            return Ok(match raw.custom_title.as_deref().map(str::trim) {
-                Some(title) if !title.is_empty() && title != PLACEHOLDER_TITLE => {
-                    ParsedLine::Title(title.to_owned())
-                }
-                _ => ParsedLine::Skipped,
-            });
+            return Ok(title_line(raw.custom_title.as_deref(), TitleSource::Custom));
         }
-        "summary" => {
-            return Ok(match raw.summary.as_deref().map(str::trim) {
-                Some(title) if !title.is_empty() => ParsedLine::Title(title.to_owned()),
-                _ => ParsedLine::Skipped,
-            });
-        }
+        // Claude Code 2.1.289 records its generated title under its own entry
+        // type; earlier 2.1.x wrote it as `custom-title`.
+        "ai-title" => return Ok(title_line(raw.ai_title.as_deref(), TitleSource::Generated)),
+        "summary" => return Ok(title_line(raw.summary.as_deref(), TitleSource::Generated)),
         _ => {
             // Chain-only entries are tracked when they can be chained; any
             // other entry type is tolerated only if it carries no message.
@@ -431,6 +434,18 @@ fn check_version(version: Option<&str>, offset: u64) -> Result<(), TranscriptErr
         });
     }
     Ok(())
+}
+
+/// A title entry's payload as a parsed line; empty or placeholder titles are
+/// bookkeeping and skipped.
+fn title_line(raw: Option<&str>, source: TitleSource) -> ParsedLine {
+    match raw.map(str::trim) {
+        Some(title) if !title.is_empty() && title != PLACEHOLDER_TITLE => ParsedLine::Title {
+            text: title.to_owned(),
+            source,
+        },
+        _ => ParsedLine::Skipped,
+    }
 }
 
 fn parse_user_content(
@@ -683,10 +698,17 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
             _ => None,
         })
         .collect();
-    let title = lines.iter().rev().find_map(|line| match line {
-        ParsedLine::Title(title) => Some(bounded_text(title, MAX_TITLE_BYTES)),
-        _ => None,
-    });
+    // The latest title of the highest-ranking source in the window: a title
+    // the user set wins over one Claude Code generated.
+    let latest_title = |wanted: TitleSource| {
+        lines.iter().rev().find_map(|line| match line {
+            ParsedLine::Title { text, source } if *source == wanted => {
+                Some(bounded_text(text, MAX_TITLE_BYTES))
+            }
+            _ => None,
+        })
+    };
+    let title = latest_title(TitleSource::Custom).or_else(|| latest_title(TitleSource::Generated));
     let mut by_uuid: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
     for (position, entry) in entries.iter().enumerate() {
         by_uuid.entry(entry.uuid.as_str()).or_insert(position);
@@ -936,11 +958,20 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
     plan
 }
 
-/// Commit references a successful Git tool call reported. Only commit-creating
-/// subcommands are considered, and only their own output is scanned, so an
-/// unrelated hash mentioned in a diff or log is not mistaken for a new commit;
-/// the ingest step still resolves and time-checks every candidate against the
-/// repository, so a false positive here cannot create a link.
+/// Commit hashes named by a committing Bash command's recorded output, in
+/// order of appearance. Four exact shapes are recognised:
+///
+/// * git's own summary line, `[<branch> <short-sha>] <subject>`;
+/// * the line CVC's post-commit hook prints into that same output,
+///   `CVC: Linked <n> thought(s) to commit <sha>.`, which is how a quiet
+///   `git commit -q` still names its commit;
+/// * a hash at the start of a line, as `git log --oneline`,
+///   `git show --oneline` and `git rev-parse --short HEAD` print;
+/// * a bare full-length hash anywhere, as `git rev-parse HEAD` prints.
+///
+/// Every candidate is verified against the repository before a link is made
+/// (it must resolve to a commit whose time is consistent with the response),
+/// so a token that merely looks like a hash is harmless.
 fn commit_candidates_from_tool(tool_name: &str, input: &Value, result: &str) -> Vec<String> {
     if tool_name != "Bash" {
         return Vec::new();
@@ -951,33 +982,40 @@ fn commit_candidates_from_tool(tool_name: &str, input: &Value, result: &str) -> 
     if !creates_commit(command) {
         return Vec::new();
     }
-    let mut candidates = Vec::new();
-    // `git commit`/`git merge` print `[<branch> <short-sha>] <subject>`; the
-    // bracketed short SHA is the reliable signal.
-    let bytes = result.as_bytes();
-    let mut index = 0;
-    while let Some(open) = result[index..].find('[') {
-        let start = index + open + 1;
-        if let Some(close_rel) = result[start..].find(']') {
-            let inside = &result[start..start + close_rel];
-            if let Some((_, token)) = inside.rsplit_once(' ') {
-                if is_hex_token(token) {
-                    candidates.push(token.to_ascii_lowercase());
-                }
-            }
-            index = start + close_rel + 1;
-        } else {
-            break;
-        }
-    }
-    // Also accept a bare full-length SHA line, as `git rev-parse HEAD` prints.
-    let _ = bytes;
-    for token in result.split(|c: char| !c.is_ascii_hexdigit()) {
-        if token.len() == 40 && is_hex_token(token) {
+    fn push(candidates: &mut Vec<String>, token: &str) {
+        if is_hex_token(token) {
             let lowered = token.to_ascii_lowercase();
             if !candidates.contains(&lowered) {
                 candidates.push(lowered);
             }
+        }
+    }
+    let mut candidates = Vec::new();
+    for line in result.lines() {
+        let line = line.trim();
+        // `[<branch> <short-sha>] <subject>`, possibly after other text.
+        for (open, _) in line.match_indices('[') {
+            if let Some(inside) = line[open + 1..].split(']').next() {
+                if let Some((_, token)) = inside.rsplit_once(' ') {
+                    push(&mut candidates, token);
+                }
+            }
+        }
+        // `CVC: Linked <n> thought(s) to commit <sha>.`
+        if line.starts_with("CVC:") {
+            if let Some((_, tail)) = line.rsplit_once(" to commit ") {
+                push(&mut candidates, tail.trim_end_matches('.').trim());
+            }
+        }
+        // `<sha> <subject>` or a lone `<sha>` at the start of a line.
+        if let Some(first) = line.split_whitespace().next() {
+            push(&mut candidates, first);
+        }
+    }
+    // A full-length hash anywhere, as `git rev-parse HEAD` prints.
+    for token in result.split(|c: char| !c.is_ascii_hexdigit()) {
+        if token.len() == 40 {
+            push(&mut candidates, token);
         }
     }
     candidates
@@ -1279,13 +1317,47 @@ mod tests {
         assert!(commit_candidates_from_tool("Bash", &log, "1a2b3c4 old\n5d6e7f8 older").is_empty());
         // A non-Bash tool contributes nothing.
         assert!(commit_candidates_from_tool("Read", &commit, "[main 1a2b3c4] work").is_empty());
-        // No spurious short token from ordinary prose.
+        // No spurious short token from ordinary prose or status output.
         assert!(commit_candidates_from_tool(
             "Bash",
             &commit,
-            "nothing bracketed or hex-shaped here"
+            "nothing bracketed or hex-shaped here\n M fs.go\n?? deadbeef.txt"
         )
         .is_empty());
+
+        // A quiet commit prints no summary line; the hash still reaches the
+        // output through the agent's own `git log --oneline`, at the start of
+        // a line, and through the line CVC's post-commit hook prints. Older
+        // log entries are candidates too: verification rejects them by time.
+        let quiet = serde_json::json!({
+            "command": "git add -A && git commit -q -F - <<'EOF'\nfeature\nEOF\ngit log --oneline -3"
+        });
+        assert_eq!(
+            commit_candidates_from_tool(
+                "Bash",
+                &quiet,
+                "CVC: Linked 14 thought(s) to this commit.\n2a1fa36 Add roadmap\na3d57a5 Make copy safe\na7a6249 Merge pull request #36"
+            ),
+            vec![
+                "2a1fa36".to_string(),
+                "a3d57a5".to_string(),
+                "a7a6249".to_string()
+            ]
+        );
+        let hook_only = serde_json::json!({"command": "git commit -q -m feature"});
+        assert_eq!(
+            commit_candidates_from_tool(
+                "Bash",
+                &hook_only,
+                "CVC: Linked 0 thought(s) to commit 2a1fa36b8c0d."
+            ),
+            vec!["2a1fa36b8c0d".to_string()]
+        );
+        // A short hash alone on a line, as `git rev-parse --short HEAD` prints.
+        assert_eq!(
+            commit_candidates_from_tool("Bash", &hook_only, "2a1fa36\n"),
+            vec!["2a1fa36".to_string()]
+        );
     }
 
     #[test]
