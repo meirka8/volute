@@ -68,6 +68,12 @@ pub struct IngestReport {
     pub subagent_sessions: usize,
     pub subagent_inserted: usize,
     pub subagent_linked: usize,
+    /// Content blocks of a type this version does not record, in the
+    /// responses this run newly saw. Each stays in the captured text as a
+    /// bracketed placeholder naming the type, never its content.
+    pub unrecorded_blocks: usize,
+    /// The distinct block types behind `unrecorded_blocks`, sorted.
+    pub unrecorded_block_types: Vec<String>,
 }
 
 /// One transcript file to ingest: the file, the session id every entry must
@@ -148,6 +154,13 @@ pub fn ingest(
         report.subagent_sessions += 1;
         report.subagent_inserted += target_report.inserted;
         report.subagent_linked += target_report.linked_from_commits;
+        report.unrecorded_blocks += target_report.unrecorded_blocks;
+        for kind in target_report.unrecorded_block_types {
+            if !report.unrecorded_block_types.contains(&kind) {
+                report.unrecorded_block_types.push(kind);
+            }
+        }
+        report.unrecorded_block_types.sort();
     }
 
     Ok(report)
@@ -235,6 +248,8 @@ fn ingest_target(
     let mut captures = Vec::new();
     let mut batch_ids: HashSet<InteractionId> = HashSet::new();
     let mut already_present = 0usize;
+    let mut unrecorded_blocks = 0usize;
+    let mut unrecorded_block_types: BTreeSet<String> = BTreeSet::new();
     let mut commit_bearing: Vec<links::CommitBearingResponse> = Vec::new();
     for planned in plan.interactions {
         if !planned.commit_candidates.is_empty() {
@@ -248,6 +263,8 @@ fn ingest_target(
             already_present += 1;
             continue;
         }
+        unrecorded_blocks += planned.unrecorded_blocks.len();
+        unrecorded_block_types.extend(planned.unrecorded_blocks.iter().cloned());
         // A parent outside this batch and outside the store (suppressed, or
         // never recorded) breaks the chain rather than failing the batch.
         let parent_id = match planned.parent_id {
@@ -317,6 +334,8 @@ fn ingest_target(
         subagent_sessions: 0,
         subagent_inserted: 0,
         subagent_linked: 0,
+        unrecorded_blocks,
+        unrecorded_block_types: unrecorded_block_types.into_iter().collect(),
     })
 }
 

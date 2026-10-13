@@ -138,8 +138,8 @@ fn a_session_without_subagents_reports_none() {
 #[test]
 fn a_malformed_subagent_fails_loudly_after_the_main_session_persists() {
     let fixture = Fixture::new();
-    // Main is fine; the subagent names an unknown content block type.
-    let broken = subagent_transcript().replace("\"type\":\"thinking\"", "\"type\":\"mystery\"");
+    // Main is fine; the subagent has a content block without a type.
+    let broken = subagent_transcript().replace("\"type\":\"thinking\"", "\"kind\":\"thinking\"");
     let path = fixture.lay_out(&main_transcript(), Some((&broken, META)));
 
     let error = ingest(

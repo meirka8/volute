@@ -216,8 +216,17 @@ fn run_post_commit_logic(current_dir: &std::path::Path) -> Result<()> {
 
     let count = linker::link_current_commit_to_floating_nodes(repo, &store)?;
 
-    if count > 0 {
-        println!("CVC: Linked {} thought(s) to this commit.", count);
+    // Name the commit, so the line this hook leaves in an agent's tool output
+    // is exact evidence even when the agent committed quietly (`-q` prints no
+    // summary): Claude Code transcript ingestion links the committing response
+    // from it. Printed whenever something was linked, and on every commit in a
+    // checkout whose Claude Code harness is installed, where that evidence is
+    // needed.
+    if count > 0 || cvc_core::claude_code::settings::installed(&layout) {
+        match head_short_sha(repo) {
+            Some(short) => println!("CVC: Linked {count} thought(s) to commit {short}."),
+            None => println!("CVC: Linked {count} thought(s) to this commit."),
+        }
     }
     let exact =
         cvc_core::squash::scan_for(repo, &mut store, true, std::time::Duration::from_secs(5))?;
@@ -226,6 +235,13 @@ fn run_post_commit_logic(current_dir: &std::path::Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The first twelve hex digits of HEAD's commit id: unambiguous in practice,
+/// and within the 7 to 40 characters transcript ingestion accepts.
+fn head_short_sha(repo: &Repository) -> Option<String> {
+    let id = repo.head().ok()?.peel_to_commit().ok()?.id().to_string();
+    Some(id[..12].to_owned())
 }
 
 #[cfg(test)]

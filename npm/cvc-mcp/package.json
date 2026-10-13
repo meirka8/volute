@@ -9,6 +9,7 @@
   "files": [
     "bin/*.js",
     "scripts/stage-third-party-notices.mjs",
+    "README.md",
     "THIRD-PARTY-NOTICES.md"
   ],
   "scripts": {

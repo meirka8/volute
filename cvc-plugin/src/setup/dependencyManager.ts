@@ -160,7 +160,7 @@ export async function promptForMissingDependencies(
     promptInstall(
       context,
       DISMISS_KEY_CLI,
-      "CVC CLI is not installed. It is required for CVC to function (init, log, push/pull).",
+      "CVC CLI is not installed. It is required for CVC to function (init, log, push/pull). After installing, run ‘Volute: Check Setup’.",
       "Install CVC CLI", isActive,
     );
   }
@@ -174,7 +174,7 @@ export async function promptForMissingDependencies(
     promptInstall(
       context,
       DISMISS_KEY_LSP,
-      "CVC Language Server (cvc-lsp) was not found. The extension needs it to function.",
+      "CVC Language Server (cvc-lsp) was not found. The extension needs it to function. After installing, run ‘Volute: Check Setup’.",
       "Install CVC", isActive,
     );
   }

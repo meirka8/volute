@@ -60,6 +60,13 @@ pub async fn claude_code(
             report.subagent_sessions, report.subagent_inserted, report.subagent_linked
         );
     }
+    if report.unrecorded_blocks > 0 {
+        println!(
+            "  {} content block(s) of a type this version does not record were kept as placeholders: {}",
+            report.unrecorded_blocks,
+            report.unrecorded_block_types.join(", ")
+        );
+    }
     Ok(())
 }
 
