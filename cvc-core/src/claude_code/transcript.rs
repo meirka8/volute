@@ -24,8 +24,11 @@
 //! content and is skipped outright.
 //!
 //! Entry types that carry no conversation content (session bookkeeping such as
-//! `queue-operation` or `last-prompt`) are skipped by design: an unknown entry
-//! type is tolerated only when it has no `message`.
+//! `queue-operation` or `last-prompt`) are skipped by design. The conversation
+//! is the `uuid`/`parentUuid` chain, so an entry without a `uuid` is
+//! bookkeeping whatever else it carries (2.1.300 caches request messages as
+//! chain-less `api-request-blob` entries with a `message`); a chained entry of
+//! an unknown type is tolerated only when it has no `message`.
 //!
 //! # Unit of capture
 //!
@@ -305,17 +308,22 @@ pub fn parse_line(
         "ai-title" => return Ok(title_line(raw.ai_title.as_deref(), TitleSource::Generated)),
         "summary" => return Ok(title_line(raw.summary.as_deref(), TitleSource::Generated)),
         _ => {
-            // Chain-only entries are tracked when they can be chained; any
-            // other entry type is tolerated only if it carries no message.
+            // The conversation is the uuid/parentUuid chain. An entry without
+            // a uuid can neither be referenced by nor reference anything in
+            // it, so it is bookkeeping whatever else it carries: Claude Code
+            // 2.1.300 caches request messages as chain-less `api-request-blob`
+            // entries that have a `message`. A chained entry of an unknown
+            // type is tolerated only if it carries no message, because
+            // silently dropping one could misrepresent the session.
+            let Some(uuid) = raw.uuid.clone() else {
+                return Ok(ParsedLine::Skipped);
+            };
             if raw.message.is_some() && kind != "system" && kind != "attachment" {
                 return Err(malformed(
                     offset,
                     format!("unknown entry type {kind:?} carries a message"),
                 ));
             }
-            let Some(uuid) = raw.uuid.clone() else {
-                return Ok(ParsedLine::Skipped);
-            };
             let other = match (kind, raw.subtype.as_deref()) {
                 ("system", Some("compact_boundary")) => OtherKind::CompactBoundary,
                 ("system", Some("stop_hook_summary")) => OtherKind::StopHookSummary,
