@@ -22,6 +22,8 @@ const BASIC: &str = include_str!("fixtures/claude-code/v2.1.260/basic.jsonl");
 const MINIMAL_219: &str = include_str!("fixtures/claude-code/v2.1.219/minimal.jsonl");
 const TITLED_289: &str = include_str!("fixtures/claude-code/v2.1.289/titled.jsonl");
 const TITLED_289_SESSION: &str = "9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43";
+const CACHED_300: &str = include_str!("fixtures/claude-code/v2.1.300/cached-requests.jsonl");
+const CACHED_300_SESSION: &str = "4c8e1f2a-9b7d-4e6f-a3c5-1d2e3f4a5b6c";
 const BASIC_SESSION: &str = "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60";
 
 struct Fixture {
@@ -371,6 +373,48 @@ fn generated_titles_and_bookkeeping_entries_of_2_1_289_are_understood() {
         &fixture.plan_input(true),
     );
     assert_eq!(plan.title.as_deref(), Some("My own name"));
+}
+
+/// Public issue 110: Claude Code 2.1.300 caches request messages as
+/// chain-less `api-request-blob` entries that carry a `message`. An entry
+/// without a uuid is outside the conversation chain and is skipped whatever
+/// it carries; a chained entry of an unknown type with a message still fails.
+#[test]
+fn chainless_cache_entries_of_2_1_300_are_skipped_and_never_captured() {
+    let fixture = Fixture::new();
+    let content = fixture.render(CACHED_300);
+    let window = parse(&content, CACHED_300_SESSION).unwrap();
+    let plan = transcript::plan(&window.lines, 0, &fixture.plan_input(true));
+    assert_eq!(plan.title.as_deref(), Some("Version flag"));
+    assert_eq!(plan.pending_responses, 0);
+    assert_eq!(plan.interactions.len(), 2);
+    let captured: String = plan
+        .interactions
+        .iter()
+        .map(|planned| {
+            format!(
+                "{} {} {}",
+                planned.user_prompt,
+                planned.model_response.clone().unwrap_or_default(),
+                planned.model_cot.clone().unwrap_or_default()
+            )
+        })
+        .collect();
+    assert!(!captured.contains("CACHED COPY"), "{captured}");
+    assert!(captured.contains("Add a --version flag"), "{captured}");
+
+    // The same blob with a uuid would be part of the chain: refused.
+    let chained = content.replacen(
+        "\"type\":\"api-request-blob\"",
+        "\"type\":\"api-request-blob\",\"uuid\":\"x9\"",
+        1,
+    );
+    match parse(&chained, CACHED_300_SESSION) {
+        Err(TranscriptError::Malformed { reason, .. }) => {
+            assert!(reason.contains("carries a message"), "{reason}")
+        }
+        other => panic!("expected malformed, got {other:?}"),
+    }
 }
 
 #[test]
