@@ -141,7 +141,10 @@ try {
         [IO.File]::Copy((Join-Path $StageDir $Binary), $Temporary, $false)
         $Prepared[$Binary] = $Temporary
     }
-    foreach ($Binary in $Binaries) { Move-Item -LiteralPath $Prepared[$Binary] -Destination (Join-Path $InstallDir $Binary) -Force }
+    # cvc.exe moves into place LAST: the npm launcher probes `cvc --version`
+    # without the lock, so a new cvc must imply its siblings are already new.
+    $MoveOrder = @("cvc-lsp.exe", "cvc-mcp.exe", "cvc.exe")
+    foreach ($Binary in $MoveOrder) { Move-Item -LiteralPath $Prepared[$Binary] -Destination (Join-Path $InstallDir $Binary) -Force }
 }
 finally {
     if ($null -ne $InstallLock) { $InstallLock.Dispose() }
