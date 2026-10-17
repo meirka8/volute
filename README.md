@@ -47,7 +47,7 @@ CVC records each Claude Code session from the transcript Claude Code writes, thr
 
 1. `cvc init` — create the local cache and the advisory Git hooks.
 2. `cvc privacy acknowledge-capture` — the one-time local capture acknowledgement. It is an interactive typed challenge, and passive capture stays off until it is granted.
-3. `cvc harness install claude-code` — write the capture hooks into this checkout's `.claude/settings.local.json`, using the absolute path of the `cvc` you just ran.
+3. `cvc harness install claude-code` — write the capture hooks into this checkout's `.claude/settings.local.json`, using the absolute path of the `cvc` you just ran. By default the installer scripts and the npm launcher put `cvc` in `~/.cvc/bin` and replace it in place on upgrade (the launcher on its next run), so hooks that point there follow upgrades.
 4. Start a *new* Claude Code session. A session already running does not pick up the new hooks.
 5. Work as usual, then `cvc conversations` to see the captured sessions and `cvc log` for detail.
 

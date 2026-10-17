@@ -268,7 +268,20 @@ After all jobs complete, verify:
 - npm shows `@volute_cvc/cvc-mcp@X.Y.Z` with Apache-2.0 license, the `meirka8/volute`
   repository metadata, and provenance; inspect the actual npm tarball to confirm it
   includes `LICENSE`. Only then, in an isolated disposable environment, run a launcher
-  smoke test such as `npx --yes @volute_cvc/cvc-mcp@X.Y.Z --help`.
+  smoke test with a throwaway home directory. The launcher publishes into `~/.cvc/bin`
+  and never downgrades, so on a machine that already holds a newer or locally built
+  `cvc` it would run that binary instead of X.Y.Z. Run the `cvc` bin, not `cvc-mcp`,
+  which ignores `--help`, starts the MCP server, and exits 1 outside a Git repository:
+
+  ```bash
+  smoke_home=$(mktemp -d)
+  HOME="$smoke_home" npx --yes --package @volute_cvc/cvc-mcp@X.Y.Z -- cvc --version
+  rm -rf "$smoke_home"
+  ```
+
+  The output must be `cvc X.Y.Z`. Stderr also shows the launcher's download lines and
+  `Installed CVC X.Y.Z to <tmp>/.cvc/bin`. On Windows, set `USERPROFILE` instead of
+  `HOME`.
 - The VS Code Marketplace shows Apache-2.0 and all four target variants for publisher
   `volute` at the expected version.
 
