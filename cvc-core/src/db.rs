@@ -807,7 +807,9 @@ impl CvcStore {
         }
         if let Some(remote) = remote_fingerprint {
             for id in published_ids {
-                tx.execute("INSERT INTO publications(interaction_id,remote_fingerprint,state,updated_at) VALUES(?1,?2,'published',?3) ON CONFLICT(interaction_id,remote_fingerprint) DO UPDATE SET state='published',updated_at=excluded.updated_at", params![id.to_string(), remote, Utc::now().timestamp()])?;
+                // `updated_at` records when a row became published; observing a row that
+                // is already published at a later fetch must not re-stamp it.
+                tx.execute("INSERT INTO publications(interaction_id,remote_fingerprint,state,updated_at) VALUES(?1,?2,'published',?3) ON CONFLICT(interaction_id,remote_fingerprint) DO UPDATE SET state='published',updated_at=CASE WHEN publications.state='published' THEN publications.updated_at ELSE excluded.updated_at END", params![id.to_string(), remote, Utc::now().timestamp()])?;
             }
         }
         tx.commit()?;
@@ -2508,6 +2510,9 @@ impl CvcStore {
             .map_err(Into::into);
         result
     }
+    /// Records publication progress for `ids` at one destination. `Published` is
+    /// terminal here: a row already `published` is never moved back to `pending` or
+    /// `unknown` (its timestamp is also kept when `published` is re-asserted).
     pub fn mark_publication(
         &self,
         ids: &[InteractionId],
@@ -2519,9 +2524,17 @@ impl CvcStore {
             PublicationState::Published => "published",
             PublicationState::Unknown => "unknown",
         };
+        if ids.is_empty() {
+            return Ok(());
+        }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         for id in ids {
-            tx.execute("INSERT INTO publications(interaction_id,remote_fingerprint,state,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(interaction_id,remote_fingerprint) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at", params![id.to_string(), remote, value, Utc::now().timestamp()])?;
+            // A row that is `published` for this destination is never demoted: that fact
+            // is what blocks `unshare` and authorizes `redact` for content the
+            // destination holds, and a failed re-send of an id the remote lost must not
+            // make it look as if it was never published. Re-asserting `published` keeps
+            // the original timestamp; every genuine state change records a new one.
+            tx.execute("INSERT INTO publications(interaction_id,remote_fingerprint,state,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(interaction_id,remote_fingerprint) DO UPDATE SET state=excluded.state,updated_at=CASE WHEN publications.state='published' AND excluded.state='published' THEN publications.updated_at ELSE excluded.updated_at END WHERE publications.state <> 'published' OR excluded.state = 'published'", params![id.to_string(), remote, value, Utc::now().timestamp()])?;
         }
         tx.commit()?;
         Ok(())

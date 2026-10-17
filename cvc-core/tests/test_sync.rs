@@ -12,6 +12,18 @@ use tempfile::TempDir;
 
 const TEST_DESTINATION: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+/// Pins what `baseline` currently resolves to; `""` means "no remote baseline"
+/// (a tracking ref that does not exist, so the projection starts empty and
+/// verifies that nothing appeared).
+fn pinned(repo: &Repository, baseline: &str) -> sync::ImportedBaseline {
+    let name = if baseline.is_empty() {
+        "refs/remotes/unpublished/cvc/main"
+    } else {
+        baseline
+    };
+    sync::ImportedBaseline::observe(repo, name).unwrap()
+}
+
 #[test]
 fn historical_redaction_plan_v1_fixture_round_trips_exactly() -> anyhow::Result<()> {
     let fixture = include_str!("fixtures/redaction-plan-v1.json");
@@ -99,13 +111,14 @@ fn project_fixture_to_ref(
     } else {
         ""
     };
-    let projection = sync::push_projection_to_ref(repo, store, baseline, TEST_DESTINATION)?;
+    let projection =
+        sync::push_projection_to_ref(repo, store, &pinned(repo, baseline), TEST_DESTINATION)?;
     match projection {
         sync::ProjectionResult::Candidate { oid, candidate, .. } => {
             repo.reference(ref_name, oid, true, "fixture: remote accepted candidate")?;
             drop(candidate);
         }
-        sync::ProjectionResult::NoChanges => {}
+        sync::ProjectionResult::NoChanges { .. } => {}
     }
     Ok(())
 }
@@ -307,7 +320,8 @@ fn outbound_events_require_trusted_observation_and_exact_destination_authority(
         db.execute("INSERT INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) VALUES(?1,NULL,'fingerprintless','remote_sync',0)", [&assertion.event_id])?;
         db.execute("INSERT INTO derivation_authorizations(event_id,remote_fingerprint,source_event_id) VALUES(?1,?2,?1)", rusqlite::params![assertion.event_id, TEST_DESTINATION])?;
     }
-    let projection = sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION)?;
+    let projection =
+        sync::push_projection_to_ref(&repo, &store, &pinned(&repo, ""), TEST_DESTINATION)?;
     let oid = match projection {
         sync::ProjectionResult::Candidate { oid, .. } => oid,
         _ => anyhow::bail!("expected projection"),
@@ -317,7 +331,7 @@ fn outbound_events_require_trusted_observation_and_exact_destination_authority(
         vec![allowed.event_id.clone()]
     );
 
-    let other = sync::push_projection_to_ref(&repo, &store, "", OTHER)?;
+    let other = sync::push_projection_to_ref(&repo, &store, &pinned(&repo, ""), OTHER)?;
     let oid = match other {
         sync::ProjectionResult::Candidate { oid, .. } => oid,
         _ => anyhow::bail!("node should project"),
@@ -408,7 +422,9 @@ fn projection_refuses_dangling_exact_event_instead_of_pruning_it() -> anyhow::Re
     event.event_id = event.canonical_id();
     insert_event_fixture(&db_path, &event)?;
     trust_and_authorize_event(&db_path, &event)?;
-    assert!(sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION).is_err());
+    assert!(
+        sync::push_projection_to_ref(&repo, &store, &pinned(&repo, ""), TEST_DESTINATION).is_err()
+    );
     Ok(())
 }
 
@@ -1266,10 +1282,10 @@ fn matching_wire_tombstone_reconciles_pending_redaction_on_no_change_projection(
         sync::push_projection_to_ref(
             &repo,
             &target,
-            "refs/remotes/fixture/cvc/main",
+            &pinned(&repo, "refs/remotes/fixture/cvc/main"),
             TEST_DESTINATION,
         )?,
-        sync::ProjectionResult::NoChanges
+        sync::ProjectionResult::NoChanges { .. }
     ));
     Ok(())
 }
@@ -1554,7 +1570,7 @@ fn projection_reports_no_changes_against_verified_baseline() -> anyhow::Result<(
     };
     store.create_interaction(&interaction)?;
 
-    let first = sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION)?;
+    let first = sync::push_projection_to_ref(&repo, &store, &pinned(&repo, ""), TEST_DESTINATION)?;
     let sync::ProjectionResult::Candidate { oid, candidate, .. } = first else {
         anyhow::bail!("initial projection must create a candidate");
     };
@@ -1570,10 +1586,10 @@ fn projection_reports_no_changes_against_verified_baseline() -> anyhow::Result<(
         sync::push_projection_to_ref(
             &repo,
             &store,
-            "refs/remotes/fixture/cvc/main",
+            &pinned(&repo, "refs/remotes/fixture/cvc/main"),
             TEST_DESTINATION,
         )?,
-        sync::ProjectionResult::NoChanges
+        sync::ProjectionResult::NoChanges { .. }
     ));
     Ok(())
 }
@@ -1596,7 +1612,8 @@ fn failed_transport_cleanup_removes_projection_candidate() -> anyhow::Result<()>
         source_request_id: None,
     };
     store.create_interaction(&interaction)?;
-    let projection = sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION)?;
+    let projection =
+        sync::push_projection_to_ref(&repo, &store, &pinned(&repo, ""), TEST_DESTINATION)?;
     let sync::ProjectionResult::Candidate { candidate, .. } = projection else {
         anyhow::bail!("fixture expected projection candidate");
     };
@@ -1631,7 +1648,8 @@ fn candidate_guard_cleans_up_on_early_error() -> anyhow::Result<()> {
         source_request_id: None,
     };
     store.create_interaction(&interaction)?;
-    let projection = sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION)?;
+    let projection =
+        sync::push_projection_to_ref(&repo, &store, &pinned(&repo, ""), TEST_DESTINATION)?;
     let sync::ProjectionResult::Candidate { candidate, .. } = projection else {
         anyhow::bail!("fixture expected projection candidate");
     };
@@ -2674,5 +2692,750 @@ fn test_sync_cycle_detection() -> anyhow::Result<()> {
         "Node A should NOT be ingested if cycle detected"
     );
 
+    Ok(())
+}
+
+// --- Publication summary (#106): what a candidate newly writes -----------------
+
+const SUMMARY_BASELINE: &str = "refs/remotes/fixture/cvc/main";
+
+fn summary_interaction(conversation: &str, prompt: &str) -> Interaction {
+    Interaction {
+        id: InteractionId::new(),
+        conversation_id: conversation.into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: prompt.into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    }
+}
+
+/// Projects against the fixture baseline (if one was accepted before), accepts a
+/// candidate as the new verified baseline, and returns its publication summary.
+/// `None` means the projection equals the baseline.
+fn project_and_accept(
+    repo: &Repository,
+    store: &CvcStore,
+) -> anyhow::Result<Option<sync::ProjectionPublication>> {
+    let baseline = if repo.find_reference(SUMMARY_BASELINE).is_ok() {
+        SUMMARY_BASELINE
+    } else {
+        ""
+    };
+    match sync::push_projection_to_ref(repo, store, &pinned(repo, baseline), TEST_DESTINATION)? {
+        sync::ProjectionResult::NoChanges { .. } => Ok(None),
+        sync::ProjectionResult::Candidate {
+            oid,
+            candidate,
+            publication,
+        } => {
+            repo.reference(SUMMARY_BASELINE, oid, true, "fixture: accepted candidate")?;
+            drop(candidate);
+            Ok(Some(publication))
+        }
+    }
+}
+
+fn sorted_ids<'a>(ids: impl IntoIterator<Item = &'a InteractionId>) -> Vec<String> {
+    let mut ids: Vec<String> = ids.into_iter().map(|id| id.to_string()).collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn publication_summary_counts_only_interactions_new_to_the_baseline() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("source.db"))?;
+
+    let published: Vec<Interaction> = (0..3)
+        .map(|n| summary_interaction(&format!("published-{n}"), "already there"))
+        .collect();
+    for interaction in &published {
+        store.create_interaction(interaction)?;
+    }
+    let first = project_and_accept(&repo, &store)?.expect("first projection is a candidate");
+    assert_eq!(
+        sorted_ids(&first.new_ids),
+        sorted_ids(published.iter().map(|i| &i.id))
+    );
+    assert_eq!(first.shared_total, 3);
+    assert_eq!(
+        (
+            first.new_link_records,
+            first.new_tombstones,
+            first.new_derivation_records
+        ),
+        (0, 0, 0)
+    );
+
+    let fresh: Vec<Interaction> = (0..2)
+        .map(|n| summary_interaction(&format!("fresh-{n}"), "newly shared"))
+        .collect();
+    for interaction in &fresh {
+        store.create_interaction(interaction)?;
+    }
+    let second = project_and_accept(&repo, &store)?.expect("new shares need a candidate");
+    assert_eq!(
+        sorted_ids(&second.new_ids),
+        sorted_ids(fresh.iter().map(|i| &i.id)),
+        "only the newly shared interactions are new"
+    );
+    assert_eq!(second.shared_total, 5, "K published + M new");
+    assert!(!second.is_structural_only());
+
+    // Identical projection: nothing to write, so no candidate at all.
+    match sync::push_projection_to_ref(
+        &repo,
+        &store,
+        &pinned(&repo, SUMMARY_BASELINE),
+        TEST_DESTINATION,
+    )? {
+        sync::ProjectionResult::NoChanges { shared_total } => assert_eq!(shared_total, 5),
+        sync::ProjectionResult::Candidate { .. } => anyhow::bail!("identical projection"),
+    }
+    assert!(project_and_accept(&repo, &store)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn publication_summary_reports_a_new_link_on_an_already_published_interaction() -> anyhow::Result<()>
+{
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let interaction = summary_interaction("linked-later", "published floating");
+    store.create_interaction(&interaction)?;
+    let first = project_and_accept(&repo, &store)?.expect("first candidate");
+    assert_eq!(first.new_ids.len(), 1);
+
+    store.link_automatic_interactions(
+        std::slice::from_ref(&interaction.id),
+        &CommitSha::new("c".repeat(40)),
+        "generated",
+        None,
+    )?;
+    let linked = project_and_accept(&repo, &store)?.expect("a new link record is a candidate");
+    assert!(linked.new_ids.is_empty(), "the node is already published");
+    assert_eq!(linked.new_link_records, 1);
+    assert_eq!(linked.new_tombstones, 0);
+    assert_eq!(linked.shared_total, 1);
+    assert!(!linked.is_structural_only());
+    assert!(project_and_accept(&repo, &store)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn publication_summary_counts_a_new_derivation_event_without_a_new_node() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let db_path = temp_dir.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let interaction = summary_interaction("derived", "published first");
+    store.create_interaction(&interaction)?;
+    project_and_accept(&repo, &store)?.expect("first candidate");
+
+    let event = derivation(&interaction.id, 'a', Vec::new());
+    insert_event_fixture(&db_path, &event)?;
+    trust_and_authorize_event(&db_path, &event)?;
+    let summary = project_and_accept(&repo, &store)?.expect("a new event is a candidate");
+    assert!(summary.new_ids.is_empty());
+    assert_eq!(summary.new_derivation_records, 1);
+    assert_eq!(summary.shared_total, 1);
+    Ok(())
+}
+
+#[test]
+fn publication_summary_counts_a_pending_tombstone_but_not_the_suppressed_node() -> anyhow::Result<()>
+{
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let kept = summary_interaction("kept", "stays published");
+    let redacted = summary_interaction("redacted", "to be suppressed");
+    store.create_interaction(&kept)?;
+    store.create_interaction(&redacted)?;
+    let first = project_and_accept(&repo, &store)?.expect("first candidate");
+    assert_eq!(first.shared_total, 2);
+
+    store.tombstone_remote(
+        &redacted.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::UserRequested,
+        None,
+    )?;
+    let after = project_and_accept(&repo, &store)?.expect("a tombstone is a candidate");
+    assert_eq!(after.new_tombstones, 1);
+    assert!(
+        after.new_ids.is_empty(),
+        "the tombstoned id is never published as a node: {:?}",
+        after.new_ids
+    );
+    assert!(!after.new_ids.iter().any(|id| id == &redacted.id));
+    assert_eq!(
+        after.shared_total, 1,
+        "the suppressed interaction is excluded"
+    );
+    assert_eq!(
+        (after.removed_interactions, after.removed_records),
+        (1, 0),
+        "the baseline's node for the tombstoned interaction leaves the tip tree"
+    );
+    assert!(!after.is_structural_only());
+
+    // The suppressed node is really gone from the accepted tree.
+    let tree = repo
+        .find_reference(SUMMARY_BASELINE)?
+        .peel_to_commit()?
+        .tree()?;
+    let nodes = tree
+        .get_name("nodes")
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    let still_there = nodes.iter().any(|shard| {
+        shard
+            .to_object(&repo)
+            .and_then(|o| o.peel_to_tree())
+            .map(|t| t.get_name(&format!("{}.json", redacted.id)).is_some())
+            .unwrap_or(true)
+    });
+    assert!(!still_there);
+    assert!(project_and_accept(&repo, &store)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn publication_summary_does_not_count_legacy_flat_baseline_nodes() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let signature = Signature::now("Test User", "test@example.com")?;
+
+    let legacy_id = InteractionId::new();
+    let node = SyncNode {
+        interaction: Interaction {
+            id: legacy_id.clone(),
+            ..summary_interaction("conv-legacy", "Legacy thought")
+        },
+        context_items: vec![],
+        tool_executions: vec![],
+        artifact_links: vec![],
+    };
+    let mut flat = repo.treebuilder(None)?;
+    flat.insert(
+        format!("{legacy_id}.json"),
+        repo.blob(serde_json::to_string_pretty(&node)?.as_bytes())?,
+        FileMode::Blob.into(),
+    )?;
+    let legacy_tree = repo.find_tree(flat.write()?)?;
+    let legacy_commit = repo.commit(
+        Some("refs/cvc/legacy-source"),
+        &signature,
+        &signature,
+        "Legacy v1 sync",
+        &legacy_tree,
+        &[],
+    )?;
+    repo.reference(SUMMARY_BASELINE, legacy_commit, true, "legacy baseline")?;
+
+    let store = CvcStore::open(temp_dir.path().join("cvc.db"))?;
+    sync::pull_from_ref(&repo, &store, "refs/cvc/legacy-source")?;
+    // Sharing the (already imported) conversation puts the legacy node in this
+    // destination's projection next to the genuinely new one.
+    let fresh = summary_interaction("conv-legacy", "Post-upgrade thought");
+    store.create_interaction(&fresh)?;
+
+    let summary = project_and_accept(&repo, &store)?.expect("the fresh node needs a candidate");
+    assert_eq!(sorted_ids(&summary.new_ids), vec![fresh.id.to_string()]);
+    assert_eq!(
+        summary.shared_total, 2,
+        "the legacy node is projected and present, but not new"
+    );
+    Ok(())
+}
+
+#[test]
+fn publication_marks_preserve_the_timestamp_of_already_published_rows() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let source = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let target_path = temp_dir.path().join("target.db");
+    let target = CvcStore::open(&target_path)?;
+    let interaction = summary_interaction("stamped", "published once");
+    source.create_interaction(&interaction)?;
+    project_fixture_to_ref(&repo, &source, "refs/cvc/stamped")?;
+
+    let raw = Connection::open(&target_path)?;
+    let row = |raw: &Connection| -> rusqlite::Result<(String, i64)> {
+        raw.query_row(
+            "SELECT state, updated_at FROM publications WHERE interaction_id=?1 AND remote_fingerprint=?2",
+            rusqlite::params![interaction.id.to_string(), TEST_DESTINATION],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    };
+    const SENTINEL: i64 = 1_000;
+
+    // Fetch/import records the node as published for this exact destination.
+    sync::pull_from_ref_for_remote(&repo, &target, "refs/cvc/stamped", Some(TEST_DESTINATION))?;
+    let (state, stamped) = row(&raw)?;
+    assert_eq!(state, "published");
+    assert!(stamped > SENTINEL);
+
+    // Observing the same node at a later fetch must not re-stamp the row.
+    raw.execute("UPDATE publications SET updated_at=?1", [SENTINEL])?;
+    sync::pull_from_ref_for_remote(&repo, &target, "refs/cvc/stamped", Some(TEST_DESTINATION))?;
+    assert_eq!(row(&raw)?, ("published".to_owned(), SENTINEL));
+
+    // Re-asserting `published` through the publication mark is equally inert...
+    target.mark_publication(
+        std::slice::from_ref(&interaction.id),
+        TEST_DESTINATION,
+        PublicationState::Published,
+    )?;
+    assert_eq!(row(&raw)?, ("published".to_owned(), SENTINEL));
+
+    // ...while a row that was not published is stamped when it becomes published:
+    // by a later fetch (the row is forced to `unknown`, as a failed first send
+    // would have left it) and by the publication mark itself (forced to `pending`).
+    // Demotion is covered by `published_rows_are_never_demoted_by_pending_or_unknown_marks`.
+    for not_published in ["unknown", "pending"] {
+        raw.execute(
+            "UPDATE publications SET state=?1, updated_at=?2",
+            rusqlite::params![not_published, SENTINEL],
+        )?;
+        if not_published == "unknown" {
+            sync::pull_from_ref_for_remote(
+                &repo,
+                &target,
+                "refs/cvc/stamped",
+                Some(TEST_DESTINATION),
+            )?;
+        } else {
+            target.mark_publication(
+                std::slice::from_ref(&interaction.id),
+                TEST_DESTINATION,
+                PublicationState::Published,
+            )?;
+        }
+        let (state, stamped_again) = row(&raw)?;
+        assert_eq!(state, "published", "from {not_published}");
+        assert!(
+            stamped_again > SENTINEL,
+            "a row that was {not_published} is stamped when it becomes published"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn publication_summary_names_a_stale_node_removed_next_to_its_tombstone() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let kept = summary_interaction("kept", "stays");
+    let redacted = summary_interaction("redacted", "suppressed");
+    store.create_interaction(&kept)?;
+    store.create_interaction(&redacted)?;
+    project_and_accept(&repo, &store)?.expect("first candidate");
+    let with_node = repo.find_reference(SUMMARY_BASELINE)?.peel_to_commit()?;
+
+    store.tombstone_remote(
+        &redacted.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::UserRequested,
+        None,
+    )?;
+    project_and_accept(&repo, &store)?.expect("tombstone candidate");
+    let tombstoned = repo.find_reference(SUMMARY_BASELINE)?.peel_to_commit()?;
+
+    // An older client that ignores tombstones/ pushes the suppressed node back
+    // next to its tombstone: take the tombstoned tree and re-insert that blob.
+    let file = format!("{}.json", redacted.id);
+    let prefix = &redacted.id.to_string()[0..2];
+    let old_nodes = with_node
+        .tree()?
+        .get_name("nodes")
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    let old_shard = old_nodes
+        .get_name(prefix)
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    let blob = old_shard.get_name(&file).unwrap().id();
+    let tree = tombstoned.tree()?;
+    let nodes = tree
+        .get_name("nodes")
+        .unwrap()
+        .to_object(&repo)?
+        .peel_to_tree()?;
+    let mut shard_builder = match nodes.get_name(prefix) {
+        Some(entry) => repo.treebuilder(Some(&entry.to_object(&repo)?.peel_to_tree()?))?,
+        None => repo.treebuilder(None)?,
+    };
+    shard_builder.insert(&file, blob, FileMode::Blob.into())?;
+    let mut nodes_builder = repo.treebuilder(Some(&nodes))?;
+    nodes_builder.insert(prefix, shard_builder.write()?, FileMode::Tree.into())?;
+    let mut root_builder = repo.treebuilder(Some(&tree))?;
+    root_builder.insert("nodes", nodes_builder.write()?, FileMode::Tree.into())?;
+    let signature = Signature::now("Old Client", "old@example.com")?;
+    let resurrected = repo.commit(
+        None,
+        &signature,
+        &signature,
+        "old client re-adds a node",
+        &repo.find_tree(root_builder.write()?)?,
+        &[&tombstoned],
+    )?;
+    repo.reference(SUMMARY_BASELINE, resurrected, true, "stale baseline")?;
+
+    let cleanup = project_and_accept(&repo, &store)?.expect("pruning the stale node is a change");
+    assert!(cleanup.new_ids.is_empty());
+    assert_eq!(cleanup.new_tombstones, 0, "the tombstone is already there");
+    assert_eq!(cleanup.removed_interactions, 1);
+    assert!(
+        !cleanup.is_structural_only(),
+        "a content removal is not a format or index update"
+    );
+    assert_eq!(cleanup.shared_total, 1);
+    Ok(())
+}
+
+#[test]
+fn publication_summary_is_structural_only_for_a_format_upgrade() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("source.db"))?;
+    store.create_interaction(&summary_interaction("upgrade", "preserve me"))?;
+    project_and_accept(&repo, &store)?.expect("first candidate");
+
+    // Re-mark the accepted baseline as the older v2 layout (as in
+    // `push_upgrades_v2_format_without_downgrading_data`).
+    let previous = repo.find_reference(SUMMARY_BASELINE)?.peel_to_commit()?;
+    let mut builder = repo.treebuilder(Some(&previous.tree()?))?;
+    builder.insert("FORMAT", repo.blob(b"2")?, FileMode::Blob.into())?;
+    builder.remove("events")?;
+    builder.remove("ranges")?;
+    let signature = Signature::now("Test User", "test@example.com")?;
+    let v2 = repo.commit(
+        None,
+        &signature,
+        &signature,
+        "v2 marker",
+        &repo.find_tree(builder.write()?)?,
+        &[&previous],
+    )?;
+    repo.reference(SUMMARY_BASELINE, v2, true, "v2 baseline")?;
+
+    let upgrade = project_and_accept(&repo, &store)?.expect("the format upgrade is a candidate");
+    assert!(upgrade.is_structural_only(), "{upgrade:?}");
+    assert_eq!(upgrade.shared_total, 1);
+    Ok(())
+}
+
+// --- Baseline pinning and the publication-state guard (#106 round 2) -----------
+
+const PIN_TRACKING_REF: &str = "refs/remotes/fixture/cvc/main";
+
+fn pin_destination() -> cvc_core::privacy::RemoteDestination {
+    cvc_core::privacy::RemoteDestination {
+        name: "fixture".into(),
+        effective_url: "unused-in-these-tests".into(),
+        fingerprint: TEST_DESTINATION.into(),
+        ref_name: "refs/cvc/main".into(),
+    }
+}
+
+fn publication_rows(db_path: &std::path::Path) -> anyhow::Result<Vec<(String, String, i64)>> {
+    let raw = Connection::open(db_path)?;
+    let mut statement = raw.prepare(
+        "SELECT interaction_id, state, updated_at FROM publications \
+         ORDER BY interaction_id, remote_fingerprint",
+    )?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn candidate_refs(repo: &Repository) -> anyhow::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for reference in repo.references_glob("refs/cvc/candidate-*")? {
+        names.push(reference?.name().unwrap_or_default().to_owned());
+    }
+    Ok(names)
+}
+
+/// Asserts `result` is the fail-closed "baseline moved" error and nothing else.
+fn assert_baseline_moved(
+    result: Result<sync::ProjectionResult<'_>, sync::SyncError>,
+) -> anyhow::Result<()> {
+    match result {
+        Err(error @ sync::SyncError::BaselineMoved(_)) => {
+            assert_eq!(
+                error.to_string(),
+                "the remote CVC ref for 'fixture' changed while publishing; nothing was \
+                 published. Run the command again."
+            );
+            Ok(())
+        }
+        Err(other) => anyhow::bail!("unexpected error: {other}"),
+        Ok(_) => anyhow::bail!("a moved baseline must not produce a projection"),
+    }
+}
+
+#[test]
+fn import_pins_the_commit_it_read_and_projection_accepts_it() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let destination = pin_destination();
+
+    // Absent: the import records that it saw no ref, and the projection starts empty.
+    let (imported, baseline) = sync::pull_destination_pinned(&repo, &store, &destination)?;
+    assert_eq!(imported, 0);
+    assert_eq!(baseline.tip(), None);
+    assert_eq!(baseline.ref_name(), PIN_TRACKING_REF);
+
+    store.create_interaction(&summary_interaction("pinned-a", "already there"))?;
+    project_fixture_to_ref(&repo, &store, PIN_TRACKING_REF)?;
+    let tip = repo
+        .find_reference(PIN_TRACKING_REF)?
+        .peel_to_commit()?
+        .id();
+    let (_, baseline) = sync::pull_destination_pinned(&repo, &store, &destination)?;
+    assert_eq!(baseline.tip(), Some(tip));
+
+    store.create_interaction(&summary_interaction("pinned-b", "newly shared"))?;
+    let sync::ProjectionResult::Candidate { publication, .. } =
+        sync::push_projection_to_ref(&repo, &store, &baseline, TEST_DESTINATION)?
+    else {
+        anyhow::bail!("expected a candidate on the pinned baseline");
+    };
+    assert_eq!(publication.new_ids.len(), 1);
+    assert_eq!(publication.shared_total, 2);
+    Ok(())
+}
+
+#[test]
+fn projection_fails_closed_when_the_tracking_ref_moves_after_the_import() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let db_path = temp_dir.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let destination = pin_destination();
+
+    store.create_interaction(&summary_interaction("moved-a", "on the destination"))?;
+    project_fixture_to_ref(&repo, &store, PIN_TRACKING_REF)?;
+    let (_, baseline) = sync::pull_destination_pinned(&repo, &store, &destination)?;
+    let imported_tip = baseline.tip();
+    assert!(imported_tip.is_some());
+
+    // Another writer (a second process after a URL change, a plain `git fetch`)
+    // moves the tracking ref to a commit holding more than the import read.
+    store.create_interaction(&summary_interaction("moved-b", "on the destination too"))?;
+    project_fixture_to_ref(&repo, &store, PIN_TRACKING_REF)?;
+    assert_ne!(
+        repo.find_reference(PIN_TRACKING_REF)?
+            .peel_to_commit()?
+            .id(),
+        imported_tip.unwrap()
+    );
+
+    let rows_before = publication_rows(&db_path)?;
+    assert_baseline_moved(sync::push_projection_to_ref(
+        &repo,
+        &store,
+        &baseline,
+        TEST_DESTINATION,
+    ))?;
+    assert_eq!(
+        publication_rows(&db_path)?,
+        rows_before,
+        "no publication state may change"
+    );
+    assert!(
+        candidate_refs(&repo)?.is_empty(),
+        "no candidate may be left behind"
+    );
+    Ok(())
+}
+
+#[test]
+fn projection_fails_closed_when_a_ref_the_import_saw_absent_appears() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let db_path = temp_dir.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    store.create_interaction(&summary_interaction("appears-a", "local"))?;
+
+    let (_, baseline) = sync::pull_destination_pinned(&repo, &store, &pin_destination())?;
+    assert_eq!(baseline.tip(), None);
+
+    // The ref appears after the import saw it absent.
+    project_fixture_to_ref(&repo, &store, PIN_TRACKING_REF)?;
+    let rows_before = publication_rows(&db_path)?;
+    assert_baseline_moved(sync::push_projection_to_ref(
+        &repo,
+        &store,
+        &baseline,
+        TEST_DESTINATION,
+    ))?;
+    assert_eq!(publication_rows(&db_path)?, rows_before);
+    assert!(candidate_refs(&repo)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn projection_fails_closed_when_the_ref_the_import_read_disappears() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let db_path = temp_dir.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    store.create_interaction(&summary_interaction("vanishes-a", "local"))?;
+    project_fixture_to_ref(&repo, &store, PIN_TRACKING_REF)?;
+    let (_, baseline) = sync::pull_destination_pinned(&repo, &store, &pin_destination())?;
+    assert!(baseline.tip().is_some());
+
+    repo.find_reference(PIN_TRACKING_REF)?.delete()?;
+    let rows_before = publication_rows(&db_path)?;
+    assert_baseline_moved(sync::push_projection_to_ref(
+        &repo,
+        &store,
+        &baseline,
+        TEST_DESTINATION,
+    ))?;
+    assert_eq!(publication_rows(&db_path)?, rows_before);
+    Ok(())
+}
+
+#[test]
+fn published_rows_are_never_demoted_by_pending_or_unknown_marks() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let interaction = summary_interaction("never-demoted", "published once");
+    store.create_interaction(&interaction)?;
+    let ids = std::slice::from_ref(&interaction.id);
+
+    store.mark_publication(ids, TEST_DESTINATION, PublicationState::Published)?;
+    let raw = Connection::open(&db_path)?;
+    raw.execute("UPDATE publications SET updated_at = 1000", [])?;
+    let expected = vec![(interaction.id.to_string(), "published".to_owned(), 1000)];
+
+    store.mark_publication(ids, TEST_DESTINATION, PublicationState::Pending)?;
+    assert_eq!(publication_rows(&db_path)?, expected);
+    store.mark_publication(ids, TEST_DESTINATION, PublicationState::Unknown)?;
+    assert_eq!(publication_rows(&db_path)?, expected);
+    store.mark_publication(ids, TEST_DESTINATION, PublicationState::Published)?;
+    assert_eq!(publication_rows(&db_path)?, expected);
+
+    // The guard is per destination, and the other transitions still work.
+    let other = "f".repeat(64);
+    store.mark_publication(ids, &other, PublicationState::Pending)?;
+    store.mark_publication(ids, &other, PublicationState::Unknown)?;
+    let states: Vec<String> = publication_rows(&db_path)?
+        .into_iter()
+        .filter(|row| row.1 != "published")
+        .map(|row| row.1)
+        .collect();
+    assert_eq!(states, vec!["unknown".to_owned()]);
+    Ok(())
+}
+
+#[test]
+fn a_locally_published_id_missing_from_the_baseline_is_resent_and_stays_published(
+) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let db_path = temp_dir.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let interaction = summary_interaction("rewound", "the remote lost this");
+    store.create_interaction(&interaction)?;
+    store.mark_publication(
+        std::slice::from_ref(&interaction.id),
+        TEST_DESTINATION,
+        PublicationState::Published,
+    )?;
+    Connection::open(&db_path)?.execute("UPDATE publications SET updated_at = 1000", [])?;
+
+    // The destination was rewound or recreated: the import sees no ref at all.
+    let (_, baseline) = sync::pull_destination_pinned(&repo, &store, &pin_destination())?;
+    assert_eq!(baseline.tip(), None);
+    let sync::ProjectionResult::Candidate { publication, .. } =
+        sync::push_projection_to_ref(&repo, &store, &baseline, TEST_DESTINATION)?
+    else {
+        anyhow::bail!("the missing node must be re-sent");
+    };
+    assert_eq!(publication.new_ids, vec![interaction.id.clone()]);
+
+    // The marks `push_destination` applies around a re-send, including a failure.
+    let ids = publication.new_ids.as_slice();
+    store.mark_publication(ids, TEST_DESTINATION, PublicationState::Pending)?;
+    store.mark_publication(ids, TEST_DESTINATION, PublicationState::Unknown)?;
+    assert_eq!(
+        publication_rows(&db_path)?,
+        vec![(interaction.id.to_string(), "published".to_owned(), 1000)],
+        "unshare and redact must keep treating this content as published"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_failed_transport_leaves_baseline_held_rows_published_and_marks_only_new_ones_unknown(
+) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let db_path = temp_dir.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let destination = pin_destination();
+    let held = summary_interaction("held", "already on the destination");
+    store.create_interaction(&held)?;
+    project_fixture_to_ref(&repo, &store, PIN_TRACKING_REF)?;
+    let (_, baseline) = sync::pull_destination_pinned(&repo, &store, &destination)?;
+    Connection::open(&db_path)?.execute("UPDATE publications SET updated_at = 1000", [])?;
+    let fresh = summary_interaction("fresh", "being published now");
+    store.create_interaction(&fresh)?;
+
+    let sync::ProjectionResult::Candidate {
+        candidate,
+        publication,
+        ..
+    } = sync::push_projection_to_ref(&repo, &store, &baseline, TEST_DESTINATION)?
+    else {
+        anyhow::bail!("expected a candidate");
+    };
+    assert_eq!(publication.new_ids, vec![fresh.id.clone()]);
+
+    // What `push_destination` does around the transport, with a real failure.
+    let ids = publication.new_ids.as_slice();
+    store.mark_publication(ids, TEST_DESTINATION, PublicationState::Pending)?;
+    let unreachable = cvc_core::privacy::RemoteDestination {
+        name: "unreachable".into(),
+        effective_url: temp_dir.path().join("missing-remote").display().to_string(),
+        fingerprint: TEST_DESTINATION.into(),
+        ref_name: "refs/cvc/main".into(),
+    };
+    assert!(sync::push_temp_ref(&repo, &unreachable, candidate.ref_name()).is_err());
+    store.mark_publication(ids, TEST_DESTINATION, PublicationState::Unknown)?;
+    drop(candidate);
+
+    let rows = publication_rows(&db_path)?;
+    let state_of = |id: &InteractionId| {
+        rows.iter()
+            .find(|row| row.0 == id.to_string())
+            .map(|row| (row.1.clone(), row.2))
+    };
+    assert_eq!(state_of(&held.id), Some(("published".to_owned(), 1000)));
+    assert_eq!(
+        state_of(&fresh.id).map(|row| row.0),
+        Some("unknown".to_owned())
+    );
+    assert_eq!(rows.len(), 2);
     Ok(())
 }

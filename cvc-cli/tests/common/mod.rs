@@ -124,13 +124,24 @@ impl Fixture {
 
     /// The id of the single `cvc run` conversation captured so far.
     pub fn only_run_conversation_id(&self) -> String {
-        let listing = self.cvc_ok(&["conversations"]);
-        let ids: Vec<_> = listing
+        let ids = self.run_conversation_ids();
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        ids[0].clone()
+    }
+
+    /// The ids of every `cvc run` conversation captured so far, most recent
+    /// first (the order of `cvc conversations`).
+    pub fn run_conversation_ids(&self) -> Vec<String> {
+        self.cvc_ok(&["conversations"])
             .split_whitespace()
             .filter(|token| token.starts_with("run-"))
-            .collect();
-        assert_eq!(ids.len(), 1, "{listing}");
-        ids[0].to_owned()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The SQLite index shared by the repository's worktrees.
+    pub fn index_db_path(&self) -> PathBuf {
+        self.open_repo().commondir().join("cvc").join("index.db")
     }
 }
 

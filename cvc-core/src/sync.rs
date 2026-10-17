@@ -38,6 +38,12 @@ pub enum SyncError {
     Serde(#[from] serde_json::Error),
     #[error("Reference error: {0}")]
     Ref(String),
+    /// The tracking ref moved between the import that was recorded as the
+    /// projection baseline and the projection itself. Nothing was written.
+    #[error(
+        "the remote CVC ref for '{0}' changed while publishing; nothing was published. Run the command again."
+    )]
+    BaselineMoved(String),
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
@@ -62,6 +68,77 @@ impl Default for SyncReadLimits {
     }
 }
 
+/// The exact state of a destination's tracking ref that an import read: the
+/// commit it resolved to (or the tree, for a ref that points straight at one),
+/// or `None` when the import saw the ref absent.
+///
+/// Publication state is recorded from what the import read, so the projection
+/// must be built from that very state. The tracking ref is keyed by remote name
+/// while the operation lock is keyed by destination fingerprint, which leaves
+/// room for another writer (a second process after a URL change, a plain
+/// `git fetch`) to move it between import and projection. `push_projection_to_ref`
+/// therefore refuses any baseline other than the one pinned here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedBaseline {
+    remote: String,
+    ref_name: String,
+    tip: Option<git2::Oid>,
+}
+
+impl ImportedBaseline {
+    /// The tracking ref the import read.
+    pub fn ref_name(&self) -> &str {
+        &self.ref_name
+    }
+
+    /// What the import read: `None` means it saw the ref absent.
+    pub fn tip(&self) -> Option<git2::Oid> {
+        self.tip
+    }
+
+    /// Pins whatever `ref_name` currently resolves to, with no import behind it.
+    ///
+    /// This is a convenience for fixtures that fully control the ref. It does
+    /// not close the window between an import and a projection, so production
+    /// publication must use the baseline returned by `fetch_and_pull_destination_pinned`
+    /// or `pull_destination_pinned`, never this. A production call site would
+    /// reopen the import-to-projection window that #106 closes.
+    #[doc(hidden)]
+    pub fn observe(repo: &Repository, ref_name: &str) -> Result<Self> {
+        if !validate_ref_name(ref_name) {
+            return Err(SyncError::Ref(format!("Invalid baseline ref: {ref_name}")));
+        }
+        let tip = match repo.find_reference(ref_name) {
+            Ok(reference) => Some(ref_state_id(&reference)?),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let remote = ref_name
+            .strip_prefix("refs/remotes/")
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or(ref_name)
+            .to_owned();
+        Ok(Self {
+            remote,
+            ref_name: ref_name.to_owned(),
+            tip,
+        })
+    }
+
+    fn moved(&self) -> SyncError {
+        SyncError::BaselineMoved(self.remote.clone())
+    }
+}
+
+/// The object a CVC ref resolves to for import and seeding: its commit, or the
+/// tree it points at directly.
+fn ref_state_id(reference: &git2::Reference<'_>) -> Result<git2::Oid> {
+    if let Ok(commit) = reference.peel_to_commit() {
+        return Ok(commit.id());
+    }
+    Ok(reference.peel(ObjectType::Tree)?.id())
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct SyncNode {
@@ -83,12 +160,72 @@ fn validate_tombstone(t: &Tombstone) -> Result<()> {
     }
     Ok(())
 }
+/// What a projection candidate newly writes on top of the verified remote
+/// baseline, measured from the tree edits `push_ids_to_ref` actually performs.
+/// Entries the baseline already holds (byte-identical, verified) are never
+/// counted; they do not leave the machine again.
+///
+/// This is the only description of a publication that may be shown to the user
+/// for consent or used to mark publication state. It is derived from the tree
+/// work itself, never from local database state, so it cannot drift from the
+/// bytes the candidate commit adds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectionPublication {
+    /// Interactions whose node blobs this candidate adds for the first time:
+    /// not present in the baseline (legacy flat or sharded layout), not
+    /// tombstoned, deduplicated. Only these may be marked pending/published.
+    pub new_ids: Vec<crate::models::InteractionId>,
+    /// Distinct, non-tombstoned interactions of this destination's projection.
+    /// After the candidate lands each of them is a node of the remote tree
+    /// (either already there or in `new_ids`). Context for display only.
+    pub shared_total: usize,
+    /// Automatic `links/<interaction>/<commit>.json` records added.
+    pub new_link_records: usize,
+    /// `tombstones/<prefix>/<id>.json` suppression records added.
+    pub new_tombstones: usize,
+    /// Derivation `events/` plus `ranges/` records added.
+    pub new_derivation_records: usize,
+    /// Tombstoned interactions whose node the baseline still held and this
+    /// candidate drops from the ref's tip tree (a stale clone or an older
+    /// client left it next to its tombstone, or the tombstone is new in this
+    /// candidate). The blobs stay reachable in the ref's earlier history.
+    pub removed_interactions: usize,
+    /// Other baseline entries dropped by tombstone pruning: link directories of
+    /// tombstoned interactions plus `events/` and `ranges/` records the pruned
+    /// tree no longer carries. Not counted for anything that is re-added
+    /// byte-for-byte.
+    pub removed_records: usize,
+}
+
+impl ProjectionPublication {
+    /// True when the candidate neither adds nor removes any interaction, link,
+    /// tombstone, or derivation record: only structural tree changes (index
+    /// rebuild, FORMAT upgrade, empty namespace creation).
+    pub fn is_structural_only(&self) -> bool {
+        self.new_ids.is_empty()
+            && self.new_link_records == 0
+            && self.new_tombstones == 0
+            && self.new_derivation_records == 0
+            && self.removed_interactions == 0
+            && self.removed_records == 0
+    }
+}
+
 pub enum ProjectionResult<'repo> {
-    NoChanges,
+    /// The projection equals the verified baseline; nothing would be written.
+    NoChanges {
+        /// Distinct non-tombstoned interactions in this destination's
+        /// projection (all already present at the destination).
+        shared_total: usize,
+    },
     Candidate {
         oid: git2::Oid,
         candidate: CandidateRef<'repo>,
-        ids: Vec<crate::models::InteractionId>,
+        /// Exactly what `candidate` adds relative to the baseline. There is
+        /// deliberately no list of all projected ids here: marking the whole
+        /// projection as published re-stamps rows the baseline already holds
+        /// and misstates what the user consented to.
+        publication: ProjectionPublication,
     },
 }
 
@@ -864,7 +1001,7 @@ fn common_git_dir_fingerprint(repo: &Repository) -> Result<String> {
 pub fn push_projection_to_ref<'repo>(
     repo: &'repo Repository,
     db: &CvcStore,
-    baseline_ref: &str,
+    baseline: &ImportedBaseline,
     remote_fingerprint: &str,
 ) -> Result<ProjectionResult<'repo>> {
     let ids = db.projection_interaction_ids(remote_fingerprint)?;
@@ -872,14 +1009,14 @@ pub fn push_projection_to_ref<'repo>(
     // locally-only or another remote's received suppression as outbound input.
     let tombstones = db.tombstones_for_projection(remote_fingerprint)?;
     if ids.is_empty() && tombstones.is_empty() {
-        return Ok(ProjectionResult::NoChanges);
+        return Ok(ProjectionResult::NoChanges { shared_total: 0 });
     }
     let temp_ref = format!("refs/cvc/candidate-{}", uuid::Uuid::new_v4());
-    let oid = push_ids_to_ref(
+    let (oid, publication) = push_ids_to_ref(
         repo,
         db,
         &temp_ref,
-        (!baseline_ref.is_empty()).then_some(baseline_ref),
+        baseline,
         &ids,
         &tombstones,
         remote_fingerprint,
@@ -889,7 +1026,9 @@ pub fn push_projection_to_ref<'repo>(
     // a true no-op; handing a nonexistent temporary ref to transport would turn
     // a harmless repeat publish into a failure.
     if repo.find_reference(&temp_ref).is_err() {
-        return Ok(ProjectionResult::NoChanges);
+        return Ok(ProjectionResult::NoChanges {
+            shared_total: publication.shared_total,
+        });
     }
     // Construct the owner immediately after the staging ref exists. From here
     // cancellation, errors, and panic unwind all clean it up via Drop.
@@ -897,7 +1036,7 @@ pub fn push_projection_to_ref<'repo>(
     Ok(ProjectionResult::Candidate {
         oid,
         candidate,
-        ids,
+        publication,
     })
 }
 
@@ -905,11 +1044,11 @@ fn push_ids_to_ref(
     repo: &Repository,
     db: &CvcStore,
     ref_name: &str,
-    baseline_ref: Option<&str>,
+    baseline: &ImportedBaseline,
     all_ids: &[crate::models::InteractionId],
     tombstones: &[Tombstone],
     remote_fingerprint: &str,
-) -> Result<git2::Oid> {
+) -> Result<(git2::Oid, ProjectionPublication)> {
     if !validate_ref_name(ref_name) {
         return Err(SyncError::Ref(format!("Invalid ref name: {}", ref_name)));
     }
@@ -918,31 +1057,63 @@ fn push_ids_to_ref(
     let mut parent_commit = None;
     let mut existing_root_tree: Option<Tree> = None;
 
-    if let Some(seed_ref) = baseline_ref {
-        if !validate_ref_name(seed_ref) {
-            return Err(SyncError::Ref(format!("Invalid baseline ref: {seed_ref}")));
-        }
-        if let Ok(reference) = repo.find_reference(seed_ref) {
+    // Seed from the tracking ref only if it still is exactly what the import read
+    // (and recorded as published). The check is made on the commit peeled here for
+    // seeding, so no gap remains between verifying the baseline and using it. On any
+    // mismatch nothing is built: no candidate, no publication, no state change.
+    let seed_ref = baseline.ref_name.as_str();
+    match repo.find_reference(seed_ref) {
+        Ok(reference) => {
+            if !validate_ref_name(seed_ref) {
+                return Err(SyncError::Ref(format!("Invalid baseline ref: {seed_ref}")));
+            }
             if let Ok(commit) = reference.peel_to_commit() {
+                if baseline.tip != Some(commit.id()) {
+                    return Err(baseline.moved());
+                }
                 let tree = commit.tree()?;
                 validate_v5_reserved_namespaces(repo, &tree)?;
                 root_builder = repo.treebuilder(Some(&tree))?;
                 existing_root_tree = Some(tree);
                 parent_commit = Some(commit);
             } else if let Ok(obj) = reference.peel(ObjectType::Tree) {
-                if let Some(tree) = obj.as_tree() {
-                    validate_v5_reserved_namespaces(repo, tree)?;
-                    root_builder = repo.treebuilder(Some(tree))?;
-                    existing_root_tree = Some(repo.find_tree(tree.id())?);
+                let tree = obj
+                    .as_tree()
+                    .ok_or_else(|| SyncError::Ref("baseline ref is not a tree".into()))?;
+                if baseline.tip != Some(tree.id()) {
+                    return Err(baseline.moved());
                 }
+                validate_v5_reserved_namespaces(repo, tree)?;
+                root_builder = repo.treebuilder(Some(tree))?;
+                existing_root_tree = Some(repo.find_tree(tree.id())?);
+            } else {
+                return Err(SyncError::Ref(
+                    "baseline ref resolves to neither a commit nor a tree".into(),
+                ));
             }
         }
-    } else {
-        // An empty baseline is only valid after the caller has proved the remote
-        // ref absent. Never seed outbound bytes from a mutable local shadow ref.
+        // The import saw the ref absent: it must still be absent. An empty
+        // baseline is never assumed from a mutable ref.
+        Err(error) if error.code() == git2::ErrorCode::NotFound => {
+            if baseline.tip.is_some() {
+                return Err(baseline.moved());
+            }
+        }
+        Err(error) => return Err(error.into()),
     }
 
+    // `existing_root_tree` is replaced by a privacy-pruned copy once tombstones
+    // apply. Keep the untouched baseline to measure what this candidate adds to
+    // it and removes from it.
+    let baseline_root_tree = existing_root_tree
+        .as_ref()
+        .map(|tree| repo.find_tree(tree.id()))
+        .transpose()?;
+
     let mut emitted_bytes = 0usize;
+    // Everything below that adds a new entry to the outbound tree is counted
+    // here at the insertion site, so the summary cannot disagree with the tree.
+    let mut publication = ProjectionPublication::default();
 
     // Tombstones dominate every historical projection. Remove all target paths
     // from the seeded remote tree before adding immutable suppression records.
@@ -986,11 +1157,15 @@ fn push_ids_to_ref(
     let existing_ranges_tree = child_tree(repo, existing_root_tree.as_ref(), "ranges");
     // --- nodes/<prefix>/<id>.json ---
     let mut prefix_builders: HashMap<String, TreeBuilder> = HashMap::new();
+    // Distinct projected interactions that are nodes of the final tree, whether
+    // the baseline already holds them or this candidate adds them.
+    let mut projected_nodes: HashSet<String> = HashSet::new();
 
     for id in all_ids {
         if tombstoned.contains(&id.to_string()) {
             continue;
         }
+        projected_nodes.insert(id.as_str());
         let legacy_filename = format!("{}.json", id.as_str());
         if let Some(entry) = root_builder.get(&legacy_filename)? {
             verify_existing_node(repo, entry.id(), &id.as_str())?;
@@ -1048,7 +1223,9 @@ fn push_ids_to_ref(
         validate_final_node_bytes(&json)?;
         let blob_oid = repo.blob(&json)?;
         builder.insert(&legacy_filename, blob_oid, FileMode::Blob.into())?;
+        publication.new_ids.push(id.clone());
     }
+    publication.shared_total = projected_nodes.len();
 
     // --- tombstones/<prefix>/<id>.json ---
     let existing_tombstones = child_tree(repo, existing_root_tree.as_ref(), "tombstones");
@@ -1079,7 +1256,9 @@ fn push_ids_to_ref(
         let bytes = serde_json::to_vec(tombstone)?;
         add_sync_bytes(&mut emitted_bytes, bytes.len(), MAX_SYNC_TOTAL_BYTES)?;
         let oid = repo.blob(&bytes)?;
-        builder.insert(&file, oid, FileMode::Blob.into())?;
+        if insert_blob_counting_new(builder, &file, oid)? {
+            publication.new_tombstones += 1;
+        }
     }
     if !tombstone_prefixes.is_empty() {
         let mut b = child_treebuilder(repo, existing_root_tree.as_ref(), "tombstones")?;
@@ -1105,6 +1284,10 @@ fn push_ids_to_ref(
     let mut link_builders: HashMap<String, TreeBuilder> = HashMap::new();
     for id in all_ids {
         let id_string = id.as_str();
+        // Fail closed: a suppressed interaction never regains a link record.
+        if tombstoned.contains(&id_string) {
+            continue;
+        }
         for link in db.get_legacy_artifact_links(id)? {
             if !is_automatic_link_type(&link.link_type)
                 || !is_safe_commit_sha(link.git_commit_hash.as_str())
@@ -1181,6 +1364,7 @@ fn push_ids_to_ref(
                 validate_final_link_bytes(&bytes)?;
                 let blob_oid = repo.blob(&bytes)?;
                 builder.insert(&filename, blob_oid, FileMode::Blob.into())?;
+                publication.new_link_records += 1;
             }
         }
     }
@@ -1238,7 +1422,13 @@ fn push_ids_to_ref(
             )?),
         };
         add_sync_bytes(&mut emitted_bytes, bytes.len(), MAX_SYNC_TOTAL_BYTES)?;
-        b.insert(&file, repo.blob(&bytes)?, FileMode::Blob.into())?;
+        // Counted against the untouched baseline: an entry that tombstone pruning
+        // dropped and the projection re-adds is not new to the destination.
+        if insert_blob_counting_new(b, &file, repo.blob(&bytes)?)?
+            && !baseline_holds(repo, baseline_root_tree.as_ref(), "events", shard, &file)
+        {
+            publication.new_derivation_records += 1;
+        }
     }
     if !event_shards.is_empty() {
         let mut outer = child_treebuilder(repo, existing_root_tree.as_ref(), "events")?;
@@ -1274,7 +1464,13 @@ fn push_ids_to_ref(
             )?),
         };
         add_sync_bytes(&mut emitted_bytes, bytes.len(), MAX_SYNC_TOTAL_BYTES)?;
-        b.insert(&file, repo.blob(&bytes)?, FileMode::Blob.into())?;
+        // `prune_range_sources` drops every range no surviving baseline event
+        // references, so a range the projection re-adds may be unchanged.
+        if insert_blob_counting_new(b, &file, repo.blob(&bytes)?)?
+            && !baseline_holds(repo, baseline_root_tree.as_ref(), "ranges", shard, &file)
+        {
+            publication.new_derivation_records += 1;
+        }
     }
     if !range_shards.is_empty() {
         let mut outer = child_treebuilder(repo, existing_root_tree.as_ref(), "ranges")?;
@@ -1297,6 +1493,15 @@ fn push_ids_to_ref(
     // from the one final pruned/projected tree so stale baseline pointers cannot
     // survive privacy pruning or point at unprojectable assertions.
     let projected_without_index = repo.find_tree(root_builder.write()?)?;
+    if let Some(baseline) = baseline_root_tree
+        .as_ref()
+        .filter(|_| !tombstoned.is_empty())
+    {
+        let (interactions, records) =
+            count_pruned_baseline_entries(repo, baseline, &projected_without_index, &tombstoned)?;
+        publication.removed_interactions = interactions;
+        publication.removed_records = records;
+    }
     validate_by_commit_structure(repo, &projected_without_index)?;
     validate_tree_derivation_graph(repo, &projected_without_index)?;
     let expected = projected_endpoints(repo, &projected_without_index)?;
@@ -1342,7 +1547,7 @@ fn push_ids_to_ref(
     // Optimization: Skip commit if tree hasn't changed
     if let Some(parent) = &parent_commit {
         if parent.tree_id() == new_tree_oid {
-            return Ok(parent.id());
+            return Ok((parent.id(), publication));
         }
     }
 
@@ -1370,7 +1575,91 @@ fn push_ids_to_ref(
         &parents,
     )?;
 
-    Ok(commit_oid)
+    Ok((commit_oid, publication))
+}
+
+/// True when `<namespace>/<shard>/<file>` exists in the (untouched) baseline.
+fn baseline_holds(
+    repo: &Repository,
+    baseline: Option<&Tree>,
+    namespace: &str,
+    shard: &str,
+    file: &str,
+) -> bool {
+    child_tree(repo, baseline, namespace)
+        .and_then(|namespace| child_tree(repo, Some(&namespace), shard))
+        .is_some_and(|shard| shard.get_name(file).is_some())
+}
+
+/// Whether `tree` holds the node of interaction `id`, in either the legacy flat
+/// layout or the sharded `nodes/` layout.
+fn holds_node(repo: &Repository, tree: &Tree, id: &str) -> bool {
+    let file = format!("{id}.json");
+    tree.get_name(&file).is_some()
+        || child_tree(repo, Some(tree), "nodes")
+            .and_then(|nodes| child_tree(repo, Some(&nodes), shard_prefix(id)))
+            .is_some_and(|shard| shard.get_name(&file).is_some())
+}
+
+/// What tombstone pruning took out of the baseline: `(interactions, records)`.
+/// Measured as "held by the baseline and absent from the projected tree", so
+/// anything pruned and then re-added is not counted. Index (`by-commit/`) pointers
+/// are derived and deliberately not counted.
+fn count_pruned_baseline_entries(
+    repo: &Repository,
+    baseline: &Tree,
+    projected: &Tree,
+    tombstoned: &HashSet<String>,
+) -> Result<(usize, usize)> {
+    let mut interactions = 0usize;
+    let mut records = 0usize;
+    let baseline_links = child_tree(repo, Some(baseline), "links");
+    let projected_links = child_tree(repo, Some(projected), "links");
+    for id in tombstoned {
+        if holds_node(repo, baseline, id) && !holds_node(repo, projected, id) {
+            interactions += 1;
+        }
+        let held = baseline_links
+            .as_ref()
+            .is_some_and(|links| links.get_name(id).is_some());
+        let kept = projected_links
+            .as_ref()
+            .is_some_and(|links| links.get_name(id).is_some());
+        if held && !kept {
+            records += 1;
+        }
+    }
+    for namespace in ["events", "ranges"] {
+        let Some(before) = child_tree(repo, Some(baseline), namespace) else {
+            continue;
+        };
+        let after = child_tree(repo, Some(projected), namespace);
+        for shard in before.iter() {
+            if shard.kind() != Some(ObjectType::Tree) {
+                continue;
+            }
+            let shard_name = shard.name().unwrap_or_default();
+            let kept = child_tree(repo, after.as_ref(), shard_name);
+            for entry in repo.find_tree(shard.id())?.iter() {
+                let name = entry.name().unwrap_or_default();
+                if !kept
+                    .as_ref()
+                    .is_some_and(|tree| tree.get_name(name).is_some())
+                {
+                    records += 1;
+                }
+            }
+        }
+    }
+    Ok((interactions, records))
+}
+
+/// Inserts a blob entry and reports whether `name` was absent from `builder`
+/// beforehand, so publication summaries count only entries that really are new.
+fn insert_blob_counting_new(builder: &mut TreeBuilder, name: &str, oid: git2::Oid) -> Result<bool> {
+    let was_absent = builder.get(name)?.is_none();
+    builder.insert(name, oid, FileMode::Blob.into())?;
+    Ok(was_absent)
 }
 
 /// Recursively collects `(interaction_id, blob_oid)` pairs for every `<id>.json` blob
@@ -1675,17 +1964,42 @@ pub fn pull_from_ref_with_limits(
     if !validate_ref_name(ref_name) {
         return Err(SyncError::Ref(format!("Invalid ref name: {}", ref_name)));
     }
+    import_ref_with_limits(repo, db, ref_name, remote_fingerprint, limits).map(|_| ())
+}
 
-    // 1. Resolve Ref
+/// The import itself. Returns what it read: the commit (or direct tree) `ref_name`
+/// resolved to, or `None` when the ref is absent. The tree that is decoded and the
+/// returned id come from the same peel, so the id names exactly the imported state.
+fn import_ref_with_limits(
+    repo: &Repository,
+    db: &CvcStore,
+    ref_name: &str,
+    remote_fingerprint: Option<&str>,
+    limits: SyncReadLimits,
+) -> Result<Option<git2::Oid>> {
+    // 1. Resolve Ref. Only a ref that is really absent means "nothing to pull";
+    // any other lookup failure must not be mistaken for an empty remote. The name
+    // is validated once the ref exists, as the pre-existing destination path did.
     let reference = match repo.find_reference(ref_name) {
         Ok(r) => r,
-        Err(_) => return Ok(()), // Nothing to pull
+        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
+    if !validate_ref_name(ref_name) {
+        return Err(SyncError::Ref(format!("Invalid ref name: {}", ref_name)));
+    }
 
-    let obj = reference.peel(ObjectType::Tree)?;
-    let tree = obj
-        .as_tree()
-        .ok_or_else(|| SyncError::Ref("Ref is not a tree".into()))?;
+    let (imported_tip, tree_holder) = match reference.peel_to_commit() {
+        Ok(commit) => (commit.id(), commit.tree()?),
+        Err(_) => {
+            let tree = reference
+                .peel(ObjectType::Tree)?
+                .into_tree()
+                .map_err(|_| SyncError::Ref("Ref is not a tree".into()))?;
+            (tree.id(), tree)
+        }
+    };
+    let tree = &tree_holder;
     let mut format_version = 1u64;
     if let Some(entry) = tree.get_name("FORMAT") {
         let blob = repo.find_blob(entry.id())?;
@@ -2007,7 +2321,7 @@ pub fn pull_from_ref_with_limits(
         &published_ids,
     )?;
 
-    Ok(())
+    Ok(Some(imported_tip))
 }
 
 fn validate_v5_reserved_namespaces(repo: &Repository, root: &Tree) -> Result<()> {
@@ -2568,8 +2882,18 @@ pub fn fetch_and_pull_destination(
     db: &CvcStore,
     destination: &crate::privacy::RemoteDestination,
 ) -> Result<usize> {
+    fetch_and_pull_destination_pinned(repo, db, destination).map(|(count, _)| count)
+}
+
+/// Like `fetch_and_pull_destination`, and also returns exactly what the import
+/// read from the tracking ref. Publication must project from this baseline.
+pub fn fetch_and_pull_destination_pinned(
+    repo: &Repository,
+    db: &CvcStore,
+    destination: &crate::privacy::RemoteDestination,
+) -> Result<(usize, ImportedBaseline)> {
     fetch_destination(repo, destination)?;
-    pull_destination(repo, db, destination)
+    pull_destination_pinned(repo, db, destination)
 }
 
 /// Fetches the approved CVC ref without touching the local CVC database.
@@ -2618,23 +2942,39 @@ pub fn pull_destination(
     db: &CvcStore,
     destination: &crate::privacy::RemoteDestination,
 ) -> Result<usize> {
+    pull_destination_pinned(repo, db, destination).map(|(count, _)| count)
+}
+
+/// Like `pull_destination`, and also returns the exact state of the tracking ref
+/// the import read (absent, or the commit it decoded), so that a later projection
+/// can refuse to build on anything else.
+pub fn pull_destination_pinned(
+    repo: &Repository,
+    db: &CvcStore,
+    destination: &crate::privacy::RemoteDestination,
+) -> Result<(usize, ImportedBaseline)> {
     let remote_tracking_ref = format!("refs/remotes/{}/cvc/main", destination.name);
-    if repo.find_reference(&remote_tracking_ref).is_err() {
-        return Ok(0);
-    }
     let before_count = db.get_all_interaction_ids()?.len();
-    pull_from_ref_for_remote(
+    let tip = import_ref_with_limits(
         repo,
         db,
         &remote_tracking_ref,
         Some(&destination.fingerprint),
+        SyncReadLimits::default(),
     )?;
     let new_count = db
         .get_all_interaction_ids()?
         .len()
         .saturating_sub(before_count);
 
-    Ok(new_count)
+    Ok((
+        new_count,
+        ImportedBaseline {
+            remote: destination.name.clone(),
+            ref_name: remote_tracking_ref,
+            tip,
+        },
+    ))
 }
 
 pub fn push_temp_ref(
@@ -2777,5 +3117,41 @@ mod derivation_graph_tests {
             &legacy,
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod projection_publication_tests {
+    use super::*;
+    use crate::models::{InteractionId, TombstoneReasonCode};
+
+    /// Defense in depth: even if a tombstoned id reached the projection input, it
+    /// is never serialized as a node, never counted as new, and not counted in
+    /// the shared total. The id is absent from the database, so serializing it
+    /// would fail the call outright.
+    #[test]
+    fn a_tombstoned_id_in_the_projection_input_is_neither_published_nor_counted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let store = CvcStore::open(dir.path().join("cvc.db")).unwrap();
+        let suppressed = InteractionId::new();
+        let tombstone =
+            Tombstone::new(suppressed.clone(), TombstoneReasonCode::UserRequested, None);
+
+        let (_, publication) = push_ids_to_ref(
+            &repo,
+            &store,
+            "refs/cvc/candidate-unit",
+            &ImportedBaseline::observe(&repo, "refs/remotes/unit/cvc/main").unwrap(),
+            std::slice::from_ref(&suppressed),
+            std::slice::from_ref(&tombstone),
+            &"f".repeat(64),
+        )
+        .unwrap();
+
+        assert!(publication.new_ids.is_empty());
+        assert_eq!(publication.shared_total, 0);
+        assert_eq!(publication.new_tombstones, 1);
+        assert_eq!(publication.new_link_records, 0);
     }
 }

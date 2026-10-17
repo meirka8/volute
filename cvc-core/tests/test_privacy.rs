@@ -12,8 +12,15 @@ use cvc_core::sync;
 use git2::Repository;
 use tempfile::tempdir;
 
+/// "No remote baseline": pins a tracking ref that does not exist, so the
+/// projection starts from an empty tree and verifies that nothing appeared.
+fn no_baseline(repo: &Repository) -> sync::ImportedBaseline {
+    sync::ImportedBaseline::observe(repo, "refs/remotes/unpublished/cvc/main").unwrap()
+}
+
 fn project_fixture_to_ref(repo: &Repository, store: &CvcStore, ref_name: &str, destination: &str) {
-    let projection = sync::push_projection_to_ref(repo, store, "", destination).unwrap();
+    let projection =
+        sync::push_projection_to_ref(repo, store, &no_baseline(repo), destination).unwrap();
     let sync::ProjectionResult::Candidate { oid, candidate, .. } = projection else {
         panic!("fixture expected projection candidate");
     };
@@ -433,7 +440,8 @@ fn aws_pair_is_absent_from_all_captured_fields_db_wal_and_projection() {
     if wal.exists() {
         assert!(!String::from_utf8_lossy(&std::fs::read(wal).unwrap()).contains(secret));
     }
-    let projection = sync::push_projection_to_ref(&repo, &store, "", "remote").unwrap();
+    let projection =
+        sync::push_projection_to_ref(&repo, &store, &no_baseline(&repo), "remote").unwrap();
     let sync::ProjectionResult::Candidate { oid, candidate, .. } = projection else {
         panic!("expected projection")
     };

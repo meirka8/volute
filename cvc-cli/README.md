@@ -120,7 +120,22 @@ Publish selected shared content manually:
 cvc push --manual --remote origin
 ```
 
-Manual publication requires destination sharing consent and a TTY `I PUBLISH ...` challenge. A bare `cvc push` is treated as an auto-consent-gated path: it will not publish unless auto-push was explicitly enabled for that remote. Hooks use the same destination-specific auto-push gate. Reconcile ambiguous transport results before changing publication choices:
+Manual publication requires destination sharing consent and a TTY `I PUBLISH <fingerprint> <candidate> <count>` challenge. A bare `cvc push` is treated as an auto-consent-gated path: it will not publish unless auto-push was explicitly enabled for that remote. Hooks use the same destination-specific auto-push gate.
+
+Before the challenge, `push` states what it is about to publish:
+
+```text
+Publishing 21 new shared interaction(s) to 'origin' (42 shared in total).
+Type exactly 'I PUBLISH <fingerprint> a1b2c3d4e5f6 21' to continue:
+```
+
+`<candidate>` is the first 12 characters of the commit that will be pushed. `<count>` is the number of shared interactions (the "thoughts" that `cvc conversations` counts) that the destination's current `refs/cvc/main` does not already hold, checked against a fresh fetch just before the prompt. Interactions it already holds are not counted again: after sharing one more 21-thought conversation, a second push asks for `21`, not `42`. If the remote ref was rewound or recreated, interactions published earlier are sent and counted again. The total in parentheses counts only what this clone shares with that destination, not everything on the remote, since other clones may have published more; it is for orientation only. The `published` figures in `cvc conversations` show what this clone knows a destination already has.
+
+Everything else the push changes is named on the same line rather than counted in the challenge; the candidate id covers it. Added commit links, tombstones, and derivation records follow the count (`, plus 3 commit link(s) and 1 tombstone(s)`). When tombstones also drop an interaction, or records attached to it, from the current `refs/cvc/main` tree, the line names that removal too. That is suppression, not erasure: the ref's earlier commits still hold what was dropped, as can clones and third-party copies (see [Suppress, redact, and local rewrite plans](#suppress-redact-and-local-rewrite-plans)).
+
+A push with no new interactions says so, as in `Publishing 3 commit link(s) and 1 tombstone(s) to 'origin' (no new shared interactions; 42 shared in total).`, and its challenge ends in `0`. A push that changes only the ref's format or index says `a format/index update of refs/cvc/main` instead. When nothing differs from the destination, `push` prints `No new shared interactions to publish to 'origin' (42 shared in total).` and asks for no challenge. Hooks and an acknowledged auto-push print the result line (`Published 21 new shared interaction(s) to 'origin' (42 shared in total).`) without a challenge.
+
+Reconcile ambiguous transport results before changing publication choices:
 
 ```bash
 cvc privacy reconcile --remote origin

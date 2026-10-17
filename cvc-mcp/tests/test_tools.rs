@@ -9,6 +9,12 @@ use serde_json::json;
 use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
 
+/// "No remote baseline": pins a tracking ref that does not exist, so the
+/// projection starts from an empty tree and verifies that nothing appeared.
+fn no_baseline(repo: &Repository) -> cvc_core::sync::ImportedBaseline {
+    cvc_core::sync::ImportedBaseline::observe(repo, "refs/remotes/unpublished/cvc/main").unwrap()
+}
+
 trait CaptureFixture {
     fn create_conversation(&self, _: &Conversation) -> cvc_core::db::Result<()>;
     fn create_interaction(&self, interaction: &Interaction) -> cvc_core::db::Result<()>;
@@ -35,7 +41,9 @@ impl CaptureFixture for CvcStore {
 }
 
 fn project_fixture_to_ref(repo: &Repository, store: &CvcStore, ref_name: &str, destination: &str) {
-    let projection = cvc_core::sync::push_projection_to_ref(repo, store, "", destination).unwrap();
+    let projection =
+        cvc_core::sync::push_projection_to_ref(repo, store, &no_baseline(repo), destination)
+            .unwrap();
     let cvc_core::sync::ProjectionResult::Candidate { oid, candidate, .. } = projection else {
         panic!("fixture expected projection candidate");
     };

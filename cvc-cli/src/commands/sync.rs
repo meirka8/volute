@@ -465,68 +465,226 @@ fn push_destination(
         return Ok(());
     }
     reconcile_destination(repo, store, destination)?;
-    // Fetch first: this exact tracking ref is the only permissible projection baseline.
-    sync::fetch_and_pull_destination(repo, store, destination)?;
-    let baseline = format!("refs/remotes/{}/cvc/main", destination.name);
-    let projection = sync::push_projection_to_ref(
-        repo,
-        store,
-        // fetch has proved absence by removing any stale tracking ref first.
-        if repo.find_reference(&baseline).is_ok() {
-            &baseline
-        } else {
-            ""
-        },
-        &status.remote_fingerprint,
-    )?;
-    let (oid, candidate, ids) = match projection {
-        sync::ProjectionResult::NoChanges => {
+    // Fetch first. The import returns exactly what it read from the tracking ref (or
+    // that it was absent); the projection is built from that state and nothing else,
+    // and fails closed, publishing nothing, if the ref has moved since.
+    let (_, baseline) = sync::fetch_and_pull_destination_pinned(repo, store, destination)?;
+    let projection =
+        sync::push_projection_to_ref(repo, store, &baseline, &status.remote_fingerprint)?;
+    let (oid, candidate, publication) = match projection {
+        sync::ProjectionResult::NoChanges { shared_total } => {
             println!(
-                "No shared CVC interactions pending for '{}'.",
-                destination.name
+                "{}",
+                nothing_to_publish_line(&destination.name, shared_total)
             );
             return Ok(());
         }
         sync::ProjectionResult::Candidate {
             oid,
             candidate,
-            ids,
-        } => (oid, candidate, ids),
+            publication,
+        } => (oid, candidate, publication),
     };
+    // The one count of interactions this push adds. The pre-challenge line, the
+    // typed phrase, and the result line all use it.
+    let new_interactions = publication.new_ids.len();
     if trigger.requires_challenge(status.auto_push) {
-        typed_acknowledgement(&format!(
-            "I PUBLISH {} {} {}",
-            destination.fingerprint,
-            &oid.to_string()[..12],
-            ids.len()
-        ))?;
+        // The summary is printed immediately before the prompt, nothing in between,
+        // so the count inside the challenge is one the user has just read.
+        let prompt = publish_prompt(
+            &destination.name,
+            &destination.fingerprint,
+            oid,
+            new_interactions,
+            &publication,
+        );
+        println!("{}", prompt.summary);
+        typed_acknowledgement(&prompt.challenge)?;
     }
-    store.mark_publication(&ids, &status.remote_fingerprint, PublicationState::Pending)?;
+    // Publication state is recorded only for interactions this candidate newly
+    // writes. Rows the baseline already holds are neither re-marked nor demoted
+    // if the transport fails.
+    let new_ids = publication.new_ids.as_slice();
+    store.mark_publication(
+        new_ids,
+        &status.remote_fingerprint,
+        PublicationState::Pending,
+    )?;
     let result = match sync::push_temp_ref(repo, destination, candidate.ref_name()) {
         Ok(()) => {
             store.mark_publication(
-                &ids,
+                new_ids,
                 &status.remote_fingerprint,
                 PublicationState::Published,
             )?;
             store.mark_remote_tombstones_published(&status.remote_fingerprint)?;
             println!(
-                "Published {} shared interaction(s) to '{}'.",
-                ids.len(),
-                destination.name
+                "{}",
+                describe_publication(
+                    &destination.name,
+                    new_interactions,
+                    &publication,
+                    PublicationPhase::Done
+                )
             );
             Ok(())
         }
         Err(e) => {
             // A failed transport is ambiguous: do not make content mutable until a
             // later reconciliation proves the destination did not receive it.
-            store.mark_publication(&ids, &status.remote_fingerprint, PublicationState::Unknown)?;
+            store.mark_publication(
+                new_ids,
+                &status.remote_fingerprint,
+                PublicationState::Unknown,
+            )?;
             Err(e.into())
         }
     };
     // `candidate` cleans up on success, errors, TTY cancellation, and unwinding.
     drop(candidate);
     result
+}
+/// Shown when the projection already equals the fetched remote baseline.
+fn nothing_to_publish_line(remote: &str, shared_total: usize) -> String {
+    if shared_total > 0 {
+        format!(
+            "No new shared interactions to publish to '{remote}' ({shared_total} shared in total)."
+        )
+    } else {
+        format!("No new shared interactions to publish to '{remote}'.")
+    }
+}
+
+/// The typed phrase that authorizes one publication. The trailing number is the
+/// count of interactions this push adds to the destination (not the size of the
+/// whole shared projection); the candidate commit prefix pins the exact tree.
+fn publish_challenge(fingerprint: &str, candidate: git2::Oid, new_interactions: usize) -> String {
+    format!(
+        "I PUBLISH {fingerprint} {} {new_interactions}",
+        &candidate.to_string()[..12]
+    )
+}
+
+/// The summary line shown right before the challenge and the challenge itself.
+/// Both are built from the same `new_interactions` value.
+struct PublishPrompt {
+    summary: String,
+    challenge: String,
+}
+
+fn publish_prompt(
+    remote: &str,
+    fingerprint: &str,
+    candidate: git2::Oid,
+    new_interactions: usize,
+    publication: &sync::ProjectionPublication,
+) -> PublishPrompt {
+    PublishPrompt {
+        summary: describe_publication(
+            remote,
+            new_interactions,
+            publication,
+            PublicationPhase::Planned,
+        ),
+        challenge: publish_challenge(fingerprint, candidate, new_interactions),
+    }
+}
+
+/// Whether a publication summary is shown before the user confirms it
+/// (`Planned`) or reports a push that has completed (`Done`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationPhase {
+    Planned,
+    Done,
+}
+
+/// What tombstone pruning takes out of the ref's current tree, worded so it cannot
+/// be read as erasure: the earlier commits of the ref keep those blobs.
+fn removal_phrase(publication: &sync::ProjectionPublication) -> Option<String> {
+    const SCOPE: &str = "the removal from the current tree of";
+    match (
+        publication.removed_interactions,
+        publication.removed_records,
+    ) {
+        (0, 0) => None,
+        (interactions, 0) => Some(format!("{SCOPE} {interactions} tombstoned interaction(s)")),
+        (interactions, records) if interactions > 0 => Some(format!(
+            "{SCOPE} {interactions} tombstoned interaction(s) with {records} attached record(s)"
+        )),
+        (_, records) => Some(format!(
+            "{SCOPE} {records} record(s) of tombstoned interaction(s)"
+        )),
+    }
+}
+
+/// Everything a push carries besides new interactions, as a noun phrase such as
+/// `3 commit link(s) and 1 tombstone(s)`. `None` when there is nothing else.
+fn extra_records_phrase(publication: &sync::ProjectionPublication) -> Option<String> {
+    let counted = |count: usize, phrase: String| (count > 0).then_some(phrase);
+    let parts: Vec<String> = [
+        counted(
+            publication.new_link_records,
+            format!("{} commit link(s)", publication.new_link_records),
+        ),
+        counted(
+            publication.new_tombstones,
+            format!("{} tombstone(s)", publication.new_tombstones),
+        ),
+        counted(
+            publication.new_derivation_records,
+            format!(
+                "{} derivation record(s)",
+                publication.new_derivation_records
+            ),
+        ),
+        removal_phrase(publication),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    match parts.as_slice() {
+        [] => None,
+        [only] => Some(only.clone()),
+        [head @ .., last] => Some(format!("{} and {last}", head.join(", "))),
+    }
+}
+
+/// The single line describing what a push carries, before (`Planned`) or after
+/// (`Done`) it. All wording for these lines lives here. A push that adds no
+/// interactions never reads as "Published 0 ...".
+fn describe_publication(
+    remote: &str,
+    new_interactions: usize,
+    publication: &sync::ProjectionPublication,
+    phase: PublicationPhase,
+) -> String {
+    let total = publication.shared_total;
+    let lead = match phase {
+        PublicationPhase::Planned => "Publishing",
+        PublicationPhase::Done => "Published",
+    };
+    match (new_interactions, extra_records_phrase(publication)) {
+        // Only the ref's format, empty namespaces, or the derived by-commit index
+        // differ: no interaction, link, tombstone, or derivation record moves.
+        (0, None) => format!(
+            "{lead} a format/index update of refs/cvc/main to '{remote}' (no new interactions, links, or tombstones)."
+        ),
+        (0, Some(extras)) => format!(
+            "{lead} {extras} to '{remote}' (no new shared interactions; {total} shared in total)."
+        ),
+        (new, extras) => {
+            // On a first push the total is the new count; say it once.
+            let context = if extras.is_none() && new == total {
+                String::new()
+            } else {
+                format!(" ({total} shared in total)")
+            };
+            let tail = extras
+                .map(|extras| format!(", plus {extras}"))
+                .unwrap_or_default();
+            format!("{lead} {new} new shared interaction(s) to '{remote}'{context}{tail}.")
+        }
+    }
 }
 fn reconcile_destination(
     repo: &Repository,
@@ -684,5 +842,210 @@ mod publication_trigger_tests {
         // `automatic` flag would have hit the silent early return here.
         assert!(!BundledWithShare.skips_without_auto_push());
         assert!(BundledWithShare.requires_challenge(false));
+    }
+}
+
+#[cfg(test)]
+mod publication_summary_tests {
+    use super::PublicationPhase::{Done, Planned};
+    use super::{describe_publication, nothing_to_publish_line, publish_challenge, publish_prompt};
+    use cvc_core::{sync::ProjectionPublication, InteractionId};
+
+    /// `[links, tombstones, derivations, removed interactions, removed records]`.
+    fn publication(new: usize, total: usize, others: [usize; 5]) -> ProjectionPublication {
+        ProjectionPublication {
+            new_ids: (0..new).map(|_| InteractionId::new()).collect(),
+            shared_total: total,
+            new_link_records: others[0],
+            new_tombstones: others[1],
+            new_derivation_records: others[2],
+            removed_interactions: others[3],
+            removed_records: others[4],
+        }
+    }
+
+    fn line(p: &ProjectionPublication, phase: super::PublicationPhase) -> String {
+        describe_publication("origin", p.new_ids.len(), p, phase)
+    }
+
+    #[test]
+    fn new_interactions_are_counted_apart_from_the_shared_total() {
+        let p = publication(21, 42, [0; 5]);
+        assert_eq!(
+            line(&p, Planned),
+            "Publishing 21 new shared interaction(s) to 'origin' (42 shared in total)."
+        );
+        assert_eq!(
+            line(&p, Done),
+            "Published 21 new shared interaction(s) to 'origin' (42 shared in total)."
+        );
+    }
+
+    #[test]
+    fn a_first_push_does_not_repeat_the_count_as_a_total() {
+        let p = publication(21, 21, [0; 5]);
+        assert_eq!(
+            line(&p, Planned),
+            "Publishing 21 new shared interaction(s) to 'origin'."
+        );
+        assert_eq!(
+            line(&p, Done),
+            "Published 21 new shared interaction(s) to 'origin'."
+        );
+        // With something else riding along the context stays, so the line keeps
+        // one shape.
+        let with_links = publication(21, 21, [3, 0, 0, 0, 0]);
+        assert_eq!(
+            line(&with_links, Done),
+            "Published 21 new shared interaction(s) to 'origin' (21 shared in total), plus 3 commit link(s)."
+        );
+    }
+
+    #[test]
+    fn other_records_ride_along_and_zero_categories_are_omitted() {
+        assert_eq!(
+            line(&publication(21, 42, [3, 0, 0, 0, 0]), Planned),
+            "Publishing 21 new shared interaction(s) to 'origin' (42 shared in total), plus 3 commit link(s)."
+        );
+        assert_eq!(
+            line(&publication(21, 42, [3, 1, 0, 0, 0]), Planned),
+            "Publishing 21 new shared interaction(s) to 'origin' (42 shared in total), plus 3 commit link(s) and 1 tombstone(s)."
+        );
+        assert_eq!(
+            line(&publication(5, 9, [3, 1, 2, 0, 0]), Done),
+            "Published 5 new shared interaction(s) to 'origin' (9 shared in total), plus 3 commit link(s), 1 tombstone(s) and 2 derivation record(s)."
+        );
+        assert_eq!(
+            line(&publication(1, 4, [0, 2, 0, 0, 0]), Done),
+            "Published 1 new shared interaction(s) to 'origin' (4 shared in total), plus 2 tombstone(s)."
+        );
+    }
+
+    #[test]
+    fn a_push_without_new_interactions_leads_with_what_it_does_carry() {
+        let p = publication(0, 42, [3, 1, 0, 0, 0]);
+        assert_eq!(
+            line(&p, Planned),
+            "Publishing 3 commit link(s) and 1 tombstone(s) to 'origin' (no new shared interactions; 42 shared in total)."
+        );
+        assert_eq!(
+            line(&p, Done),
+            "Published 3 commit link(s) and 1 tombstone(s) to 'origin' (no new shared interactions; 42 shared in total)."
+        );
+        assert_eq!(
+            line(&publication(0, 2, [0, 0, 1, 0, 0]), Done),
+            "Published 1 derivation record(s) to 'origin' (no new shared interactions; 2 shared in total)."
+        );
+    }
+
+    #[test]
+    fn removals_by_tombstone_pruning_are_named_never_called_a_format_update() {
+        let removal = publication(0, 40, [0, 0, 0, 2, 0]);
+        assert!(!removal.is_structural_only());
+        assert_eq!(
+            line(&removal, Planned),
+            "Publishing the removal from the current tree of 2 tombstoned interaction(s) to 'origin' (no new shared interactions; 40 shared in total)."
+        );
+        let redaction = publication(0, 41, [0, 1, 0, 1, 2]);
+        assert_eq!(
+            line(&redaction, Done),
+            "Published 1 tombstone(s) and the removal from the current tree of 1 tombstoned interaction(s) with 2 attached record(s) to 'origin' (no new shared interactions; 41 shared in total)."
+        );
+        let stale = publication(0, 41, [0, 0, 0, 0, 3]);
+        assert_eq!(
+            line(&stale, Done),
+            "Published the removal from the current tree of 3 record(s) of tombstoned interaction(s) to 'origin' (no new shared interactions; 41 shared in total)."
+        );
+        // One trailing element, after links, tombstones, and derivations.
+        let everything = publication(2, 9, [3, 1, 2, 1, 4]);
+        assert_eq!(
+            line(&everything, Planned),
+            "Publishing 2 new shared interaction(s) to 'origin' (9 shared in total), plus 3 commit link(s), 1 tombstone(s), 2 derivation record(s) and the removal from the current tree of 1 tombstoned interaction(s) with 4 attached record(s)."
+        );
+        for p in [&removal, &redaction, &stale] {
+            assert!(!line(p, Planned).contains("format/index"));
+        }
+    }
+
+    #[test]
+    fn a_residual_candidate_is_a_format_or_index_update_and_never_zero_published() {
+        let p = publication(0, 42, [0; 5]);
+        assert!(p.is_structural_only());
+        assert_eq!(
+            line(&p, Planned),
+            "Publishing a format/index update of refs/cvc/main to 'origin' (no new interactions, links, or tombstones)."
+        );
+        assert_eq!(
+            line(&p, Done),
+            "Published a format/index update of refs/cvc/main to 'origin' (no new interactions, links, or tombstones)."
+        );
+        for text in [line(&p, Planned), line(&p, Done)] {
+            assert!(!text.contains("Published 0"), "{text}");
+            assert!(!text.contains("Publishing 0"), "{text}");
+        }
+    }
+
+    #[test]
+    fn nothing_to_publish_mentions_the_total_only_when_there_is_one() {
+        assert_eq!(
+            nothing_to_publish_line("origin", 42),
+            "No new shared interactions to publish to 'origin' (42 shared in total)."
+        );
+        assert_eq!(
+            nothing_to_publish_line("origin", 0),
+            "No new shared interactions to publish to 'origin'."
+        );
+    }
+
+    #[test]
+    fn the_challenge_carries_the_new_count_and_the_candidate_prefix() {
+        let oid = git2::Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let fingerprint = "f".repeat(64);
+        assert_eq!(
+            publish_challenge(&fingerprint, oid, 21),
+            format!("I PUBLISH {fingerprint} 0123456789ab 21")
+        );
+        assert!(publish_challenge(&fingerprint, oid, 0).ends_with(" 0123456789ab 0"));
+    }
+
+    /// The count the user reads in the summary line.
+    fn count_in_summary(summary: &str) -> usize {
+        if summary.contains("no new shared interactions") || summary.contains("no new interactions")
+        {
+            return 0;
+        }
+        summary
+            .strip_prefix("Publishing ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|count| count.parse().ok())
+            .unwrap_or_else(|| panic!("no interaction count in {summary:?}"))
+    }
+
+    #[test]
+    fn the_challenge_count_is_the_count_in_the_line_printed_before_it() {
+        let oid = git2::Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let fingerprint = "f".repeat(64);
+        let shapes = [
+            publication(21, 42, [0; 5]),
+            publication(21, 21, [0; 5]),
+            publication(1, 1, [0, 1, 0, 1, 0]),
+            publication(7, 9, [3, 1, 2, 0, 0]),
+            publication(0, 42, [3, 1, 0, 0, 0]),
+            publication(0, 40, [0, 0, 0, 2, 0]),
+            publication(0, 42, [0; 5]),
+            publication(0, 0, [0, 1, 0, 0, 0]),
+        ];
+        for p in &shapes {
+            let prompt = publish_prompt("origin", &fingerprint, oid, p.new_ids.len(), p);
+            let token = prompt.challenge.rsplit(' ').next().unwrap();
+            assert_eq!(
+                token.parse::<usize>().unwrap(),
+                count_in_summary(&prompt.summary),
+                "{} / {}",
+                prompt.summary,
+                prompt.challenge
+            );
+            assert!(prompt.challenge.starts_with("I PUBLISH "));
+        }
     }
 }
