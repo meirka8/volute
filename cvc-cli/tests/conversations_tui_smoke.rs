@@ -218,3 +218,101 @@ fn a_flow_brings_the_view_back_on_a_terminal_that_never_answers_cursor_queries()
         "{output:?}"
     );
 }
+
+/// The view on a repository whose `origin` is authorized for publishing, with
+/// one captured conversation.
+fn authorized_session() -> (Fixture, PtySession) {
+    let fixture = fixture_with_a_conversation();
+    fixture.consent_to_sharing();
+    let mut session =
+        PtySession::spawn_sized(tui_command(&fixture, &["conversations"]), b"", 120, 40);
+    session.wait_for_screen_text("CVC conversations");
+    (fixture, session)
+}
+
+const SETTINGS_CHANGED: &str =
+    "Publishing settings for 'origin' changed; check them and press the key again.";
+
+#[test]
+fn a_share_asked_for_after_auto_push_was_turned_on_elsewhere_runs_nothing() {
+    let (fixture, mut session) = authorized_session();
+    session.write(b"s");
+    session.wait_for_screen_text("not yet shared");
+
+    // Another terminal turns auto-push on while the bar is open. The bar, and
+    // the banner that would follow, say nothing of it.
+    fixture.enable_auto_push();
+    session.write(b"\r");
+    let screen = session.wait_for_screen_text(SETTINGS_CHANGED);
+    assert!(
+        !session.output().contains("Type exactly"),
+        "no phrase may be asked on settings the screen did not show"
+    );
+    // The screen is refreshed: the header says it loudly now.
+    assert!(
+        screen.iter().any(|row| row.contains("auto-push: ON")),
+        "{screen:#?}"
+    );
+
+    // Pressing the key again shows the bar for the settings that apply.
+    session.write(b"s");
+    let screen = session.wait_for_screen_text("auto-push publishes them");
+    assert!(screen.iter().any(|row| row.contains("Esc: cancel")));
+    // Esc closes the bar. It is sent alone and waited for: a terminal reads an
+    // Esc with a key right behind it as Alt and that key.
+    session.write(b"\x1b");
+    session.wait_for_screen_text("q quit");
+    session.write(b"q");
+    let status = session.wait_for_exit();
+    assert!(status.success(), "{}", session.output());
+}
+
+#[test]
+fn a_publish_asked_for_after_the_settings_changed_elsewhere_runs_nothing() {
+    let (fixture, mut session) = authorized_session();
+    session.write(b"p");
+    session.wait_for_screen_text("Check 'origin' anyway?");
+
+    fixture.enable_auto_push();
+    session.write(b"\r");
+    session.wait_for_screen_text(SETTINGS_CHANGED);
+    let output = session.output();
+    assert!(!output.contains("Type exactly"), "{output}");
+    assert!(!output.contains("Checking 'origin' first"), "{output}");
+    session.write(b"q");
+    let status = session.wait_for_exit();
+    assert!(status.success(), "{}", session.output());
+}
+
+#[test]
+fn a_conversation_with_an_id_that_cannot_be_shown_safely_is_not_shared_or_unshared() {
+    let fixture = fixture_with_a_conversation();
+    fixture.consent_to_sharing();
+    // An MCP client chooses the id of what it records. This one holds an escape
+    // sequence, which the phrase to type would carry.
+    let id = "'evil' || char(27) || '[2Jid'";
+    rusqlite::Connection::open(fixture.index_db_path())
+        .unwrap()
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF;
+             UPDATE conversations SET id = {id};
+             UPDATE interactions SET conversation_id = {id};"
+        ))
+        .unwrap();
+    let mut session =
+        PtySession::spawn_sized(tui_command(&fixture, &["conversations"]), b"", 120, 40);
+    session.wait_for_screen_text("Run: printf");
+
+    for key in [b"s", b"u"] {
+        session.write(key);
+        let screen = session.wait_for_screen_text(
+            "This conversation's id contains characters that cannot be shown safely, so it cannot be shared or unshared from here.",
+        );
+        assert!(screen.iter().any(|row| row.contains("any key: ok")));
+        session.write(b"x");
+    }
+    assert!(!session.output().contains("Type exactly"));
+    session.write(b"q");
+    let status = session.wait_for_exit();
+    assert!(status.success(), "{}", session.output());
+}

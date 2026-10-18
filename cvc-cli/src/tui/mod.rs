@@ -252,6 +252,16 @@ fn run_flow(ctx: &Context, screen: &mut Screen, model: &mut Model, flow: Flow) -
         return Ok(());
     }
 
+    // The phrase of a share or an unshare names the conversation by its id. One
+    // that cannot be shown safely is not asked about (the model does not open a
+    // bar for it either); core refuses such a phrase as well, as a backstop.
+    if let Flow::Share { id, .. } | Flow::Unshare { id } = &flow {
+        if !words::id_is_safe(id) {
+            model.show_blocked(words::UNSAFE_ID);
+            return Ok(());
+        }
+    }
+
     // The destination is resolved now, not when the list was loaded. If the
     // remote has been edited since, nothing runs.
     let Some(overview) = model.selected_remote() else {
@@ -283,6 +293,30 @@ fn run_flow(ctx: &Context, screen: &mut Screen, model: &mut Model, flow: Flow) -
             Ok(None) => {
                 reload(ctx, model);
                 model.set_status("That conversation is no longer listed.");
+                return Ok(());
+            }
+            Err(error) => {
+                let failure = FlowFailure::Other(format!("{error}"));
+                model.report(Report::Failed { kind, failure });
+                return Ok(());
+            }
+        }
+    }
+
+    // A share and a publish are asked for on the settings the screen showed: the
+    // header says whether auto-push is on, the share bar and banner warn that a
+    // git push will publish what is shared, and the publish bar assumes the
+    // remote is authorized. Those are read when the list is loaded, so look at
+    // them again now, and if another terminal changed either, run nothing: the
+    // screen is refreshed and the key has to be pressed again on the new state.
+    if matches!(flow, Flow::Share { .. } | Flow::Publish) {
+        match privacy::privacy_status_for_fingerprint(ctx.repo, &destination.fingerprint) {
+            Ok(status) if publishing_settings_match(&overview, &status) => {}
+            Ok(_) => {
+                reload(ctx, model);
+                model.set_status(&words::settings_changed_status(&text::sanitize(
+                    &overview.name,
+                )));
                 return Ok(());
             }
             Err(error) => {
@@ -366,6 +400,12 @@ fn run_flow(ctx: &Context, screen: &mut Screen, model: &mut Model, flow: Flow) -
     Ok(())
 }
 
+/// Whether the publishing settings of a destination are what the listing said:
+/// authorized or not, auto-push on or off.
+fn publishing_settings_match(listed: &RemoteOverview, now: &privacy::PrivacyStatus) -> bool {
+    listed.sharing_consented == now.sharing_consented && listed.auto_push == now.auto_push
+}
+
 /// Prints an unexpected failure on the main screen, every line sanitized.
 fn print_failure(kind: FlowKind, reason: &str, dest: &Destination) {
     let mut lines = reason.lines();
@@ -407,4 +447,59 @@ fn exit_note(ctx: &Context, model: &Model) -> Option<String> {
     let counts = ctx.store.destination_publication_counts(fingerprint).ok()?;
     let waiting = counts.unpublished();
     (waiting > 0).then(|| words::waiting_note(waiting, &text::sanitize(name)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listed(sharing_consented: bool, auto_push: bool) -> RemoteOverview {
+        RemoteOverview {
+            name: "origin".to_owned(),
+            fingerprint: Ok("f".repeat(64)),
+            location: None,
+            sharing_consented,
+            auto_push,
+            consent_error: None,
+        }
+    }
+
+    fn now(sharing_consented: bool, auto_push: bool) -> privacy::PrivacyStatus {
+        privacy::PrivacyStatus {
+            capture_acknowledged: true,
+            sharing_consented,
+            auto_push,
+            remote_fingerprint: "f".repeat(64),
+        }
+    }
+
+    #[test]
+    fn publishing_settings_match_only_when_authorization_and_auto_push_both_do() {
+        for consented in [false, true] {
+            for auto_push in [false, true] {
+                assert!(publishing_settings_match(
+                    &listed(consented, auto_push),
+                    &now(consented, auto_push)
+                ));
+            }
+        }
+        // Auto-push turned on, or off, since the listing.
+        assert!(!publishing_settings_match(
+            &listed(true, false),
+            &now(true, true)
+        ));
+        assert!(!publishing_settings_match(
+            &listed(true, true),
+            &now(true, false)
+        ));
+        // Authorized, or revoked, since the listing.
+        assert!(!publishing_settings_match(
+            &listed(false, false),
+            &now(true, false)
+        ));
+        assert!(!publishing_settings_match(
+            &listed(true, false),
+            &now(false, false)
+        ));
+    }
 }

@@ -569,6 +569,17 @@ pub const NOT_ON_THIS_PLATFORM: &str = "Sharing and publishing from this view ar
 pub const IMPORTED_IS_READ_ONLY: &str = "Imported from a remote, so it is read-only here.";
 pub const NO_DETAILS: &str =
     "This conversation could not be read, so nothing can be done with it from here.";
+/// The typed phrase for a share or an unshare names the conversation by its id,
+/// and an id can be chosen by whoever wrote the thought (an MCP client picks
+/// it). One that cannot be shown safely would be asked as a phrase that cannot
+/// be read or typed, so such a conversation is not shared or unshared from here.
+pub const UNSAFE_ID: &str = "This conversation's id contains characters that cannot be shown safely, so it cannot be shared or unshared from here.";
+
+/// Whether a conversation id can be shown as it is: it holds no control, format,
+/// line-separator or paragraph-separator character.
+pub fn id_is_safe(id: &str) -> bool {
+    text::sanitize(id) == id
+}
 
 /// The remote's privacy state cannot be read, so every action stays off.
 pub fn privacy_unreadable(reason: &str) -> String {
@@ -1183,6 +1194,13 @@ fn publication_extras(p: &cvc_core::sync::ProjectionPublication) -> Option<Strin
 
 pub fn authorized_status(remote: &str) -> String {
     format!("Publishing to '{remote}' is now authorized. Auto-push stays off.")
+}
+
+/// A share or a publish was asked for on publishing settings that are not the
+/// ones the screen showed: authorization or auto-push was changed elsewhere in
+/// the meantime. Nothing ran; the screen has been refreshed.
+pub fn settings_changed_status(remote: &str) -> String {
+    format!("Publishing settings for '{remote}' changed; check them and press the key again.")
 }
 
 /// Authorizing was asked for, but the remote had been authorized in the
@@ -3156,6 +3174,41 @@ mod tests {
         let h = header(&RemoteView::Usable(&bare), None, &U);
         assert!(h.remote.iter().all(|c| !c.contains("->")));
         assert_eq!(Destination::of(&bare, &U).described(), "'origin'");
+    }
+
+    #[test]
+    fn an_id_is_safe_unless_it_holds_a_control_or_format_character() {
+        for id in [
+            "run-0d2a",
+            "session:agent-a1",
+            "remote:abc:session-1:agent-7",
+            "with spaces – and שלום",
+        ] {
+            assert!(id_is_safe(id), "{id:?}");
+        }
+        for id in [
+            "a\u{1b}[2J",
+            "a\nb",
+            "a\u{202e}b",
+            "a\u{200b}",
+            "a\u{2028}",
+            "a\u{7f}",
+            "a\u{feff}",
+        ] {
+            assert!(!id_is_safe(id), "{id:?}");
+        }
+        assert_eq!(
+            UNSAFE_ID,
+            "This conversation's id contains characters that cannot be shown safely, so it cannot be shared or unshared from here."
+        );
+    }
+
+    #[test]
+    fn the_settings_changed_notice_names_the_remote() {
+        assert_eq!(
+            settings_changed_status("origin"),
+            "Publishing settings for 'origin' changed; check them and press the key again."
+        );
     }
 
     #[test]

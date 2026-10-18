@@ -1203,6 +1203,9 @@ impl Model {
             if summary.imported {
                 return Err(words::IMPORTED_IS_READ_ONLY.to_owned());
             }
+            if !words::id_is_safe(&entry.summary.id) {
+                return Err(words::UNSAFE_ID.to_owned());
+            }
             let future_on = summary.share_future == Some(true);
             let unshared = info.details.snapshot_new as i64;
             if unshared == 0 && future_on {
@@ -1232,6 +1235,9 @@ impl Model {
             let summary = &info.details.summary;
             if summary.imported {
                 return Err(words::IMPORTED_IS_READ_ONLY.to_owned());
+            }
+            if !words::id_is_safe(&entry.summary.id) {
+                return Err(words::UNSAFE_ID.to_owned());
             }
             if summary.shared_count == 0 {
                 return Err(words::nothing_to_unshare(&name));
@@ -2267,6 +2273,38 @@ mod tests {
             );
             model.handle_key(ch('x'));
         }
+    }
+
+    #[test]
+    fn a_conversation_whose_id_cannot_be_shown_safely_is_neither_shared_nor_unshared() {
+        for id in [
+            "evil\u{1b}[2Jid",
+            "a\u{202e}b",
+            "zero\u{200b}width",
+            "two\nlines",
+            "del\u{7f}",
+        ] {
+            let mut summary = shared_summary(27, 21, 21);
+            summary.id = id.to_owned();
+            let mut model = model_with(vec![summary], vec![remote("origin")]);
+            read_selected(&mut model, 6, UnshareCheck::default());
+            for key in ['s', 'u'] {
+                assert_eq!(blocked_reason(&mut model, key), words::UNSAFE_ID, "{id:?}");
+                model.handle_key(ch('x'));
+            }
+            // Dimmed in the key bar, while publishing is not about one conversation.
+            let available = model.available();
+            assert!(!available.share && !available.unshare && available.publish);
+            assert!(matches!(open_bar(&mut model, 'p'), Bar::Publish { .. }));
+            // What is drawn for it is sanitized, as ever.
+            assert!(model.rows()[0].id.chars().all(|c| !text::is_unsafe(c)));
+        }
+        // An id with spaces and other printable characters is an ordinary id.
+        let mut summary = shared_summary(27, 21, 21);
+        summary.id = "an id: with spaces – and שלום".to_owned();
+        let mut model = model_with(vec![summary], vec![remote("origin")]);
+        read_selected(&mut model, 6, UnshareCheck::default());
+        assert!(matches!(open_bar(&mut model, 's'), Bar::Share { .. }));
     }
 
     #[test]
