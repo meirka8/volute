@@ -33,7 +33,7 @@ pub fn list_tools() -> Value {
                         },
                         "conversation_id": {
                             "type": "string",
-                            "description": "Optional conversation ID for clients/harnesses that manage their own sessions instead of using the server's default per-process session. Created if it doesn't already exist."
+                            "description": "Optional conversation ID for clients/harnesses that manage their own sessions instead of using the server's default per-process session. Created if it doesn't already exist. Use 1 to 256 ASCII letters, digits, '.', '_', '-' or ':'; anything else is refused."
                         },
                         "parent_id": {
                             "type": "string",
@@ -66,7 +66,7 @@ pub fn list_tools() -> Value {
             },
             {
                 "name": "sync_history",
-                "description": "Call this before read_history whenever you cannot be sure the local CVC history cache is current: a fresh clone, a repository you have not worked in during this session, a different machine than the one that recorded prior thoughts, or a long-idle checkout. It fetches CVC history pushed to the git remote by other sessions or teammates and ingests it locally so read_history can actually find it. It never pushes local thoughts anywhere -- syncing outward happens automatically on git push, not through this tool.",
+                "description": "Call this before read_history whenever you cannot be sure the local CVC history cache is current: a fresh clone, a repository you have not worked in during this session, a different machine than the one that recorded prior thoughts, or a long-idle checkout. It fetches CVC history pushed to the git remote by other sessions or teammates and ingests it locally so read_history can actually find it. It never pushes local thoughts anywhere, and no tool of this server publishes: publishing happens only when a person runs `cvc push --manual` or `cvc share --push` and types the phrase it asks, or at git push where auto-push is on for that remote.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -177,17 +177,21 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
     // Clients/harnesses that manage their own sessions can override the server's
     // default per-process session and chaining behavior.
     //
-    // The id becomes the conversation's title ("Session <id>") and is shown in
-    // terminals, and it is named in the phrase that is typed to share or unshare
-    // the conversation. A client (a model, in effect) chooses it, so one that
-    // could make a terminal show something else, or nothing, is refused here:
-    // control, format and line- or paragraph-separator characters. Spaces and the
-    // other printable characters stay allowed.
+    // The id becomes the conversation's title ("Session <id>"), is shown in
+    // terminals, and is named in the phrase that is typed to share or unshare the
+    // conversation. A client (a model, in effect) chooses it. It is held to the
+    // rule core's capture policy applies to every conversation id, with the very
+    // function that applies it: 1 to 256 ASCII letters, digits, '.', '_', '-' or
+    // ':'. A space, any other printable character, and anything that could make a
+    // terminal show something else (control, format and separator characters) is
+    // outside it, and would be refused by the capture in any case. Checking here
+    // turns that into an error the client can read before anything is recorded,
+    // and keeps this front from stating a rule of its own.
     let explicit_conversation_id = match args.get("conversation_id").and_then(|v| v.as_str()) {
-        Some(id) if privacy::has_unsafe_display_char(id) => {
+        Some(id) if !privacy::is_safe_identifier(id) => {
             return Err(JsonRpcError {
                 code: -32602,
-                message: "Invalid 'conversation_id': it contains a control, format, line-separator or paragraph-separator character (an escape or a line break, for instance). The id becomes the conversation's title and is shown in terminals; spaces and other printable characters are allowed.".to_string(),
+                message: "Invalid 'conversation_id': use 1 to 256 ASCII letters, digits, '.', '_', '-' or ':'.".to_string(),
                 data: None,
             });
         }

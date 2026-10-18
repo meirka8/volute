@@ -141,10 +141,17 @@ fn pick_unshared_conversation(
 /// A phrase is shown so that it can be read and typed back. One with a control
 /// or format character in it can be shown as something else (an escape
 /// sequence rewrites the lines printed above the prompt, such as the summary of
-/// what is being shared) and cannot be typed, so it is not asked at all. A
-/// conversation id from a remote's projection is the one way such a character
-/// gets in; the ids captured here are limited to ASCII letters, digits and
-/// `-_.:`.
+/// what is being shared) and cannot be typed, so it is not asked at all.
+///
+/// A stored conversation id is not how such a character gets in. Every id that
+/// is stored passed the capture policy's rule, `privacy::is_safe_identifier`
+/// (1 to 256 ASCII letters, digits, `.`, `_`, `-` or `:`), whichever way it was
+/// captured: the MCP server, `cvc run`, the editor and a Claude Code transcript
+/// all go through it, and so does a pull, which checks an imported id before it
+/// namespaces it with `remote:<fingerprint>:`. What can carry one is an id typed
+/// on the command line (`cvc share <id>` does not have to name a stored
+/// conversation) and a conversation stored before the rule was enforced. This
+/// check is for those.
 fn ensure_phrase_can_be_shown(challenge: &str) -> Result<()> {
     if sanitize_for_terminal(challenge) != challenge {
         bail!(

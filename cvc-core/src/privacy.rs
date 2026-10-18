@@ -341,11 +341,7 @@ fn is_transport_helper(url: &str) -> bool {
 /// annotation anchors, the tag characters, and more), `Zl` and `Zp` (the line
 /// and paragraph separators). The categories come from the `regex` crate's
 /// Unicode tables, not from a list of ranges that could fall behind them.
-///
-/// Public so that a front that takes text from outside and keeps it as a name
-/// (the MCP server, for a conversation id) applies the same rule as the checks
-/// here.
-pub fn has_unsafe_display_char(text: &str) -> bool {
+fn has_unsafe_display_char(text: &str) -> bool {
     static UNSAFE: OnceLock<Regex> = OnceLock::new();
     UNSAFE
         .get_or_init(|| re(r"[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]"))
@@ -1218,7 +1214,24 @@ pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
     Ok(capture)
 }
 
-pub(crate) fn is_safe_identifier(value: &str) -> bool {
+/// Whether `value` is an identifier the capture policy accepts: 1 to 256 bytes,
+/// every one an ASCII letter, a digit, or one of `.`, `_`, `-` and `:`.
+///
+/// Conversation ids and source request ids are relational keys, so they are
+/// never rewritten: a randomized redaction marker cannot stand in for one
+/// without breaking what points at it. They are refused when they are not safe
+/// instead. `prepare` does that at the one capture boundary every source goes
+/// through (the MCP server, `cvc run`, the editor, a Claude Code transcript, and
+/// a pull, before it namespaces an imported id with `remote:<fingerprint>:`), so
+/// a stored id is always one of these. It also means an id cannot carry anything
+/// that acts on a terminal: no control, format or separator character, and no
+/// space.
+///
+/// Public so that a front that lets a client choose an id (the MCP server, for
+/// `conversation_id`) refuses with this very function, before anything is
+/// recorded, and not with a rule of its own that could disagree with the
+/// capture's.
+pub fn is_safe_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
         && value

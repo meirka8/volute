@@ -568,10 +568,12 @@ pub const NOT_ON_THIS_PLATFORM: &str = "Not available on this platform yet. Use 
 pub const IMPORTED_IS_READ_ONLY: &str = "Imported from a remote, so it is read-only here.";
 pub const NO_DETAILS: &str =
     "This conversation could not be read, so nothing can be done with it from here.";
-/// The typed phrase for a share or an unshare names the conversation by its id,
-/// and an id can be chosen by whoever wrote the thought (an MCP client picks
-/// it). One that cannot be shown safely would be asked as a phrase that cannot
-/// be read or typed, so such a conversation is not shared or unshared from here.
+/// The typed phrase for a share or an unshare names the conversation by its id.
+/// One that cannot be shown safely would be asked as a phrase that cannot be
+/// read or typed, so such a conversation is not shared or unshared from here.
+/// No captured conversation has one: the capture refuses an id outside 1 to 256
+/// ASCII letters, digits, `.`, `_`, `-` and `:`, however its client chose it, so
+/// this is for a conversation stored before that rule, and a backstop.
 pub const UNSAFE_ID: &str = "This conversation's id contains characters that cannot be shown safely, so it cannot be shared or unshared from here.";
 
 /// What ends the view when the terminal's input will not stop arriving (a paste

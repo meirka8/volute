@@ -943,6 +943,67 @@ fn display_location_keeps_text_of_every_script_that_is_not_a_control() {
 }
 
 #[test]
+fn the_identifier_rule_is_1_to_256_ascii_letters_digits_and_four_marks() {
+    use cvc_core::privacy::is_safe_identifier;
+
+    let longest = "a".repeat(256);
+    for id in [
+        "a",
+        "A1b2C3",
+        "client-session_42",
+        "harness.session:7",
+        "-",
+        "_",
+        ".",
+        ":",
+        "3f2b8c1e-5d4a-4b7e-9c0d-1a2b3c4d5e6f",
+        longest.as_str(),
+    ] {
+        assert!(is_safe_identifier(id), "{id:?}");
+    }
+
+    let too_long = "a".repeat(257);
+    for id in [
+        "",
+        too_long.as_str(),
+        " ",
+        "a b",
+        "a\tb",
+        "a\nb",
+        "a/b",
+        "a\\b",
+        "a@b",
+        "a'b",
+        "\u{e9}",
+        "a\u{200b}",
+        "a\u{202e}b",
+        "a\u{1b}[2J",
+        "emoji \u{1f680}",
+    ] {
+        assert!(!is_safe_identifier(id), "{id:?}");
+    }
+
+    // Byte by byte: of the ASCII characters, exactly the letters, the digits and
+    // `.`, `_`, `-` and `:` are allowed.
+    for byte in 0u8..=127 {
+        let id = format!("a{}b", byte as char);
+        let allowed = byte.is_ascii_alphanumeric() || b"._-:".contains(&byte);
+        assert_eq!(is_safe_identifier(&id), allowed, "byte {byte:#04x}");
+    }
+    // No character outside ASCII is, whatever its category.
+    for c in [
+        '\u{e9}',
+        '\u{5e9}',
+        '\u{2713}',
+        '\u{ff21}',
+        '\u{1f680}',
+        '\u{a0}',
+    ] {
+        assert!(!is_safe_identifier(&format!("a{c}b")), "{c:?}");
+    }
+}
+
+#[test]
 fn a_remote_destination_never_prints_its_url() {
     let destination = cvc_core::privacy::RemoteDestination {
         name: "origin".into(),
