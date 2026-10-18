@@ -38,8 +38,10 @@ pub const MIN_HEIGHT: u16 = 12;
 pub const STRIP_MIN_HEIGHT: u16 = 26;
 /// The strip is a rule and up to four lines.
 pub const STRIP_ROWS: usize = 5;
-/// The header is two lines; a notice may add a third.
+/// The header is two lines; a notice adds one or two more.
 pub const HEADER_ROWS: usize = 2;
+/// The most lines a notice takes.
+pub const NOTICE_MAX_ROWS: usize = 2;
 /// The widest an overlay is drawn, so lines stay readable on wide terminals.
 pub const OVERLAY_MAX_WIDTH: usize = 100;
 
@@ -509,13 +511,35 @@ impl Model {
 
     // ----- notices -----
 
-    /// Shows a one-line notice until the next key.
+    /// Shows a notice until the next key.
     pub fn set_status(&mut self, text: &str) {
         self.status = Some(text::sanitize(text));
     }
 
+    #[cfg(test)]
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
+    }
+
+    /// The notice as lines of the terminal's width, each with the space that
+    /// starts a line of the header block. A notice is one line when it fits. The
+    /// statuses that follow a flow run to 150 characters and one of them ends in
+    /// a command to run, so rather than cutting a long one off it takes a second
+    /// line; only what does not fit in two lines ends in an ellipsis.
+    pub fn notice(&self) -> Vec<String> {
+        let Some(status) = self.status.as_deref() else {
+            return Vec::new();
+        };
+        let width = (self.size.0 as usize).saturating_sub(1).max(1);
+        let mut lines = text::wrap(status, width);
+        if lines.len() > NOTICE_MAX_ROWS {
+            lines.truncate(NOTICE_MAX_ROWS);
+            if let Some(last) = lines.last_mut() {
+                let ellipsis = self.glyphs.ellipsis();
+                *last = text::truncate(&format!("{last}{ellipsis}"), width, ellipsis);
+            }
+        }
+        lines.into_iter().map(|line| format!(" {line}")).collect()
     }
 
     /// Shows why an action cannot go ahead, as the blocked bar. The loop uses
@@ -592,7 +616,7 @@ impl Model {
             };
         }
         let header = HEADER_ROWS;
-        let notice = usize::from(self.status.is_some());
+        let notice = self.notice().len();
         let head = 1;
         let strip = if self.size.1 >= STRIP_MIN_HEIGHT {
             STRIP_ROWS
@@ -2482,6 +2506,41 @@ mod tests {
     }
 
     // ----- results -----
+
+    #[test]
+    fn a_long_notice_wraps_to_a_second_line_and_only_then_ends_in_an_ellipsis() {
+        let mut model = model_with(simple(), vec![remote("origin")]);
+        model.report(Report::Failed {
+            kind: FlowKind::Publish,
+            failure: FlowFailure::Other("connection reset".to_owned()),
+        });
+        let notice = model.notice();
+        assert_eq!(notice.len(), 2, "{notice:?}");
+        assert_eq!(model.layout().notice, 2);
+        let joined = notice
+            .iter()
+            .map(|line| line.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("Run: cvc privacy reconcile --remote origin"),
+            "{joined}"
+        );
+        for line in &notice {
+            assert!(text::width(line) <= 100, "{line}");
+            assert!(line.starts_with(' '));
+        }
+        // One that does not fit in two lines is cut, and says so.
+        model.set_status(&"word ".repeat(100));
+        let notice = model.notice();
+        assert_eq!(notice.len(), 2);
+        assert!(notice[1].ends_with('…'), "{notice:?}");
+        // One that fits is one line, and none is no line.
+        model.set_status("short");
+        assert_eq!(model.notice(), vec![" short".to_owned()]);
+        model.handle_key(press(KeyCode::Down));
+        assert!(model.notice().is_empty());
+    }
 
     #[test]
     fn the_notice_after_a_share_names_the_count_and_what_comes_next() {

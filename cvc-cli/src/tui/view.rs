@@ -78,16 +78,8 @@ pub fn draw(buf: &mut Buffer, area: Rect, model: &Model, theme: Theme) {
     let mut y = area.y;
     canvas.header(model, area, y);
     y += HEADER_ROWS as u16;
-    if layout.notice > 0 {
-        if let Some(status) = model.status() {
-            // One line: a notice that is too long ends in an ellipsis.
-            let notice = text::truncate(
-                &format!(" {status}"),
-                area.width as usize,
-                model.glyphs().ellipsis(),
-            );
-            canvas.put(area.x, y, &notice, area.width as usize, Style::default());
-        }
+    for line in model.notice() {
+        canvas.put(area.x, y, &line, area.width as usize, Style::default());
         y += 1;
     }
     let plan = Plan::of(area.width as usize, model.columns());
@@ -1553,6 +1545,32 @@ mod tests {
             &lines,
             "  Share covers 27 thoughts as of now (21 already shared, 6 new). Future thoughts: private."
         ));
+    }
+
+    #[test]
+    fn a_long_notice_is_not_cut_off_in_the_middle_of_a_command() {
+        use crate::commands::failure::FlowFailure;
+        use crate::tui::model::Report;
+        use crate::tui::words::FlowKind;
+
+        let mut model = full_model();
+        model.set_size(110, 30);
+        model.report(Report::Failed {
+            kind: FlowKind::Publish,
+            failure: FlowFailure::Other("connection reset by peer".to_owned()),
+        });
+        let lines = rendered(&model);
+        assert!(
+            lines[2].starts_with(" Publish to 'origin' did not complete;"),
+            "{}",
+            dump(&lines)
+        );
+        let notice = format!("{} {}", lines[2].trim(), lines[3].trim());
+        assert!(
+            notice.contains("Run: cvc privacy reconcile --remote origin"),
+            "{notice}"
+        );
+        assert!(lines[4].contains("when (UTC)"), "{}", dump(&lines));
     }
 
     #[test]
