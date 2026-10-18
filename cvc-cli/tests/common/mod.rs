@@ -152,14 +152,31 @@ pub struct PtySession {
     child: Child,
     master: File,
     output: Arc<Mutex<Vec<u8>>>,
+    /// The window the pty was opened with, columns by rows.
+    size: (u16, u16),
 }
 
 impl PtySession {
     /// Spawns `command` on a fresh pty. `queued_input` is written to the
     /// terminal *before* the process starts, which is what type-ahead or a
     /// paste looks like from the process's side.
-    pub fn spawn(mut command: Command, queued_input: &[u8]) -> Self {
-        let (mut master, slave) = openpty();
+    ///
+    /// The pty has no window size (0 by 0), which is enough for everything that
+    /// prompts line by line; use [`PtySession::spawn_sized`] for a full-screen
+    /// program.
+    pub fn spawn(command: Command, queued_input: &[u8]) -> Self {
+        Self::spawn_on(command, queued_input, None)
+    }
+
+    /// As [`PtySession::spawn`], on a pty whose window is `columns` by `rows`
+    /// cells (set with TIOCSWINSZ before the process starts, as a terminal
+    /// emulator does), so that a program asking for its size gets an answer.
+    pub fn spawn_sized(command: Command, queued_input: &[u8], columns: u16, rows: u16) -> Self {
+        Self::spawn_on(command, queued_input, Some((columns, rows)))
+    }
+
+    fn spawn_on(mut command: Command, queued_input: &[u8], size: Option<(u16, u16)>) -> Self {
+        let (mut master, slave) = openpty(size);
         master.write_all(queued_input).unwrap();
         command
             .stdin(Stdio::from(slave.try_clone().unwrap()))
@@ -198,6 +215,7 @@ impl PtySession {
             child,
             master,
             output,
+            size: size.unwrap_or((80, 24)),
         }
     }
 
@@ -250,6 +268,44 @@ impl PtySession {
         self.wait_until(&format!("{needle:?}"), |output| output.contains(needle))
     }
 
+    /// Everything the process has shown so far with the terminal control
+    /// sequences removed: the text a person would read, in the order it was
+    /// written (cursor movement is not replayed).
+    pub fn plain_output(&self) -> String {
+        strip_ansi(&self.output())
+    }
+
+    /// Waits until `needle` has been displayed as plain text, and returns the
+    /// plain output so far. A full-screen program draws word by word with
+    /// cursor movements in between, so the plain output of one can lack its
+    /// spaces; use [`PtySession::wait_for_screen_text`] for what is on screen.
+    pub fn wait_for_plain_text(&mut self, needle: &str) -> String {
+        self.wait_until(&format!("{needle:?}"), |output| {
+            strip_ansi(output).contains(needle)
+        });
+        self.plain_output()
+    }
+
+    /// The rows of the terminal as they look now: everything the process has
+    /// written, replayed on a virtual screen the size of the pty's window.
+    pub fn screen(&self) -> Vec<String> {
+        let (columns, rows) = self.size;
+        let mut screen = VirtualScreen::new(columns as usize, rows as usize);
+        screen.feed(&self.output());
+        screen.rows()
+    }
+
+    /// Waits until a row of the screen contains `needle` and returns the rows.
+    pub fn wait_for_screen_text(&mut self, needle: &str) -> Vec<String> {
+        let (columns, rows) = self.size;
+        self.wait_until(&format!("{needle:?} on the screen"), |output| {
+            let mut screen = VirtualScreen::new(columns as usize, rows as usize);
+            screen.feed(output);
+            screen.rows().iter().any(|row| row.contains(needle))
+        });
+        self.screen()
+    }
+
     /// Waits for exit and returns the status with the full terminal output.
     pub fn wait_exit(mut self) -> (ExitStatus, String) {
         let deadline = Instant::now() + WAIT_LIMIT;
@@ -282,17 +338,352 @@ pub fn challenges(output: &str) -> Vec<String> {
         .collect()
 }
 
-fn openpty() -> (File, File) {
+/// `output` without ANSI escape sequences: CSI sequences (colors, cursor
+/// movement, modes such as `?1049h`), OSC strings, and two-byte escapes.
+pub fn strip_ansi(output: &str) -> String {
+    let mut plain = String::with_capacity(output.len());
+    let mut chars = output.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            plain.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters and intermediates, then a final byte 0x40..=0x7e.
+            Some('[') => {
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            // OSC: up to BEL or ST (ESC \).
+            Some(']') => {
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' {
+                        chars.next_if_eq(&'\\');
+                        break;
+                    }
+                }
+            }
+            // Any other escape is two bytes.
+            _ => {}
+        }
+    }
+    plain
+}
+
+/// A small virtual terminal: enough of VT100/xterm to replay what a
+/// full-screen program wrote (cursor addressing, erasing, SGR, the alternate
+/// screen, scrolling) and read back the rows a person would see.
+pub struct VirtualScreen {
+    columns: usize,
+    rows: usize,
+    main: Grid,
+    alternate: Option<Grid>,
+    saved_cursor: (usize, usize),
+}
+
+struct Grid {
+    cells: Vec<Vec<char>>,
+    row: usize,
+    column: usize,
+}
+
+impl Grid {
+    fn new(columns: usize, rows: usize) -> Self {
+        Self {
+            cells: vec![vec![' '; columns]; rows],
+            row: 0,
+            column: 0,
+        }
+    }
+}
+
+impl VirtualScreen {
+    pub fn new(columns: usize, rows: usize) -> Self {
+        Self {
+            columns,
+            rows,
+            main: Grid::new(columns, rows),
+            alternate: None,
+            saved_cursor: (0, 0),
+        }
+    }
+
+    fn grid(&mut self) -> &mut Grid {
+        self.alternate.as_mut().unwrap_or(&mut self.main)
+    }
+
+    /// The rows now on screen, without trailing spaces.
+    pub fn rows(&self) -> Vec<String> {
+        let grid = self.alternate.as_ref().unwrap_or(&self.main);
+        grid.cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .filter(|&&c| c != '\0')
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// Whether the alternate screen is in use.
+    pub fn on_alternate_screen(&self) -> bool {
+        self.alternate.is_some()
+    }
+
+    pub fn feed(&mut self, output: &str) {
+        let mut chars = output.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\u{1b}' => match chars.next() {
+                    Some('[') => {
+                        let mut private = false;
+                        let mut params = String::new();
+                        let mut last = None;
+                        for next in chars.by_ref() {
+                            match next {
+                                '?' | '>' | '<' | '=' => private = true,
+                                '0'..='9' | ';' | ':' => params.push(next),
+                                '\u{20}'..='\u{2f}' => {}
+                                _ => {
+                                    last = Some(next);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(last) = last {
+                            self.csi(private, &params, last);
+                        }
+                    }
+                    Some(']') => {
+                        while let Some(next) = chars.next() {
+                            if next == '\u{7}' {
+                                break;
+                            }
+                            if next == '\u{1b}' {
+                                chars.next_if_eq(&'\\');
+                                break;
+                            }
+                        }
+                    }
+                    Some('7') => {
+                        let grid = self.grid();
+                        self.saved_cursor = (grid.row, grid.column);
+                    }
+                    Some('8') => {
+                        let (row, column) = self.saved_cursor;
+                        let grid = self.grid();
+                        grid.row = row;
+                        grid.column = column;
+                    }
+                    _ => {}
+                },
+                '\r' => self.grid().column = 0,
+                '\n' => self.line_feed(),
+                '\u{8}' => {
+                    let grid = self.grid();
+                    grid.column = grid.column.saturating_sub(1);
+                }
+                '\t' => {
+                    let columns = self.columns;
+                    let grid = self.grid();
+                    grid.column = ((grid.column / 8 + 1) * 8).min(columns - 1);
+                }
+                c if c.is_control() => {}
+                c => self.print(c),
+            }
+        }
+    }
+
+    fn line_feed(&mut self) {
+        let rows = self.rows;
+        let columns = self.columns;
+        let grid = self.grid();
+        if grid.row + 1 >= rows {
+            grid.cells.remove(0);
+            grid.cells.push(vec![' '; columns]);
+        } else {
+            grid.row += 1;
+        }
+    }
+
+    fn print(&mut self, c: char) {
+        let width = match c as u32 {
+            0x1100..=0x115f
+            | 0x2e80..=0xa4cf
+            | 0xac00..=0xd7a3
+            | 0xf900..=0xfaff
+            | 0xfe30..=0xfe6f
+            | 0xff00..=0xff60
+            | 0xffe0..=0xffe6
+            | 0x1f300..=0x1faff => 2,
+            0x0300..=0x036f | 0x200b..=0x200f | 0xfe00..=0xfe0f => 0,
+            _ => 1,
+        };
+        if width == 0 {
+            return;
+        }
+        let columns = self.columns;
+        if self.grid().column + width > columns {
+            self.grid().column = 0;
+            self.line_feed();
+        }
+        let grid = self.grid();
+        grid.cells[grid.row][grid.column] = c;
+        if width == 2 {
+            grid.cells[grid.row][grid.column + 1] = '\0';
+        }
+        grid.column += width;
+    }
+
+    fn csi(&mut self, private: bool, params: &str, last: char) {
+        let numbers: Vec<usize> = params
+            .split(';')
+            .map(|p| p.parse::<usize>().unwrap_or(0))
+            .collect();
+        let first = |default: usize| match numbers.first() {
+            Some(&n) if n > 0 => n,
+            _ => default,
+        };
+        let (columns, rows) = (self.columns, self.rows);
+        if private {
+            // Only the alternate screen matters here: the other private modes
+            // (cursor visibility, bracketed paste) change nothing on screen.
+            let alternate = numbers.iter().any(|n| matches!(n, 47 | 1047 | 1049));
+            match last {
+                'h' if alternate && self.alternate.is_none() => {
+                    let grid = self.grid();
+                    self.saved_cursor = (grid.row, grid.column);
+                    self.alternate = Some(Grid::new(columns, rows));
+                }
+                'l' if alternate && self.alternate.take().is_some() => {
+                    let (row, column) = self.saved_cursor;
+                    self.main.row = row;
+                    self.main.column = column;
+                }
+                _ => {}
+            }
+            return;
+        }
+        match last {
+            'H' | 'f' => {
+                let row = first(1) - 1;
+                let column = numbers.get(1).copied().filter(|&n| n > 0).unwrap_or(1) - 1;
+                let grid = self.grid();
+                grid.row = row.min(rows - 1);
+                grid.column = column.min(columns - 1);
+            }
+            'A' => {
+                let n = first(1);
+                let grid = self.grid();
+                grid.row = grid.row.saturating_sub(n);
+            }
+            'B' => {
+                let n = first(1);
+                let grid = self.grid();
+                grid.row = (grid.row + n).min(rows - 1);
+            }
+            'C' => {
+                let n = first(1);
+                let grid = self.grid();
+                grid.column = (grid.column + n).min(columns - 1);
+            }
+            'D' => {
+                let n = first(1);
+                let grid = self.grid();
+                grid.column = grid.column.saturating_sub(n);
+            }
+            'G' => {
+                let n = first(1);
+                self.grid().column = (n - 1).min(columns - 1);
+            }
+            'd' => {
+                let n = first(1);
+                self.grid().row = (n - 1).min(rows - 1);
+            }
+            'J' => {
+                let mode = numbers.first().copied().unwrap_or(0);
+                let grid = self.grid();
+                let (row, column) = (grid.row, grid.column);
+                match mode {
+                    0 => {
+                        for c in column..columns {
+                            grid.cells[row][c] = ' ';
+                        }
+                        for r in row + 1..rows {
+                            grid.cells[r] = vec![' '; columns];
+                        }
+                    }
+                    1 => {
+                        for r in 0..row {
+                            grid.cells[r] = vec![' '; columns];
+                        }
+                        for c in 0..=column.min(columns - 1) {
+                            grid.cells[row][c] = ' ';
+                        }
+                    }
+                    2 => {
+                        for r in 0..rows {
+                            grid.cells[r] = vec![' '; columns];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            'K' => {
+                let mode = numbers.first().copied().unwrap_or(0);
+                let grid = self.grid();
+                let (row, column) = (grid.row, grid.column);
+                match mode {
+                    0 => (column..columns).for_each(|c| grid.cells[row][c] = ' '),
+                    1 => (0..=column.min(columns - 1)).for_each(|c| grid.cells[row][c] = ' '),
+                    2 => grid.cells[row] = vec![' '; columns],
+                    _ => {}
+                }
+            }
+            's' => {
+                let grid = self.grid();
+                self.saved_cursor = (grid.row, grid.column);
+            }
+            'u' => {
+                let (row, column) = self.saved_cursor;
+                let grid = self.grid();
+                grid.row = row;
+                grid.column = column;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn openpty(size: Option<(u16, u16)>) -> (File, File) {
     let mut master = -1;
     let mut slave = -1;
-    // SAFETY: both out-pointers are valid; the optional arguments may be null.
+    let mut window = size.map(|(columns, rows)| libc::winsize {
+        ws_row: rows,
+        ws_col: columns,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    });
+    let window_pointer = window
+        .as_mut()
+        .map_or(std::ptr::null_mut(), |window| window as *mut libc::winsize);
+    // SAFETY: both out-pointers are valid, and the window pointer is null or
+    // points to a live `winsize`; the other optional arguments may be null.
     let rc = unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            window_pointer,
         )
     };
     assert_eq!(rc, 0, "openpty: {}", io::Error::last_os_error());

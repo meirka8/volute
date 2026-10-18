@@ -1,5 +1,7 @@
+use crate::commands::sync::SUMMARY_SCAN_LIMIT;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{TimeZone, Utc};
+use cvc_core::claude_code;
 use cvc_core::db::{ConversationSummary, CvcStore};
 use cvc_core::privacy::{self, PrivacyError};
 use cvc_core::repository::RepositoryLayout;
@@ -84,7 +86,6 @@ fn terminal_type_allows_ui(term: Option<&std::ffi::OsStr>) -> bool {
 /// Unix for v0.7.1: elsewhere its fallback reads the shared buffered stdin and
 /// cannot discard what was queued before the prompt, so the view there only
 /// browses and points at the matching `cvc` command instead of running it.
-#[allow(dead_code)] // Consumed by the interactive view (#112, Phase B).
 pub(crate) const fn consent_actions_allowed() -> bool {
     crate::tty::protects_challenges_from_type_ahead()
 }
@@ -102,17 +103,28 @@ pub async fn run(requested: Option<&str>, limit: Option<usize>, plain: bool) -> 
         return Ok(());
     }
     let store = CvcStore::open_initialized(layout.db_path())?;
+    let interactive = interactive_ui_allowed(plain);
+    // The view's hint for an empty list asks whether this checkout records
+    // Claude Code sessions, which needs the layout that becomes a bare
+    // repository below. Only the view asks.
+    let harness_installed = interactive && claude_code::settings::installed(&layout);
     let repo = layout.into_repository();
 
-    // DISPATCH POINT for the interactive view (#112, Phase B).
-    //
-    // When this holds, Phase B starts the view here and returns its result
-    // instead of falling through, passing `&repo`, `&store`, `requested` and
-    // `limit.unwrap_or(sync::SUMMARY_SCAN_LIMIT)`. Until the view exists the
-    // plain listing below is printed in every case, and `--plain` changes
-    // nothing.
-    if interactive_ui_allowed(plain) {
-        // Intentionally empty: see above.
+    // The interactive view, from a terminal and unless `--plain` was given. It
+    // takes over the whole command, except when the terminal is too small for
+    // it: it then says so in one line and the plain listing below follows.
+    if interactive {
+        let started = crate::tui::run(crate::tui::Start {
+            repo: &repo,
+            store: &store,
+            requested,
+            limit: limit.unwrap_or(SUMMARY_SCAN_LIMIT),
+            harness_installed,
+        })?;
+        match started {
+            crate::tui::Launch::Finished => return Ok(()),
+            crate::tui::Launch::PlainListing => {}
+        }
     }
 
     let destination = display_destination(&repo, requested);
@@ -153,7 +165,6 @@ pub async fn run(requested: Option<&str>, limit: Option<usize>, plain: bool) -> 
 /// trace of the URL is the sanitized `location`. To act on a remote, call
 /// [`RemoteOverview::resolve`], which re-resolves it the way
 /// `cvc share --remote <name>` would.
-#[allow(dead_code)] // Consumed by the interactive view (#112, Phase B).
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteOverview {
     /// The remote's name as configured.
@@ -184,7 +195,6 @@ pub(crate) struct RemoteOverview {
     pub consent_error: Option<String>,
 }
 
-#[allow(dead_code)] // Consumed by the interactive view (#112, Phase B).
 impl RemoteOverview {
     /// The destination to hand to the share, unshare, publish and
     /// acknowledge flows in `sync`, resolved now rather than when the
@@ -219,7 +229,6 @@ impl RemoteOverview {
 /// A remote that cannot be a destination, or whose consent state cannot be
 /// read, is reported on its own entry and never fails the call; only being
 /// unable to list the remotes at all is an error.
-#[allow(dead_code)] // Consumed by the interactive view (#112, Phase B).
 pub(crate) fn remote_overview(repo: &Repository) -> Result<Vec<RemoteOverview>> {
     let names = repo
         .remotes()

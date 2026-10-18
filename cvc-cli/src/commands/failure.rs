@@ -54,7 +54,6 @@ const CONVERSATION_CHANGED: &str = "conversation changed during authorization; r
 const UNSHARE_BLOCKED: &str = "cannot unshare pending, published, or unknown content";
 
 /// Why a flow stopped, in terms a caller can translate.
-#[allow(dead_code)] // Consumed by the interactive view (#112, Phase B).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FlowFailure {
     /// The typed phrase did not match, or was empty. Nothing was recorded.
@@ -74,7 +73,6 @@ pub(crate) enum FlowFailure {
 
 /// Classifies the error a flow returned. It looks through added context, so a
 /// wrapped error classifies the same as the bare one.
-#[allow(dead_code)] // Consumed by the interactive view (#112, Phase B).
 pub(crate) fn classify_failure(error: &anyhow::Error) -> FlowFailure {
     if error.downcast_ref::<ChallengeNotConfirmed>().is_some() {
         return FlowFailure::NotConfirmed;
@@ -96,7 +94,6 @@ pub(crate) fn classify_failure(error: &anyhow::Error) -> FlowFailure {
 /// two variants whose `Display` adds a prefix that is wrong for the user
 /// (`Migration error:` on a refusal, `invalid .thoughtignore:` on any policy
 /// problem) contribute their bare message.
-#[allow(dead_code)] // Consumed by the interactive view (#112, Phase B).
 fn plain_message(error: &anyhow::Error) -> String {
     error
         .chain()
