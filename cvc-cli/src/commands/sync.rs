@@ -170,11 +170,25 @@ fn typed_acknowledgement(challenge: &str) -> Result<()> {
     let mut terminal = crate::tty::Terminal::open()
         .context("acknowledgement requires access to the controlling terminal")?;
     terminal.discard_pending_input()?;
-    let answer = terminal.prompt_line(&format!("Type exactly '{challenge}' to continue: "))?;
+    let answer = terminal
+        .prompt_line(&format!("Type exactly '{challenge}' to continue: "))
+        .map_err(answer_error)?;
     if answer != challenge {
         return Err(ChallengeNotConfirmed.into());
     }
     Ok(())
+}
+
+/// What a failed read of the answer to a challenge means. Bytes that are not
+/// text, or a line longer than any phrase, are an answer that cannot match: the
+/// challenge is not confirmed, the same as a phrase that is merely wrong. A
+/// terminal that fails is a failure and says so.
+fn answer_error(error: std::io::Error) -> anyhow::Error {
+    if crate::tty::is_unreadable_answer(&error) {
+        ChallengeNotConfirmed.into()
+    } else {
+        error.into()
+    }
 }
 pub async fn set_auto_push(value: &str, requested: Option<&str>) -> Result<()> {
     let enabled = match value {
@@ -1520,6 +1534,46 @@ mod output_tests {
             // And the refusal does not repeat the phrase it refused to show.
             assert!(!acts_on_a_terminal(&error), "{error:?}");
             assert!(!error.contains("fingerprint"), "{error}");
+        }
+    }
+}
+
+/// A challenge answer that cannot be read is an answer that does not match.
+#[cfg(test)]
+mod answer_tests {
+    use super::answer_error;
+    use crate::commands::failure::{classify_failure, FlowFailure};
+    use crate::tty::UnreadableAnswer;
+    use std::io;
+
+    #[test]
+    fn an_unreadable_answer_is_not_a_confirmation() {
+        let not_utf8 = io::Error::new(io::ErrorKind::InvalidData, UnreadableAnswer::NotUtf8);
+        let error = answer_error(not_utf8);
+        assert_eq!(classify_failure(&error), FlowFailure::NotConfirmed);
+        assert_eq!(error.to_string(), "acknowledgement challenge did not match");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_line_that_is_too_long_is_not_a_confirmation() {
+        let too_long = io::Error::new(io::ErrorKind::InvalidData, UnreadableAnswer::TooLong);
+        assert_eq!(
+            classify_failure(&answer_error(too_long)),
+            FlowFailure::NotConfirmed
+        );
+    }
+
+    #[test]
+    fn a_failing_terminal_is_a_failure_with_its_own_text() {
+        for error in [
+            io::Error::new(io::ErrorKind::BrokenPipe, "terminal went away"),
+            io::Error::new(io::ErrorKind::InvalidData, "some other invalid data"),
+            io::Error::from(io::ErrorKind::UnexpectedEof),
+        ] {
+            let text = error.to_string();
+            let error = answer_error(error);
+            assert_eq!(classify_failure(&error), FlowFailure::Other(text));
         }
     }
 }

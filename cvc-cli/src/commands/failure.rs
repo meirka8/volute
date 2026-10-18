@@ -15,8 +15,9 @@ use cvc_core::privacy::PrivacyError;
 use std::error::Error;
 use std::fmt;
 
-/// The phrase typed at a challenge was not the one displayed, or was empty. No
-/// consent was recorded.
+/// The phrase typed at a challenge was not the one displayed, or was empty, or
+/// was not text at all (bytes that are not UTF-8, a line longer than any
+/// phrase). No consent was recorded.
 #[derive(Debug)]
 pub(crate) struct ChallengeNotConfirmed;
 
@@ -128,8 +129,9 @@ const UNSHARE_BLOCKED: &str = "cannot unshare pending, published, or unknown con
 /// Why a flow stopped, in terms a caller can translate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FlowFailure {
-    /// The typed phrase did not match, or was empty. It is what the flow's own
-    /// consent gate says when it is not satisfied, and the gate comes before the
+    /// The typed phrase did not match, was empty, or was not text at all (bytes
+    /// that are not UTF-8, a line longer than any phrase). It is what the flow's
+    /// own consent gate says when it is not satisfied, and the gate comes before the
     /// flow writes anything it asks consent for, so this guarantees:
     ///
     /// - no consent, share or unshare was recorded, and no publication state was

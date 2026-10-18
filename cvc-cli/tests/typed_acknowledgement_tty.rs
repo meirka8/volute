@@ -82,3 +82,39 @@ fn a_chained_challenge_waits_for_fresh_input_instead_of_the_previous_lines_type_
     let remote = git2::Repository::open_bare(&fixture.remote).unwrap();
     assert!(remote.find_reference("refs/cvc/main").is_ok());
 }
+
+#[test]
+fn an_answer_that_is_not_text_does_not_confirm_a_challenge_and_reads_as_not_matching() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+
+    // The right phrase, followed by bytes that are not UTF-8: not an answer.
+    let mut session = PtySession::spawn(
+        fixture.cvc_command(&["privacy", "acknowledge-capture"]),
+        b"",
+    );
+    assert_eq!(session.wait_for_challenge(1), "I UNDERSTAND LOCAL CAPTURE");
+    session.write(b"I UNDERSTAND LOCAL CAPTURE\xff\xfe\n");
+    let (status, output) = session.wait_exit();
+    assert!(!status.success(), "{output}");
+    // It reads as the phrase not matching, not as an I/O failure.
+    assert!(
+        output.contains("acknowledgement challenge did not match"),
+        "{output}"
+    );
+    assert!(!output.contains("invalid"), "{output}");
+    let status = fixture.cvc_ok(&["privacy", "status"]);
+    assert!(status.contains("capture_acknowledged: false"), "{status}");
+
+    // Control: the same phrase as text is accepted.
+    let mut session = PtySession::spawn(
+        fixture.cvc_command(&["privacy", "acknowledge-capture"]),
+        b"",
+    );
+    assert_eq!(session.wait_for_challenge(1), "I UNDERSTAND LOCAL CAPTURE");
+    session.write(b"I UNDERSTAND LOCAL CAPTURE\n");
+    let (status, output) = session.wait_exit();
+    assert!(status.success(), "{output}");
+    let status = fixture.cvc_ok(&["privacy", "status"]);
+    assert!(status.contains("capture_acknowledged: true"), "{status}");
+}

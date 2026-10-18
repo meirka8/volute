@@ -20,6 +20,7 @@
 //!
 //! Roughly one syscall per typed character is immaterial for a prompt.
 
+use std::fmt;
 use std::io::{self, IsTerminal, Write};
 
 #[cfg(unix)]
@@ -33,6 +34,48 @@ use std::os::unix::io::AsRawFd;
 /// longer is not a human typing an acknowledgement.
 #[cfg(unix)]
 const MAX_ANSWER_BYTES: usize = 4096;
+
+/// What was typed at a prompt cannot be taken as an answer at all: it is not
+/// UTF-8 text, or it is longer than any acknowledgement. It travels as the
+/// source of an `InvalidData` I/O error, so the I/O error type stays the
+/// prompt's only one, and [`is_unreadable_answer`] tells it from a failure of
+/// the terminal itself.
+#[derive(Debug)]
+pub enum UnreadableAnswer {
+    /// The bytes typed are not valid UTF-8.
+    NotUtf8,
+    /// The line is longer than the longest answer read (4096 bytes).
+    #[cfg(unix)]
+    TooLong,
+}
+
+impl fmt::Display for UnreadableAnswer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotUtf8 => f.write_str("acknowledgement answer is not valid UTF-8"),
+            #[cfg(unix)]
+            Self::TooLong => f.write_str("acknowledgement answer exceeds the maximum line length"),
+        }
+    }
+}
+
+impl std::error::Error for UnreadableAnswer {}
+
+impl UnreadableAnswer {
+    fn into_io_error(self) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, self)
+    }
+}
+
+/// Whether `error` came from [`Terminal::prompt_line`] being typed something
+/// that is not an answer (see [`UnreadableAnswer`]), and not from the terminal
+/// failing. The caller treats the first as an answer that does not match: the
+/// challenge is not confirmed, which is the fail-closed outcome.
+pub fn is_unreadable_answer(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<UnreadableAnswer>())
+}
 
 /// Whether a typed acknowledgement can be protected from type-ahead: whether
 /// [`Terminal::discard_pending_input`] really discards what was queued before
@@ -87,7 +130,9 @@ impl Terminal {
     }
 
     /// Writes `prompt` to the terminal and reads one line of answer, without
-    /// the trailing line terminator.
+    /// the trailing line terminator. An answer that is not UTF-8, or is longer
+    /// than any acknowledgement, is an `InvalidData` error whose source is
+    /// [`UnreadableAnswer`]; see [`is_unreadable_answer`].
     #[cfg(unix)]
     pub fn prompt_line(&mut self, prompt: &str) -> io::Result<String> {
         self.file.write_all(prompt.as_bytes())?;
@@ -114,7 +159,14 @@ impl Terminal {
         stdout.write_all(prompt.as_bytes())?;
         stdout.flush()?;
         let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
+        match io::stdin().read_line(&mut answer) {
+            Ok(_) => {}
+            // `read_line` reports bytes that are not UTF-8 this way.
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                return Err(UnreadableAnswer::NotUtf8.into_io_error());
+            }
+            Err(error) => return Err(error),
+        }
         Ok(answer.trim_end_matches(['\r', '\n']).to_owned())
     }
 }
@@ -139,16 +191,13 @@ fn read_line_unbuffered(reader: &mut impl Read) -> io::Result<String> {
         }
         answer.push(byte[0]);
         if answer.len() > MAX_ANSWER_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "acknowledgement answer exceeds the maximum line length",
-            ));
+            return Err(UnreadableAnswer::TooLong.into_io_error());
         }
     }
     if answer.last() == Some(&b'\r') {
         answer.pop();
     }
-    String::from_utf8(answer).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    String::from_utf8(answer).map_err(|_| UnreadableAnswer::NotUtf8.into_io_error())
 }
 
 #[cfg(all(unix, test))]
@@ -295,6 +344,63 @@ mod tests {
     #[test]
     fn read_line_rejects_absurdly_long_answers() {
         let mut input = io::Cursor::new(vec![b'x'; MAX_ANSWER_BYTES + 1]);
-        assert!(read_line_unbuffered(&mut input).is_err());
+        let error = read_line_unbuffered(&mut input).unwrap_err();
+        assert!(is_unreadable_answer(&error), "{error}");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "acknowledgement answer exceeds the maximum line length"
+        );
+        // The longest answer allowed is still read.
+        let mut input = io::Cursor::new([vec![b'x'; MAX_ANSWER_BYTES], b"\n".to_vec()].concat());
+        assert_eq!(
+            read_line_unbuffered(&mut input).unwrap().len(),
+            MAX_ANSWER_BYTES
+        );
+    }
+
+    #[test]
+    fn read_line_rejects_answers_that_are_not_utf8() {
+        for bytes in [
+            &b"\xff\xfe\n"[..],
+            b"I SHARE \xc3\n",
+            b"\x80\n",
+            // A truncated multi-byte sequence at the end of the input.
+            b"I SHARE \xe2\x82",
+        ] {
+            let error = read_line_unbuffered(&mut io::Cursor::new(bytes)).unwrap_err();
+            assert!(is_unreadable_answer(&error), "{bytes:?}: {error}");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "acknowledgement answer is not valid UTF-8"
+            );
+        }
+        // Valid UTF-8 that is not ASCII is an answer like any other.
+        let mut input = io::Cursor::new("שלום ✓\n".as_bytes().to_vec());
+        assert_eq!(read_line_unbuffered(&mut input).unwrap(), "שלום ✓");
+    }
+
+    #[test]
+    fn a_failure_of_the_terminal_is_not_an_unreadable_answer() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "terminal went away",
+                ))
+            }
+        }
+        let error = read_line_unbuffered(&mut Broken).unwrap_err();
+        assert!(!is_unreadable_answer(&error), "{error}");
+        // Not even when the kind is the same.
+        assert!(!is_unreadable_answer(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "some other invalid data"
+        )));
+        assert!(!is_unreadable_answer(&io::Error::from(
+            io::ErrorKind::InvalidData
+        )));
     }
 }
