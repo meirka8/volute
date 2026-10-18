@@ -113,10 +113,15 @@ node .github/scripts/generate-third-party-notices.mjs --check
 node .github/scripts/check-release-version.mjs vX.Y.Z
 ```
 
-The last command is the release version gate: it requires the tag spelling and the
-four Cargo manifests, extension manifest, and npm wrapper manifest to match exactly.
-Inspect the resulting diff, including both lockfiles. Commit with DCO sign-off, push
-the branch, and open a PR to `main`:
+CI's `npm-wrapper` job also fails if npm would rewrite `npm/cvc-mcp/package.json`
+while publishing. It checks this with `npm pkg fix` and a publish dry run on the same
+npm version that the release job pins. If that check fails, run `npm pkg fix` in
+`npm/cvc-mcp` and commit the result.
+
+The last command in the block above is the release version gate: it requires the tag
+spelling and the four Cargo manifests, extension manifest, and npm wrapper manifest
+to match exactly. Inspect the resulting diff, including both lockfiles. Commit with
+DCO sign-off, push the branch, and open a PR to `main`:
 
 ```bash
 git add cvc-core/Cargo.toml cvc-cli/Cargo.toml cvc-lsp/Cargo.toml cvc-mcp/Cargo.toml Cargo.lock cvc-plugin/package.json cvc-plugin/package-lock.json npm/cvc-mcp/package.json docs/releases/vX.Y.Z.md
