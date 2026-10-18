@@ -19,7 +19,9 @@ cvc run -- <command> [args...]
 cvc pull
 ```
 
-`conversations` lists conversations most-recent-first with thought/linked counts and, for the selected (or `origin`) remote, their share and publication state — it is the read-only view that answers "what would I be sharing?". A conversation reads `[shared, …]` while some of its thoughts are shared with that remote and `[private]` otherwise: after `cvc unshare` it is private again (and `cvc share` offers it again), and a conversation imported by `cvc pull` stays private until you share it yourself, even though its thoughts are known to be published at the remote they came from.
+`conversations` lists conversations most-recent-first with thought and linked counts and, for the selected remote (`--remote <name>`, default `origin`), their share and publication state, so it answers "what would I be sharing?". In a terminal it opens an [interactive view](#browse-and-share-interactively) for browsing and, on Linux and macOS, for sharing, unsharing and publishing, each only through the same typed phrase as the matching command. With `--plain`, in a pipe, or without a terminal it prints a plain listing instead, which only reads and prints ids and titles with control and format characters replaced by `?`. `--limit <N>` caps how many conversations are listed; the plain listing shows 20 by default.
+
+In the plain listing a conversation reads `[shared, …]` while some of its thoughts are shared for that remote. When nothing is shared but this clone's records show the remote holds some of it, it reads `[published, not shared here]`, and `[unconfirmed, not shared here]` when they show only an unfinished publish with nothing published; a re-ingested session and a conversation imported by `cvc pull` read this way, never as `[private]`. It reads `[shared, future only]` when future sharing is on but nothing is shared and the remote holds nothing of it, and `[private]` otherwise, so `[private]` means private as far as this clone knows: this clone shares nothing in it for that remote and has no record of the remote holding any of it. After `cvc unshare` it is `[private]` again, and the `cvc share` picker offers it again (the picker leaves out imported conversations). The `published` figure counts only thoughts that this clone shares for that remote and knows the remote holds, so a conversation imported by `cvc pull` is not counted as shared or published from this clone, however many of its thoughts the remote holds.
 
 `init` creates the local SQLite cache and installs advisory `post-commit`, `pre-push`, `post-merge`, and `post-rewrite` hooks (respecting `core.hooksPath`). `run` records its command and output as a private floating interaction. The post-commit linker may associate recent eligible interactions with a commit, but it does not share them. When it links, it prints one line naming the commit, `CVC: Linked N thought(s) to commit <sha>.`; in a checkout with the Claude Code harness installed it prints that line on every commit, because transcript ingestion reads the commit hash from it (see below). Configure its conservative window with `git config cvc.linkWindow <seconds>` (`0..=2592000`, default `86400`; `0` disables automatic linking). Automatic linking uses only the documented time/file-context policy—not author, message, or file-set similarity heuristics; `CVC-Session` trailers are not implemented. Captures additionally record a local-only fingerprint of their active worktree, and automatic linking considers only thoughts captured in the committing worktree (legacy rows without a recorded origin remain broadly eligible); parallel linked worktrees cannot claim each other's floating thoughts. Thoughts captured in a worktree that is later removed stay floating rather than being linked elsewhere.
 
@@ -63,7 +65,7 @@ Record a finished session, or one that ran before the hooks were installed, expl
 cvc ingest claude-code --transcript ~/.claude/projects/<workspace>/<session>.jsonl
 ```
 
-Ingestion is idempotent: every assistant response has a deterministic id within its session, so re-running never duplicates or replaces a thought, and never disturbs commit links it has already earned. One thought is recorded per assistant response: the prompt or tool results it reacted to become the prompt, its exposed thinking becomes `model_cot`, its text becomes the response, and its tool calls become tool executions carrying the status of their results. Paths the session read or edited inside the worktree become file context, subject to `.thoughtignore` `path:` rules; tool output is rendered into the following thought's prompt with bounded size. The conversation id is the Claude Code session id, so `cvc conversations` and `cvc share` work on it directly, and its title follows Claude Code's own: a title you set yourself outranks the generated one, and the first prompt stands in until either exists. Captures follow the usual boundaries: private by default, scrubbed on the way in, shared only per conversation and destination, and attributed to the worktree the hook ran in, so parallel checkouts cannot claim each other's thoughts.
+Ingestion is idempotent: every assistant response has a deterministic id within its session, so re-running never duplicates or replaces a thought, and never disturbs commit links it has already earned. One thought is recorded per assistant response: the prompt or tool results it reacted to become the prompt, its exposed thinking becomes `model_cot`, its text becomes the response, and its tool calls become tool executions carrying the status of their results. Paths the session read or edited inside the worktree become file context, subject to `.thoughtignore` `path:` rules; tool output is rendered into the following thought's prompt with bounded size. The conversation id is the Claude Code session id, so `cvc conversations` and `cvc share` work on it directly, and its title follows Claude Code's own: a title you set yourself outranks the generated one, and the first prompt stands in until either exists. Captures follow the usual boundaries: private by default, scrubbed on the way in, shared only per conversation and destination (a session's thoughts include the prompts it gave its agents and the results they returned, so sharing a session shares those, while each agent's own conversation is shared separately), and attributed to the worktree the hook ran in, so parallel checkouts cannot claim each other's thoughts.
 
 ## Privacy acknowledgement and destination consent
 
@@ -96,7 +98,7 @@ cvc privacy set-auto-push on --remote origin
 cvc privacy set-auto-push off --remote origin
 ```
 
-Non-interactive input is rejected for acknowledgements. This intentionally prevents scripts, IDEs, and MCP clients from silently granting capture, sharing, or auto-push consent. The answer is read from the controlling terminal itself, and anything already queued on it (a paste, type-ahead, or a line left over from a preceding challenge in the same command) is discarded when the prompt appears, so a challenge can only be satisfied by input typed after it was displayed.
+Non-interactive input is rejected for acknowledgements. This is meant to stop scripts, IDEs, and MCP clients from granting capture, sharing, or auto-push consent through piped or queued input. It is a confirmation step, not a security boundary: a program that drives a terminal as you, such as an AI agent with terminal access, can still type a phrase. On Linux and macOS the answer is read from the controlling terminal itself, and anything already queued on it (a paste, type-ahead, or a line left over from a preceding challenge in the same command) is discarded when the prompt appears, so a challenge can only be satisfied by input typed after it was displayed. The prompt also waits until input has been quiet for about 250 ms, which is the short pause you may see before it appears, and if input keeps arriving for about 3 seconds no phrase is asked and the challenge is not confirmed (`input kept arriving at the terminal, so no phrase was asked: acknowledgement challenge did not match`). On Windows the prompt reads standard input and cannot discard type-ahead.
 
 ## Share and publish
 
@@ -110,7 +112,9 @@ cvc unshare <conversation-id> --remote origin
 
 Discover conversation ids with `cvc conversations`, or run `cvc share` with no id from a terminal for an interactive picker over the destination's unshared conversations. The picker is TTY-only and feeds the same typed challenge, so non-interactive callers must always name a conversation explicitly; before the challenge, `share` prints the conversation's title, counts, and activity range so the consent is legible.
 
-`share` requires the displayed TTY challenge, which includes the destination fingerprint and snapshot count. `unshare` makes only unpublished turns private; it cannot recall content already published.
+`share` requires the displayed TTY challenge, which includes the destination fingerprint and snapshot count. `unshare` makes the whole conversation private again for that remote, or changes nothing: it is refused if any turn of the conversation has been published to that remote, or is pending or of unknown state after an unfinished publish (`cvc privacy reconcile` settles those against the remote). It cannot recall content already published.
+
+A thought can hold material that is not yours to publish: file contents and web pages the agent read, command output, and model output that your AI provider's terms govern. Publishing copies it to everyone who can read the remote; the repository's license does not cover material you have no right to license. CVC's typed phrases record your choice; they are not consent from anyone whose personal data a thought contains.
 
 `cvc share <conversation-id> --remote origin --push` publishes the snapshot in the same command. Where auto-push was acknowledged for that destination, the share challenge is the only one: that standing grant already covers publication, exactly as it does for hooks and a bare `cvc push`. Without it, the `I PUBLISH` challenge follows, and declining it leaves the turns shared but unpublished.
 
@@ -142,6 +146,70 @@ cvc privacy reconcile --remote origin
 ```
 
 `pull` fetches the CVC ref and imports it into the local cache; receiving content from a remote does not grant local sharing intent for another destination.
+
+### Browse and share interactively
+
+Run `cvc conversations` in a terminal to open an interactive view of your captured conversations, most recent first, with their share and publication state for one remote at a time. Press `?` for help and `q` to quit. The view hides conversations that have no thoughts.
+
+It opens only when standard input and output are both terminals, `TERM` names a terminal that can redraw (not `dumb` or empty, and on Linux and macOS not unset), and the window is at least 60 columns by 12 rows. In a smaller window, or one whose size cannot be read, `cvc conversations` prints the plain listing with one line saying why. `--plain`, a pipe, or no terminal prints the plain listing too. With nothing to list it says so, with a hint for the next step, instead of opening the view.
+
+When the view opens, and again after each share, unshare, publish or authorization, it waits until the terminal's input has been quiet for about 300 ms and discards whatever arrives meanwhile, so nothing typed or pasted before the screen appeared, or sent during the wait, acts in it. If input keeps arriving for about 3 seconds, the view closes without acting (`input kept arriving at the terminal, so the view was closed without acting on any of it`). When a phrase prompt cannot be asked for the same reason, the view says so instead, for example `Not shared: input kept arriving at the terminal, so no phrase was asked. Nothing was changed.` (likewise `Not unshared`, `Not published` and `Not authorized`).
+
+**The screen.** The header shows the selected remote with a shortened location (user information, query and fragment removed), for example `github.com/acme/repo`, and the first 12 characters of its destination fingerprint; `publishing: authorized in this clone` (shortened to `publishing: authorized` on a narrow terminal), `publishing: not authorized yet`, or `publishing: unknown` when CVC's privacy state cannot be read, which turns sharing and publishing in the view off; the auto-push state, shown loudly when it is on; and `N shared thoughts waiting to publish`. These figures come from this clone's own records, and a publish fetches the remote first, so the count you are asked to confirm can differ. Each row shows when the conversation was last active (the column is headed `when (UTC)`), its thought and linked counts, its title, and a state label. Claude Code subagent conversations nest under their session, collapsed behind a badge such as `+2 agents · 1 waiting`. Sharing a session does not share an agent's own conversation, which is shared separately. But the session's own thoughts include the prompt it gave each agent and the result each returned (tool arguments and tool results are captured), and those are shared with the session. Conversations pulled from a remote are dim and read-only.
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓`, `j` `k` | Move the selection |
+| `PgUp` `PgDn`, `Home` `End` | Move a page, or to the first or last row |
+| `→` or `l` | Show a session's subagents |
+| `←` or `h` | Hide them; on a subagent, select its session |
+| `Enter` | Open details for the selected conversation |
+| `s` | Share the selected conversation |
+| `u` | Unshare it |
+| `p` | Publish shared thoughts to the selected remote |
+| `r` | Choose another remote |
+| `?` | Help |
+| `q` | Quit from the list; in an overlay or the remote list, close it |
+| `Esc` | Close a bar, an overlay or the remote list |
+
+Letters are case-insensitive, so Shift and Caps Lock change nothing. Sharing with future thoughts is a choice made in the share bar rather than a separate key, because the typed phrase is the same with and without `--future`. A key that cannot act right now is dimmed in the bottom bar, and pressing it says why.
+
+| State | Meaning |
+| --- | --- |
+| `○ private` | This clone shares nothing in the conversation for the selected remote, and has no record of the remote holding any of it. |
+| `◐ shared · N waiting` | Shared here; N shared thoughts are not yet published. |
+| `◐ shared · future only` | Future sharing is on, but nothing in the conversation is shared yet and the remote holds nothing of it. |
+| `● published` | Every shared thought is published. |
+| `● published · N private` | Published, and N thoughts are not shared and the remote holds none of them (for example thoughts added after the share). The same `· N private` tail can follow `◐ shared`. |
+| `● published · not shared here` | This clone's records show the remote holds it, but this clone has no share for it (for example after re-ingesting a transcript). |
+| `? unconfirmed · not shared here` | This clone has no share for it, and its records for the remote show only an unfinished publish (pending or unknown), with nothing published. `cvc privacy reconcile` settles it. |
+| `imported` | Pulled from a remote; read-only here. |
+| `· N not shared here` | When something is shared, a tail after `◐ shared` or `● published`: N thoughts that this clone has not shared but that the remote holds, by this clone's records. |
+| `+future` | Added after another label, except `◐ shared · future only`, which already says it: thoughts captured later are shared as they are captured, without a new phrase. |
+
+Every label describes this clone's own records for that remote, not a live check of the remote; `private` means private as far as this clone knows. On the Linux console (`TERM=linux`) or in a locale that is not UTF-8, the glyphs are replaced by ASCII stand-ins and the words stay the same; `NO_COLOR` is honored.
+
+**Share, unshare and publish: a bar, then the phrase.** `s`, `u` and `p` do not act on their own. Each opens a short bar at the bottom of the screen that says what will happen next; nothing has happened yet, and `Esc` cancels. In the share bar, `Enter` means "this snapshot only" (the thoughts recorded so far) and `f` means "also future thoughts": thoughts captured later are marked shared as they are captured, without a new phrase, and reach the remote at the next publish. Where auto-push is on for that remote, every `git push` to that remote publishes them. Re-sharing a conversation whose future sharing is on, with `Enter`, turns future sharing off; the bar says so. `u` is refused, with the reason on screen, when any thought of the conversation has been published to the selected remote or is pending or unknown after an unfinished publish, because unsharing cannot recall content the remote may already hold. Otherwise every shared thought of the conversation becomes private again for that remote, and later thoughts stay private.
+
+In a bar, `Enter` or `f` only continues to the phrase; it is never consent. The view then leaves the full-screen display and prints a short banner on the normal screen (the remote and its fingerprint, what the action will do, and that an empty line and Enter cancels), followed by the same typed phrase that the matching command asks for and whatever summary that command prints. It returns to the list afterwards:
+
+| Key | Same as | Typed phrase |
+| --- | --- | --- |
+| `s` | `cvc share` | `I SHARE <conversation-id> <fingerprint> <count> <token>` |
+| `u` | `cvc unshare` | `I UNSHARE <conversation-id> <fingerprint>` |
+| `p` | `cvc push --manual` | `I PUBLISH <fingerprint> <candidate> <count>` |
+
+In the share phrase, `<count>` and `<token>` pin the exact set of thoughts the share covers; the publish phrase is explained above. On Linux and macOS the prompt discards anything typed before it appears, so only text typed after the prompt can answer it. The view does not answer a phrase for you, and no key shares or publishes by itself. Two standing choices act later without a new phrase: `+future` shares new thoughts as they are captured, and auto-push (set with `cvc privacy set-auto-push`, never from this view) publishes shared thoughts at every `git push` to that remote. Scrubbing can miss secrets and personal data, and published thoughts cannot be recalled, so review a conversation's content before you share it.
+
+**Authorization.** Publishing needs a one-time authorization for the remote's exact push URL; CVC checks only the URL, not who owns the repository or who can read it. While it is missing, `s` and `p` offer the `cvc privacy acknowledge-sharing` phrase (`I AUTHORIZE SHARING <fingerprint>`) instead of the share or publish phrase. Authorizing does not continue into the share or the publish, so press `s` or `p` again afterwards. It never turns on auto-push, which is set with `cvc privacy set-auto-push`, never from this view.
+
+**Remotes.** `r` lists the repository's remotes with each one's location, fingerprint prefix, whether publishing is authorized, and the auto-push state. Choosing a remote changes what the view shows and acts on; it never authorizes anything. Authorization belongs to a push URL, not a remote name: it grants nothing for a different URL, and a remote with the same push URL is already covered. The view starts on `--remote <name>` if you pass it, otherwise on `origin`, and does not remember the choice between runs.
+
+**Windows.** In v0.7.1 the view only browses on Windows: `s`, `u` and `p` are disabled and point to `cvc share`, `cvc unshare` and `cvc push --manual` (and `cvc privacy acknowledge-sharing` to authorize publishing). Those commands still work there, but on Windows their typed phrase cannot yet discard keys typed ahead of the prompt, which is why the view does not start one. The type-ahead protection described under [Privacy acknowledgement and destination consent](#privacy-acknowledgement-and-destination-consent) applies on Linux and macOS only.
+
+**Words.** The view counts thoughts. A thought is one recorded step; for Claude Code, one assistant response. `cvc share` calls the same unit a "turn" and `cvc push` calls it an "interaction", so a count can read differently on the screen, in a phrase, and in a command's output.
+
+**Scripts and automation.** Use `cvc conversations --plain` in scripts and in any tool that drives `cvc` through a pseudo-terminal, which looks like a terminal and would otherwise get the view. The view adds no consent path of its own: each phrase is still typed at the prompt, as with the commands.
 
 ## Suppress, redact, and local rewrite plans
 
