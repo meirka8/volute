@@ -107,6 +107,109 @@ fn a_terminate_signal_gives_the_terminal_back_and_still_ends_the_process() {
 }
 
 #[test]
+fn a_hangup_or_an_interrupt_gives_the_terminal_back_and_still_ends_the_process() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for signal in [libc::SIGHUP, libc::SIGINT] {
+        let fixture = fixture_with_a_conversation();
+        let mut session =
+            PtySession::spawn_sized(tui_command(&fixture, &["conversations"]), b"", 120, 40);
+        session.wait_for_screen_text("CVC conversations");
+        assert!(!session.terminal_is_cooked());
+
+        session.signal(signal);
+        let status = session.wait_for_exit();
+        let output = session.output();
+        assert_eq!(status.signal(), Some(signal), "{status:?}");
+        assert!(output.contains(LEAVE_ALTERNATE_SCREEN), "{output:?}");
+        assert!(session.terminal_is_cooked(), "raw mode was left on");
+    }
+}
+
+#[test]
+fn a_terminate_signal_ends_a_view_that_is_stuck_writing_to_a_terminal_that_takes_no_more() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let fixture = fixture_with_a_conversation();
+    let mut session =
+        PtySession::spawn_sized(tui_command(&fixture, &["conversations"]), b"", 120, 40);
+    session.wait_for_screen_text("CVC conversations");
+
+    // Nothing reads what the view writes from here on. Every redraw (the help
+    // opens and closes on `?`) adds to the terminal's buffer until it is full,
+    // and the view blocks in the write that does not fit, holding the lock on
+    // its output.
+    session.pause_output();
+    let mut queued = 0;
+    let mut unchanged = 0;
+    for _ in 0..600 {
+        session.write(b"?");
+        std::thread::sleep(Duration::from_millis(30));
+        let now = session.unread_output();
+        if now == queued {
+            unchanged += 1;
+        } else {
+            unchanged = 0;
+            queued = now;
+        }
+        if unchanged >= 10 {
+            break;
+        }
+    }
+    assert!(
+        unchanged >= 10,
+        "the terminal never filled up ({queued} bytes queued)"
+    );
+
+    // Putting the terminal back must not wait for that lock, or the signal would
+    // never take effect.
+    session.signal(libc::SIGTERM);
+    let status = session.wait_for_exit();
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    assert!(session.terminal_is_cooked(), "raw mode was left on");
+}
+
+#[test]
+fn a_signal_that_was_ignored_when_the_process_started_stays_ignored() {
+    use std::os::unix::process::CommandExt;
+
+    let fixture = fixture_with_a_conversation();
+    let mut command = tui_command(&fixture, &["conversations"]);
+    // What `nohup cvc conversations` hands the process: a hangup it is to
+    // survive. (`nohup` itself would also take the terminal off its stdin.)
+    // SAFETY: the hook calls only `signal`, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut session = PtySession::spawn_sized(command, b"", 120, 40);
+    session.wait_for_screen_text("CVC conversations");
+
+    session.signal(libc::SIGHUP);
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        !session.has_exited(),
+        "the view ended on a signal it was told to ignore:\n{}",
+        session.output()
+    );
+    assert!(!session.terminal_is_cooked(), "the view is still up");
+
+    session.write(b"q");
+    let status = session.wait_for_exit();
+    assert!(status.success(), "{}", session.output());
+
+    // A signal that was not ignored still ends it, as before.
+    let mut session =
+        PtySession::spawn_sized(tui_command(&fixture, &["conversations"]), b"", 120, 40);
+    session.wait_for_screen_text("CVC conversations");
+    session.signal(libc::SIGHUP);
+    let status = session.wait_for_exit();
+    assert!(!status.success(), "{}", session.output());
+}
+
+#[test]
 fn plain_prints_the_listing_without_the_alternate_screen() {
     let fixture = fixture_with_a_conversation();
     let session = PtySession::spawn_sized(

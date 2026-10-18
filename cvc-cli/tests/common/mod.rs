@@ -9,6 +9,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -152,6 +153,8 @@ pub struct PtySession {
     child: Child,
     master: File,
     output: Arc<Mutex<Vec<u8>>>,
+    /// Whether the thread that collects the output is reading it.
+    reading: Arc<AtomicBool>,
     /// The window the pty was opened with, columns by rows.
     size: (u16, u16),
 }
@@ -200,11 +203,17 @@ impl PtySession {
         // the master sees hangup once the child exits.
         drop(command);
         let output = Arc::new(Mutex::new(Vec::new()));
+        let reading = Arc::new(AtomicBool::new(true));
         let mut reader = master.try_clone().unwrap();
         let sink = Arc::clone(&output);
+        let reads = Arc::clone(&reading);
         std::thread::spawn(move || {
             let mut chunk = [0u8; 1024];
             loop {
+                if !reads.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
                 match reader.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => sink.lock().unwrap().extend_from_slice(&chunk[..n]),
@@ -215,8 +224,25 @@ impl PtySession {
             child,
             master,
             output,
+            reading,
             size: size.unwrap_or((80, 24)),
         }
+    }
+
+    /// Stops reading what the process writes, so that it piles up in the
+    /// terminal's buffer, like a terminal that has stopped taking output. (What
+    /// is already being read is still collected.)
+    pub fn pause_output(&self) {
+        self.reading.store(false, Ordering::SeqCst);
+    }
+
+    /// How many bytes the process has written that nothing has read yet.
+    pub fn unread_output(&self) -> usize {
+        let mut count: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one c_int through the pointer it is given.
+        let rc = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::FIONREAD as _, &mut count) };
+        assert_eq!(rc, 0, "FIONREAD: {}", io::Error::last_os_error());
+        count as usize
     }
 
     /// Types `bytes` at the terminal.
