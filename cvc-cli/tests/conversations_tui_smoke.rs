@@ -534,6 +534,46 @@ fn input_that_never_stops_after_a_flow_closes_the_view_and_still_tells_the_resul
 }
 
 #[test]
+fn a_challenge_that_gets_no_prompt_because_input_kept_arriving_says_so_in_the_view() {
+    let fixture = fixture_with_a_conversation();
+    let mut session =
+        PtySession::spawn_sized(tui_command(&fixture, &["conversations"]), b"", 120, 40);
+    session.wait_for_screen_text("CVC conversations");
+    session.write(b"s");
+    session.wait_for_screen_text("is not authorized");
+    session.write(b"\r");
+    // Keys arrive from the moment the flow starts, for longer than a phrase waits
+    // for the input to stop (three seconds), and for less than the view then
+    // waits for it to (three more).
+    session.flood(QUIT_KEYS, Duration::from_millis(10), Duration::from_secs(4));
+
+    // The view comes back with what became of the challenge: it was never asked,
+    // which is not the same as a phrase that did not match.
+    session.wait_for_screen_text(
+        "Not authorized: input kept arriving at the terminal, so no phrase was asked.",
+    );
+    let output = session.output();
+    assert!(
+        !output.contains("Type exactly"),
+        "the prompt was shown:\n{output}"
+    );
+    assert!(
+        !output.contains("the typed phrase did not match"),
+        "{output}"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !session.has_exited(),
+        "a key of the stream acted:\n{}",
+        session.output()
+    );
+
+    session.write(b"q");
+    let status = session.wait_for_exit();
+    assert!(status.success(), "{}", session.output());
+}
+
+#[test]
 fn input_that_never_stops_when_the_view_starts_means_it_does_not_start() {
     let fixture = fixture_with_a_conversation();
     let mut session =

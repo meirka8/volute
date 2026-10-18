@@ -15,11 +15,32 @@ use cvc_core::privacy::PrivacyError;
 use std::error::Error;
 use std::fmt;
 
-/// The phrase typed at a challenge was not the one displayed, or was empty, or
-/// was not text at all (bytes that are not UTF-8, a line longer than any
-/// phrase). No consent was recorded.
-#[derive(Debug)]
-pub(crate) struct ChallengeNotConfirmed;
+/// A consent challenge was not confirmed, and why. No consent was recorded.
+///
+/// Every reason reads the same on the command line, `acknowledgement challenge
+/// did not match`: that text is what the commands have always printed and what
+/// scripts may match on, and where a reason is also worth saying to a person it
+/// is added in front as context (see `answer_error` in `sync.rs`). The reason is
+/// for a caller that words the refusal itself, as the interactive view does, so
+/// that a challenge that was never asked is not reported as a phrase that did
+/// not match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChallengeNotConfirmed {
+    /// A phrase was asked and what was typed was not it, or was empty.
+    Mismatch,
+    /// A phrase was asked and what came back was not text at all: bytes that
+    /// are not UTF-8, or a line longer than any phrase. It cannot match either.
+    Unreadable,
+    /// No phrase was asked: input kept arriving at the terminal, without a quiet
+    /// moment, for longer than the prompt waits for one, so the prompt was not
+    /// shown. Something may be sending a phrase in advance, and a person who
+    /// answers after seeing the prompt cannot be told from it.
+    InputKeptArriving,
+    /// No phrase was asked: the terminal's line editing and echo, switched off
+    /// while waiting for the input to settle, could not be switched back on, and
+    /// a phrase typed with echo off is not one a person can see themselves give.
+    TerminalNotRestored,
+}
 
 impl fmt::Display for ChallengeNotConfirmed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -146,7 +167,19 @@ pub(crate) enum FlowFailure {
     /// It is never what the second challenge of `cvc share --push` produces: the
     /// `I SHARE` phrase was answered by then and the share is recorded, so that
     /// mismatch is [`FlowFailure::SharedButNotPublished`].
+    ///
+    /// A phrase was asked. When none was, see [`FlowFailure::InputKeptArriving`]
+    /// and [`FlowFailure::TerminalNotRestored`], which guarantee the same.
     NotConfirmed,
+    /// No phrase was asked, because input kept arriving at the terminal without
+    /// a quiet moment (see [`ChallengeNotConfirmed::InputKeptArriving`]). The
+    /// guarantees of [`FlowFailure::NotConfirmed`] hold, and a phrase that
+    /// arrived with the input answered nothing.
+    InputKeptArriving,
+    /// No phrase was asked, because the terminal's line editing and echo could
+    /// not be switched back on (see [`ChallengeNotConfirmed::TerminalNotRestored`]).
+    /// The guarantees of [`FlowFailure::NotConfirmed`] hold.
+    TerminalNotRestored,
     /// The conversation changed while the challenge was open, so the snapshot
     /// the phrase counted is stale. Nothing was shared; try again.
     ConversationChanged,
@@ -185,8 +218,14 @@ pub(crate) fn classify_failure(error: &anyhow::Error) -> FlowFailure {
     if error.downcast_ref::<PublicationOutcomeUnknown>().is_some() {
         return FlowFailure::OutcomeUnknown(plain_message(error));
     }
-    if error.downcast_ref::<ChallengeNotConfirmed>().is_some() {
-        return FlowFailure::NotConfirmed;
+    if let Some(not_confirmed) = error.downcast_ref::<ChallengeNotConfirmed>() {
+        return match not_confirmed {
+            ChallengeNotConfirmed::Mismatch | ChallengeNotConfirmed::Unreadable => {
+                FlowFailure::NotConfirmed
+            }
+            ChallengeNotConfirmed::InputKeptArriving => FlowFailure::InputKeptArriving,
+            ChallengeNotConfirmed::TerminalNotRestored => FlowFailure::TerminalNotRestored,
+        };
     }
     if error.downcast_ref::<SharingConsentMissing>().is_some() {
         return FlowFailure::ConsentMissing;
@@ -270,12 +309,61 @@ mod tests {
     #[test]
     fn a_challenge_mismatch_keeps_its_text_and_classifies_as_not_confirmed() {
         assert_eq!(
-            ChallengeNotConfirmed.to_string(),
+            ChallengeNotConfirmed::Mismatch.to_string(),
             "acknowledgement challenge did not match"
         );
-        assert_eq!(classify(ChallengeNotConfirmed), FlowFailure::NotConfirmed);
-        let wrapped = anyhow::Error::from(ChallengeNotConfirmed).context("while sharing");
+        assert_eq!(
+            classify(ChallengeNotConfirmed::Mismatch),
+            FlowFailure::NotConfirmed
+        );
+        let wrapped = anyhow::Error::from(ChallengeNotConfirmed::Mismatch).context("while sharing");
         assert_eq!(classify_failure(&wrapped), FlowFailure::NotConfirmed);
+    }
+
+    #[test]
+    fn every_reason_a_challenge_was_not_confirmed_reads_the_same_on_the_command_line() {
+        for reason in [
+            ChallengeNotConfirmed::Mismatch,
+            ChallengeNotConfirmed::Unreadable,
+            ChallengeNotConfirmed::InputKeptArriving,
+            ChallengeNotConfirmed::TerminalNotRestored,
+        ] {
+            assert_eq!(
+                reason.to_string(),
+                "acknowledgement challenge did not match"
+            );
+        }
+    }
+
+    #[test]
+    fn a_challenge_that_was_never_asked_is_told_apart_from_a_phrase_that_did_not_match() {
+        // A phrase was asked, and what came back was wrong or was not text.
+        assert_eq!(
+            classify(ChallengeNotConfirmed::Mismatch),
+            FlowFailure::NotConfirmed
+        );
+        assert_eq!(
+            classify(ChallengeNotConfirmed::Unreadable),
+            FlowFailure::NotConfirmed
+        );
+        // No phrase was asked.
+        assert_eq!(
+            classify(ChallengeNotConfirmed::InputKeptArriving),
+            FlowFailure::InputKeptArriving
+        );
+        assert_eq!(
+            classify(ChallengeNotConfirmed::TerminalNotRestored),
+            FlowFailure::TerminalNotRestored
+        );
+        // Through the context the command line adds in front, and inside a
+        // publication bundled with a share.
+        let said_why = anyhow::Error::from(ChallengeNotConfirmed::InputKeptArriving)
+            .context("input kept arriving at the terminal, so no phrase was asked");
+        assert_eq!(classify_failure(&said_why), FlowFailure::InputKeptArriving);
+        assert_eq!(
+            classify_failure(&BundledPublishFailed::wrap(said_why)),
+            FlowFailure::SharedButNotPublished(Box::new(FlowFailure::InputKeptArriving))
+        );
     }
 
     #[test]
@@ -434,10 +522,13 @@ mod tests {
         // `I PUBLISH` did not match. On its own that type means that nothing was
         // recorded; after `I SHARE` it does not.
         assert_eq!(
-            bundled(ChallengeNotConfirmed.into()),
+            bundled(ChallengeNotConfirmed::Mismatch.into()),
             after_share(FlowFailure::NotConfirmed)
         );
-        assert_eq!(classify(ChallengeNotConfirmed), FlowFailure::NotConfirmed);
+        assert_eq!(
+            classify(ChallengeNotConfirmed::Mismatch),
+            FlowFailure::NotConfirmed
+        );
         assert_eq!(
             bundled(
                 SharingConsentMissing {
@@ -460,7 +551,8 @@ mod tests {
             after_share(FlowFailure::Other("while publishing: disk is full".into()))
         );
         // Context added further out changes nothing.
-        let outer = BundledPublishFailed::wrap(ChallengeNotConfirmed.into()).context("share");
+        let outer =
+            BundledPublishFailed::wrap(ChallengeNotConfirmed::Mismatch.into()).context("share");
         assert_eq!(
             classify_failure(&outer),
             after_share(FlowFailure::NotConfirmed)
@@ -469,7 +561,7 @@ mod tests {
 
     #[test]
     fn a_bundled_failure_says_the_share_was_recorded_in_front_of_its_cause() {
-        let error = BundledPublishFailed::wrap(ChallengeNotConfirmed.into());
+        let error = BundledPublishFailed::wrap(ChallengeNotConfirmed::Mismatch.into());
         assert_eq!(
             format!("{error:#}"),
             "the share was recorded, but publishing did not complete: acknowledgement challenge did not match"

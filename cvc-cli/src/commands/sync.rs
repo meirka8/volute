@@ -183,25 +183,34 @@ fn typed_acknowledgement(challenge: &str) -> Result<()> {
         .prompt_line(&format!("Type exactly '{challenge}' to continue: "))
         .map_err(answer_error)?;
     if answer != challenge {
-        return Err(ChallengeNotConfirmed.into());
+        return Err(ChallengeNotConfirmed::Mismatch.into());
     }
     Ok(())
 }
 
 /// What a failed read of the answer to a challenge, or a failure to clear the
-/// terminal's input before it, means. Bytes that are not text, or a line longer
-/// than any phrase, are an answer that cannot match: the challenge is not
-/// confirmed, the same as a phrase that is merely wrong. Input that never
-/// stopped arriving is not confirmed either: no phrase was asked, so none was
-/// given, and the text says why. A terminal that fails is a failure and says so.
+/// terminal's input before it, means. Every one that is about the answer or the
+/// prompt, and not about the terminal failing, is a challenge that was not
+/// confirmed, typed as `ChallengeNotConfirmed` with the reason, which is what a
+/// caller that words the refusal itself tells them apart by:
+///
+/// - Bytes that are not text, or a line longer than any phrase, are an answer
+///   that cannot match, the same as a phrase that is merely wrong.
+/// - Input that kept arriving, or a terminal that could not be put back to
+///   normal input after waiting for it to stop, means no phrase was asked, so
+///   none was given. The command says why in front of the usual text.
+///
+/// A terminal that fails otherwise is a failure and says so.
 fn answer_error(error: std::io::Error) -> anyhow::Error {
     if crate::tty::is_input_kept_arriving(&error) {
-        // Still typed `ChallengeNotConfirmed`, which is what a caller tells a
-        // challenge that was not confirmed by.
-        anyhow::Error::from(ChallengeNotConfirmed)
+        anyhow::Error::from(ChallengeNotConfirmed::InputKeptArriving)
             .context("input kept arriving at the terminal, so no phrase was asked")
+    } else if crate::tty::is_terminal_not_restored(&error) {
+        // The system's own words are in the error's text.
+        anyhow::Error::from(ChallengeNotConfirmed::TerminalNotRestored)
+            .context(format!("{error}, so no phrase was asked"))
     } else if crate::tty::is_unreadable_answer(&error) {
-        ChallengeNotConfirmed.into()
+        ChallengeNotConfirmed::Unreadable.into()
     } else {
         error.into()
     }
@@ -1558,7 +1567,7 @@ mod output_tests {
 #[cfg(test)]
 mod answer_tests {
     use super::answer_error;
-    use crate::commands::failure::{classify_failure, FlowFailure};
+    use crate::commands::failure::{classify_failure, ChallengeNotConfirmed, FlowFailure};
     use crate::tty::UnreadableAnswer;
     use std::io;
 
@@ -1580,12 +1589,59 @@ mod answer_tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn input_that_kept_arriving_is_a_challenge_that_was_not_asked() {
+        let kept_arriving = io::Error::new(
+            io::ErrorKind::InvalidData,
+            UnreadableAnswer::InputKeptArriving,
+        );
+        let error = answer_error(kept_arriving);
+        // The command says why in front of the usual text, as it always has...
+        assert_eq!(
+            format!("{error:#}"),
+            "input kept arriving at the terminal, so no phrase was asked: acknowledgement challenge did not match"
+        );
+        // ...and a caller that words the refusal itself is told that it was not
+        // a phrase that did not match.
+        assert_eq!(classify_failure(&error), FlowFailure::InputKeptArriving);
+        assert!(error
+            .downcast_ref::<ChallengeNotConfirmed>()
+            .is_some_and(|reason| *reason == ChallengeNotConfirmed::InputKeptArriving));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_that_could_not_be_put_back_is_a_challenge_that_was_not_asked() {
+        let error = answer_error(
+            crate::tty::TerminalNotRestored::new("Input/output error (os error 5)").into_io_error(),
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "the terminal could not be put back to normal input (Input/output error (os error 5)), so no phrase was asked: acknowledgement challenge did not match"
+        );
+        assert_eq!(classify_failure(&error), FlowFailure::TerminalNotRestored);
+    }
+
+    #[test]
+    fn a_phrase_that_was_asked_and_not_matched_is_not_one_that_was_not_asked() {
+        assert_eq!(
+            classify_failure(&ChallengeNotConfirmed::Mismatch.into()),
+            FlowFailure::NotConfirmed
+        );
+        assert_eq!(
+            classify_failure(&ChallengeNotConfirmed::Unreadable.into()),
+            FlowFailure::NotConfirmed
+        );
+    }
+
     #[test]
     fn a_failing_terminal_is_a_failure_with_its_own_text() {
         for error in [
             io::Error::new(io::ErrorKind::BrokenPipe, "terminal went away"),
             io::Error::new(io::ErrorKind::InvalidData, "some other invalid data"),
             io::Error::from(io::ErrorKind::UnexpectedEof),
+            io::Error::other("some other failure"),
         ] {
             let text = error.to_string();
             let error = answer_error(error);

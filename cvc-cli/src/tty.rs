@@ -91,6 +91,62 @@ impl UnreadableAnswer {
     }
 }
 
+/// The terminal's line editing and echo, switched off to wait for input to
+/// settle, could not be switched back on. A prompt shown now would be answered
+/// with nothing echoed and no way to correct what is typed: the person would
+/// not see their own answer. That is not a prompt, so none is shown. It travels
+/// as the source of an `Other` I/O error, and [`is_terminal_not_restored`] finds
+/// it; a caller treats it as a challenge that was not confirmed.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct TerminalNotRestored {
+    reason: String,
+}
+
+#[cfg(unix)]
+impl TerminalNotRestored {
+    /// `reason` is what the system said, or what the check that followed found.
+    pub fn new(reason: impl fmt::Display) -> Self {
+        Self {
+            reason: reason.to_string(),
+        }
+    }
+
+    pub fn into_io_error(self) -> io::Error {
+        io::Error::other(self)
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for TerminalNotRestored {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the terminal could not be put back to normal input ({})",
+            self.reason
+        )
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for TerminalNotRestored {}
+
+/// Whether `error` says that the terminal's line editing and echo could not be
+/// put back after waiting for input to settle (see [`TerminalNotRestored`]).
+pub fn is_terminal_not_restored(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error
+            .get_ref()
+            .is_some_and(|source| source.is::<TerminalNotRestored>())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// Whether `error` came from [`Terminal::prompt_line`] being typed something
 /// that is not an answer (see [`UnreadableAnswer`]), and not from the terminal
 /// failing. The caller treats the first as an answer that does not match: the
@@ -186,7 +242,9 @@ impl Terminal {
     /// The wait is done with line editing and echo off, because in canonical
     /// mode the terminal shows a reader only complete lines: a partial line is
     /// invisible to it, and a stream without a line feed would look quiet. Those
-    /// settings come back before this returns, on every path.
+    /// settings are put back before this returns, and the putting back is
+    /// checked (see [`TerminalNotRestored`]): a prompt that follows is answered
+    /// with echo on, or it is not shown.
     ///
     /// If input does not go quiet within three seconds the prompt is refused:
     /// the error is [`UnreadableAnswer::InputKeptArriving`], which callers treat
@@ -205,15 +263,35 @@ impl Terminal {
         quiet: Duration,
         limit: Duration,
     ) -> io::Result<()> {
+        self.discard_input_until_quiet_restoring(quiet, limit, LineEditingOff::restore)
+    }
+
+    /// [`Terminal::discard_input_until_quiet`] with how the settings are put
+    /// back given, so that a test can make that fail.
+    #[cfg(unix)]
+    fn discard_input_until_quiet_restoring(
+        &mut self,
+        quiet: Duration,
+        limit: Duration,
+        restore: fn(&mut LineEditingOff) -> io::Result<()>,
+    ) -> io::Result<()> {
         self.flush_input()?;
-        let editing = LineEditingOff::enter(self.file.as_raw_fd())?;
+        let mut editing = LineEditingOff::enter(self.file.as_raw_fd())?;
         let waited = self.wait_for_quiet_input(quiet, limit);
-        // Line editing and echo are back before anything is written, and what
-        // arrived since the last read is dropped with them. (Switching line
-        // editing on makes the bytes waiting in the queue a line to be read.)
+        // Line editing and echo are back before anything is written, and the
+        // result of putting them back is looked at: when the wait itself went
+        // well, this is what stands between the caller and a prompt that is
+        // answered with echo off. (When the wait failed there is no prompt, and
+        // its error is the one to report.) The drop that follows tries once more
+        // if this did not work, and is the way back on every path that did not
+        // get this far.
+        let restored =
+            restore(&mut editing).map_err(|error| TerminalNotRestored::new(error).into_io_error());
         drop(editing);
+        // What arrived since the last read is dropped with them. (Switching line
+        // editing on makes the bytes waiting in the queue a line to be read.)
         let flushed = self.flush_input();
-        waited.and(flushed)
+        waited.and(restored).and(flushed)
     }
 
     /// Reads and discards input until `quiet` has passed without any, or fails
@@ -376,14 +454,19 @@ fn input_is_ready(fd: RawFd, timeout: Duration) -> io::Result<bool> {
 }
 
 /// The terminal with line editing and echo off, and reads that wait for at
-/// least a byte, for as long as it lives; the attributes it found are put back
-/// when it is dropped, whatever the reason. Signals stay enabled, so Ctrl-C
-/// still interrupts. (A process that is killed here leaves the terminal so; a
-/// shell sets its own modes again at its next prompt.)
+/// least a byte, for as long as it lives. The attributes it found are put back
+/// by [`LineEditingOff::restore`], which says whether that worked; the normal
+/// path calls it and looks at the result. Dropping the guard puts them back too,
+/// if `restore` has not already succeeded, for every path that does not call it
+/// (an early return, a panic): there is nobody left to tell, so the result is
+/// not looked at. Signals stay enabled, so Ctrl-C still interrupts. (A process
+/// that is killed here leaves the terminal so; a shell sets its own modes again
+/// at its next prompt.)
 #[cfg(unix)]
 struct LineEditingOff {
     fd: RawFd,
     saved: libc::termios,
+    restored: bool,
 }
 
 #[cfg(unix)]
@@ -403,15 +486,57 @@ impl LineEditingOff {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd, saved })
+        Ok(Self {
+            fd,
+            saved,
+            restored: false,
+        })
     }
+
+    /// Puts back the attributes `enter` found, and checks that it worked:
+    /// `tcsetattr` succeeds when it carried out any of what it was asked, not
+    /// all of it, so the settings are read back and the ones that were changed
+    /// (line editing, echo, and how a read waits) have to be the saved ones.
+    fn restore(&mut self) -> io::Result<()> {
+        // SAFETY: puts back the attributes `enter` read from the same
+        // descriptor; `tcsetattr` reads them and keeps nothing.
+        if unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `tcgetattr` fills the `termios` it is given for the descriptor;
+        // an all-zero `termios` is a valid value to be overwritten.
+        let mut now: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(self.fd, &mut now) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if !same_input_modes(&self.saved, &now) {
+            return Err(io::Error::other(
+                "the terminal kept settings other than the ones it was given",
+            ));
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+
+/// Whether two sets of attributes agree on what [`LineEditingOff`] changes: line
+/// editing, echo, and how many bytes a read waits for and for how long.
+#[cfg(unix)]
+fn same_input_modes(a: &libc::termios, b: &libc::termios) -> bool {
+    let changed = libc::ICANON | libc::ECHO;
+    a.c_lflag & changed == b.c_lflag & changed
+        && a.c_cc[libc::VMIN] == b.c_cc[libc::VMIN]
+        && a.c_cc[libc::VTIME] == b.c_cc[libc::VTIME]
 }
 
 #[cfg(unix)]
 impl Drop for LineEditingOff {
     fn drop(&mut self) {
-        // SAFETY: puts back the attributes `enter` read from the same descriptor.
-        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
+        if !self.restored {
+            // The fallback, for a path that did not restore (or could not):
+            // nobody is left to tell if this fails too.
+            let _ = self.restore();
+        }
     }
 }
 
@@ -591,6 +716,174 @@ mod tests {
             "line editing and echo are back"
         );
         sender.join().unwrap();
+    }
+
+    /// Changes the local modes of the terminal as another process could.
+    fn change_local_modes(file: &File, change: impl FnOnce(libc::tcflag_t) -> libc::tcflag_t) {
+        // SAFETY: as in `local_modes`; `tcsetattr` reads the `termios` it is given.
+        let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::tcgetattr(file.as_raw_fd(), &mut attributes) };
+        assert_eq!(rc, 0, "tcgetattr: {}", io::Error::last_os_error());
+        attributes.c_lflag = change(attributes.c_lflag);
+        let rc = unsafe { libc::tcsetattr(file.as_raw_fd(), libc::TCSANOW, &attributes) };
+        assert_eq!(rc, 0, "tcsetattr: {}", io::Error::last_os_error());
+    }
+
+    #[test]
+    fn restoring_puts_the_settings_back_and_the_drop_that_follows_leaves_them_alone() {
+        let (_master, slave) = openpty();
+        let modes = local_modes(&slave);
+        let changed = libc::ICANON | libc::ECHO;
+        assert_eq!(
+            modes & changed,
+            changed,
+            "a fresh terminal edits and echoes"
+        );
+
+        let mut editing = LineEditingOff::enter(slave.as_raw_fd()).unwrap();
+        assert_eq!(
+            local_modes(&slave) & changed,
+            0,
+            "line editing and echo are off"
+        );
+        editing.restore().unwrap();
+        assert_eq!(local_modes(&slave), modes, "restored, and checked");
+
+        // The restore worked, so the drop has nothing to do: whatever another
+        // process set since is not undone.
+        change_local_modes(&slave, |modes| modes & !libc::ECHO);
+        drop(editing);
+        assert_eq!(
+            local_modes(&slave) & libc::ECHO,
+            0,
+            "the drop left it alone"
+        );
+    }
+
+    #[test]
+    fn dropping_the_guard_puts_the_settings_back_when_nothing_else_did() {
+        let (_master, slave) = openpty();
+        let modes = local_modes(&slave);
+        let editing = LineEditingOff::enter(slave.as_raw_fd()).unwrap();
+        assert_ne!(local_modes(&slave), modes);
+        drop(editing);
+        assert_eq!(local_modes(&slave), modes);
+    }
+
+    #[test]
+    fn a_restore_the_system_refuses_is_an_error_and_not_a_restore() {
+        // A descriptor that is not open: `tcsetattr` refuses.
+        let mut editing = LineEditingOff {
+            fd: -1,
+            // SAFETY: an all-zero `termios` is a valid value.
+            saved: unsafe { std::mem::zeroed() },
+            restored: false,
+        };
+        let error = editing.restore().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF), "{error}");
+        assert!(!editing.restored);
+        // The drop tries again, fails again, and says nothing.
+        drop(editing);
+    }
+
+    #[test]
+    fn settings_that_differ_in_what_the_guard_changed_are_not_the_same_settings() {
+        // SAFETY: an all-zero `termios` is a valid value.
+        let saved: libc::termios = unsafe { std::mem::zeroed() };
+        assert!(same_input_modes(&saved, &saved));
+
+        let mut now = saved;
+        now.c_lflag |= libc::ECHO;
+        assert!(!same_input_modes(&saved, &now), "echo");
+        now = saved;
+        now.c_lflag |= libc::ICANON;
+        assert!(!same_input_modes(&saved, &now), "line editing");
+        now = saved;
+        now.c_cc[libc::VMIN] = 1;
+        assert!(
+            !same_input_modes(&saved, &now),
+            "how many bytes a read waits for"
+        );
+        now = saved;
+        now.c_cc[libc::VTIME] = 5;
+        assert!(!same_input_modes(&saved, &now), "how long a read waits");
+
+        // What the guard never touches is not compared.
+        now = saved;
+        now.c_lflag |= libc::ISIG | libc::IEXTEN;
+        assert!(same_input_modes(&saved, &now));
+    }
+
+    #[test]
+    fn a_terminal_that_cannot_be_put_back_gets_no_prompt_and_the_drop_still_puts_it_back() {
+        let (_master, slave) = openpty();
+        let mut terminal = Terminal::from_file(slave);
+        let modes = local_modes(&terminal.file);
+
+        let error = terminal
+            .discard_input_until_quiet_restoring(
+                Duration::from_millis(50),
+                Duration::from_secs(5),
+                |_| Err(io::Error::from_raw_os_error(libc::EIO)),
+            )
+            .unwrap_err();
+        // A challenge that was not confirmed, and not an answer that was unreadable.
+        assert!(is_terminal_not_restored(&error), "{error}");
+        assert!(!is_unreadable_answer(&error), "{error}");
+        assert!(!is_input_kept_arriving(&error), "{error}");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let text = error.to_string();
+        assert!(
+            text.starts_with("the terminal could not be put back to normal input ("),
+            "{text}"
+        );
+        assert!(text.contains("os error 5"), "{text}");
+        // The fallback ran: nothing is left with echo off.
+        assert_eq!(local_modes(&terminal.file), modes);
+    }
+
+    #[test]
+    fn a_wait_that_failed_keeps_its_own_error_whether_or_not_the_restore_worked() {
+        let (master, slave) = openpty();
+        let mut terminal = Terminal::from_file(slave);
+        let chunks = (0..100)
+            .map(|_| (Duration::from_millis(10), b"x".to_vec()))
+            .collect();
+        let sender = send_later(&master, chunks);
+
+        // There is no prompt to protect when the wait failed, and the cause that
+        // matters is that one.
+        let error = terminal
+            .discard_input_until_quiet_restoring(
+                Duration::from_millis(200),
+                Duration::from_millis(600),
+                |_| Err(io::Error::from_raw_os_error(libc::EIO)),
+            )
+            .unwrap_err();
+        assert!(is_input_kept_arriving(&error), "{error}");
+        assert!(!is_terminal_not_restored(&error), "{error}");
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn a_failure_to_put_the_terminal_back_is_found_only_by_its_own_check() {
+        let error = TerminalNotRestored::new("Input/output error (os error 5)").into_io_error();
+        assert!(is_terminal_not_restored(&error));
+        assert_eq!(
+            error.to_string(),
+            "the terminal could not be put back to normal input (Input/output error (os error 5))"
+        );
+        for other in [
+            io::Error::from_raw_os_error(libc::EIO),
+            io::Error::other("some other failure"),
+            io::Error::new(io::ErrorKind::InvalidData, UnreadableAnswer::NotUtf8),
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                UnreadableAnswer::InputKeptArriving,
+            ),
+        ] {
+            assert!(!is_terminal_not_restored(&other), "{other}");
+        }
     }
 
     #[test]

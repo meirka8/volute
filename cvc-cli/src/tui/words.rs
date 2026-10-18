@@ -1231,19 +1231,20 @@ pub fn already_authorized_status(remote: &str) -> String {
 /// is cut to its first line and sanitized.
 pub fn failure_status(kind: FlowKind, failure: &FlowFailure, remote: &str) -> String {
     match (failure, kind) {
-        (FlowFailure::NotConfirmed, FlowKind::Share) => {
-            "Not shared: the typed phrase did not match. Nothing was changed.".to_owned()
-        }
-        (FlowFailure::NotConfirmed, FlowKind::Unshare) => {
-            "Not unshared: the typed phrase did not match. Nothing was changed.".to_owned()
-        }
-        // The fetch that comes first did contact the remote; nothing was published.
-        (FlowFailure::NotConfirmed, FlowKind::Publish) => format!(
-            "Not published: the typed phrase did not match. Nothing was published to '{remote}'."
+        (FlowFailure::NotConfirmed, kind) => not_done(kind, "the typed phrase did not match", remote),
+        // No phrase was asked at all, which is a different thing to say from a
+        // phrase that was asked and did not match: nothing was typed, so nothing
+        // can be said about what was.
+        (FlowFailure::InputKeptArriving, kind) => not_done(
+            kind,
+            "input kept arriving at the terminal, so no phrase was asked",
+            remote,
         ),
-        (FlowFailure::NotConfirmed, FlowKind::Authorize) => {
-            "Not authorized: the typed phrase did not match.".to_owned()
-        }
+        (FlowFailure::TerminalNotRestored, kind) => not_done(
+            kind,
+            "the terminal could not be put back to normal input, so no phrase was asked",
+            remote,
+        ),
         (FlowFailure::ConversationChanged, _) => {
             "Not shared: this conversation gained new thoughts while you were confirming. Press s to try again."
                 .to_owned()
@@ -1279,6 +1280,22 @@ pub fn failure_status(kind: FlowKind, failure: &FlowFailure, remote: &str) -> St
                 text::sanitize(text::first_line(text))
             )
         }
+    }
+}
+
+/// What a flow that stopped at its consent gate says, whichever way the gate
+/// was not satisfied: that it did not happen, `why` (a clause without its final
+/// period), and what that leaves untouched. The four kinds have their own words
+/// for each.
+fn not_done(kind: FlowKind, why: &str, remote: &str) -> String {
+    match kind {
+        FlowKind::Share => format!("Not shared: {why}. Nothing was changed."),
+        FlowKind::Unshare => format!("Not unshared: {why}. Nothing was changed."),
+        // The fetch that comes first did contact the remote; nothing was published.
+        FlowKind::Publish => {
+            format!("Not published: {why}. Nothing was published to '{remote}'.")
+        }
+        FlowKind::Authorize => format!("Not authorized: {why}."),
     }
 }
 
@@ -2814,6 +2831,67 @@ mod tests {
         assert_eq!(
             say(FlowKind::Publish, FlowFailure::ConsentMissing),
             "Publishing to 'origin' is not authorized yet. Press p to set it up."
+        );
+    }
+
+    #[test]
+    fn a_challenge_that_was_never_asked_does_not_read_as_a_phrase_that_did_not_match() {
+        let say = |kind, failure: FlowFailure| failure_status(kind, &failure, "origin");
+        assert_eq!(
+            say(FlowKind::Share, FlowFailure::InputKeptArriving),
+            "Not shared: input kept arriving at the terminal, so no phrase was asked. Nothing was changed."
+        );
+        assert_eq!(
+            say(FlowKind::Unshare, FlowFailure::InputKeptArriving),
+            "Not unshared: input kept arriving at the terminal, so no phrase was asked. Nothing was changed."
+        );
+        assert_eq!(
+            say(FlowKind::Publish, FlowFailure::InputKeptArriving),
+            "Not published: input kept arriving at the terminal, so no phrase was asked. Nothing was published to 'origin'."
+        );
+        assert_eq!(
+            say(FlowKind::Authorize, FlowFailure::InputKeptArriving),
+            "Not authorized: input kept arriving at the terminal, so no phrase was asked."
+        );
+        assert_eq!(
+            say(FlowKind::Share, FlowFailure::TerminalNotRestored),
+            "Not shared: the terminal could not be put back to normal input, so no phrase was asked. Nothing was changed."
+        );
+        assert_eq!(
+            say(FlowKind::Authorize, FlowFailure::TerminalNotRestored),
+            "Not authorized: the terminal could not be put back to normal input, so no phrase was asked."
+        );
+        // Whatever the kind, one that was not asked never says a phrase did not
+        // match, and one that was asked always says so.
+        for kind in [
+            FlowKind::Share,
+            FlowKind::Unshare,
+            FlowKind::Publish,
+            FlowKind::Authorize,
+        ] {
+            for not_asked in [
+                FlowFailure::InputKeptArriving,
+                FlowFailure::TerminalNotRestored,
+            ] {
+                let said = say(kind, not_asked.clone());
+                assert!(said.contains("no phrase was asked"), "{kind:?}: {said}");
+                assert!(!said.contains("did not match"), "{kind:?}: {said}");
+                assert!(!said.contains("typed phrase"), "{kind:?}: {said}");
+            }
+            let said = say(kind, FlowFailure::NotConfirmed);
+            assert!(
+                said.contains("the typed phrase did not match"),
+                "{kind:?}: {said}"
+            );
+            assert!(!said.contains("no phrase was asked"), "{kind:?}: {said}");
+        }
+        // Inside a share that was bundled with a publish, the same.
+        assert_eq!(
+            say(
+                FlowKind::Share,
+                FlowFailure::SharedButNotPublished(Box::new(FlowFailure::InputKeptArriving))
+            ),
+            "The share was recorded, but publishing did not complete. Not published: input kept arriving at the terminal, so no phrase was asked. Nothing was published to 'origin'."
         );
     }
 
