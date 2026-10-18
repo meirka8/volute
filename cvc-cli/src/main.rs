@@ -190,14 +190,34 @@ fn main() -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) if advisory_hook => {
-            eprintln!("CVC Hook Warning: advisory hook skipped: {error}");
+            eprintln!(
+                "CVC Hook Warning: advisory hook skipped: {}",
+                error_text(&error, false)
+            );
             std::process::ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("{error:#}");
+            eprintln!("{}", error_text(&error, true));
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// An error as it is printed, with its causes (`outer: inner`) when `chain` is
+/// set. What it says can come from outside: the text of a remote's error
+/// reaches it, a value that was refused is quoted in it, and a stored title or
+/// id can be named in it. None of that may carry anything that acts on the
+/// terminal, so every control and format character is replaced, a line feed
+/// excepted: an error is several lines when it has several (the usage that
+/// follows a command-line mistake), and a line feed cannot redraw what came
+/// before it.
+fn error_text(error: &anyhow::Error, chain: bool) -> String {
+    let text = if chain {
+        format!("{error:#}")
+    } else {
+        error.to_string()
+    };
+    terminal_text::sanitize_lines_for_terminal(&text).into_owned()
 }
 
 async fn dispatch(cli: Cli) -> Result<()> {
@@ -421,6 +441,26 @@ mod hook_cli_tests {
         );
         assert!(Cli::try_parse_from(["cvc", "conversations", "--limit", "many"]).is_err());
         assert!(Cli::try_parse_from(["cvc", "conversations", "--plain=maybe"]).is_err());
+    }
+
+    #[test]
+    fn a_printed_error_cannot_act_on_the_terminal_but_keeps_its_lines() {
+        let error = anyhow::anyhow!("remote said: \u{1b}[2J\u{1b}]0;pwned\u{7}\r\u{202e}gnp")
+            .context("push failed\nsecond line");
+        // ESC, BEL, the carriage return and the right-to-left override are each
+        // one `?`; the line feed between the two lines of the message stays.
+        assert_eq!(
+            error_text(&error, true),
+            "push failed\nsecond line: remote said: ?[2J?]0;pwned???gnp"
+        );
+        // Only the outermost message when the chain is not asked for.
+        assert_eq!(error_text(&error, false), "push failed\nsecond line");
+        // Text without such characters, several lines included, is unchanged.
+        let plain = anyhow::anyhow!("שלום – café ✓\nUsage: cvc <COMMAND>");
+        assert_eq!(
+            error_text(&plain, true),
+            "שלום – café ✓\nUsage: cvc <COMMAND>"
+        );
     }
 
     #[test]

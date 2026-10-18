@@ -1,6 +1,7 @@
 use crate::commands::failure::{
     BundledPublishFailed, ChallengeNotConfirmed, PublicationOutcomeUnknown, SharingConsentMissing,
 };
+use crate::terminal_text::sanitize_for_terminal;
 use anyhow::{bail, Context, Result};
 use cvc_core::repository::RepositoryLayout;
 use cvc_core::{
@@ -69,7 +70,7 @@ pub(crate) fn acknowledge_sharing_for(
     destination: &privacy::RemoteDestination,
 ) -> Result<()> {
     let s = privacy::privacy_status_for_fingerprint(repo, &destination.fingerprint)?;
-    println!("Acknowledging immutable publication to remote '{}' (fingerprint {}). This does not enable automatic push.", destination.name, s.remote_fingerprint);
+    println!("Acknowledging immutable publication to remote '{}' (fingerprint {}). This does not enable automatic push.", sanitize_for_terminal(&destination.name), s.remote_fingerprint);
     typed_acknowledgement(&format!("I AUTHORIZE SHARING {}", s.remote_fingerprint))?;
     privacy::acknowledge_sharing_destination(repo, destination)?;
     Ok(())
@@ -104,6 +105,7 @@ fn pick_unshared_conversation(
         .into_iter()
         .filter(|summary| !summary.shared && !summary.imported && summary.thoughts > 0)
         .collect();
+    let remote_name = sanitize_for_terminal(remote_name);
     if candidates.is_empty() {
         println!("No unshared conversations for remote '{remote_name}'.");
         return Ok(None);
@@ -136,6 +138,22 @@ fn pick_unshared_conversation(
     Ok(Some(candidates[choice - 1].id.clone()))
 }
 
+/// A phrase is shown so that it can be read and typed back. One with a control
+/// or format character in it can be shown as something else (an escape
+/// sequence rewrites the lines printed above the prompt, such as the summary of
+/// what is being shared) and cannot be typed, so it is not asked at all. A
+/// conversation id from a remote's projection is the one way such a character
+/// gets in; the ids captured here are limited to ASCII letters, digits and
+/// `-_.:`.
+fn ensure_phrase_can_be_shown(challenge: &str) -> Result<()> {
+    if sanitize_for_terminal(challenge) != challenge {
+        bail!(
+            "the phrase to type contains control or format characters and cannot be shown, so it is not asked; nothing was recorded"
+        );
+    }
+    Ok(())
+}
+
 /// Consent gate: the human must type `challenge` verbatim after seeing it.
 ///
 /// The answer is read from the controlling terminal itself, not from the
@@ -148,6 +166,7 @@ fn typed_acknowledgement(challenge: &str) -> Result<()> {
     if !crate::tty::stdio_is_terminal() {
         bail!("acknowledgement requires an interactive TTY");
     }
+    ensure_phrase_can_be_shown(challenge)?;
     let mut terminal = crate::tty::Terminal::open()
         .context("acknowledgement requires access to the controlling terminal")?;
     terminal.discard_pending_input()?;
@@ -249,11 +268,7 @@ pub(crate) fn share_conversation(
         .into_iter()
         .find(|summary| summary.id == id)
     {
-        println!(
-            "Sharing conversation for remote '{}':\n{}",
-            destination.name,
-            crate::commands::conversations::render_line(&summary, true)
-        );
+        println!("{}", share_summary(&destination.name, &summary));
     }
     let ids = store.share_snapshot(id)?;
     let closure = ids.iter().map(|x| x.as_str()).collect::<String>();
@@ -290,6 +305,18 @@ pub(crate) fn share_conversation(
         snapshot_count: count,
         future,
     })
+}
+
+/// The lines printed right before the `I SHARE` prompt: where the share goes and
+/// the conversation it covers. Both are text a person is about to consent on, so
+/// neither the remote's name nor the title may carry anything that rewrites the
+/// lines above the prompt.
+fn share_summary(remote: &str, summary: &cvc_core::db::ConversationSummary) -> String {
+    format!(
+        "Sharing conversation for remote '{}':\n{}",
+        sanitize_for_terminal(remote),
+        crate::commands::conversations::render_line(summary, true)
+    )
 }
 
 /// What a completed [`share_conversation`] recorded.
@@ -694,6 +721,7 @@ fn settle_push(
 }
 /// Shown when the projection already equals the fetched remote baseline.
 fn nothing_to_publish_line(remote: &str, shared_total: usize) -> String {
+    let remote = sanitize_for_terminal(remote);
     if shared_total > 0 {
         format!(
             "No new shared interactions to publish to '{remote}' ({shared_total} shared in total)."
@@ -806,6 +834,7 @@ fn describe_publication(
     publication: &sync::ProjectionPublication,
     phase: PublicationPhase,
 ) -> String {
+    let remote = sanitize_for_terminal(remote);
     let total = publication.shared_total;
     let lead = match phase {
         PublicationPhase::Planned => "Publishing",
@@ -1385,6 +1414,112 @@ mod settle_tests {
                 );
             }
             other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// What is printed around a consent challenge cannot be rewritten by text that
+/// came from the store or the repository's configuration.
+#[cfg(test)]
+mod output_tests {
+    use super::{
+        describe_publication, ensure_phrase_can_be_shown, nothing_to_publish_line, share_summary,
+        PublicationPhase,
+    };
+    use crate::terminal_text::is_unsafe_for_terminal;
+    use cvc_core::db::ConversationSummary;
+    use cvc_core::sync::ProjectionPublication;
+
+    fn acts_on_a_terminal(text: &str) -> bool {
+        text.chars().any(|c| c != '\n' && is_unsafe_for_terminal(c))
+    }
+
+    fn summary() -> ConversationSummary {
+        ConversationSummary {
+            id: "c-1".into(),
+            title: "Refactor the sync module".into(),
+            thoughts: 2,
+            linked: 0,
+            first_activity: 1_700_000_000,
+            last_activity: 1_700_000_000,
+            shared: false,
+            shared_count: 0,
+            published: 0,
+            unconfirmed: 0,
+            share_future: None,
+            imported: false,
+            held: 0,
+            held_published: 0,
+        }
+    }
+
+    #[test]
+    fn the_share_summary_names_the_remote_and_the_conversation_as_plain_text() {
+        let text = share_summary("origin", &summary());
+        assert_eq!(
+            text,
+            "Sharing conversation for remote 'origin':\n2023-11-14 22:13    2 thought(s),   0 linked  c-1  [private]\n      Refactor the sync module"
+        );
+
+        // The title is what a prompt-injected agent writes; the remote name is
+        // whatever the configuration says.
+        let mut hostile = summary();
+        hostile.title = "Fix\u{1b}[1A\u{1b}[2KSharing conversation for remote 'origin':".into();
+        hostile.id = "c\u{202e}-1".into();
+        let text = share_summary("or\u{1b}[2Jigin\n", &hostile);
+        assert!(!acts_on_a_terminal(&text), "{text:?}");
+        assert!(
+            text.starts_with("Sharing conversation for remote 'or?[2Jigin?':\n"),
+            "{text:?}"
+        );
+        assert_eq!(text.matches('\n').count(), 2, "{text:?}");
+    }
+
+    #[test]
+    fn the_publication_lines_name_the_remote_as_plain_text() {
+        let name = "or\u{1b}[2Jigin";
+        let nothing = nothing_to_publish_line(name, 3);
+        assert_eq!(
+            nothing,
+            "No new shared interactions to publish to 'or?[2Jigin' (3 shared in total)."
+        );
+        let publication = ProjectionPublication {
+            shared_total: 3,
+            ..ProjectionPublication::default()
+        };
+        for phase in [PublicationPhase::Planned, PublicationPhase::Done] {
+            let line = describe_publication(name, 0, &publication, phase);
+            assert!(!acts_on_a_terminal(&line), "{line:?}");
+            assert!(line.contains("'or?[2Jigin'"), "{line:?}");
+        }
+        // And an ordinary name is printed as it is.
+        assert_eq!(
+            nothing_to_publish_line("origin", 0),
+            "No new shared interactions to publish to 'origin'."
+        );
+    }
+
+    #[test]
+    fn a_phrase_with_a_control_or_format_character_is_not_asked() {
+        for phrase in [
+            "I SHARE c-1 fingerprint 3 token",
+            "I UNSHARE run-0d2a:agent_1.b fingerprint",
+        ] {
+            assert!(ensure_phrase_can_be_shown(phrase).is_ok(), "{phrase}");
+        }
+        for phrase in [
+            "I SHARE c\u{1b}[2J-1 fingerprint 3 token",
+            "I SHARE c-1\u{202e} fingerprint 3 token",
+            "I SHARE c-\u{200b}1 fingerprint 3 token",
+            "I SHARE c-1\nfingerprint 3 token",
+            "I SHARE c-1\u{2028}x",
+        ] {
+            let error = ensure_phrase_can_be_shown(phrase).unwrap_err().to_string();
+            assert!(error.contains("cannot be shown"), "{error}");
+            assert!(error.contains("nothing was recorded"), "{error}");
+            // And the refusal does not repeat the phrase it refused to show.
+            assert!(!acts_on_a_terminal(&error), "{error:?}");
+            assert!(!error.contains("fingerprint"), "{error}");
         }
     }
 }

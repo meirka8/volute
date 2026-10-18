@@ -58,12 +58,32 @@ fn is_format(c: char) -> bool {
 /// `text` with every character [`is_unsafe_for_terminal`] replaced by `?`.
 /// Borrows when there is nothing to replace.
 pub(crate) fn sanitize_for_terminal(text: &str) -> Cow<'_, str> {
-    if !text.chars().any(is_unsafe_for_terminal) {
+    replace_where(text, is_unsafe_for_terminal)
+}
+
+/// As [`sanitize_for_terminal`], for text that is several lines by nature, such
+/// as an error and the causes under it, where a line feed is the structure of
+/// the text and not a control that could act on the terminal. Every other
+/// character of the set is replaced, a carriage return included: it would move
+/// the cursor back over what was just printed.
+///
+/// A line feed cannot redraw anything that was printed before it; what it can
+/// do is start a line, which a message with several lines does anyway. Text that
+/// is one line by nature (a title, an id, a name) goes through
+/// [`sanitize_for_terminal`], so that it stays one line.
+pub(crate) fn sanitize_lines_for_terminal(text: &str) -> Cow<'_, str> {
+    replace_where(text, |c| c != '\n' && is_unsafe_for_terminal(c))
+}
+
+/// `text` with every character `is_unsafe` accepts replaced by `?`. Borrows when
+/// there is nothing to replace.
+fn replace_where(text: &str, is_unsafe: impl Fn(char) -> bool) -> Cow<'_, str> {
+    if !text.chars().any(&is_unsafe) {
         return Cow::Borrowed(text);
     }
     Cow::Owned(
         text.chars()
-            .map(|c| if is_unsafe_for_terminal(c) { '?' } else { c })
+            .map(|c| if is_unsafe(c) { '?' } else { c })
             .collect(),
     )
 }
@@ -157,6 +177,25 @@ mod tests {
             "pre ?gnp.exe? post"
         );
         assert_eq!(sanitize_for_terminal("שלום\u{200f} עולם"), "שלום? עולם");
+    }
+
+    #[test]
+    fn lines_keep_their_line_feeds_and_lose_everything_else_that_is_unsafe() {
+        let several = "error: first\n  caused by: second\nthird";
+        assert!(matches!(
+            sanitize_lines_for_terminal(several),
+            Cow::Borrowed(t) if t == several
+        ));
+        // The same text with an escape sequence and a carriage return in it.
+        assert_eq!(
+            sanitize_lines_for_terminal("a\u{1b}[2Kb\r\nc\u{202e}d\n\u{1b}]0;title\u{7}e"),
+            "a?[2Kb?\nc?d\n?]0;title?e"
+        );
+        // A single line is still a single line where it must be.
+        assert_eq!(sanitize_for_terminal("a\nb"), "a?b");
+        // Tabs are controls too, and nothing else is spared.
+        assert_eq!(sanitize_lines_for_terminal("a\tb\u{85}c"), "a?b?c");
+        assert!(matches!(sanitize_lines_for_terminal(""), Cow::Borrowed("")));
     }
 
     /// The table above is the Unicode definition: every scalar value agrees with

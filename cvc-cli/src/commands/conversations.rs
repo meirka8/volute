@@ -1,4 +1,5 @@
 use crate::commands::sync::SUMMARY_SCAN_LIMIT;
+use crate::terminal_text::sanitize_for_terminal;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use cvc_core::claude_code;
@@ -51,6 +52,14 @@ fn share_state(summary: &ConversationSummary) -> String {
 
 /// Renders one summary line. Kept width-stable so the picker and the listing
 /// read identically.
+///
+/// The id and the title are text from the store, and a title is whatever the
+/// harness or the first prompt line said (a Claude Code `ai-title`, a subagent
+/// description), secret-scrubbed and nothing more, so a prompt-injected agent
+/// can put escape sequences in it. Both go through
+/// [`sanitize_for_terminal`](crate::terminal_text::sanitize_for_terminal): a
+/// title cannot redraw the lines above it, and a title with a line break stays
+/// one title. Text without such characters is printed as it is.
 pub(crate) fn render_line(summary: &ConversationSummary, with_destination: bool) -> String {
     let when = |seconds: i64| {
         Utc.timestamp_opt(seconds, 0)
@@ -68,9 +77,9 @@ pub(crate) fn render_line(summary: &ConversationSummary, with_destination: bool)
         when(summary.last_activity),
         summary.thoughts,
         summary.linked,
-        summary.id,
+        sanitize_for_terminal(&summary.id),
         state,
-        summary.title,
+        sanitize_for_terminal(&summary.title),
     )
 }
 
@@ -172,7 +181,7 @@ pub async fn run(requested: Option<&str>, limit: Option<usize>, plain: bool) -> 
     match &destination {
         Some((name, fingerprint)) => println!(
             "Conversations (most recent first); share state for remote '{}' ({}…):",
-            name,
+            sanitize_for_terminal(name),
             &fingerprint[..12]
         ),
         None => println!("Conversations (most recent first); no remote resolved for share state:"),
@@ -451,6 +460,50 @@ mod tests {
         let line = render_line(&held(1, 0), false);
         assert!(!line.contains('['), "{line}");
         assert!(line.contains("c-1\n      a title"), "{line}");
+    }
+
+    /// Whether `text` holds a character that acts on a terminal. A line feed is
+    /// how a line ends, so it is the one thing allowed.
+    fn acts_on_a_terminal(text: &str) -> bool {
+        text.chars()
+            .any(|c| c != '\n' && crate::terminal_text::is_unsafe_for_terminal(c))
+    }
+
+    #[test]
+    fn a_title_or_an_id_cannot_act_on_the_terminal_or_redraw_a_line() {
+        let mut hostile = summary();
+        hostile.id = "c\u{1b}[2J-1".into();
+        hostile.title =
+            "Fix it\u{1b}]0;pwned\u{7}\u{202e}\rSharing conversation for remote 'x':\nI SHARE c-1"
+                .into();
+        let line = render_line(&hostile, true);
+        assert!(!acts_on_a_terminal(&line), "{line:?}");
+        // One entry stays two lines, whatever the title holds.
+        assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+        assert!(line.contains("  c?[2J-1  [private]\n"), "{line:?}");
+        assert!(
+            line.ends_with(
+                "      Fix it?]0;pwned???Sharing conversation for remote 'x':?I SHARE c-1"
+            ),
+            "{line:?}"
+        );
+        // Without a destination too.
+        assert!(!acts_on_a_terminal(&render_line(&hostile, false)));
+    }
+
+    #[test]
+    fn text_without_control_or_format_characters_is_printed_as_it_is() {
+        let mut ordinary = summary();
+        ordinary.id = "run-0d2a:agent_1.b".into();
+        ordinary.title = "שלום – café – 日本語 ✓ emoji 🙂 \"quoted\" <tag> & more".into();
+        let line = render_line(&ordinary, true);
+        assert_eq!(
+            line,
+            format!(
+                "2023-11-14 22:13    4 thought(s),   1 linked  run-0d2a:agent_1.b  [private]\n      {}",
+                ordinary.title
+            )
+        );
     }
 
     #[test]
