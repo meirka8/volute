@@ -224,6 +224,41 @@ impl PtySession {
         self.master.write_all(bytes).unwrap();
     }
 
+    /// Types each chunk at the terminal after its delay, from another thread:
+    /// input that is still on its way while the process works. The thread ends
+    /// with the last chunk, or when the terminal is gone.
+    pub fn send_later(&self, chunks: Vec<(Duration, Vec<u8>)>) -> std::thread::JoinHandle<()> {
+        let mut writer = self.master.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for (delay, bytes) in chunks {
+                std::thread::sleep(delay);
+                if writer.write_all(&bytes).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// Types `bytes` at the terminal every `gap` for `duration`, from another
+    /// thread: input that does not go quiet, as a paste into a terminal that
+    /// does not bracket it, or a slow link, would be.
+    ///
+    /// The thread is never joined. A writer into a terminal that nobody reads
+    /// any more blocks for good once its lines fill the terminal's buffer
+    /// (about 14 KB), even after the process on the other end has gone; it dies
+    /// with the test process.
+    pub fn flood(&self, bytes: &[u8], gap: Duration, duration: Duration) {
+        let chunks = (0..duration.as_millis() / gap.as_millis().max(1))
+            .map(|_| (gap, bytes.to_vec()))
+            .collect();
+        drop(self.send_later(chunks));
+    }
+
+    /// Whether the process has exited by now.
+    pub fn has_exited(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_some()
+    }
+
     /// Everything the process has shown so far, including echoed input.
     pub fn output(&self) -> String {
         String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
@@ -361,6 +396,15 @@ impl PtySession {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+}
+
+impl Drop for PtySession {
+    /// A test that fails leaves its process waiting at a prompt or in a view;
+    /// ending it ends whatever else is waiting on its terminal too.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -727,5 +771,18 @@ fn openpty(size: Option<(u16, u16)>) -> (File, File) {
     };
     assert_eq!(rc, 0, "openpty: {}", io::Error::last_os_error());
     // SAFETY: openpty returned two fresh descriptors that we now own.
-    unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+    let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+    // `openpty` does not set close-on-exec. Without it the process started on
+    // the pty would inherit the master itself and keep its own terminal open for
+    // as long as it lives, so that hanging up (or dropping the session) could
+    // never reach it.
+    close_on_exec(&master);
+    close_on_exec(&slave);
+    (master, slave)
+}
+
+fn close_on_exec(file: &File) {
+    // SAFETY: `fcntl` with `F_SETFD` only changes a flag of the descriptor.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    assert_eq!(rc, 0, "fcntl: {}", io::Error::last_os_error());
 }

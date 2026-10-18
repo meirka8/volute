@@ -2,6 +2,11 @@
 //! flow can print and ask on the main screen, and putting everything back on
 //! every way out.
 //!
+//! Nothing that was typed, pasted or is still on its way when the view appears
+//! (and again when it returns from a flow) may act in it: before the first key
+//! is read, the input must have been quiet for 300 ms, and what arrives until
+//! then is discarded.
+//!
 //! The way out is covered on every path there is. A normal quit and an error
 //! return drop the [`Screen`]. A panic runs the hook installed here, which puts
 //! the terminal back before the panic message prints, so the message is
@@ -25,14 +30,23 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::{Frame, Terminal};
 
+use super::words;
+
 /// Whether the terminal is in the view's modes: raw mode, the alternate screen
 /// and bracketed paste. The panic hook and the signal thread put the terminal
 /// back only if it is, and only once.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// How long draining pending input may take before it gives up. A terminal that
-/// is being flooded has more to worry about than a stray key.
-const DRAIN_LIMIT: Duration = Duration::from_millis(500);
+/// How long the terminal's input must have been quiet before a key may act.
+const INPUT_QUIET: Duration = Duration::from_millis(300);
+
+/// How long input may keep arriving before the view gives up waiting for it to
+/// stop. It then ends instead of acting on what is still coming: a terminal
+/// that cannot be quiet for a moment is not one to take keys from.
+const INPUT_SETTLE_LIMIT: Duration = Duration::from_secs(3);
+
+/// How long the events crossterm has already parsed may take to be thrown away.
+const PARSED_EVENTS_LIMIT: Duration = Duration::from_millis(500);
 
 /// Puts the terminal back as the shell had it: raw mode off, the main screen,
 /// the cursor shown, bracketed paste off. Does nothing when the view's modes
@@ -77,7 +91,9 @@ pub struct Screen {
 
 impl Screen {
     /// Enters raw mode and the alternate screen. Whatever was typed before the
-    /// view appeared is discarded, so it cannot act in the list.
+    /// view appeared, or is still arriving, is discarded until the input has
+    /// been quiet for a moment, so it cannot act in the list; if it never is,
+    /// the view does not start.
     pub fn enter() -> io::Result<Self> {
         install_panic_hook();
         install_signal_watch();
@@ -89,7 +105,10 @@ impl Screen {
                 return Err(error);
             }
         };
-        discard_pending_input();
+        if let Err(error) = settle_input() {
+            restore_terminal();
+            return Err(error);
+        }
         Ok(Self { terminal })
     }
 
@@ -106,8 +125,11 @@ impl Screen {
     }
 
     /// Re-enters the modes `suspend` left, redraws everything on the next draw,
-    /// and drains every pending input event before the caller reads one, so
-    /// nothing typed during or before a challenge acts in the list.
+    /// and waits for the input to be quiet, discarding what arrives until it is,
+    /// before the caller reads a key, so nothing typed during or before a
+    /// challenge, or still on its way, acts in the list. An error says that the
+    /// input never was; the terminal is then in the view's modes still, for the
+    /// caller to give back.
     pub fn resume(&mut self) -> io::Result<()> {
         enter_modes()?;
         // A full repaint on the next draw. `Terminal::clear` would do it, but it
@@ -121,8 +143,7 @@ impl Screen {
         // screen viewport, never an inline one, and calls no cursor query.
         let size = self.terminal.size()?;
         self.terminal.resize(size.into())?;
-        discard_pending_input();
-        Ok(())
+        settle_input()
     }
 }
 
@@ -132,19 +153,74 @@ impl Drop for Screen {
     }
 }
 
-/// Throws away input nobody has read: what the terminal itself holds (the same
-/// flush a typed challenge starts with), then every event crossterm already
-/// read and parsed, by polling with no timeout until none is left.
-fn discard_pending_input() {
-    if let Ok(mut tty) = crate::tty::Terminal::open() {
-        let _ = tty.discard_pending_input();
+/// What ends the view when input will not stop arriving.
+fn input_would_not_settle() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, words::INPUT_WOULD_NOT_SETTLE)
+}
+
+/// Waits until the terminal's input has been quiet for [`INPUT_QUIET`], and
+/// throws away everything that arrives meanwhile, so that no key typed or pasted
+/// before the view (or still on its way: a paste into a terminal that does not
+/// bracket it, a slow link) is read as a key of the view. Fails when that does
+/// not happen within [`INPUT_SETTLE_LIMIT`].
+///
+/// The bytes are looked at on the terminal itself, where nothing is parsed and
+/// nothing can hide in a sequence that never completes, and then the events
+/// crossterm had already read and parsed are thrown away as well.
+fn settle_input() -> io::Result<()> {
+    #[cfg(unix)]
+    let looked_at_the_terminal = match crate::tty::Terminal::open() {
+        Ok(mut tty) => {
+            tty.discard_input_until_quiet(INPUT_QUIET, INPUT_SETTLE_LIMIT)
+                .map_err(|error| {
+                    if crate::tty::is_input_kept_arriving(&error) {
+                        input_would_not_settle()
+                    } else {
+                        error
+                    }
+                })?;
+            true
+        }
+        // No controlling terminal to look at; a phrase could not be asked on one
+        // either.
+        Err(_) => false,
+    };
+    #[cfg(not(unix))]
+    let looked_at_the_terminal = false;
+
+    if !looked_at_the_terminal {
+        wait_for_quiet_events()?;
     }
-    let deadline = Instant::now() + DRAIN_LIMIT;
-    while Instant::now() < deadline && event::poll(Duration::ZERO).unwrap_or(false) {
+    discard_parsed_events()
+}
+
+/// The same wait, by the events crossterm reports, for where the terminal
+/// itself cannot be looked at.
+fn wait_for_quiet_events() -> io::Result<()> {
+    let started = Instant::now();
+    while event::poll(INPUT_QUIET)? {
+        event::read()?;
+        if started.elapsed() >= INPUT_SETTLE_LIMIT {
+            return Err(input_would_not_settle());
+        }
+    }
+    Ok(())
+}
+
+/// Throws away the events crossterm already holds, by polling with no timeout
+/// until none is left. The input is quiet by now, so it has few; one that keeps
+/// producing them for half a second is not.
+fn discard_parsed_events() -> io::Result<()> {
+    let deadline = Instant::now() + PARSED_EVENTS_LIMIT;
+    while event::poll(Duration::ZERO).unwrap_or(false) {
+        if Instant::now() >= deadline {
+            return Err(input_would_not_settle());
+        }
         if event::read().is_err() {
             break;
         }
     }
+    Ok(())
 }
 
 /// Makes a panic put the terminal back before its message prints.

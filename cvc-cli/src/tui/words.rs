@@ -575,6 +575,13 @@ pub const NO_DETAILS: &str =
 /// be read or typed, so such a conversation is not shared or unshared from here.
 pub const UNSAFE_ID: &str = "This conversation's id contains characters that cannot be shown safely, so it cannot be shared or unshared from here.";
 
+/// What ends the view when the terminal's input will not stop arriving (a paste
+/// that goes on, a link that trickles): no key is acted on while it does, so
+/// when it never stops the view is closed instead. Said as an error, in the
+/// manner of the other messages of the command line.
+pub const INPUT_WOULD_NOT_SETTLE: &str =
+    "input kept arriving at the terminal, so the view was closed without acting on any of it";
+
 /// Whether a conversation id can be shown as it is: it holds no control, format,
 /// line-separator or paragraph-separator character.
 pub fn id_is_safe(id: &str) -> bool {

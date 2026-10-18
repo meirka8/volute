@@ -15,8 +15,9 @@
 //! - Before a flow the screen is suspended completely (alternate screen left,
 //!   raw mode off, cursor shown, output flushed), so the flow prints and asks on
 //!   the ordinary main screen, as the subcommand would. Afterwards the screen is
-//!   resumed and every pending input event is drained before the next key is
-//!   read.
+//!   resumed and the next key is not read until the input has been quiet for a
+//!   moment (and what arrives until then is thrown away), as it is not at the
+//!   start.
 //! - The destination is resolved at the moment of the action, with
 //!   `RemoteOverview::resolve`, which fails closed if the remote now resolves
 //!   to a different destination than the one that was listed. A remote is never
@@ -394,7 +395,18 @@ fn run_flow(ctx: &Context, screen: &mut Screen, model: &mut Model, flow: Flow) -
     };
     let _ = io::stdout().flush();
 
-    screen.resume()?;
+    if let Err(error) = screen.resume() {
+        // The view cannot go on (input that never stops arriving is the likely
+        // reason), but what the flow came to is still told: the screen is given
+        // back and the notice printed on it, where the flow itself printed.
+        let _ = screen.suspend();
+        reload(ctx, model);
+        model.report(report);
+        for line in model.notice() {
+            println!("{}", line.trim_end());
+        }
+        return Err(error.into());
+    }
     reload(ctx, model);
     model.report(report);
     Ok(())
@@ -424,12 +436,13 @@ fn print_failure(kind: FlowKind, reason: &str, dest: &Destination) {
 }
 
 /// Waits for Enter on the controlling terminal, after discarding whatever was
-/// typed while the failure was printed.
+/// typed while the failure was printed. Enter grants nothing, so the keys typed
+/// ahead are flushed once and the wait does not insist on a quiet terminal.
 fn wait_for_enter() {
     println!("Press Enter to return to cvc conversations.");
     let _ = io::stdout().flush();
     if let Ok(mut tty) = crate::tty::Terminal::open() {
-        let _ = tty.discard_pending_input();
+        let _ = tty.flush_input();
         let _ = tty.prompt_line("");
     }
 }

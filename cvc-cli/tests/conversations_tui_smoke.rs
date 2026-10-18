@@ -12,6 +12,7 @@ mod common;
 
 use common::{Fixture, PtySession};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 const ENTER_ALTERNATE_SCREEN: &str = "\x1b[?1049h";
 const LEAVE_ALTERNATE_SCREEN: &str = "\x1b[?1049l";
@@ -315,4 +316,137 @@ fn a_conversation_with_an_id_that_cannot_be_shown_safely_is_not_shared_or_unshar
     session.write(b"q");
     let status = session.wait_for_exit();
     assert!(status.success(), "{}", session.output());
+}
+
+/// `q` quits the view, so a stream of them that is acted on ends it.
+const QUIT_KEYS: &[u8] = b"q";
+
+/// Longer than the view once drained for (half a second).
+const A_LONG_STREAM: Duration = Duration::from_millis(1200);
+
+#[test]
+fn keys_that_keep_arriving_when_the_view_starts_do_not_act_in_it() {
+    let fixture = fixture_with_a_conversation();
+    let started = Instant::now();
+    let mut session =
+        PtySession::spawn_sized(tui_command(&fixture, &["conversations"]), b"", 120, 40);
+    // A paste into a terminal that does not bracket it, or a slow link: keys that
+    // are still arriving after the view has started.
+    session.flood(QUIT_KEYS, Duration::from_millis(10), A_LONG_STREAM);
+
+    // The view is shown once the input has been quiet, which is after the stream.
+    session.wait_for_screen_text("CVC conversations");
+    assert!(
+        started.elapsed() >= A_LONG_STREAM,
+        "the view was ready after {:?}, while keys were still arriving",
+        started.elapsed()
+    );
+    // None of the keys acted.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !session.has_exited(),
+        "a key of the stream acted:\n{}",
+        session.output()
+    );
+    assert!(!session.terminal_is_cooked());
+
+    session.write(b"q");
+    let status = session.wait_for_exit();
+    assert!(status.success(), "{}", session.output());
+}
+
+/// A flow that ends in "Not authorized: the typed phrase did not match.", with
+/// `then` typed at the terminal right after the wrong phrase.
+fn failed_authorization_then(session: &mut PtySession, then: impl FnOnce(&PtySession)) {
+    session.wait_for_screen_text("CVC conversations");
+    session.write(b"s");
+    session.wait_for_screen_text("is not authorized");
+    session.write(b"\r");
+    let phrase = session.wait_for_challenge(1);
+    assert!(phrase.starts_with("I AUTHORIZE SHARING "), "{phrase}");
+    session.write(b"not the phrase\n");
+    then(session);
+}
+
+#[test]
+fn keys_that_keep_arriving_after_a_flow_do_not_act_in_the_view() {
+    let fixture = fixture_with_a_conversation();
+    let mut session =
+        PtySession::spawn_sized(tui_command(&fixture, &["conversations"]), b"", 120, 40);
+    let mut flooded_at = None;
+    failed_authorization_then(&mut session, |session| {
+        session.flood(QUIT_KEYS, Duration::from_millis(10), A_LONG_STREAM);
+        flooded_at = Some(Instant::now());
+    });
+
+    // The view comes back with the result once the input has been quiet.
+    session.wait_for_screen_text("Not authorized: the typed phrase did not match.");
+    assert!(
+        flooded_at.unwrap().elapsed() >= A_LONG_STREAM,
+        "the view was back after {:?}, while keys were still arriving",
+        flooded_at.unwrap().elapsed()
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !session.has_exited(),
+        "a key of the stream acted:\n{}",
+        session.output()
+    );
+
+    session.write(b"q");
+    let status = session.wait_for_exit();
+    assert!(status.success(), "{}", session.output());
+}
+
+#[test]
+fn input_that_never_stops_after_a_flow_closes_the_view_and_still_tells_the_result() {
+    let fixture = fixture_with_a_conversation();
+    let mut session =
+        PtySession::spawn_sized(tui_command(&fixture, &["conversations"]), b"", 120, 40);
+    failed_authorization_then(&mut session, |session| {
+        // Longer than the view waits for the input to stop.
+        session.flood(QUIT_KEYS, Duration::from_millis(10), Duration::from_secs(8));
+    });
+
+    let status = session.wait_for_exit();
+    let output = session.output();
+    assert!(!status.success(), "{output}");
+    assert!(session.terminal_is_cooked(), "raw mode was left on");
+    // The screen was given back, and on it what the flow came to and why the view
+    // ended.
+    let left = output
+        .rfind(LEAVE_ALTERNATE_SCREEN)
+        .expect("the screen is given back");
+    let main_screen = &output[left + LEAVE_ALTERNATE_SCREEN.len()..];
+    assert!(
+        main_screen.contains("Not authorized: the typed phrase did not match."),
+        "{main_screen:?}"
+    );
+    assert!(
+        main_screen.contains(
+            "input kept arriving at the terminal, so the view was closed without acting on any of it"
+        ),
+        "{main_screen:?}"
+    );
+}
+
+#[test]
+fn input_that_never_stops_when_the_view_starts_means_it_does_not_start() {
+    let fixture = fixture_with_a_conversation();
+    let mut session =
+        PtySession::spawn_sized(tui_command(&fixture, &["conversations"]), b"", 120, 40);
+    session.flood(QUIT_KEYS, Duration::from_millis(10), Duration::from_secs(8));
+
+    let status = session.wait_for_exit();
+    let output = session.output();
+    assert!(!status.success(), "{output}");
+    assert!(session.terminal_is_cooked(), "raw mode was left on");
+    assert!(
+        output.contains(
+            "input kept arriving at the terminal, so the view was closed without acting on any of it"
+        ),
+        "{output:?}"
+    );
+    // No frame was ever drawn.
+    assert!(!output.contains("CVC conversations"), "{output:?}");
 }

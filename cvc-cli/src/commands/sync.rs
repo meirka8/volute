@@ -158,10 +158,12 @@ fn ensure_phrase_can_be_shown(challenge: &str) -> Result<()> {
 ///
 /// The answer is read from the controlling terminal itself, not from the
 /// process-global stdin, and whatever was queued before the prompt is
-/// discarded first. Stdin is a shared buffered reader, so an earlier
-/// `read_line` (the picker, or a preceding challenge in the same command) may
-/// already hold the next line; answering from that would let type-ahead or a
-/// paste satisfy a challenge that was never displayed. See `crate::tty`.
+/// discarded first, and what is still arriving waited out (the prompt is not
+/// shown until input has been quiet for a moment, and not at all if it never
+/// is). Stdin is a shared buffered reader, so an earlier `read_line` (the
+/// picker, or a preceding challenge in the same command) may already hold the
+/// next line; answering from that would let type-ahead or a paste satisfy a
+/// challenge that was never displayed. See `crate::tty`.
 fn typed_acknowledgement(challenge: &str) -> Result<()> {
     if !crate::tty::stdio_is_terminal() {
         bail!("acknowledgement requires an interactive TTY");
@@ -169,7 +171,7 @@ fn typed_acknowledgement(challenge: &str) -> Result<()> {
     ensure_phrase_can_be_shown(challenge)?;
     let mut terminal = crate::tty::Terminal::open()
         .context("acknowledgement requires access to the controlling terminal")?;
-    terminal.discard_pending_input()?;
+    terminal.discard_pending_input().map_err(answer_error)?;
     let answer = terminal
         .prompt_line(&format!("Type exactly '{challenge}' to continue: "))
         .map_err(answer_error)?;
@@ -179,12 +181,19 @@ fn typed_acknowledgement(challenge: &str) -> Result<()> {
     Ok(())
 }
 
-/// What a failed read of the answer to a challenge means. Bytes that are not
-/// text, or a line longer than any phrase, are an answer that cannot match: the
-/// challenge is not confirmed, the same as a phrase that is merely wrong. A
-/// terminal that fails is a failure and says so.
+/// What a failed read of the answer to a challenge, or a failure to clear the
+/// terminal's input before it, means. Bytes that are not text, or a line longer
+/// than any phrase, are an answer that cannot match: the challenge is not
+/// confirmed, the same as a phrase that is merely wrong. Input that never
+/// stopped arriving is not confirmed either: no phrase was asked, so none was
+/// given, and the text says why. A terminal that fails is a failure and says so.
 fn answer_error(error: std::io::Error) -> anyhow::Error {
-    if crate::tty::is_unreadable_answer(&error) {
+    if crate::tty::is_input_kept_arriving(&error) {
+        // Still typed `ChallengeNotConfirmed`, which is what a caller tells a
+        // challenge that was not confirmed by.
+        anyhow::Error::from(ChallengeNotConfirmed)
+            .context("input kept arriving at the terminal, so no phrase was asked")
+    } else if crate::tty::is_unreadable_answer(&error) {
         ChallengeNotConfirmed.into()
     } else {
         error.into()

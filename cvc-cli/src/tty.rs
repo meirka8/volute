@@ -11,11 +11,15 @@
 //! displayed. `tcflush` alone cannot fix that either: it drains the kernel
 //! queue but has no reach into Rust's buffer.
 //!
-//! This module therefore talks to the terminal itself, with two layers:
+//! This module therefore talks to the terminal itself, with three layers:
 //!
 //! 1. the terminal's pending input is discarded immediately before the prompt
-//!    is written, so the answer is provably typed *after* the prompt; and
-//! 2. the answer is read one byte at a time from an unbuffered handle, so a
+//!    is written, so the answer is provably typed *after* the prompt;
+//! 2. the prompt is not written until the input has been quiet for a moment
+//!    (see [`Terminal::discard_pending_input`]): a flush alone does not catch
+//!    input that was sent earlier and is still on its way, such as a paste that
+//!    a terminal emulator has not finished writing or a slow link; and
+//! 3. the answer is read one byte at a time from an unbuffered handle, so a
 //!    challenge never over-reads into the line meant for the next one.
 //!
 //! Roughly one syscall per typed character is immaterial for a prompt.
@@ -28,18 +32,29 @@ use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::io::Read;
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 /// Upper bound on one answer line. Every challenge is far shorter; anything
 /// longer is not a human typing an acknowledgement.
 #[cfg(unix)]
 const MAX_ANSWER_BYTES: usize = 4096;
 
+/// How long the terminal's input must have been quiet before a prompt is
+/// written.
+#[cfg(unix)]
+const QUIET_BEFORE_PROMPT: Duration = Duration::from_millis(250);
+
+/// How long input may keep arriving before the prompt is refused instead.
+#[cfg(unix)]
+const QUIET_WAIT_LIMIT: Duration = Duration::from_secs(3);
+
 /// What was typed at a prompt cannot be taken as an answer at all: it is not
-/// UTF-8 text, or it is longer than any acknowledgement. It travels as the
-/// source of an `InvalidData` I/O error, so the I/O error type stays the
-/// prompt's only one, and [`is_unreadable_answer`] tells it from a failure of
-/// the terminal itself.
+/// UTF-8 text, it is longer than any acknowledgement, or input would not stop
+/// arriving long enough to show the prompt. It travels as the source of an
+/// `InvalidData` I/O error, so the I/O error type stays the prompt's only one,
+/// and [`is_unreadable_answer`] tells it from a failure of the terminal itself.
 #[derive(Debug)]
 pub enum UnreadableAnswer {
     /// The bytes typed are not valid UTF-8.
@@ -47,6 +62,11 @@ pub enum UnreadableAnswer {
     /// The line is longer than the longest answer read (4096 bytes).
     #[cfg(unix)]
     TooLong,
+    /// Input kept arriving, without a quiet moment, for longer than the prompt
+    /// waits for one, so it was not shown: whatever is sending it, a person
+    /// answering after seeing it cannot be told from it.
+    #[cfg(unix)]
+    InputKeptArriving,
 }
 
 impl fmt::Display for UnreadableAnswer {
@@ -55,6 +75,10 @@ impl fmt::Display for UnreadableAnswer {
             Self::NotUtf8 => f.write_str("acknowledgement answer is not valid UTF-8"),
             #[cfg(unix)]
             Self::TooLong => f.write_str("acknowledgement answer exceeds the maximum line length"),
+            #[cfg(unix)]
+            Self::InputKeptArriving => {
+                f.write_str("input kept arriving at the terminal, so the prompt was not shown")
+            }
         }
     }
 }
@@ -75,6 +99,23 @@ pub fn is_unreadable_answer(error: &io::Error) -> bool {
     error
         .get_ref()
         .is_some_and(|source| source.is::<UnreadableAnswer>())
+}
+
+/// Whether `error` says that input kept arriving until the prompt was given up
+/// on (see [`UnreadableAnswer::InputKeptArriving`]).
+pub fn is_input_kept_arriving(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<UnreadableAnswer>())
+            .is_some_and(|answer| matches!(answer, UnreadableAnswer::InputKeptArriving))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 /// Whether a typed acknowledgement can be protected from type-ahead: whether
@@ -118,15 +159,102 @@ impl Terminal {
     }
 
     /// Discards every byte queued on the terminal's input that has not been
-    /// read yet, so nothing typed or pasted before the prompt can answer it.
+    /// read yet, once, and returns at once.
     #[cfg(unix)]
-    pub fn discard_pending_input(&mut self) -> io::Result<()> {
+    pub fn flush_input(&mut self) -> io::Result<()> {
         // SAFETY: `tcflush` only takes a valid open descriptor and a queue
         // selector; it neither retains the descriptor nor touches memory.
         if unsafe { libc::tcflush(self.file.as_raw_fd(), libc::TCIFLUSH) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Discards the terminal's pending input, and keeps discarding it until
+    /// none has arrived for a quarter of a second, so that nothing sent before
+    /// the prompt can answer it. Call it right before [`Terminal::prompt_line`]
+    /// writes the prompt.
+    ///
+    /// A flush alone leaves a gap: input that was sent before the prompt and
+    /// reaches the terminal after the flush (a terminal emulator whose write was
+    /// blocked on a full buffer, a slow remote link) would be read as the
+    /// answer to a prompt that had only just been shown, and a phrase that can
+    /// be computed in advance would pass. A control character in such a stream
+    /// can make it worse: the line-kill character erases a partial line, so
+    /// filler followed by it and then the phrase leaves nothing but the phrase.
+    ///
+    /// The wait is done with line editing and echo off, because in canonical
+    /// mode the terminal shows a reader only complete lines: a partial line is
+    /// invisible to it, and a stream without a line feed would look quiet. Those
+    /// settings come back before this returns, on every path.
+    ///
+    /// If input does not go quiet within three seconds the prompt is refused:
+    /// the error is [`UnreadableAnswer::InputKeptArriving`], which callers treat
+    /// as a challenge that was not confirmed.
+    #[cfg(unix)]
+    pub fn discard_pending_input(&mut self) -> io::Result<()> {
+        self.discard_input_until_quiet(QUIET_BEFORE_PROMPT, QUIET_WAIT_LIMIT)
+    }
+
+    /// [`Terminal::discard_pending_input`] with the quiet time and the limit
+    /// given, for a caller whose terminal is not about to be asked a phrase (the
+    /// interactive view, before its keys may act).
+    #[cfg(unix)]
+    pub fn discard_input_until_quiet(
+        &mut self,
+        quiet: Duration,
+        limit: Duration,
+    ) -> io::Result<()> {
+        self.flush_input()?;
+        let editing = LineEditingOff::enter(self.file.as_raw_fd())?;
+        let waited = self.wait_for_quiet_input(quiet, limit);
+        // Line editing and echo are back before anything is written, and what
+        // arrived since the last read is dropped with them. (Switching line
+        // editing on makes the bytes waiting in the queue a line to be read.)
+        drop(editing);
+        let flushed = self.flush_input();
+        waited.and(flushed)
+    }
+
+    /// Reads and discards input until `quiet` has passed without any, or fails
+    /// when that has not happened within `limit`. Line editing must be off.
+    #[cfg(unix)]
+    fn wait_for_quiet_input(&mut self, quiet: Duration, limit: Duration) -> io::Result<()> {
+        let started = Instant::now();
+        let mut last_input = started;
+        let mut buffer = [0u8; 256];
+        loop {
+            let now = Instant::now();
+            let quiet_left = quiet.saturating_sub(now.duration_since(last_input));
+            if quiet_left.is_zero() {
+                return Ok(());
+            }
+            let limit_left = limit.saturating_sub(now.duration_since(started));
+            if limit_left.is_zero() {
+                return Err(UnreadableAnswer::InputKeptArriving.into_io_error());
+            }
+            if !input_is_ready(self.file.as_raw_fd(), quiet_left.min(limit_left))? {
+                continue;
+            }
+            // Ready means the read does not wait. A read of nothing is the other
+            // end of the terminal going away.
+            match self.file.read(&mut buffer) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the terminal closed while its input was being cleared",
+                    ));
+                }
+                Ok(_) => {
+                    last_input = Instant::now();
+                    // Flushed as it goes, so nothing waits in the queue to be read
+                    // as the answer.
+                    self.flush_input()?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Writes `prompt` to the terminal and reads one line of answer, without
@@ -146,6 +274,11 @@ impl Terminal {
     #[cfg(not(unix))]
     pub fn open() -> io::Result<Self> {
         Ok(Self {})
+    }
+
+    #[cfg(not(unix))]
+    pub fn flush_input(&mut self) -> io::Result<()> {
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -200,11 +333,92 @@ fn read_line_unbuffered(reader: &mut impl Read) -> io::Result<String> {
     String::from_utf8(answer).map_err(|_| UnreadableAnswer::NotUtf8.into_io_error())
 }
 
+/// Waits up to `timeout` for the terminal to have input to read, and says
+/// whether it has (a hangup counts: the read then reports it). `select` and not
+/// `poll`: `poll` does not work on terminal devices on macOS.
+#[cfg(unix)]
+fn input_is_ready(fd: RawFd, timeout: Duration) -> io::Result<bool> {
+    if fd < 0 || fd as usize >= libc::FD_SETSIZE {
+        return Err(io::Error::other(
+            "the terminal's descriptor is too large to wait on",
+        ));
+    }
+    // SAFETY: an all-zero `fd_set` is the empty set; `fd` was checked to be
+    // inside it, and the set and the timeout are valid for the call, which
+    // keeps neither.
+    unsafe {
+        let mut readable: libc::fd_set = std::mem::zeroed();
+        libc::FD_ZERO(&mut readable);
+        libc::FD_SET(fd, &mut readable);
+        let mut wait = libc::timeval {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+        };
+        match libc::select(
+            fd + 1,
+            &mut readable,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut wait,
+        ) {
+            -1 => {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+            0 => Ok(false),
+            _ => Ok(true),
+        }
+    }
+}
+
+/// The terminal with line editing and echo off, and reads that wait for at
+/// least a byte, for as long as it lives; the attributes it found are put back
+/// when it is dropped, whatever the reason. Signals stay enabled, so Ctrl-C
+/// still interrupts. (A process that is killed here leaves the terminal so; a
+/// shell sets its own modes again at its next prompt.)
+#[cfg(unix)]
+struct LineEditingOff {
+    fd: RawFd,
+    saved: libc::termios,
+}
+
+#[cfg(unix)]
+impl LineEditingOff {
+    fn enter(fd: RawFd) -> io::Result<Self> {
+        // SAFETY: `tcgetattr` fills the `termios` it is given for a valid
+        // descriptor; an all-zero `termios` is a valid value to overwrite.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut quiet = saved;
+        quiet.c_lflag &= !(libc::ICANON | libc::ECHO);
+        quiet.c_cc[libc::VMIN] = 1;
+        quiet.c_cc[libc::VTIME] = 0;
+        // SAFETY: `tcsetattr` reads the `termios` it is given and keeps nothing.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd, saved })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LineEditingOff {
+    fn drop(&mut self) {
+        // SAFETY: puts back the attributes `enter` read from the same descriptor.
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
+    }
+}
+
 #[cfg(all(unix, test))]
 mod tests {
     use super::*;
     use std::os::unix::io::FromRawFd;
-    use std::time::{Duration, Instant};
 
     /// Opens a pseudo-terminal pair as (master, slave).
     fn openpty() -> (File, File) {
@@ -247,6 +461,154 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The local modes (line editing, echo, signals ...) of the terminal.
+    fn local_modes(file: &File) -> libc::tcflag_t {
+        // SAFETY: `tcgetattr` fills the `termios` it is given for a valid
+        // descriptor; an all-zero `termios` is a valid value to be overwritten.
+        let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::tcgetattr(file.as_raw_fd(), &mut attributes) };
+        assert_eq!(rc, 0, "tcgetattr: {}", io::Error::last_os_error());
+        attributes.c_lflag
+    }
+
+    /// Writes each chunk to the terminal after its delay, from another thread,
+    /// like a sender whose bytes are still on their way.
+    fn send_later(master: &File, chunks: Vec<(Duration, Vec<u8>)>) -> std::thread::JoinHandle<()> {
+        let mut master = master.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for (delay, bytes) in chunks {
+                std::thread::sleep(delay);
+                if master.write_all(&bytes).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn flushing_drops_what_is_queued_at_once() {
+        let (mut master, slave) = openpty();
+        let mut terminal = Terminal::from_file(slave);
+        master.write_all(b"queued\n").unwrap();
+        wait_for_pending(&terminal.file, b"queued\n".len());
+
+        terminal.flush_input().unwrap();
+        assert_eq!(pending_input(&terminal.file), 0);
+    }
+
+    #[test]
+    fn input_still_on_its_way_is_discarded_until_it_stops_even_when_it_ends_in_the_phrase() {
+        let (mut master, slave) = openpty();
+        let mut terminal = Terminal::from_file(slave);
+        let modes = local_modes(&terminal.file);
+
+        // What a flush alone cannot stop: filler that reaches the terminal after
+        // the flush, then a line-kill (^U) to erase it and the phrase, which
+        // can be worked out in advance. In canonical mode, after a prompt, the
+        // phrase would be all that is left of the line.
+        let mut chunks: Vec<(Duration, Vec<u8>)> = (0..10)
+            .map(|_| (Duration::from_millis(30), b"filler".to_vec()))
+            .collect();
+        chunks.push((
+            Duration::from_millis(60),
+            b"\x15I AUTHORIZE SHARING abc\n".to_vec(),
+        ));
+        let sender = send_later(&master, chunks);
+
+        let started = Instant::now();
+        terminal
+            .discard_input_until_quiet(Duration::from_millis(300), Duration::from_secs(10))
+            .unwrap();
+        // It waited out the whole stream (10 x 30 ms and 60 ms) and then the
+        // quiet that followed.
+        assert!(
+            started.elapsed() >= Duration::from_millis(600),
+            "{:?}",
+            started.elapsed()
+        );
+        sender.join().unwrap();
+
+        assert_eq!(pending_input(&terminal.file), 0);
+        assert_eq!(
+            local_modes(&terminal.file),
+            modes,
+            "line editing and echo are back"
+        );
+        // Only what is typed now is an answer.
+        master.write_all(b"typed after the prompt\n").unwrap();
+        assert_eq!(
+            terminal.prompt_line("prompt: ").unwrap(),
+            "typed after the prompt"
+        );
+    }
+
+    #[test]
+    fn a_quiet_terminal_is_waited_on_only_for_the_quiet_time() {
+        let (_master, slave) = openpty();
+        let mut terminal = Terminal::from_file(slave);
+        let started = Instant::now();
+        terminal
+            .discard_input_until_quiet(Duration::from_millis(200), Duration::from_secs(10))
+            .unwrap();
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(200), "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+    }
+
+    #[test]
+    fn input_that_never_stops_is_refused_and_the_terminal_is_given_back() {
+        let (master, slave) = openpty();
+        let mut terminal = Terminal::from_file(slave);
+        let modes = local_modes(&terminal.file);
+        // A second of input, a byte every 10 ms: never quiet for 200 ms.
+        let chunks = (0..100)
+            .map(|_| (Duration::from_millis(10), b"x".to_vec()))
+            .collect();
+        let sender = send_later(&master, chunks);
+
+        let started = Instant::now();
+        let error = terminal
+            .discard_input_until_quiet(Duration::from_millis(200), Duration::from_millis(600))
+            .unwrap_err();
+        assert!(
+            started.elapsed() >= Duration::from_millis(600),
+            "{:?}",
+            started.elapsed()
+        );
+        // It reads as an answer that cannot match, and says what happened.
+        assert!(is_input_kept_arriving(&error), "{error}");
+        assert!(is_unreadable_answer(&error), "{error}");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "input kept arriving at the terminal, so the prompt was not shown"
+        );
+        assert_eq!(
+            local_modes(&terminal.file),
+            modes,
+            "line editing and echo are back"
+        );
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn a_terminal_that_goes_away_is_an_error_and_not_a_quiet_terminal() {
+        let (master, slave) = openpty();
+        let mut terminal = Terminal::from_file(slave);
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(master);
+        });
+        let started = Instant::now();
+        let error = terminal
+            .discard_input_until_quiet(Duration::from_secs(20), Duration::from_secs(30))
+            .unwrap_err();
+        closer.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(!is_unreadable_answer(&error), "{error}");
+        assert!(!is_input_kept_arriving(&error), "{error}");
     }
 
     #[test]
