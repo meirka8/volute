@@ -20,7 +20,7 @@
 //!
 //! Roughly one syscall per typed character is immaterial for a prompt.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 #[cfg(unix)]
 use std::fs::{File, OpenOptions};
@@ -33,6 +33,14 @@ use std::os::unix::io::AsRawFd;
 /// longer is not a human typing an acknowledgement.
 #[cfg(unix)]
 const MAX_ANSWER_BYTES: usize = 4096;
+
+/// Whether stdin and stdout are both terminals: the precondition for anything
+/// that asks a human to type, whether a consent challenge, the conversation
+/// picker, or the interactive conversations view. It is one definition so
+/// those gates cannot drift apart.
+pub fn stdio_is_terminal() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
 
 /// A handle on the process's controlling terminal.
 pub struct Terminal {

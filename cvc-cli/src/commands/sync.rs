@@ -12,7 +12,7 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     env,
-    io::{IsTerminal, Read, Write},
+    io::{Read, Write},
     path::Path,
 };
 
@@ -53,13 +53,28 @@ pub async fn acknowledge_sharing(requested: Option<&str>) -> Result<()> {
     let (repo, _) = open(&env::current_dir()?)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
-    let s = privacy::privacy_status_for_fingerprint(&repo, &destination.fingerprint)?;
-    println!("Acknowledging immutable publication to remote '{}' (fingerprint {}). This does not enable automatic push.", name, s.remote_fingerprint);
+    acknowledge_sharing_for(&repo, &destination)
+}
+
+/// What `cvc privacy acknowledge-sharing --remote <destination.name>` does once
+/// the destination is known: show its fingerprint, then require the typed
+/// `I AUTHORIZE SHARING <fingerprint>` challenge before recording the consent.
+/// The consent is bound to `destination.fingerprint` and grants nothing for
+/// any other destination; it does not enable automatic push.
+pub(crate) fn acknowledge_sharing_for(
+    repo: &Repository,
+    destination: &privacy::RemoteDestination,
+) -> Result<()> {
+    let s = privacy::privacy_status_for_fingerprint(repo, &destination.fingerprint)?;
+    println!("Acknowledging immutable publication to remote '{}' (fingerprint {}). This does not enable automatic push.", destination.name, s.remote_fingerprint);
     typed_acknowledgement(&format!("I AUTHORIZE SHARING {}", s.remote_fingerprint))?;
-    privacy::acknowledge_sharing_destination(&repo, &destination)?;
+    privacy::acknowledge_sharing_destination(repo, destination)?;
     Ok(())
 }
-const SUMMARY_SCAN_LIMIT: usize = 10_000;
+
+/// How many conversations the share summary lookup and the picker consider,
+/// most recent first. Also the ceiling for an interactive listing.
+pub(crate) const SUMMARY_SCAN_LIMIT: usize = 10_000;
 
 /// Interactive selection over conversations not yet shared for this
 /// destination. TTY-only by construction — non-interactive callers must name
@@ -70,7 +85,7 @@ fn pick_unshared_conversation(
     remote_name: &str,
     fingerprint: &str,
 ) -> Result<Option<String>> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !crate::tty::stdio_is_terminal() {
         bail!(
             "a conversation id is required in non-interactive use; run `cvc conversations` to list them, or run `cvc share` from a terminal for an interactive picker"
         );
@@ -121,7 +136,7 @@ fn pick_unshared_conversation(
 /// already hold the next line; answering from that would let type-ahead or a
 /// paste satisfy a challenge that was never displayed. See `crate::tty`.
 fn typed_acknowledgement(challenge: &str) -> Result<()> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !crate::tty::stdio_is_terminal() {
         bail!("acknowledgement requires an interactive TTY");
     }
     let mut terminal = crate::tty::Terminal::open()
@@ -180,6 +195,40 @@ pub async fn share(
             }
         }
     };
+    let future = if future {
+        FutureSharePolicy::Shared
+    } else {
+        FutureSharePolicy::Private
+    };
+    share_conversation(&repo, &store, &destination, id, future, push)
+}
+
+/// What `cvc share <conversation_id> --remote <destination.name>` does once the
+/// conversation and destination are known, with `--future` as
+/// `FutureSharePolicy::Shared` and `--push` as `publish_after`.
+///
+/// It prints the conversation summary, then requires the typed
+/// `I SHARE <id> <fingerprint> <count> <token>` challenge for the exact
+/// snapshot it just read, and only then records the share. The challenge goes
+/// through `typed_acknowledgement`, so it needs an interactive terminal and a
+/// human typing the phrase after it is displayed. With `publish_after` the
+/// bundled publication follows, behind its own challenge unless the
+/// destination's auto-push grant already covers it.
+///
+/// The destination is whatever the caller passes: this function never
+/// resolves a remote. Sharing for a destination does not need that
+/// destination's sharing consent (publishing does), exactly as `cvc share`.
+/// It does not check where the conversation came from either; callers that
+/// must not offer an imported conversation for sharing have to say so
+/// themselves.
+pub(crate) fn share_conversation(
+    repo: &Repository,
+    store: &CvcStore,
+    destination: &privacy::RemoteDestination,
+    id: &str,
+    future: FutureSharePolicy,
+    publish_after: bool,
+) -> Result<()> {
     // Make the consent legible: title and activity range alongside the
     // snapshot count already embedded in the challenge below.
     if let Some(summary) = store
@@ -188,7 +237,8 @@ pub async fn share(
         .find(|summary| summary.id == id)
     {
         println!(
-            "Sharing conversation for remote '{name}':\n{}",
+            "Sharing conversation for remote '{}':\n{}",
+            destination.name,
             crate::commands::conversations::render_line(&summary, true)
         );
     }
@@ -201,27 +251,21 @@ pub async fn share(
         ids.len(),
         &token[..12]
     ))?;
-    store.share_exact_snapshot(
-        id,
-        &destination.fingerprint,
-        &ids,
-        if future {
-            FutureSharePolicy::Shared
-        } else {
-            FutureSharePolicy::Private
-        },
-    )?;
+    store.share_exact_snapshot(id, &destination.fingerprint, &ids, future)?;
     let count = ids.len();
     println!(
         "{} turn(s) marked shared; future turns are {}.",
         count,
-        if future { "shared" } else { "private" }
+        match future {
+            FutureSharePolicy::Shared => "shared",
+            FutureSharePolicy::Private => "private",
+        }
     );
-    if push {
+    if publish_after {
         push_destination(
-            &repo,
-            &store,
-            &destination,
+            repo,
+            store,
+            destination,
             PublicationTrigger::BundledWithShare,
         )?;
     }
@@ -231,7 +275,23 @@ pub async fn unshare(id: &str, requested: Option<&str>) -> Result<()> {
     let (repo, store) = open(&env::current_dir()?)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
-    let _operation_lock = privacy::destination_operation_lock(&repo, &destination.fingerprint)?;
+    unshare_conversation(&repo, &store, &destination, id)
+}
+
+/// What `cvc unshare <conversation_id> --remote <destination.name>` does once
+/// the destination is known: under the destination's operation lock, require
+/// the typed `I UNSHARE <id> <fingerprint>` challenge, then make the
+/// conversation's turns private for that destination. The store refuses, and
+/// nothing changes, while any turn of the conversation is pending, published
+/// or of unknown state there, because unsharing cannot recall content a
+/// destination may already hold.
+pub(crate) fn unshare_conversation(
+    repo: &Repository,
+    store: &CvcStore,
+    destination: &privacy::RemoteDestination,
+    id: &str,
+) -> Result<()> {
+    let _operation_lock = privacy::destination_operation_lock(repo, &destination.fingerprint)?;
     typed_acknowledgement(&format!("I UNSHARE {id} {}", destination.fingerprint))?;
     println!(
         "{} unpublished turn(s) made private.",
@@ -392,12 +452,25 @@ pub async fn push(requested: Option<&str>, manual: bool) -> Result<()> {
     // Bare push is intentionally safe for legacy hook lines.  Humans must opt in
     // to manual publication; hooks use `auto_push` below.
     let destination = privacy::remote_destination(&repo, &name)?;
-    let trigger = if manual {
-        PublicationTrigger::Manual
+    if manual {
+        publish_manually(&repo, &store, &destination)
     } else {
-        PublicationTrigger::Hook
-    };
-    push_destination(&repo, &store, &destination, trigger)
+        push_destination(&repo, &store, &destination, PublicationTrigger::Hook)
+    }
+}
+
+/// What `cvc push --manual --remote <destination.name>` does once the
+/// destination is known: it requires the destination's sharing consent,
+/// fetches the destination's baseline, states what it is about to publish and
+/// requires the typed `I PUBLISH <fingerprint> <candidate> <count>` challenge
+/// whatever the auto-push setting, and only then pushes. When nothing differs
+/// from the destination it says so and asks for no challenge.
+pub(crate) fn publish_manually(
+    repo: &Repository,
+    store: &CvcStore,
+    destination: &privacy::RemoteDestination,
+) -> Result<()> {
+    push_destination(repo, store, destination, PublicationTrigger::Manual)
 }
 pub async fn auto_push_remote(cwd: &Path, requested: Option<&str>) -> Result<()> {
     let (repo, store) = open(cwd)?;

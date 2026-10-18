@@ -39,8 +39,12 @@ enum Commands {
     Conversations {
         #[arg(long)]
         remote: Option<String>,
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
+        /// Maximum number of conversations to show [default: 20 for the plain listing]
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Print the plain listing even when run from a terminal
+        #[arg(long)]
+        plain: bool,
     },
     /// Share a conversation explicitly; with no id, pick one interactively
     Share {
@@ -252,9 +256,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 commands::sync::reconcile(remote.as_deref()).await?
             }
         },
-        Commands::Conversations { remote, limit } => {
-            commands::conversations::run(remote.as_deref(), limit).await?
-        }
+        Commands::Conversations {
+            remote,
+            limit,
+            plain,
+        } => commands::conversations::run(remote.as_deref(), limit, plain).await?,
         Commands::Share {
             conversation_id,
             remote,
@@ -382,6 +388,37 @@ mod hook_cli_tests {
         ])
         .is_err());
         assert!(Cli::try_parse_from(["cvc", "harness", "install", "cursor"]).is_err());
+    }
+
+    #[test]
+    fn conversations_limit_is_optional_and_plain_is_a_flag() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Commands::Conversations {
+                remote,
+                limit,
+                plain,
+            } => (remote, limit, plain),
+            _ => panic!("not the conversations command: {args:?}"),
+        };
+        assert_eq!(parse(&["cvc", "conversations"]), (None, None, false));
+        assert_eq!(
+            parse(&["cvc", "conversations", "--limit", "5"]),
+            (None, Some(5), false)
+        );
+        assert_eq!(
+            parse(&[
+                "cvc",
+                "conversations",
+                "--plain",
+                "--remote",
+                "upstream",
+                "--limit",
+                "0"
+            ]),
+            (Some("upstream".to_owned()), Some(0), true)
+        );
+        assert!(Cli::try_parse_from(["cvc", "conversations", "--limit", "many"]).is_err());
+        assert!(Cli::try_parse_from(["cvc", "conversations", "--plain=maybe"]).is_err());
     }
 
     #[test]
