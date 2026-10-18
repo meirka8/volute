@@ -37,14 +37,30 @@ enum Commands {
         #[command(subcommand)]
         command: PrivacyCommands,
     },
-    /// List conversations with activity and per-destination share state
+    /// Browse conversations and their per-destination share state
+    ///
+    /// In a terminal this opens an interactive view of the captured
+    /// conversations, most recent first, with their share state for one remote.
+    /// The view can hand over to the usual typed-phrase prompts (the ones of
+    /// `cvc share`, `cvc unshare`, `cvc push --manual` and `cvc privacy
+    /// acknowledge-sharing`) but cannot answer them: only what you type at the
+    /// prompt does, so keys alone never share or publish anything.
+    ///
+    /// When standard input or output is not a terminal (a pipe, a redirect, a
+    /// script), or with --plain, it prints the plain listing instead, which only
+    /// reads.
     Conversations {
+        /// Remote to show share state for (default: origin)
         #[arg(long)]
         remote: Option<String>,
-        /// Maximum number of conversations to show [default: 20 for the plain listing]
+        /// Show at most this many conversations (plain default: 20; the interactive view shows all unless set)
         #[arg(long)]
         limit: Option<usize>,
-        /// Print the plain listing even when run from a terminal
+        /// Print the plain listing instead of the interactive view
+        ///
+        /// Use it in scripts, and in any tool that runs cvc under a
+        /// pseudo-terminal: that looks like a terminal, so without --plain the
+        /// tool would get the interactive view.
         #[arg(long)]
         plain: bool,
     },
@@ -53,12 +69,13 @@ enum Commands {
         conversation_id: Option<String>,
         #[arg(long)]
         remote: Option<String>,
+        /// Also share thoughts added to this conversation later
         #[arg(long)]
         future: bool,
         #[arg(long)]
         push: bool,
     },
-    /// Stop sharing unpublished turns in a conversation
+    /// Make a conversation's shared thoughts private again for a remote; refused once any of it has been published, or while a publish of it is unfinished
     Unshare {
         conversation_id: String,
         #[arg(long)]
@@ -441,6 +458,102 @@ mod hook_cli_tests {
         );
         assert!(Cli::try_parse_from(["cvc", "conversations", "--limit", "many"]).is_err());
         assert!(Cli::try_parse_from(["cvc", "conversations", "--plain=maybe"]).is_err());
+    }
+
+    /// The help of the `conversations`, `share` and `unshare` commands, as the
+    /// person reading `--help` gets it.
+    fn rendered_help(command: &str) -> String {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        cli.find_subcommand_mut(command)
+            .unwrap_or_else(|| panic!("no {command} command"))
+            .render_long_help()
+            .to_string()
+    }
+
+    fn argument_help(command: &str, argument: &str) -> (String, Option<String>) {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        let argument = cli
+            .find_subcommand(command)
+            .and_then(|command| command.get_arguments().find(|a| a.get_id() == argument))
+            .unwrap_or_else(|| panic!("no --{argument} on {command}"))
+            .clone();
+        (
+            argument.get_help().expect("it has help").to_string(),
+            argument.get_long_help().map(|help| help.to_string()),
+        )
+    }
+
+    #[test]
+    fn the_conversations_help_explains_the_view_and_the_listing() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        let conversations = cli.find_subcommand("conversations").unwrap();
+        assert_eq!(
+            conversations.get_about().unwrap().to_string(),
+            "Browse conversations and their per-destination share state"
+        );
+        let long = rendered_help("conversations");
+        // What the view is, and that it adds no way to consent.
+        assert!(
+            long.contains("In a terminal this opens an interactive view"),
+            "{long}"
+        );
+        assert!(
+            long.contains("hand over to the usual typed-phrase prompts"),
+            "{long}"
+        );
+        assert!(long.contains("cannot answer them"), "{long}");
+        assert!(long.contains("keys alone never share or publish"), "{long}");
+        // And when it does not open.
+        assert!(long.contains("not a terminal"), "{long}");
+        assert!(
+            long.contains("with --plain, it prints the plain listing instead"),
+            "{long}"
+        );
+
+        assert_eq!(
+            argument_help("conversations", "remote").0,
+            "Remote to show share state for (default: origin)"
+        );
+        assert_eq!(
+            argument_help("conversations", "limit").0,
+            "Show at most this many conversations (plain default: 20; the interactive view shows all unless set)"
+        );
+        let (plain, long_plain) = argument_help("conversations", "plain");
+        assert_eq!(
+            plain,
+            "Print the plain listing instead of the interactive view"
+        );
+        let long_plain = long_plain.expect("--plain has a long help");
+        assert!(long_plain.contains("scripts"), "{long_plain}");
+        assert!(long_plain.contains("pseudo-terminal"), "{long_plain}");
+    }
+
+    #[test]
+    fn the_share_and_unshare_help_say_what_they_do_and_refuse() {
+        assert_eq!(
+            argument_help("share", "future").0,
+            "Also share thoughts added to this conversation later"
+        );
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        assert_eq!(
+            cli.find_subcommand("unshare")
+                .unwrap()
+                .get_about()
+                .unwrap()
+                .to_string(),
+            "Make a conversation's shared thoughts private again for a remote; refused once any of it has been published, or while a publish of it is unfinished"
+        );
+        // The help of a command that exists to stop sharing must not promise
+        // more than it does: it cannot recall what a remote already holds.
+        let unshare = rendered_help("unshare");
+        assert!(
+            unshare.contains("refused once any of it has been published"),
+            "{unshare}"
+        );
     }
 
     #[test]

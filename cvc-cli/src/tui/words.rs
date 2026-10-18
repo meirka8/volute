@@ -1750,7 +1750,11 @@ pub fn help_page(g: &Glyphs) -> Vec<Page> {
             "publish the shared thoughts to the selected remote",
         ),
         key("r".to_owned(), "choose another remote"),
-        key("esc".to_owned(), "close a bar or a page; q quits"),
+        key("esc".to_owned(), "close a bar, a page or the remote list"),
+        key(
+            "q".to_owned(),
+            "close a page or the remote list; quit from the list",
+        ),
         Page::Blank,
         Page::Heading("States".to_owned()),
         state(
@@ -3424,6 +3428,10 @@ mod tests {
         for expected in [
             "private --s--> shared (on this machine) --p--> published (on the remote)",
             "u works only before publish.",
+            // `q` closes a page or the remote list first and quits only from
+            // the list; `esc` never quits.
+            "close a bar, a page or the remote list",
+            "close a page or the remote list; quit from the list",
             "○ private",
             "◐ shared · 2 waiting",
             "● published",
@@ -3435,6 +3443,9 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected:?}");
         }
+        // `q` closes an overlay before it quits, and quits only from the list;
+        // the page must not promise more than that.
+        assert!(!text.contains("q quits"), "{text}");
         assert!(page_lines(&help_page(&A)).join("\n").is_ascii());
     }
 
