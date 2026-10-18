@@ -930,7 +930,7 @@ mod tests {
             "{}",
             lines[0]
         );
-        assert!(lines[1].starts_with("publishing: authorized   auto-push: off"));
+        assert!(lines[1].starts_with("publishing: authorized by you   auto-push: off"));
         assert!(
             lines[1].ends_with("2 shared thoughts waiting to publish"),
             "{}",
@@ -945,8 +945,12 @@ mod tests {
         origin.auto_push = true;
         let model = model_of(conversations(), vec![origin], (110, 30), Glyphs::UNICODE);
         let (terminal, lines) = screen_of(&model, Glyphs::UNICODE, COLOR);
+        // Not the next push only: every push, and the line says so as long as it
+        // can be made to fit.
         assert!(
-            lines[1].contains("auto-push: ON - your next git push also publishes shared thoughts"),
+            lines[1].contains(
+                "auto-push: ON - every git push to this remote also publishes shared thoughts"
+            ),
             "{}",
             lines[1]
         );
@@ -958,6 +962,33 @@ mod tests {
         assert_eq!(cell.style().fg, Some(Color::Yellow));
         // "publishing: authorized" is quiet.
         assert!(!buffer[(0, 1)].style().add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn the_auto_push_warning_shortens_with_the_terminal_but_stays_a_warning() {
+        let mut origin = remote("origin");
+        origin.auto_push = true;
+        let mut model = model_of(conversations(), vec![origin], (100, 30), Glyphs::UNICODE);
+        // Too narrow for the whole sentence: it still says every push, and the
+        // waiting count is kept.
+        let lines = rendered(&model);
+        assert!(
+            lines[1].starts_with(
+                "publishing: authorized   auto-push: ON - every git push also publishes shared thoughts"
+            ),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[1].ends_with("2 waiting"), "{}", lines[1]);
+        // Narrower still: only the ON is left.
+        model.set_size(60, 30);
+        let lines = rendered(&model);
+        assert!(
+            lines[1].starts_with("publishing: authorized   auto-push: ON"),
+            "{}",
+            lines[1]
+        );
+        assert!(!lines[1].contains("every git push"), "{}", lines[1]);
     }
 
     #[test]
@@ -1060,14 +1091,15 @@ mod tests {
         let mut unreadable = remote("origin");
         unreadable.sharing_consented = false;
         unreadable.consent_error = Some("privacy state permissions are insecure".to_owned());
-        let lines = header_at(vec![unreadable.clone()], None, 140);
+        let lines = header_at(vec![unreadable.clone()], None, 150);
         assert!(lines[1].starts_with(
-            "publishing: unknown (CVC privacy state cannot be read: privacy state permissions are insecure); sharing and publishing are off."
+            "publishing: unknown (CVC privacy state cannot be read: privacy state permissions are insecure); sharing and publishing from this view are off."
         ), "{}", lines[1]);
         // On a narrower terminal the parenthetical goes first.
         let lines = header_of(vec![unreadable], None);
         assert!(
-            lines[1].starts_with("publishing: unknown; sharing and publishing are off."),
+            lines[1]
+                .starts_with("publishing: unknown; sharing and publishing from this view are off."),
             "{}",
             lines[1]
         );
@@ -1496,7 +1528,7 @@ mod tests {
         let n = lines.len();
         assert_eq!(
             lines[n - 2],
-            " Publishing to 'origin' (github.com/acme/repo) is not authorized on this machine yet."
+            " Publishing to 'origin' (github.com/acme/repo) is not authorized in this clone yet."
         );
         assert_eq!(
             lines[n - 1],
@@ -1613,7 +1645,8 @@ mod tests {
             "Thoughts         27",
             "Linked           26 of 27 thoughts linked to a commit",
             "Context files    14: src/sync.rs (12), src/db.rs (9), … (+12 more)",
-            "Subagents        2 conversations, each shared separately",
+            "Subagents        2 conversations, each shared separately; their prompts and results are part of",
+            "this one",
             "With 'origin' (fingerprint 8348b79e2c41…)",
             "State            ◐ shared · 2 waiting · 6 private",
             "Future thoughts  private",
@@ -1621,7 +1654,7 @@ mod tests {
             "Auto-push        off",
             "A thought is one recorded step (for Claude Code, one assistant response).",
             "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\".",
-            "Scrubbing is best-effort. Published thoughts cannot be recalled.",
+            "Scrubbing can miss secrets. Published thoughts cannot be recalled.",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in\n{text}");
         }
@@ -1666,7 +1699,7 @@ mod tests {
         let first = rendered(&model);
         assert!(contains(&first, "Refactor the sync module"));
         assert!(
-            !contains(&first, "Scrubbing is best-effort"),
+            !contains(&first, "Scrubbing can miss secrets"),
             "{}",
             dump(&first)
         );
@@ -1674,7 +1707,7 @@ mod tests {
         model.handle_key(key(KeyCode::End));
         let last = rendered(&model);
         assert!(
-            contains(&last, "Scrubbing is best-effort"),
+            contains(&last, "Scrubbing can miss secrets"),
             "{}",
             dump(&last)
         );
@@ -1709,10 +1742,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(
-            flat.contains("Publishing is authorized per exact push URL; authorizing one remote"),
+            flat.contains("Publishing is authorized per exact push URL, not per remote name:"),
             "{text}"
         );
-        assert!(flat.contains("does not carry over to another."), "{text}");
+        assert!(
+            flat.contains("remotes with the same push URL share it."),
+            "{text}"
+        );
         for column in [
             "remote",
             "location",
@@ -1765,13 +1801,24 @@ mod tests {
         model.handle_key(key(KeyCode::Char('?')));
         let text = dump(&rendered(&model));
         assert!(
-            text.contains(
-                "private --s--> shared (on this machine) --p--> published (on the remote)"
-            ),
+            text.contains("private --s--> shared (in this clone) --p--> published (on the remote)"),
             "{text}"
         );
         assert!(text.contains("u works only before publish."));
-        assert!(text.contains("Typing the phrase is your signature."));
+        // On a tall terminal the whole page is in view, with what it says about
+        // consent: no key does it alone, and two choices act later.
+        model.set_size(100, 60);
+        let text = dump(&rendered(&model));
+        for expected in [
+            "Share, unshare, publish and authorize each wait for their typed phrase; no key does any of them",
+            "by itself.",
+            "Two standing choices act later without a new phrase: +future shares new thoughts as they are",
+            "captured, and auto-push (set only with cvc privacy set-auto-push) publishes shared thoughts at",
+            "every git push to that remote.",
+            "Scrubbing and .thoughtignore can miss secrets; they are not a guarantee.",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+        }
         model.set_size(60, 12);
         model.handle_key(key(KeyCode::End));
         let text = dump(&rendered(&model));

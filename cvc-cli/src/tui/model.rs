@@ -557,13 +557,13 @@ impl Model {
             Report::Shared { id, outcome } => {
                 self.shared_remote = self.remote.clone();
                 let auto_push = self.usable_remote().is_some_and(|o| o.auto_push);
-                let private_agents = self.private_agents_of(&id);
+                let unshared_agents = self.unshared_agents_of(&id);
                 words::shared_status(
                     outcome.snapshot_count,
                     &remote,
                     outcome.future,
                     auto_push,
-                    private_agents,
+                    unshared_agents,
                     &self.glyphs,
                 )
             }
@@ -586,11 +586,14 @@ impl Model {
             .unwrap_or_default()
     }
 
-    /// How many agent conversations listed under `id` are still private: not
-    /// shared, not held by the remote, and not sharing later thoughts. An agent
-    /// the remote already holds, or one whose later thoughts are shared, is not
-    /// private and is not counted.
-    fn private_agents_of(&self, id: &str) -> usize {
+    /// How many agent conversations listed under `id` have nothing shared from
+    /// this clone: no thought of their own shared, and not imported from a
+    /// remote. Whatever else is true of one (the remote holds it, or its later
+    /// thoughts are shared as they are captured) does not matter here: the
+    /// conversation that was shared carries each agent's prompt and result in its
+    /// own thoughts, and the notice after a share says so for every agent that is
+    /// not shared in its own right.
+    fn unshared_agents_of(&self, id: &str) -> usize {
         let Some(index) = self.tree.position(id) else {
             return 0;
         };
@@ -599,7 +602,7 @@ impl Model {
             .iter()
             .filter(|&&child| {
                 let summary = &self.tree.entries[child].summary;
-                !summary.imported && words::is_private(summary)
+                !summary.imported && summary.shared_count == 0
             })
             .count()
     }
@@ -2171,7 +2174,7 @@ mod tests {
         for key in ['s', 'u', 'p'] {
             assert_eq!(
                 blocked_reason(&mut model, key),
-                "Sharing and publishing from this view are not available on this platform yet. Use cvc share, cvc unshare and cvc push --manual."
+                "Not available on this platform yet. Use cvc share, cvc unshare or cvc push --manual; on this platform they cannot discard keys typed ahead of the phrase."
             );
             model.handle_key(ch('x'));
         }
@@ -2269,7 +2272,7 @@ mod tests {
         for key in ['s', 'u', 'p'] {
             assert_eq!(
                 blocked_reason(&mut model, key),
-                "CVC privacy state cannot be read (privacy state permissions are insecure); sharing and publishing are off."
+                "CVC privacy state cannot be read (privacy state permissions are insecure); sharing and publishing from this view are off."
             );
             model.handle_key(ch('x'));
         }
@@ -2601,7 +2604,7 @@ mod tests {
     }
 
     #[test]
-    fn sharing_a_parent_mentions_the_agents_that_stay_private_once() {
+    fn sharing_a_parent_mentions_the_agents_that_are_not_shared_once() {
         let mut summaries = with_agents();
         summaries[0].shared_count = 10;
         summaries[0].shared = true;
@@ -2615,7 +2618,9 @@ mod tests {
         });
         let status = model.status().unwrap();
         assert!(
-            status.ends_with(" 2 agent conversations remain private (→ to see)."),
+            status.ends_with(
+                " 2 agent conversations are not shared, but this session's thoughts include their prompts and results (→ to see)."
+            ),
             "{status}"
         );
         // An agent that was shared too is not counted.
@@ -2630,10 +2635,9 @@ mod tests {
                 future: FutureSharePolicy::Private,
             },
         });
-        assert!(model
-            .status()
-            .unwrap()
-            .ends_with(" 1 agent conversation remains private (→ to see)."));
+        assert!(model.status().unwrap().ends_with(
+            " 1 agent conversation is not shared, but this session's thoughts include its prompt and result (→ to see)."
+        ));
         // Sharing an agent mentions none.
         model.report(Report::Shared {
             id: "session:agent-a".to_owned(),
@@ -2646,7 +2650,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_the_remote_holds_or_shares_later_thoughts_of_is_not_called_private() {
+    fn every_agent_with_nothing_shared_from_this_clone_is_counted_whatever_else_is_true_of_it() {
         let report = |summaries: Vec<ConversationSummary>| {
             let mut model = model_with(summaries, vec![remote("origin")]);
             model.report(Report::Shared {
@@ -2664,27 +2668,40 @@ mod tests {
             summaries[0].shared = true;
             summaries
         };
-        // Both agents are private: both are counted.
-        assert!(report(session()).ends_with(" 2 agent conversations remain private (→ to see)."));
+        const TWO: &str = " 2 agent conversations are not shared, but this session's thoughts include their prompts and results (→ to see).";
+        const ONE: &str = " 1 agent conversation is not shared, but this session's thoughts include its prompt and result (→ to see).";
+        assert!(report(session()).ends_with(TWO));
 
-        // One is held by the remote, shared from nowhere here.
+        // The parent's thoughts carry each agent's prompt and result, so it does
+        // not matter that the remote holds an agent, or that it is not sharing
+        // later thoughts: nothing of it is shared from here. Held, and published.
         let mut summaries = session();
         summaries[1].held = 3;
         summaries[1].held_published = 3;
-        assert!(report(summaries).ends_with(" 1 agent conversation remains private (→ to see)."));
-        // Held by a publish that did not conclude: still not private.
+        assert!(report(summaries).ends_with(TWO));
+        // Held by a publish that did not conclude.
         let mut summaries = session();
         summaries[1].held = 1;
-        assert!(report(summaries).ends_with(" 1 agent conversation remains private (→ to see)."));
-        // Its later thoughts are shared as they are captured.
+        assert!(report(summaries).ends_with(TWO));
+        // Its later thoughts are shared as they are captured, none yet.
         let mut summaries = session();
         summaries[2].share_future = Some(true);
-        assert!(report(summaries).ends_with(" 1 agent conversation remains private (→ to see)."));
-        // Neither is private: nothing is mentioned.
+        assert!(report(summaries).ends_with(TWO));
+
+        // Something of an agent shared from here: it is not counted.
         let mut summaries = session();
-        summaries[1].held = 2;
-        summaries[1].held_published = 2;
-        summaries[2].held = 1;
+        summaries[1].shared_count = 2;
+        summaries[1].shared = true;
+        assert!(report(summaries).ends_with(ONE));
+        // An agent that came from a remote is not counted either.
+        let mut summaries = session();
+        summaries[2].imported = true;
+        assert!(report(summaries).ends_with(ONE));
+        // Both shared or imported: nothing is mentioned.
+        let mut summaries = session();
+        summaries[1].shared_count = 2;
+        summaries[1].shared = true;
+        summaries[2].imported = true;
         assert!(!report(summaries).contains("agent conversation"));
     }
 
@@ -2702,7 +2719,7 @@ mod tests {
         });
         assert_eq!(
             model.status(),
-            Some("2 thoughts marked shared for remote 'origin'; future thoughts are shared too. Auto-push is on.")
+            Some("2 thoughts marked shared for remote 'origin'; future thoughts are shared too. Auto-push is on: every git push to 'origin' publishes them.")
         );
     }
 
@@ -2824,7 +2841,7 @@ mod tests {
         };
         assert!(page.iter().any(|row| matches!(
             row,
-            Page::Field { label: "Subagents", value } if value == "2 conversations, each shared separately"
+            Page::Field { label: "Subagents", value } if value == "2 conversations, each shared separately; their prompts and results are part of this one"
         )));
     }
 

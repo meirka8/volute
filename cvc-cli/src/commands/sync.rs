@@ -798,22 +798,22 @@ enum PublicationPhase {
 }
 
 /// What tombstone pruning takes out of the ref's current tree, worded so it cannot
-/// be read as erasure: the earlier commits of the ref keep those blobs.
+/// be read as erasure: the earlier commits of the ref keep those blobs, and it
+/// says so (`not erased from history`).
 fn removal_phrase(publication: &sync::ProjectionPublication) -> Option<String> {
     const SCOPE: &str = "the removal from the current tree of";
-    match (
+    let removed = match (
         publication.removed_interactions,
         publication.removed_records,
     ) {
-        (0, 0) => None,
-        (interactions, 0) => Some(format!("{SCOPE} {interactions} tombstoned interaction(s)")),
-        (interactions, records) if interactions > 0 => Some(format!(
+        (0, 0) => return None,
+        (interactions, 0) => format!("{SCOPE} {interactions} tombstoned interaction(s)"),
+        (interactions, records) if interactions > 0 => format!(
             "{SCOPE} {interactions} tombstoned interaction(s) with {records} attached record(s)"
-        )),
-        (_, records) => Some(format!(
-            "{SCOPE} {records} record(s) of tombstoned interaction(s)"
-        )),
-    }
+        ),
+        (_, records) => format!("{SCOPE} {records} record(s) of tombstoned interaction(s)"),
+    };
+    Some(format!("{removed} (not erased from history)"))
 }
 
 /// Everything a push carries besides new interactions, as a noun phrase such as
@@ -1144,23 +1144,23 @@ mod publication_summary_tests {
         assert!(!removal.is_structural_only());
         assert_eq!(
             line(&removal, Planned),
-            "Publishing the removal from the current tree of 2 tombstoned interaction(s) to 'origin' (no new shared interactions; 40 shared in total)."
+            "Publishing the removal from the current tree of 2 tombstoned interaction(s) (not erased from history) to 'origin' (no new shared interactions; 40 shared in total)."
         );
         let redaction = publication(0, 41, [0, 1, 0, 1, 2]);
         assert_eq!(
             line(&redaction, Done),
-            "Published 1 tombstone(s) and the removal from the current tree of 1 tombstoned interaction(s) with 2 attached record(s) to 'origin' (no new shared interactions; 41 shared in total)."
+            "Published 1 tombstone(s) and the removal from the current tree of 1 tombstoned interaction(s) with 2 attached record(s) (not erased from history) to 'origin' (no new shared interactions; 41 shared in total)."
         );
         let stale = publication(0, 41, [0, 0, 0, 0, 3]);
         assert_eq!(
             line(&stale, Done),
-            "Published the removal from the current tree of 3 record(s) of tombstoned interaction(s) to 'origin' (no new shared interactions; 41 shared in total)."
+            "Published the removal from the current tree of 3 record(s) of tombstoned interaction(s) (not erased from history) to 'origin' (no new shared interactions; 41 shared in total)."
         );
         // One trailing element, after links, tombstones, and derivations.
         let everything = publication(2, 9, [3, 1, 2, 1, 4]);
         assert_eq!(
             line(&everything, Planned),
-            "Publishing 2 new shared interaction(s) to 'origin' (9 shared in total), plus 3 commit link(s), 1 tombstone(s), 2 derivation record(s) and the removal from the current tree of 1 tombstoned interaction(s) with 4 attached record(s)."
+            "Publishing 2 new shared interaction(s) to 'origin' (9 shared in total), plus 3 commit link(s), 1 tombstone(s), 2 derivation record(s) and the removal from the current tree of 1 tombstoned interaction(s) with 4 attached record(s) (not erased from history)."
         );
         for p in [&removal, &redaction, &stale] {
             assert!(!line(p, Planned).contains("format/index"));

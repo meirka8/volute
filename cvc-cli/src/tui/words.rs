@@ -200,16 +200,6 @@ impl LabelInput {
     }
 }
 
-/// Whether a conversation reads `private` for the selected remote: nothing is
-/// shared from here, the remote holds nothing of it and holds none for certain
-/// or by doubt, and later thoughts are not shared as they are captured. What the
-/// notice after a share counts as "remaining private" is exactly this, so it
-/// cannot call a conversation the remote holds private when the row says
-/// otherwise.
-pub fn is_private(summary: &ConversationSummary) -> bool {
-    LabelInput::of(summary).standing() == Standing::Private
-}
-
 /// The state column for one conversation and the remote it is shown for.
 ///
 /// With S shared, P published among those, H held (published, pending or
@@ -511,10 +501,10 @@ fn publishing_line(overview: &RemoteOverview) -> Vec<Vec<Seg>> {
         let reason = text::sanitize(reason);
         return vec![
             vec![Seg::plain(format!(
-                "publishing: unknown (CVC privacy state cannot be read: {reason}); sharing and publishing are off."
+                "publishing: unknown (CVC privacy state cannot be read: {reason}); sharing and publishing from this view are off."
             ))],
             vec![Seg::plain(
-                "publishing: unknown; sharing and publishing are off.",
+                "publishing: unknown; sharing and publishing from this view are off.",
             )],
         ];
     }
@@ -527,10 +517,19 @@ fn publishing_line(overview: &RemoteOverview) -> Vec<Vec<Seg>> {
         ];
     }
     if overview.auto_push {
+        // Auto-push is a standing choice, not the next push only, and the longer
+        // forms say so; the middle one is for a terminal too narrow for the full
+        // sentence.
         return vec![
             vec![
+                Seg::plain("publishing: authorized by you   "),
+                Seg::loud(
+                    "auto-push: ON - every git push to this remote also publishes shared thoughts",
+                ),
+            ],
+            vec![
                 Seg::plain("publishing: authorized   "),
-                Seg::loud("auto-push: ON - your next git push also publishes shared thoughts"),
+                Seg::loud("auto-push: ON - every git push also publishes shared thoughts"),
             ],
             vec![
                 Seg::plain("publishing: authorized   "),
@@ -539,7 +538,7 @@ fn publishing_line(overview: &RemoteOverview) -> Vec<Vec<Seg>> {
         ];
     }
     vec![
-        vec![Seg::plain("publishing: authorized   auto-push: off")],
+        vec![Seg::plain("publishing: authorized by you   auto-push: off")],
         vec![Seg::plain("publishing: authorized")],
     ]
 }
@@ -565,7 +564,7 @@ fn waiting_text(n: i64) -> Vec<String> {
 // Why an action is blocked
 // ---------------------------------------------------------------------------
 
-pub const NOT_ON_THIS_PLATFORM: &str = "Sharing and publishing from this view are not available on this platform yet. Use cvc share, cvc unshare and cvc push --manual.";
+pub const NOT_ON_THIS_PLATFORM: &str = "Not available on this platform yet. Use cvc share, cvc unshare or cvc push --manual; on this platform they cannot discard keys typed ahead of the phrase.";
 pub const IMPORTED_IS_READ_ONLY: &str = "Imported from a remote, so it is read-only here.";
 pub const NO_DETAILS: &str =
     "This conversation could not be read, so nothing can be done with it from here.";
@@ -588,10 +587,11 @@ pub fn id_is_safe(id: &str) -> bool {
     text::sanitize(id) == id
 }
 
-/// The remote's privacy state cannot be read, so every action stays off.
+/// The remote's privacy state cannot be read, so every action of this view
+/// stays off.
 pub fn privacy_unreadable(reason: &str) -> String {
     format!(
-        "CVC privacy state cannot be read ({}); sharing and publishing are off.",
+        "CVC privacy state cannot be read ({}); sharing and publishing from this view are off.",
         text::sanitize(reason)
     )
 }
@@ -846,7 +846,7 @@ pub fn share_bar(ask: &ShareAsk, dest: &Destination, width: usize, g: &Glyphs) -
             String::new()
         }
     };
-    let long_note = auto(" (auto-push publishes them at your next git push)");
+    let long_note = auto(" (auto-push publishes them at each git push)");
     let short_note = auto(" (auto-push publishes them)");
     if ask.unshared <= 0 {
         // Everything is shared already: only the future can still be added.
@@ -983,7 +983,7 @@ pub fn publish_bar(waiting: i64, dest: &Destination, width: usize) -> Vec<Vec<Se
 pub fn authorize_bar(dest: &Destination, width: usize) -> Vec<Vec<Seg>> {
     let mut lines = sentence(
         &format!(
-            "Publishing to {} is not authorized on this machine yet.",
+            "Publishing to {} is not authorized in this clone yet.",
             dest.described()
         ),
         width,
@@ -1072,15 +1072,17 @@ impl FlowKind {
     }
 }
 
-/// The notice after a share. `private_agents` is how many agent conversations
-/// listed under the shared one are still private; sharing a conversation never
-/// shares them.
+/// The notice after a share. `unshared_agents` is how many agent conversations
+/// listed under the shared one have nothing shared from this clone. Sharing a
+/// conversation never shares them as conversations of their own, but the
+/// thoughts of the conversation that was shared include each agent's prompt and
+/// result, so the notice says so.
 pub fn shared_status(
     thoughts_shared: usize,
     remote: &str,
     future: FutureSharePolicy,
     auto_push: bool,
-    private_agents: usize,
+    unshared_agents: usize,
     g: &Glyphs,
 ) -> String {
     let mut said = format!(
@@ -1091,19 +1093,25 @@ pub fn shared_status(
             FutureSharePolicy::Private => "private",
         }
     );
-    said.push_str(if auto_push {
-        " Auto-push is on."
+    said.push_str(&if auto_push {
+        // A standing choice: it publishes at every push, not only the next one.
+        format!(" Auto-push is on: every git push to '{remote}' publishes them.")
     } else {
-        " Not published yet (p)."
+        " Not published yet (p).".to_owned()
     });
-    if private_agents > 0 {
-        let n = private_agents as i64;
-        said.push_str(&format!(
-            " {} {} private ({} to see).",
-            count(n, "agent conversation", "agent conversations"),
-            if n == 1 { "remains" } else { "remain" },
-            g.right()
-        ));
+    if unshared_agents > 0 {
+        let n = unshared_agents as i64;
+        said.push_str(&if n == 1 {
+            format!(
+                " 1 agent conversation is not shared, but this session's thoughts include its prompt and result ({} to see).",
+                g.right()
+            )
+        } else {
+            format!(
+                " {n} agent conversations are not shared, but this session's thoughts include their prompts and results ({} to see).",
+                g.right()
+            )
+        });
     }
     said
 }
@@ -1166,16 +1174,16 @@ fn publication_extras(p: &cvc_core::sync::ProjectionPublication) -> Option<Strin
     let removal = match (p.removed_interactions, p.removed_records) {
         (0, 0) => None,
         (n, 0) => Some(format!(
-            "the removal of {} from the current tree",
+            "the removal of {} from the current tree (not erased from history)",
             count(n as i64, "tombstoned thought", "tombstoned thoughts")
         )),
         (n, records) if n > 0 => Some(format!(
-            "the removal of {} and {} from the current tree",
+            "the removal of {} and {} from the current tree (not erased from history)",
             count(n as i64, "tombstoned thought", "tombstoned thoughts"),
             count(records as i64, "attached record", "attached records")
         )),
         (_, records) => Some(format!(
-            "the removal of {} of tombstoned thoughts from the current tree",
+            "the removal of {} of tombstoned thoughts from the current tree (not erased from history)",
             count(records as i64, "record", "records")
         )),
     };
@@ -1227,8 +1235,9 @@ pub fn failure_status(kind: FlowKind, failure: &FlowFailure, remote: &str) -> St
         (FlowFailure::NotConfirmed, FlowKind::Unshare) => {
             "Not unshared: the typed phrase did not match. Nothing was changed.".to_owned()
         }
+        // The fetch that comes first did contact the remote; nothing was published.
         (FlowFailure::NotConfirmed, FlowKind::Publish) => format!(
-            "Not published: the typed phrase did not match. Nothing was sent to '{remote}'."
+            "Not published: the typed phrase did not match. Nothing was published to '{remote}'."
         ),
         (FlowFailure::NotConfirmed, FlowKind::Authorize) => {
             "Not authorized: the typed phrase did not match.".to_owned()
@@ -1238,7 +1247,7 @@ pub fn failure_status(kind: FlowKind, failure: &FlowFailure, remote: &str) -> St
                 .to_owned()
         }
         (FlowFailure::UnshareBlocked, _) => format!(
-            "Cannot unshare: some of this conversation is already published to '{remote}'."
+            "Cannot unshare: some of this conversation is published, or a publish of it did not finish, for '{remote}'."
         ),
         (FlowFailure::ConsentMissing, _) => {
             format!("Publishing to '{remote}' is not authorized yet. Press p to set it up.")
@@ -1320,11 +1329,11 @@ pub fn banner(
     match kind {
         FlowKind::Share => {
             let mut effect = format!(
-                "Marks this conversation's thoughts as shared for {remote}. Nothing leaves this machine yet."
+                "Marks this conversation's thoughts as shared for {remote}. CVC sends nothing to {remote} yet."
             );
             if dest.auto_push {
                 effect.push_str(&format!(
-                    " Auto-push is on: your next git push to {remote} publishes them."
+                    " Auto-push is on: every git push to {remote}, including one an editor runs, publishes them."
                 ));
             }
             lines.push(format!("Effect   {effect}"));
@@ -1341,12 +1350,12 @@ pub fn banner(
         )),
         FlowKind::Publish => {
             lines.push(format!(
-                "Effect   Sends the shared thoughts to {remote}. Published thoughts cannot be recalled; secret scrubbing is best-effort."
+                "Effect   Sends the shared thoughts to {remote}, where anyone who can read it can read them. Published thoughts cannot be recalled, and scrubbing can miss secrets."
             ));
             lines.push("Note     The summary below counts thoughts as \"interactions\".".to_owned());
         }
         FlowKind::Authorize => lines.push(format!(
-            "Effect   Allows publishing to {remote} at this exact push URL; you are asked again if the URL changes. Publishes nothing and does not turn on auto-push."
+            "Effect   Allows publishing to {remote} at this exact push URL; you are asked again if the URL changes. CVC checks only the URL, not who owns the repository or who can read it. Publishes nothing and does not turn on auto-push."
         )),
     }
     lines.push("         An empty line and Enter cancels.".to_owned());
@@ -1611,9 +1620,13 @@ pub fn details_page(input: &DetailsInput, g: &Glyphs) -> Vec<Page> {
         page.push(Page::Field {
             label: "Subagents",
             value: if input.agents == 1 {
-                "1 conversation, shared separately".to_owned()
+                "1 conversation, shared separately; its prompt and result are part of this one"
+                    .to_owned()
             } else {
-                format!("{} conversations, each shared separately", input.agents)
+                format!(
+                    "{} conversations, each shared separately; their prompts and results are part of this one",
+                    input.agents
+                )
             },
         });
     }
@@ -1658,7 +1671,7 @@ pub fn details_page(input: &DetailsInput, g: &Glyphs) -> Vec<Page> {
             label: "Auto-push",
             value: if dest.auto_push {
                 format!(
-                    "on: a git push to {} also publishes shared thoughts",
+                    "on: every git push to {} also publishes shared thoughts",
                     dest.quoted()
                 )
             } else {
@@ -1675,7 +1688,7 @@ pub fn details_page(input: &DetailsInput, g: &Glyphs) -> Vec<Page> {
             .to_owned(),
     ));
     page.push(Page::Text(
-        "Scrubbing is best-effort. Published thoughts cannot be recalled.".to_owned(),
+        "Scrubbing can miss secrets. Published thoughts cannot be recalled.".to_owned(),
     ));
     page
 }
@@ -1758,7 +1771,7 @@ pub fn help_page(g: &Glyphs) -> Vec<Page> {
         Page::Title("Help".to_owned()),
         Page::Blank,
         Page::Text(
-            "private --s--> shared (on this machine) --p--> published (on the remote)".to_owned(),
+            "private --s--> shared (in this clone) --p--> published (on the remote)".to_owned(),
         ),
         Page::Text("u works only before publish.".to_owned()),
         Page::Blank,
@@ -1794,7 +1807,7 @@ pub fn help_page(g: &Glyphs) -> Vec<Page> {
         Page::Heading("States".to_owned()),
         state(
             format!("{} private", g.private()),
-            "not shared for this remote.",
+            "not shared from this clone for this remote.",
         ),
         state(
             format!("{} shared {dot} 2 waiting", g.waiting()),
@@ -1815,10 +1828,16 @@ pub fn help_page(g: &Glyphs) -> Vec<Page> {
         state("imported".to_owned(), "came from a remote; read-only here."),
         Page::Blank,
         Page::Text(
-            "Typing the phrase is your signature. Nothing is shared or published without it."
+            "Share, unshare, publish and authorize each wait for their typed phrase; no key does any of them by itself."
                 .to_owned(),
         ),
-        Page::Text("Scrubbing and .thoughtignore are best-effort, not a guarantee.".to_owned()),
+        Page::Text(
+            "Two standing choices act later without a new phrase: +future shares new thoughts as they are captured, and auto-push (set only with cvc privacy set-auto-push) publishes shared thoughts at every git push to that remote."
+                .to_owned(),
+        ),
+        Page::Text(
+            "Scrubbing and .thoughtignore can miss secrets; they are not a guarantee.".to_owned(),
+        ),
         Page::Text(
             "Counts in the header are this clone's view; publish re-checks the remote first."
                 .to_owned(),
@@ -1839,7 +1858,7 @@ pub fn help_page(g: &Glyphs) -> Vec<Page> {
 // ---------------------------------------------------------------------------
 
 pub const PICKER_TITLE: &str = "Choose a remote";
-pub const PICKER_SUBTITLE: &str = "Publishing is authorized per exact push URL; authorizing one remote does not carry over to another.";
+pub const PICKER_SUBTITLE: &str = "Publishing is authorized per exact push URL, not per remote name: remotes with the same push URL share it.";
 
 /// One remote of the picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2159,8 +2178,9 @@ mod tests {
         );
         assert_eq!(
             first(&h.publishing[0]),
-            "publishing: authorized   auto-push: off"
+            "publishing: authorized by you   auto-push: off"
         );
+        assert_eq!(first(&h.publishing[1]), "publishing: authorized");
         assert_eq!(h.waiting[0], "2 shared thoughts waiting to publish");
         assert_eq!(h.waiting[1], "2 waiting to publish");
     }
@@ -2191,7 +2211,7 @@ mod tests {
         let h = header_of(&RemoteView::Usable(&overview), Some(3));
         assert_eq!(
             first(&h.publishing[0]),
-            "publishing: authorized   auto-push: ON - your next git push also publishes shared thoughts"
+            "publishing: authorized by you   auto-push: ON - every git push to this remote also publishes shared thoughts"
         );
         let loud: Vec<_> = h.publishing[0]
             .iter()
@@ -2200,7 +2220,12 @@ mod tests {
         assert_eq!(loud.len(), 1);
         assert_eq!(
             loud[0].text,
-            "auto-push: ON - your next git push also publishes shared thoughts"
+            "auto-push: ON - every git push to this remote also publishes shared thoughts"
+        );
+        // A narrower form still says that it is every push, not the next one.
+        assert_eq!(
+            first(&h.publishing[1]),
+            "publishing: authorized   auto-push: ON - every git push also publishes shared thoughts"
         );
         // Even the shortest form keeps the ON.
         assert_eq!(
@@ -2234,11 +2259,11 @@ mod tests {
         let h = header_of(&RemoteView::Usable(&overview), Some(0));
         assert_eq!(
             first(&h.publishing[0]),
-            "publishing: unknown (CVC privacy state cannot be read: privacy state permissions are insecure); sharing and publishing are off."
+            "publishing: unknown (CVC privacy state cannot be read: privacy state permissions are insecure); sharing and publishing from this view are off."
         );
         assert_eq!(
             first(&h.publishing[1]),
-            "publishing: unknown; sharing and publishing are off."
+            "publishing: unknown; sharing and publishing from this view are off."
         );
     }
 
@@ -2356,11 +2381,11 @@ mod tests {
         let bar = share_bar(&ask(27, 6, false), &destination, 300, &U);
         assert_eq!(
             lines(&bar)[1],
-            "Enter: this snapshot only   f: also future thoughts (auto-push publishes them at your next git push)   Esc: cancel"
+            "Enter: this snapshot only   f: also future thoughts (auto-push publishes them at each git push)   Esc: cancel"
         );
         let bar = share_bar(&ask(27, 6, true), &destination, 300, &U);
         assert!(lines(&bar)[1].contains(
-            "f: keep sharing future thoughts (auto-push publishes them at your next git push)"
+            "f: keep sharing future thoughts (auto-push publishes them at each git push)"
         ));
     }
 
@@ -2539,7 +2564,7 @@ mod tests {
         assert_eq!(
             lines(&bar),
             vec![
-                "Publishing to 'origin' (github.com/acme/repo) is not authorized on this machine yet.",
+                "Publishing to 'origin' (github.com/acme/repo) is not authorized in this clone yet.",
                 "Enter: authorize (you will type a phrase)   Esc: cancel",
             ]
         );
@@ -2561,6 +2586,31 @@ mod tests {
         }
         let all = lines(&wrapped).join(" ");
         assert!(all.contains("cvc push --manual"), "{all}");
+    }
+
+    #[test]
+    fn the_reason_a_platform_cannot_share_survives_whole_on_the_narrowest_bar() {
+        // The reason is what the person is told instead of a phrase to type, and
+        // its end says why the commands it points to are not the same thing: none
+        // of it may be cut off, down to the 60 columns of the smallest terminal
+        // (and the one column the bar keeps free).
+        assert_eq!(
+            NOT_ON_THIS_PLATFORM,
+            "Not available on this platform yet. Use cvc share, cvc unshare or cvc push --manual; on this platform they cannot discard keys typed ahead of the phrase."
+        );
+        for width in [59, 60, 70, 80, 100] {
+            let bar = lines(&blocked_bar(NOT_ON_THIS_PLATFORM, width));
+            assert!(bar.len() <= 3, "{width}: {bar:?}");
+            let said = bar
+                .join(" ")
+                .trim_end()
+                .trim_end_matches("any key: ok")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(said, NOT_ON_THIS_PLATFORM, "{width}: {bar:?}");
+            assert!(bar.last().unwrap().ends_with("any key: ok"), "{width}");
+        }
     }
 
     #[test]
@@ -2601,19 +2651,20 @@ mod tests {
         );
         assert_eq!(
             shared_status(1, "origin", FutureSharePolicy::Shared, true, 0, &U),
-            "1 thought marked shared for remote 'origin'; future thoughts are shared too. Auto-push is on."
+            "1 thought marked shared for remote 'origin'; future thoughts are shared too. Auto-push is on: every git push to 'origin' publishes them."
         );
     }
 
     #[test]
-    fn sharing_a_parent_says_once_that_its_agents_stay_private() {
+    fn sharing_a_parent_says_once_that_its_agents_prompts_and_results_go_with_it() {
         assert_eq!(
             shared_status(27, "origin", FutureSharePolicy::Private, false, 2, &U),
-            "27 thoughts marked shared for remote 'origin'; future thoughts are private. Not published yet (p). 2 agent conversations remain private (→ to see)."
+            "27 thoughts marked shared for remote 'origin'; future thoughts are private. Not published yet (p). 2 agent conversations are not shared, but this session's thoughts include their prompts and results (→ to see)."
         );
         assert!(
-            shared_status(27, "origin", FutureSharePolicy::Private, false, 1, &A)
-                .ends_with(" 1 agent conversation remains private (-> to see).")
+            shared_status(27, "origin", FutureSharePolicy::Private, false, 1, &A).ends_with(
+                " 1 agent conversation is not shared, but this session's thoughts include its prompt and result (-> to see)."
+            )
         );
         assert!(
             !shared_status(27, "origin", FutureSharePolicy::Private, false, 0, &U)
@@ -2688,8 +2739,24 @@ mod tests {
         );
         assert_eq!(
             published_status(&publication(0, 40, [0, 0, 0, 2, 0]), "origin"),
-            "Published to 'origin': the removal of 2 tombstoned thoughts from the current tree."
+            "Published to 'origin': the removal of 2 tombstoned thoughts from the current tree (not erased from history)."
         );
+        // A removal is suppression, not erasure, in each of its forms.
+        for (shape, removal) in [
+            (
+                [0, 1, 0, 1, 2],
+                "1 tombstone and the removal of 1 tombstoned thought and 2 attached records from the current tree",
+            ),
+            (
+                [0, 0, 0, 0, 3],
+                "the removal of 3 records of tombstoned thoughts from the current tree",
+            ),
+        ] {
+            assert_eq!(
+                published_status(&publication(0, 41, shape), "origin"),
+                format!("Published to 'origin': {removal} (not erased from history).")
+            );
+        }
         assert_eq!(
             published_status(&publication(0, 42, [0; 5]), "origin"),
             "Published a format update to 'origin'; no new thoughts, links or tombstones."
@@ -2728,7 +2795,7 @@ mod tests {
         );
         assert_eq!(
             say(FlowKind::Publish, FlowFailure::NotConfirmed),
-            "Not published: the typed phrase did not match. Nothing was sent to 'origin'."
+            "Not published: the typed phrase did not match. Nothing was published to 'origin'."
         );
         assert_eq!(
             say(FlowKind::Authorize, FlowFailure::NotConfirmed),
@@ -2740,7 +2807,7 @@ mod tests {
         );
         assert_eq!(
             say(FlowKind::Unshare, FlowFailure::UnshareBlocked),
-            "Cannot unshare: some of this conversation is already published to 'origin'."
+            "Cannot unshare: some of this conversation is published, or a publish of it did not finish, for 'origin'."
         );
         assert_eq!(
             say(FlowKind::Publish, FlowFailure::ConsentMissing),
@@ -2780,7 +2847,7 @@ mod tests {
         for (inner, ending) in [
             (
                 FlowFailure::NotConfirmed,
-                "Not published: the typed phrase did not match. Nothing was sent to 'origin'.",
+                "Not published: the typed phrase did not match. Nothing was published to 'origin'.",
             ),
             (
                 FlowFailure::ConsentMissing,
@@ -2841,7 +2908,7 @@ mod tests {
         );
         assert_eq!(
             lines[2],
-            "Effect   Marks this conversation's thoughts as shared for 'origin'. Nothing leaves this machine yet."
+            "Effect   Marks this conversation's thoughts as shared for 'origin'. CVC sends nothing to 'origin' yet."
         );
         assert_eq!(lines[3], "Future   Thoughts added later stay private.");
         assert_eq!(lines[4], "         An empty line and Enter cancels.");
@@ -2866,7 +2933,7 @@ mod tests {
             &U,
         );
         assert!(lines[2].ends_with(
-            "Nothing leaves this machine yet. Auto-push is on: your next git push to 'origin' publishes them."
+            "CVC sends nothing to 'origin' yet. Auto-push is on: every git push to 'origin', including one an editor runs, publishes them."
         ));
     }
 
@@ -2883,7 +2950,7 @@ mod tests {
         let publish = banner(FlowKind::Publish, &dest(), None, &U);
         assert_eq!(
             publish[2],
-            "Effect   Sends the shared thoughts to 'origin'. Published thoughts cannot be recalled; secret scrubbing is best-effort."
+            "Effect   Sends the shared thoughts to 'origin', where anyone who can read it can read them. Published thoughts cannot be recalled, and scrubbing can miss secrets."
         );
         assert_eq!(
             publish[3],
@@ -2900,7 +2967,7 @@ mod tests {
         assert!(authorize[0].starts_with("-- cvc: authorize publishing "));
         assert_eq!(
             authorize[2],
-            "Effect   Allows publishing to 'origin' at this exact push URL; you are asked again if the URL changes. Publishes nothing and does not turn on auto-push."
+            "Effect   Allows publishing to 'origin' at this exact push URL; you are asked again if the URL changes. CVC checks only the URL, not who owns the repository or who can read it. Publishes nothing and does not turn on auto-push."
         );
     }
 
@@ -2928,10 +2995,12 @@ mod tests {
             publish_unfinished("origin"),
             "Publish to 'origin' did not complete; the remote may hold some of it. Run: cvc privacy reconcile --remote origin"
         );
-        // Only a typed refusal at the challenge, before anything is pushed, may say so.
+        // Only a typed refusal at the challenge, before anything is pushed, may say
+        // so. (The fetch that comes first did reach the remote, which is why it
+        // says nothing was published and not that nothing was sent.)
         assert!(
             failure_status(FlowKind::Publish, &FlowFailure::NotConfirmed, "origin")
-                .contains("Nothing was sent to 'origin'.")
+                .contains("Nothing was published to 'origin'.")
         );
     }
 
@@ -3068,37 +3137,6 @@ mod tests {
                 imported: true,
             }
         );
-    }
-
-    #[test]
-    fn a_conversation_is_private_exactly_when_its_label_says_so() {
-        let mut future_only = state(5, 0, 0);
-        future_only.share_future = Some(true);
-        let mut private_later_off = state(5, 0, 0);
-        private_later_off.share_future = Some(false);
-        let cases = [
-            state(5, 0, 0),
-            private_later_off,
-            future_only,
-            held(5, 2, 0),
-            held(5, 0, 2),
-            state(5, 3, 3),
-            state(5, 5, 1),
-            state(5, 5, 5),
-        ];
-        let private: Vec<_> = cases.iter().map(is_private).collect();
-        assert_eq!(
-            private,
-            [true, true, false, false, false, false, false, false]
-        );
-        for case in &cases {
-            assert_eq!(
-                is_private(case),
-                label(case).starts_with("○ private"),
-                "{}",
-                label(case)
-            );
-        }
     }
 
     #[test]
@@ -3317,6 +3355,69 @@ mod tests {
     }
 
     #[test]
+    fn the_details_page_says_a_subagents_prompt_and_result_are_part_of_its_parent() {
+        let details = details((29, 0, 29));
+        let summary = details.summary.clone();
+        let subagents = |agents: usize| {
+            let page = details_page(
+                &DetailsInput {
+                    summary: &summary,
+                    details: Some(&details),
+                    lineage: Lineage::None,
+                    agents,
+                    remote: None,
+                },
+                &U,
+            );
+            page_lines(&page)
+                .into_iter()
+                .find(|line| line.starts_with("Subagents"))
+        };
+        assert_eq!(
+            subagents(1).as_deref(),
+            Some(
+                "Subagents: 1 conversation, shared separately; its prompt and result are part of this one"
+            )
+        );
+        assert_eq!(
+            subagents(3).as_deref(),
+            Some(
+                "Subagents: 3 conversations, each shared separately; their prompts and results are part of this one"
+            )
+        );
+        assert_eq!(subagents(0), None);
+    }
+
+    #[test]
+    fn the_details_page_says_auto_push_acts_at_every_push() {
+        let details = details((29, 0, 29));
+        let summary = details.summary.clone();
+        let auto = |on: bool| {
+            let mut remote = overview("origin");
+            remote.auto_push = on;
+            let page = details_page(
+                &DetailsInput {
+                    summary: &summary,
+                    details: Some(&details),
+                    lineage: Lineage::None,
+                    agents: 0,
+                    remote: Some(&remote),
+                },
+                &U,
+            );
+            page_lines(&page)
+                .into_iter()
+                .find(|line| line.starts_with("Auto-push"))
+                .unwrap()
+        };
+        assert_eq!(
+            auto(true),
+            "Auto-push: on: every git push to 'origin' also publishes shared thoughts"
+        );
+        assert_eq!(auto(false), "Auto-push: off");
+    }
+
+    #[test]
     fn the_details_page_for_a_shared_conversation() {
         let details = details((29, 27, 2));
         let mut summary = details.summary.clone();
@@ -3343,7 +3444,7 @@ mod tests {
             "Thoughts: 29",
             "Linked: 26 of 29 thoughts linked to a commit",
             "Context files: 14: src/sync.rs (12), src/db.rs (9), … (+12 more)",
-            "Subagents: 2 conversations, each shared separately",
+            "Subagents: 2 conversations, each shared separately; their prompts and results are part of this one",
             "With 'origin' (fingerprint 8348b79e2c41…)",
             "State: ◐ shared · 6 waiting · 2 private",
             "Future thoughts: private",
@@ -3352,7 +3453,7 @@ mod tests {
             "Auto-push: off",
             "A thought is one recorded step (for Claude Code, one assistant response).",
             "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\".",
-            "Scrubbing is best-effort. Published thoughts cannot be recalled.",
+            "Scrubbing can miss secrets. Published thoughts cannot be recalled.",
         ] {
             assert!(
                 lines
@@ -3527,7 +3628,7 @@ mod tests {
     fn the_help_page_covers_the_pipeline_the_keys_the_states_and_the_cautions() {
         let text = page_lines(&help_page(&U)).join("\n");
         for expected in [
-            "private --s--> shared (on this machine) --p--> published (on the remote)",
+            "private --s--> shared (in this clone) --p--> published (on the remote)",
             "u works only before publish.",
             // `q` closes a page or the remote list first and quits only from
             // the list; `esc` never quits.
@@ -3537,8 +3638,10 @@ mod tests {
             "◐ shared · 2 waiting",
             "● published",
             "+future",
-            "Typing the phrase is your signature. Nothing is shared or published without it.",
-            "Scrubbing and .thoughtignore are best-effort, not a guarantee.",
+            "not shared from this clone for this remote.",
+            "Share, unshare, publish and authorize each wait for their typed phrase; no key does any of them by itself.",
+            "Two standing choices act later without a new phrase: +future shares new thoughts as they are captured, and auto-push (set only with cvc privacy set-auto-push) publishes shared thoughts at every git push to that remote.",
+            "Scrubbing and .thoughtignore can miss secrets; they are not a guarantee.",
             "Counts in the header are this clone's view; publish re-checks the remote first.",
             "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\".",
         ] {
