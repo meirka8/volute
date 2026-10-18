@@ -200,6 +200,16 @@ impl LabelInput {
     }
 }
 
+/// Whether a conversation reads `private` for the selected remote: nothing is
+/// shared from here, the remote holds nothing of it and holds none for certain
+/// or by doubt, and later thoughts are not shared as they are captured. What the
+/// notice after a share counts as "remaining private" is exactly this, so it
+/// cannot call a conversation the remote holds private when the row says
+/// otherwise.
+pub fn is_private(summary: &ConversationSummary) -> bool {
+    LabelInput::of(summary).standing() == Standing::Private
+}
+
 /// The state column for one conversation and the remote it is shown for.
 ///
 /// With S shared, P published among those, H held (published, pending or
@@ -3033,6 +3043,37 @@ mod tests {
                 imported: true,
             }
         );
+    }
+
+    #[test]
+    fn a_conversation_is_private_exactly_when_its_label_says_so() {
+        let mut future_only = state(5, 0, 0);
+        future_only.share_future = Some(true);
+        let mut private_later_off = state(5, 0, 0);
+        private_later_off.share_future = Some(false);
+        let cases = [
+            state(5, 0, 0),
+            private_later_off,
+            future_only,
+            held(5, 2, 0),
+            held(5, 0, 2),
+            state(5, 3, 3),
+            state(5, 5, 1),
+            state(5, 5, 5),
+        ];
+        let private: Vec<_> = cases.iter().map(is_private).collect();
+        assert_eq!(
+            private,
+            [true, true, false, false, false, false, false, false]
+        );
+        for case in &cases {
+            assert_eq!(
+                is_private(case),
+                label(case).starts_with("○ private"),
+                "{}",
+                label(case)
+            );
+        }
     }
 
     #[test]

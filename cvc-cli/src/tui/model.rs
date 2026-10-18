@@ -586,7 +586,10 @@ impl Model {
             .unwrap_or_default()
     }
 
-    /// How many agent conversations listed under `id` are not shared at all.
+    /// How many agent conversations listed under `id` are still private: not
+    /// shared, not held by the remote, and not sharing later thoughts. An agent
+    /// the remote already holds, or one whose later thoughts are shared, is not
+    /// private and is not counted.
     fn private_agents_of(&self, id: &str) -> usize {
         let Some(index) = self.tree.position(id) else {
             return 0;
@@ -596,7 +599,7 @@ impl Model {
             .iter()
             .filter(|&&child| {
                 let summary = &self.tree.entries[child].summary;
-                !summary.imported && summary.shared_count == 0
+                !summary.imported && words::is_private(summary)
             })
             .count()
     }
@@ -2602,6 +2605,49 @@ mod tests {
             },
         });
         assert!(!model.status().unwrap().contains("agent conversation"));
+    }
+
+    #[test]
+    fn an_agent_the_remote_holds_or_shares_later_thoughts_of_is_not_called_private() {
+        let report = |summaries: Vec<ConversationSummary>| {
+            let mut model = model_with(summaries, vec![remote("origin")]);
+            model.report(Report::Shared {
+                id: "session".to_owned(),
+                outcome: ShareOutcome {
+                    snapshot_count: 10,
+                    future: FutureSharePolicy::Private,
+                },
+            });
+            model.status().unwrap().to_owned()
+        };
+        let session = || {
+            let mut summaries = with_agents();
+            summaries[0].shared_count = 10;
+            summaries[0].shared = true;
+            summaries
+        };
+        // Both agents are private: both are counted.
+        assert!(report(session()).ends_with(" 2 agent conversations remain private (→ to see)."));
+
+        // One is held by the remote, shared from nowhere here.
+        let mut summaries = session();
+        summaries[1].held = 3;
+        summaries[1].held_published = 3;
+        assert!(report(summaries).ends_with(" 1 agent conversation remains private (→ to see)."));
+        // Held by a publish that did not conclude: still not private.
+        let mut summaries = session();
+        summaries[1].held = 1;
+        assert!(report(summaries).ends_with(" 1 agent conversation remains private (→ to see)."));
+        // Its later thoughts are shared as they are captured.
+        let mut summaries = session();
+        summaries[2].share_future = Some(true);
+        assert!(report(summaries).ends_with(" 1 agent conversation remains private (→ to see)."));
+        // Neither is private: nothing is mentioned.
+        let mut summaries = session();
+        summaries[1].held = 2;
+        summaries[1].held_published = 2;
+        summaries[2].held = 1;
+        assert!(!report(summaries).contains("agent conversation"));
     }
 
     #[test]
