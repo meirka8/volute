@@ -2331,6 +2331,97 @@ fn test_fetch_and_pull_from_fresh_clone() -> anyhow::Result<()> {
 }
 
 #[test]
+fn a_pulled_conversation_is_imported_and_not_shared_by_the_pull() -> anyhow::Result<()> {
+    // Machine A projects one conversation to a shared remote; machine B, a
+    // fresh clone, pulls it. What B holds is imported, and receiving content
+    // grants B no sharing authority.
+    let temp_dir = TempDir::new()?;
+    let remote_path = temp_dir.path().join("remote");
+    let _remote_repo = Repository::init_bare(&remote_path)?;
+    let local_a_path = temp_dir.path().join("local_a");
+    let repo_a = Repository::clone(remote_path.to_str().expect("Path not UTF-8"), &local_a_path)?;
+    let mut config_a = repo_a.config()?;
+    config_a.set_str("user.name", "User A")?;
+    config_a.set_str("user.email", "a@example.com")?;
+    let store_a = CvcStore::open(local_a_path.join(".git/cvc/index.db"))?;
+    store_a.init()?;
+    let interaction = Interaction {
+        id: InteractionId::new(),
+        conversation_id: "conv-a".to_string(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: "Thought from machine A".to_string(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    };
+    store_a.create_interaction(&interaction)?;
+    project_fixture_to_ref(&repo_a, &store_a, "refs/cvc/main")?;
+    let mut push_callbacks = git2::RemoteCallbacks::new();
+    push_callbacks.credentials(|_, _, _| git2::Cred::default());
+    let mut push_opts = git2::PushOptions::new();
+    push_opts.remote_callbacks(push_callbacks);
+    repo_a
+        .find_remote("origin")?
+        .push(&["refs/cvc/main:refs/cvc/main"], Some(&mut push_opts))?;
+
+    let local_b_path = temp_dir.path().join("local_b");
+    let repo_b = Repository::clone(remote_path.to_str().expect("Path not UTF-8"), &local_b_path)?;
+    let store_b = CvcStore::open(local_b_path.join(".git/cvc/index.db"))?;
+    let destination = cvc_core::privacy::remote_destination(&repo_b, "origin")?;
+    assert_eq!(
+        sync::fetch_and_pull_destination(&repo_b, &store_b, &destination)?,
+        1
+    );
+
+    let summaries = store_b.list_conversation_summaries(Some(&destination.fingerprint), 10)?;
+    assert_eq!(summaries.len(), 1);
+    let imported = &summaries[0];
+    assert!(
+        imported.id.starts_with("remote:") && imported.id.ends_with(":conv-a"),
+        "{}",
+        imported.id
+    );
+    assert!(imported.imported, "{imported:?}");
+    assert_eq!(imported.thoughts, 1);
+    // The pull recorded the interaction as published at its source, but did
+    // not share it from this clone.
+    assert!(!imported.shared);
+    assert_eq!(
+        (
+            imported.shared_count,
+            imported.published,
+            imported.unconfirmed
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(imported.share_future, None);
+    let counts = store_b.destination_publication_counts(&destination.fingerprint)?;
+    assert_eq!(
+        (counts.shared, counts.published, counts.unconfirmed),
+        (0, 0, 0)
+    );
+
+    let details = store_b
+        .conversation_details(&imported.id, Some(&destination.fingerprint))?
+        .expect("the imported conversation exists");
+    assert_eq!(&details.summary, imported);
+    assert_eq!(details.snapshot_count, 1);
+    assert_eq!((details.snapshot_shared, details.snapshot_new), (0, 1));
+    // The publication the pull recorded is what the unshare rule looks at.
+    let check = store_b.can_unshare(&imported.id, &destination.fingerprint)?;
+    assert_eq!((check.published, check.pending, check.unknown), (1, 0, 0));
+
+    // The local capture on machine A is not imported.
+    let local = store_a.list_conversation_summaries(Some(&destination.fingerprint), 10)?;
+    assert_eq!(local.len(), 1);
+    assert!(!local[0].imported);
+    Ok(())
+}
+
+#[test]
 fn test_sync_v2_round_trip() -> anyhow::Result<()> {
     // Round-trip requirement for the sharded v2 layout: push it, pull into a fresh clone, DBs equal.
     let temp_dir = TempDir::new()?;

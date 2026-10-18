@@ -602,3 +602,422 @@ fn share_state_counts_shared_interactions_only_and_honours_the_wildcard() -> any
     assert_eq!(neutral.share_future, None);
     Ok(())
 }
+
+fn capture_with_context(
+    store: &CvcStore,
+    conversation: &str,
+    paths: &[&str],
+) -> anyhow::Result<InteractionId> {
+    let id = InteractionId::new();
+    store.capture_mcp(McpCapture::new(
+        Conversation {
+            id: conversation.into(),
+            title: format!("{conversation} title"),
+            created_at: Utc::now(),
+        },
+        Interaction {
+            id: id.clone(),
+            conversation_id: conversation.into(),
+            parent_id: None,
+            timestamp: Utc::now(),
+            author: Author::Agent,
+            user_prompt: "context".into(),
+            model_name: None,
+            model_cot: None,
+            model_response: None,
+            source_request_id: None,
+        },
+        paths
+            .iter()
+            .map(|path| ContextItem {
+                id: None,
+                interaction_id: id.clone(),
+                file_path: (*path).into(),
+                git_blob_sha: None,
+                dirty_patch: None,
+                start_line: None,
+                end_line: None,
+            })
+            .collect(),
+        Vec::new(),
+        PreparedPolicy::built_ins_only(),
+        "a".repeat(64),
+    ))?;
+    Ok(id)
+}
+
+#[test]
+fn a_conversation_is_imported_only_when_every_interaction_was() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("index.db");
+    let store = CvcStore::open(&path)?;
+    let worktree = "a".repeat(64);
+    let fingerprint = "7".repeat(64);
+    let all = [
+        capture_with_worktree(&store, "all-imported", worktree.clone())?,
+        capture_with_worktree(&store, "all-imported", worktree.clone())?,
+    ];
+    let mixed = [
+        capture_with_worktree(&store, "mixed", worktree.clone())?,
+        capture_with_worktree(&store, "mixed", worktree.clone())?,
+    ];
+    capture_with_worktree(&store, "local-only", worktree.clone())?;
+    let connection = Connection::open(&path)?;
+    // What a pull does to the rows it imports.
+    for id in all.iter().chain(&mixed[..1]) {
+        connection.execute(
+            "UPDATE interactions SET capture_source='sync_import' WHERE id=?1",
+            [id.as_str()],
+        )?;
+    }
+    connection.execute(
+        "INSERT INTO conversations(id, title, created_at) VALUES('empty', 'no interactions', 0)",
+        [],
+    )?;
+
+    for destination in [None, Some(fingerprint.as_str())] {
+        let imported: Vec<_> = store
+            .list_conversation_summaries(destination, 100)?
+            .into_iter()
+            .map(|summary| (summary.id, summary.imported))
+            .collect();
+        for (id, expected) in [
+            ("all-imported", true),
+            ("mixed", false),
+            ("local-only", false),
+            ("empty", false),
+        ] {
+            assert!(
+                imported.contains(&(id.to_string(), expected)),
+                "{id} should be imported={expected}: {imported:?}"
+            );
+        }
+        assert_eq!(imported.len(), 4);
+    }
+    // The detail view reports the same thing.
+    for (id, expected) in [("all-imported", true), ("mixed", false), ("empty", false)] {
+        let details = store.conversation_details(id, None)?.unwrap();
+        assert_eq!(details.summary.imported, expected, "{id}");
+    }
+    Ok(())
+}
+
+#[test]
+fn details_list_the_most_used_paths_and_the_exact_share_snapshot() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("index.db");
+    let store = CvcStore::open(&path)?;
+    let fingerprint = "7".repeat(64);
+    let extras: Vec<String> = (0..14).map(|n| format!("extra/f{n:02}.rs")).collect();
+    let extra_refs: Vec<&str> = extras.iter().map(String::as_str).collect();
+
+    // `src/a.rs` is in three interactions (twice in the first, which counts
+    // once), `src/b.rs` in two, the rest in one each.
+    let first = capture_with_context(
+        &store,
+        "details",
+        &["src/a.rs", "src/a.rs", "src/b.rs", "README.md"],
+    )?;
+    let second = capture_with_context(&store, "details", &["src/a.rs", "src/b.rs"])?;
+    let third = capture_with_context(&store, "details", &["src/a.rs", "docs/x.md", "docs/y.md"])?;
+    let fourth = capture_with_context(&store, "details", &extra_refs)?;
+    capture_with_context(&store, "elsewhere", &["other/only.rs", "src/a.rs"])?;
+    let connection = Connection::open(&path)?;
+    // Rows that must never be listed or counted.
+    connection.execute(
+        "INSERT INTO context_items(interaction_id, file_path) VALUES(?1, '')",
+        [first.as_str()],
+    )?;
+    connection.execute(
+        "INSERT INTO context_items(interaction_id, file_path) VALUES(?1, NULL)",
+        [first.as_str()],
+    )?;
+
+    let details = store
+        .conversation_details("details", Some(&fingerprint))?
+        .expect("the conversation exists");
+    let listed: Vec<_> = details
+        .context_paths
+        .iter()
+        .map(|used| (used.path.as_str(), used.interactions))
+        .collect();
+    // Most used first, then byte order: uppercase sorts before lowercase.
+    assert_eq!(
+        listed,
+        vec![
+            ("src/a.rs", 3),
+            ("src/b.rs", 2),
+            ("README.md", 1),
+            ("docs/x.md", 1),
+            ("docs/y.md", 1),
+            ("extra/f00.rs", 1),
+            ("extra/f01.rs", 1),
+            ("extra/f02.rs", 1),
+            ("extra/f03.rs", 1),
+            ("extra/f04.rs", 1),
+        ]
+    );
+    assert_eq!(
+        details.context_paths.len(),
+        cvc_core::db::CONVERSATION_DETAIL_PATH_LIMIT
+    );
+    assert_eq!(details.context_path_total, 5 + 14, "all distinct paths");
+    assert!(!listed.iter().any(|(path, _)| path.starts_with("other/")));
+
+    // The snapshot is exactly what the share challenge will carry.
+    assert_eq!(
+        details.snapshot_count,
+        store.share_snapshot("details")?.len()
+    );
+    assert_eq!(details.snapshot_count, 4);
+    assert_eq!(details.summary.thoughts, 4);
+    assert_eq!((details.snapshot_shared, details.snapshot_new), (0, 4));
+
+    // Two interactions shared, one of them through the wildcard.
+    connection.execute(
+        "INSERT INTO interaction_shares(interaction_id, remote_fingerprint) VALUES(?1, ?2)",
+        rusqlite::params![second.as_str(), fingerprint.as_str()],
+    )?;
+    connection.execute(
+        "INSERT INTO interaction_shares(interaction_id, remote_fingerprint) VALUES(?1, '*')",
+        [third.as_str()],
+    )?;
+    let details = store
+        .conversation_details("details", Some(&fingerprint))?
+        .unwrap();
+    assert_eq!(
+        details.snapshot_count,
+        store.share_snapshot("details")?.len()
+    );
+    assert_eq!((details.snapshot_shared, details.snapshot_new), (2, 2));
+    // Without a destination nothing is shared.
+    let neutral = store.conversation_details("details", None)?.unwrap();
+    assert_eq!((neutral.snapshot_shared, neutral.snapshot_new), (0, 4));
+    assert_eq!(neutral.summary.share_future, None);
+    let _ = fourth;
+
+    // The summary inside is the row the listing shows.
+    let listed = summary_of(&store, Some(&fingerprint), "details")?;
+    assert_eq!(details.summary, listed);
+    Ok(())
+}
+
+#[test]
+fn details_report_share_future_per_destination_and_handle_missing_and_empty_conversations(
+) -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("index.db");
+    let store = CvcStore::open(&path)?;
+    let fingerprint = "7".repeat(64);
+    let other = "8".repeat(64);
+    capture_with_worktree(&store, "future", "a".repeat(64))?;
+    let share_future = |destination: Option<&str>| -> anyhow::Result<Option<bool>> {
+        Ok(store
+            .conversation_details("future", destination)?
+            .unwrap()
+            .summary
+            .share_future)
+    };
+
+    assert_eq!(share_future(Some(&fingerprint))?, None);
+    let snapshot = store.share_snapshot("future")?;
+    store.share_exact_snapshot(
+        "future",
+        &fingerprint,
+        &snapshot,
+        FutureSharePolicy::Private,
+    )?;
+    assert_eq!(share_future(Some(&fingerprint))?, Some(false));
+    store.share_exact_snapshot("future", &fingerprint, &snapshot, FutureSharePolicy::Shared)?;
+    assert_eq!(share_future(Some(&fingerprint))?, Some(true));
+    // Another destination and no destination decide nothing for this one.
+    assert_eq!(share_future(Some(&other))?, None);
+    assert_eq!(share_future(None)?, None);
+    store.unshare_conversation_for_remote("future", &fingerprint)?;
+    assert_eq!(share_future(Some(&fingerprint))?, Some(false));
+
+    assert!(store.conversation_details("no-such", None)?.is_none());
+
+    Connection::open(&path)?.execute(
+        "INSERT INTO conversations(id, title, created_at) VALUES('empty', 'nothing yet', 42)",
+        [],
+    )?;
+    let empty = store
+        .conversation_details("empty", Some(&fingerprint))?
+        .unwrap();
+    assert_eq!(empty.snapshot_count, store.share_snapshot("empty")?.len());
+    assert_eq!(
+        (
+            empty.snapshot_count,
+            empty.snapshot_shared,
+            empty.snapshot_new
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        (empty.summary.first_activity, empty.summary.last_activity),
+        (42, 42)
+    );
+    assert!(empty.context_paths.is_empty());
+    assert_eq!(empty.context_path_total, 0);
+    Ok(())
+}
+
+#[test]
+fn destination_counts_follow_the_projection_sharing_rule_minus_its_state_filter(
+) -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("index.db");
+    let store = CvcStore::open(&path)?;
+    let fingerprint = "7".repeat(64);
+    let other = "8".repeat(64);
+    let worktree = "a".repeat(64);
+
+    let none = store.destination_publication_counts(&fingerprint)?;
+    assert_eq!(none, Default::default());
+    assert_eq!(none.unpublished(), 0);
+
+    let ids: Vec<_> = (0..8)
+        .map(|n| capture_with_worktree(&store, &format!("c{}", n % 2), worktree.clone()))
+        .collect::<anyhow::Result<_>>()?;
+    let connection = Connection::open(&path)?;
+    let share = |id: &InteractionId, destination: &str| {
+        connection.execute(
+            "INSERT INTO interaction_shares(interaction_id, remote_fingerprint) VALUES(?1, ?2)",
+            rusqlite::params![id.as_str(), destination],
+        )
+    };
+    // ids[0] published; ids[1] pending; ids[2] unknown; ids[3] never attempted;
+    // ids[4] shared through the wildcard and also directly (counted once) and
+    // published; ids[5] shared for another destination only; ids[6] not shared
+    // but published (what a pull records); ids[7] not shared at all.
+    for id in &ids[..4] {
+        share(id, &fingerprint)?;
+    }
+    share(&ids[4], "*")?;
+    share(&ids[4], &fingerprint)?;
+    share(&ids[5], &other)?;
+    store.mark_publication(&ids[..1], &fingerprint, PublicationState::Published)?;
+    store.mark_publication(&ids[1..2], &fingerprint, PublicationState::Pending)?;
+    store.mark_publication(&ids[2..3], &fingerprint, PublicationState::Unknown)?;
+    store.mark_publication(&ids[4..5], &fingerprint, PublicationState::Published)?;
+    store.mark_publication(&ids[5..6], &other, PublicationState::Published)?;
+    store.mark_publication(&ids[6..7], &fingerprint, PublicationState::Published)?;
+
+    let counts = store.destination_publication_counts(&fingerprint)?;
+    assert_eq!(counts.shared, 5, "ids 0-4, ids[4] counted once");
+    assert_eq!(counts.published, 2, "ids[6] is published but not shared");
+    assert_eq!(counts.unconfirmed, 2, "pending and unknown");
+    assert_eq!(
+        counts.unpublished(),
+        3,
+        "pending, unknown and never attempted"
+    );
+
+    // It is the projection's sharing set, with the state filter taken off:
+    // the projection leaves out only what is `unknown`.
+    let projected = store.projection_interaction_ids(&fingerprint)?.len() as i64;
+    assert_eq!(counts.shared, projected + 1);
+
+    // The summaries add up to the same totals.
+    let summaries = store.list_conversation_summaries(Some(&fingerprint), 10)?;
+    assert_eq!(
+        summaries.iter().map(|s| s.shared_count).sum::<i64>(),
+        counts.shared
+    );
+    assert_eq!(
+        summaries.iter().map(|s| s.published).sum::<i64>(),
+        counts.published
+    );
+    assert_eq!(
+        summaries.iter().map(|s| s.unconfirmed).sum::<i64>(),
+        counts.unconfirmed
+    );
+
+    // A destination sees its own shares and the wildcard, nobody else's.
+    let elsewhere = store.destination_publication_counts(&other)?;
+    assert_eq!((elsewhere.shared, elsewhere.published), (2, 1));
+    // Everything published: nothing is left to publish.
+    store.mark_publication(&ids[..4], &fingerprint, PublicationState::Published)?;
+    let done = store.destination_publication_counts(&fingerprint)?;
+    assert_eq!((done.shared, done.published, done.unconfirmed), (5, 5, 0));
+    assert_eq!(done.unpublished(), 0);
+    Ok(())
+}
+
+#[test]
+fn can_unshare_applies_exactly_the_rule_unshare_enforces() -> anyhow::Result<()> {
+    let store = CvcStore::open(":memory:")?;
+    let fingerprint = "7".repeat(64);
+    let other = "8".repeat(64);
+    let worktree = "a".repeat(64);
+
+    // For each publication state: the check must predict the refusal, and a
+    // refused unshare must change nothing.
+    for (conversation, state) in [
+        ("none", None),
+        ("pending", Some(PublicationState::Pending)),
+        ("published", Some(PublicationState::Published)),
+        ("unknown", Some(PublicationState::Unknown)),
+    ] {
+        let first = capture_with_worktree(&store, conversation, worktree.clone())?;
+        capture_with_worktree(&store, conversation, worktree.clone())?;
+        let snapshot = store.share_snapshot(conversation)?;
+        store.share_exact_snapshot(
+            conversation,
+            &fingerprint,
+            &snapshot,
+            FutureSharePolicy::Private,
+        )?;
+        if let Some(state) = state {
+            store.mark_publication(std::slice::from_ref(&first), &fingerprint, state)?;
+        }
+        // Another destination's publication never blocks this one.
+        store.mark_publication(
+            std::slice::from_ref(&first),
+            &other,
+            PublicationState::Published,
+        )?;
+
+        let check = store.can_unshare(conversation, &fingerprint)?;
+        let expected = match state {
+            None => (0, 0, 0),
+            Some(PublicationState::Published) => (1, 0, 0),
+            Some(PublicationState::Pending) => (0, 1, 0),
+            Some(PublicationState::Unknown) => (0, 0, 1),
+        };
+        assert_eq!(
+            (check.published, check.pending, check.unknown),
+            expected,
+            "{conversation}"
+        );
+        assert_eq!(check.is_allowed(), state.is_none(), "{conversation}");
+
+        let shared_before = summary_of(&store, Some(&fingerprint), conversation)?.shared_count;
+        let outcome = store.unshare_conversation_for_remote(conversation, &fingerprint);
+        assert_eq!(outcome.is_ok(), check.is_allowed(), "{conversation}");
+        let shared_after = summary_of(&store, Some(&fingerprint), conversation)?.shared_count;
+        if check.is_allowed() {
+            assert_eq!(outcome?, 2);
+            assert_eq!(shared_after, 0);
+        } else {
+            assert_eq!(shared_after, shared_before, "a refusal changes nothing");
+        }
+        // The check itself never changes anything either.
+        store.can_unshare(conversation, &fingerprint)?;
+    }
+
+    // Counts are per state across the conversation's interactions.
+    let mixed: Vec<_> = (0..4)
+        .map(|_| capture_with_worktree(&store, "mixed", worktree.clone()))
+        .collect::<anyhow::Result<_>>()?;
+    store.mark_publication(&mixed[..2], &fingerprint, PublicationState::Published)?;
+    store.mark_publication(&mixed[2..3], &fingerprint, PublicationState::Pending)?;
+    store.mark_publication(&mixed[3..], &fingerprint, PublicationState::Unknown)?;
+    let check = store.can_unshare("mixed", &fingerprint)?;
+    assert_eq!((check.published, check.pending, check.unknown), (2, 1, 1));
+    assert_eq!(check.blocked(), 4);
+    // An unknown conversation has nothing to block it.
+    assert!(store.can_unshare("no-such", &fingerprint)?.is_allowed());
+    Ok(())
+}
