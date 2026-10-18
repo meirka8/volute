@@ -277,17 +277,31 @@ impl Canvas<'_> {
         // Second line: publishing on the left, what waits on the right.
         let y = y + 1;
         let mut rights: Vec<&str> = header.waiting.iter().map(String::as_str).collect();
+        let has_count = !rights.is_empty();
         rights.push("");
-        let chosen = header.publishing.iter().find_map(|left| {
-            let left_width: usize = left.iter().map(|seg| text::width(&seg.text)).sum();
-            rights
-                .iter()
-                .find(|right| {
-                    let gap = if right.is_empty() { 0 } else { GAP };
-                    left_width + gap + text::width(right) <= width
-                })
-                .map(|right| (left, *right))
-        });
+        let shortest = header.publishing.len().saturating_sub(1);
+        let chosen = header
+            .publishing
+            .iter()
+            .enumerate()
+            .find_map(|(index, left)| {
+                let left_width: usize = left.iter().map(|seg| text::width(&seg.text)).sum();
+                // A form is shown without the count only when it warns (auto-push is
+                // on: the warning is kept whole, count or no count) or is the
+                // shortest there is. A quiet form that has no room for the count is
+                // shortened first: the count shortens before it goes.
+                let may_stand_alone = !has_count
+                    || index == shortest
+                    || left.iter().any(|seg| seg.emph == Emph::Loud);
+                rights
+                    .iter()
+                    .filter(|right| may_stand_alone || !right.is_empty())
+                    .find(|right| {
+                        let gap = if right.is_empty() { 0 } else { GAP };
+                        left_width + gap + text::width(right) <= width
+                    })
+                    .map(|right| (left, *right))
+            });
         match chosen {
             Some((left, right)) => {
                 self.segs(area.x, y, left, width);
@@ -930,7 +944,7 @@ mod tests {
             "{}",
             lines[0]
         );
-        assert!(lines[1].starts_with("publishing: authorized by you   auto-push: off"));
+        assert!(lines[1].starts_with("publishing: authorized in this clone   auto-push: off"));
         assert!(
             lines[1].ends_with("2 shared thoughts waiting to publish"),
             "{}",
@@ -943,7 +957,7 @@ mod tests {
     fn auto_push_on_is_the_only_bold_loud_text_of_the_header() {
         let mut origin = remote("origin");
         origin.auto_push = true;
-        let model = model_of(conversations(), vec![origin], (110, 30), Glyphs::UNICODE);
+        let model = model_of(conversations(), vec![origin], (120, 30), Glyphs::UNICODE);
         let (terminal, lines) = screen_of(&model, Glyphs::UNICODE, COLOR);
         // Not the next push only: every push, and the line says so as long as it
         // can be made to fit.
@@ -1021,6 +1035,68 @@ mod tests {
             "{}",
             lines[1]
         );
+    }
+
+    #[test]
+    fn a_quiet_publishing_line_is_shortened_before_the_waiting_count_goes() {
+        let mut model = full_model();
+        // Room for the long line and the shortest count: both.
+        model.set_size(64, 30);
+        let lines = rendered(&model);
+        assert!(
+            lines[1].starts_with("publishing: authorized in this clone   auto-push: off"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[1].ends_with("2 waiting"), "{}", lines[1]);
+        // A column less and the line is shortened, not the count, which is as long
+        // as the room left allows.
+        for (width, count) in [(63, "2 waiting to publish"), (60, "2 waiting")] {
+            model.set_size(width, 30);
+            let lines = rendered(&model);
+            assert!(
+                lines[1].starts_with("publishing: authorized   auto-push: off"),
+                "{width}: {}",
+                lines[1]
+            );
+            assert!(lines[1].ends_with(count), "{width}: {}", lines[1]);
+        }
+
+        // The same for a remote that is not authorized yet.
+        let mut unauthorized = remote("origin");
+        unauthorized.sharing_consented = false;
+        let model = model_of(
+            conversations(),
+            vec![unauthorized],
+            (70, 30),
+            Glyphs::UNICODE,
+        );
+        let lines = rendered(&model);
+        assert!(
+            lines[1].starts_with("publishing: not authorized yet  "),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[1].ends_with("2 shared thoughts waiting to publish"),
+            "{}",
+            lines[1]
+        );
+
+        // A warning is the other way round: auto-push on is kept whole, count or
+        // no count (see the test of the warning above), down to its last form.
+        let mut origin = remote("origin");
+        origin.auto_push = true;
+        let model = model_of(conversations(), vec![origin], (118, 30), Glyphs::UNICODE);
+        let lines = rendered(&model);
+        assert!(
+            lines[1].contains(
+                "auto-push: ON - every git push to this remote also publishes shared thoughts"
+            ),
+            "{}",
+            lines[1]
+        );
+        assert!(!lines[1].contains("waiting"), "{}", lines[1]);
     }
 
     #[test]
@@ -1795,6 +1871,33 @@ mod tests {
         }
     }
 
+    /// What is on screen as plain words: the box around a page and the way its
+    /// lines were wrapped do not matter to what it says.
+    fn words_in(lines: &[String]) -> String {
+        dump(lines)
+            .replace('│', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Scrolls the open page to its top and then down a line at a time until
+    /// `needle` (in plain words) is on screen; whether it ever was.
+    fn page_shows(model: &mut Model, needle: &str) -> bool {
+        model.handle_key(key(KeyCode::Home));
+        for _ in 0..200 {
+            if words_in(&rendered(model)).contains(needle) {
+                return true;
+            }
+            let before = words_in(&rendered(model));
+            model.handle_key(key(KeyCode::Down));
+            if words_in(&rendered(model)) == before {
+                break;
+            }
+        }
+        false
+    }
+
     #[test]
     fn the_help_page_fits_and_scrolls() {
         let mut model = full_model();
@@ -1805,24 +1908,46 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("u works only before publish."));
-        // On a tall terminal the whole page is in view, with what it says about
-        // consent: no key does it alone, and two choices act later.
-        model.set_size(100, 60);
-        let text = dump(&rendered(&model));
+
+        // The page is longer than a window: everything it says is reached by
+        // scrolling, the legend and what it says about consent among it.
         for expected in [
-            "Share, unshare, publish and authorize each wait for their typed phrase; no key does any of them",
-            "by itself.",
-            "Two standing choices act later without a new phrase: +future shares new thoughts as they are",
-            "captured, and auto-push (set only with cvc privacy set-auto-push) publishes shared thoughts at",
-            "every git push to that remote.",
+            "○ private: not shared from this clone for this remote, and the remote holds none of it.",
+            "◐ shared · future only: nothing shared yet; later thoughts are shared as they are captured.",
+            "● published · not shared here: the remote already holds it, and this clone has no share for it.",
+            "? unconfirmed · not shared here: a publish of it may have reached the remote; cvc privacy reconcile settles that.",
+            "Share, unshare, publish and authorize each wait for their typed phrase; no key does any of them by itself.",
+            "Two standing choices act later without a new phrase: +future shares new thoughts as they are captured, and auto-push (set with cvc privacy set-auto-push, never from this view) publishes shared thoughts at every git push to that remote.",
             "Scrubbing and .thoughtignore can miss secrets; they are not a guarantee.",
+            "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\".",
         ] {
-            assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+            assert!(page_shows(&mut model, expected), "never on screen: {expected:?}");
         }
+
+        // The same at the smallest window, and End goes to the end.
         model.set_size(60, 12);
+        for expected in [
+            "? unconfirmed · not shared here: a publish of it may have reached the remote; cvc privacy reconcile settles that.",
+            "Two standing choices act later without a new phrase: +future shares new thoughts as they are captured, and auto-push (set with cvc privacy set-auto-push, never from this view) publishes shared thoughts at every git push to that remote.",
+        ] {
+            assert!(page_shows(&mut model, expected), "never on screen at 60x12: {expected:?}");
+        }
         model.handle_key(key(KeyCode::End));
         let text = dump(&rendered(&model));
         assert!(text.contains("\"interactions\""), "{text}");
+
+        // On a tall terminal the whole page is in view at once.
+        model.set_size(100, 90);
+        let words = words_in(&rendered(&model));
+        for expected in [
+            "Help",
+            "private --s--> shared (in this clone) --p--> published (on the remote)",
+            "? unconfirmed · not shared here:",
+            "no key does any of them by itself.",
+            "\"interactions\".",
+        ] {
+            assert!(words.contains(expected), "missing {expected:?} in\n{words}");
+        }
     }
 
     // ----- sizes -----

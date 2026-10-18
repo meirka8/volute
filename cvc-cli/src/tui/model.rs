@@ -2619,7 +2619,7 @@ mod tests {
         let status = model.status().unwrap();
         assert!(
             status.ends_with(
-                " 2 agent conversations are not shared, but this session's thoughts include their prompts and results (→ to see)."
+                " 2 agent conversations are not shared from here, but this session's thoughts include their prompts and results (→ to see)."
             ),
             "{status}"
         );
@@ -2636,7 +2636,7 @@ mod tests {
             },
         });
         assert!(model.status().unwrap().ends_with(
-            " 1 agent conversation is not shared, but this session's thoughts include its prompt and result (→ to see)."
+            " 1 agent conversation is not shared from here, but this session's thoughts include its prompt and result (→ to see)."
         ));
         // Sharing an agent mentions none.
         model.report(Report::Shared {
@@ -2668,8 +2668,8 @@ mod tests {
             summaries[0].shared = true;
             summaries
         };
-        const TWO: &str = " 2 agent conversations are not shared, but this session's thoughts include their prompts and results (→ to see).";
-        const ONE: &str = " 1 agent conversation is not shared, but this session's thoughts include its prompt and result (→ to see).";
+        const TWO: &str = " 2 agent conversations are not shared from here, but this session's thoughts include their prompts and results (→ to see).";
+        const ONE: &str = " 1 agent conversation is not shared from here, but this session's thoughts include its prompt and result (→ to see).";
         assert!(report(session()).ends_with(TWO));
 
         // The parent's thoughts carry each agent's prompt and result, so it does

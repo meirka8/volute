@@ -101,6 +101,9 @@ pub struct LabelInput {
     pub shared: i64,
     /// Of the shared thoughts, those the remote is known to hold (P).
     pub published: i64,
+    /// Of the shared thoughts, those whose publication is uncertain: a push that
+    /// began without concluding, or failed ambiguously (U).
+    pub unconfirmed: i64,
     /// Thoughts the remote holds or may hold (published, pending or unknown),
     /// whether or not they are shared from here (H). A row is never labeled
     /// `private` while this is above zero.
@@ -154,6 +157,7 @@ impl LabelInput {
             thoughts: summary.thoughts,
             shared: summary.shared_count,
             published: summary.published,
+            unconfirmed: summary.unconfirmed,
             held: summary.held,
             held_published: summary.held_published,
             future: summary.share_future == Some(true),
@@ -164,6 +168,23 @@ impl LabelInput {
     /// Shared thoughts the remote does not hold yet (W).
     fn waiting(&self) -> i64 {
         self.shared - self.published
+    }
+
+    /// Thoughts the remote holds or may hold that are not shared from here (N):
+    /// the held ones less those of them that are shared, which are the
+    /// published and the unconfirmed ones. Beside a share this is what the
+    /// `not shared here` tail counts; with nothing shared it is all of H.
+    fn held_unshared(&self) -> i64 {
+        // Never more than the thoughts that are not shared, whatever the numbers
+        // say, so that shared, held and private always add up to the thoughts.
+        (self.held - self.published - self.unconfirmed)
+            .clamp(0, (self.thoughts - self.shared).max(0))
+    }
+
+    /// Thoughts that are neither shared nor held by the remote: what `private`
+    /// counts, and nothing else (T - S - N).
+    fn private_thoughts(&self) -> i64 {
+        (self.thoughts - self.shared - self.held_unshared()).max(0)
     }
 
     fn standing(&self) -> Standing {
@@ -208,9 +229,11 @@ impl LabelInput {
 /// - S = 0 and H = 0 reads `private`. A conversation whose later thoughts are
 ///   shared as they are captured reads `shared · future only` instead.
 /// - Anything shared but not yet published reads `shared` with W `waiting`;
-///   everything shared and published reads `published`. Thoughts that are not
-///   shared are counted in a `private` tail whenever any are shared, so
-///   `private` never stands alone for a conversation with a published thought.
+///   everything shared and published reads `published`. Whenever any are
+///   shared, the thoughts that are not shared are counted in tails, apart:
+///   those the remote holds anyway as `N not shared here`, and those it holds
+///   none of as `M private`. So `private` counts only what the remote does not
+///   hold, and never stands alone for a conversation with a published thought.
 /// - S = 0 and H > 0, which is what a re-ingested session reads (the remote
 ///   holds it, nobody here shared it), reads `published · not shared here` when
 ///   the remote is known to hold some of it, and `unconfirmed · not shared
@@ -237,7 +260,6 @@ fn label_of(input: &LabelInput, has_destination: bool, g: &Glyphs) -> (String, T
         return (g.dash().to_owned(), Tone::Neutral);
     }
     let waiting = input.waiting();
-    let private_tail = input.thoughts - input.shared;
     let dot = g.dot();
     let standing = input.standing();
     let mut label = match standing {
@@ -252,8 +274,18 @@ fn label_of(input: &LabelInput, has_destination: bool, g: &Glyphs) -> (String, T
         Standing::Waiting => format!("{} shared {dot} {waiting} waiting", g.waiting()),
         Standing::Published => format!("{} published", g.published()),
     };
-    if input.shared > 0 && private_tail > 0 {
-        label.push_str(&format!(" {dot} {private_tail} private"));
+    // Beside a share, the thoughts that are not shared are told apart: those the
+    // remote holds anyway, and those it holds none of, which are the private
+    // ones. `private` counts nothing the remote holds.
+    if input.shared > 0 {
+        let held_unshared = input.held_unshared();
+        if held_unshared > 0 {
+            label.push_str(&format!(" {dot} {held_unshared} not shared here"));
+        }
+        let private = input.private_thoughts();
+        if private > 0 {
+            label.push_str(&format!(" {dot} {private} private"));
+        }
     }
     // `future only` already says it.
     if input.future && standing != Standing::FutureOnly {
@@ -522,7 +554,7 @@ fn publishing_line(overview: &RemoteOverview) -> Vec<Vec<Seg>> {
         // sentence.
         return vec![
             vec![
-                Seg::plain("publishing: authorized by you   "),
+                Seg::plain("publishing: authorized in this clone   "),
                 Seg::loud(
                     "auto-push: ON - every git push to this remote also publishes shared thoughts",
                 ),
@@ -538,7 +570,11 @@ fn publishing_line(overview: &RemoteOverview) -> Vec<Vec<Seg>> {
         ];
     }
     vec![
-        vec![Seg::plain("publishing: authorized by you   auto-push: off")],
+        vec![Seg::plain(
+            "publishing: authorized in this clone   auto-push: off",
+        )],
+        // For a terminal that has room for the state but not for its long form.
+        vec![Seg::plain("publishing: authorized   auto-push: off")],
         vec![Seg::plain("publishing: authorized")],
     ]
 }
@@ -1105,12 +1141,12 @@ pub fn shared_status(
         let n = unshared_agents as i64;
         said.push_str(&if n == 1 {
             format!(
-                " 1 agent conversation is not shared, but this session's thoughts include its prompt and result ({} to see).",
+                " 1 agent conversation is not shared from here, but this session's thoughts include its prompt and result ({} to see).",
                 g.right()
             )
         } else {
             format!(
-                " {n} agent conversations are not shared, but this session's thoughts include their prompts and results ({} to see).",
+                " {n} agent conversations are not shared from here, but this session's thoughts include their prompts and results ({} to see).",
                 g.right()
             )
         });
@@ -1826,7 +1862,7 @@ pub fn help_page(g: &Glyphs) -> Vec<Page> {
         Page::Heading("States".to_owned()),
         state(
             format!("{} private", g.private()),
-            "not shared from this clone for this remote.",
+            "not shared from this clone for this remote, and the remote holds none of it.",
         ),
         state(
             format!("{} shared {dot} 2 waiting", g.waiting()),
@@ -1837,8 +1873,24 @@ pub fn help_page(g: &Glyphs) -> Vec<Page> {
             "everything shared is published.",
         ),
         state(
+            format!("{} shared {dot} future only", g.waiting()),
+            "nothing shared yet; later thoughts are shared as they are captured.",
+        ),
+        state(
+            format!("{} published {dot} not shared here", g.published()),
+            "the remote already holds it, and this clone has no share for it.",
+        ),
+        state(
+            format!("{} unconfirmed {dot} not shared here", g.unconfirmed()),
+            "a publish of it may have reached the remote; cvc privacy reconcile settles that.",
+        ),
+        state(
+            format!("{dot} 3 not shared here"),
+            "3 more thoughts of a shared conversation that the remote holds but this clone does not share.",
+        ),
+        state(
             format!("{dot} 3 private"),
-            "thoughts added after the share, still private.",
+            "3 more thoughts of a shared conversation that are not shared from here and that the remote holds none of.",
         ),
         state(
             "+future".to_owned(),
@@ -1851,7 +1903,7 @@ pub fn help_page(g: &Glyphs) -> Vec<Page> {
                 .to_owned(),
         ),
         Page::Text(
-            "Two standing choices act later without a new phrase: +future shares new thoughts as they are captured, and auto-push (set only with cvc privacy set-auto-push) publishes shared thoughts at every git push to that remote."
+            "Two standing choices act later without a new phrase: +future shares new thoughts as they are captured, and auto-push (set with cvc privacy set-auto-push, never from this view) publishes shared thoughts at every git push to that remote."
                 .to_owned(),
         ),
         Page::Text(
@@ -1978,6 +2030,9 @@ mod tests {
         s.shared_count = shared;
         s.shared = shared > 0;
         s.published = published;
+        // What a shared thought has published is held by the remote.
+        s.held = published;
+        s.held_published = published;
         s
     }
 
@@ -2011,6 +2066,105 @@ mod tests {
             label(&state(27, 21, 19)),
             "◐ shared · 2 waiting · 6 private"
         );
+    }
+
+    /// A conversation of `thoughts` thoughts, `shared` of them shared, of which
+    /// `published` are published and `unconfirmed` are uncertain, and
+    /// `held_unshared` more that the remote holds with no share from here.
+    fn beside_a_share(
+        thoughts: i64,
+        shared: i64,
+        published: i64,
+        unconfirmed: i64,
+        held_unshared: i64,
+    ) -> ConversationSummary {
+        let mut s = state(thoughts, shared, published);
+        s.unconfirmed = unconfirmed;
+        s.held = published + unconfirmed + held_unshared;
+        s.held_published = published + held_unshared;
+        s
+    }
+
+    #[test]
+    fn thoughts_the_remote_holds_beside_a_share_are_not_counted_as_private() {
+        // 27 thoughts, 21 shared and 19 of those published; of the 6 that are
+        // not shared, 4 are held by the remote all the same.
+        let s = beside_a_share(27, 21, 19, 0, 4);
+        assert_eq!(
+            label(&s),
+            "◐ shared · 2 waiting · 4 not shared here · 2 private"
+        );
+        assert_eq!(
+            state_label(&s, true, &A).0,
+            "~ shared - 2 waiting - 4 not shared here - 2 private"
+        );
+        // All 6 held: nothing is private. None held: all 6 are, as ever.
+        assert_eq!(
+            label(&beside_a_share(27, 21, 21, 0, 6)),
+            "● published · 6 not shared here"
+        );
+        assert_eq!(
+            label(&beside_a_share(27, 21, 21, 0, 0)),
+            "● published · 6 private"
+        );
+        // Held by a shared thought whose publish did not conclude is not
+        // "not shared here": it is shared, and counted with the shared ones.
+        assert_eq!(
+            label(&beside_a_share(10, 4, 1, 2, 3)),
+            "◐ shared · 3 waiting · 3 not shared here · 3 private"
+        );
+        // `+future` follows the tails.
+        let mut s = beside_a_share(27, 21, 21, 0, 4);
+        s.share_future = Some(true);
+        assert_eq!(
+            label(&s),
+            "● published · 4 not shared here · 2 private +future"
+        );
+        // The tone follows the shared ones, as ever.
+        assert_eq!(state_label(&s, true, &U).1, Tone::Published);
+        // Numbers that cannot be (more held than there are thoughts not shared)
+        // never make the tails add up to more than the thoughts.
+        let mut odd = beside_a_share(5, 5, 3, 0, 0);
+        odd.held = 9;
+        assert_eq!(label(&odd), "◐ shared · 2 waiting");
+    }
+
+    #[test]
+    fn private_counts_exactly_the_thoughts_the_remote_holds_none_of() {
+        for thoughts in 1..=5 {
+            for shared in 1..=thoughts {
+                for published in 0..=shared {
+                    for unconfirmed in 0..=(shared - published) {
+                        for held_unshared in 0..=(thoughts - shared) {
+                            let summary = beside_a_share(
+                                thoughts,
+                                shared,
+                                published,
+                                unconfirmed,
+                                held_unshared,
+                            );
+                            let private = thoughts - shared - held_unshared;
+                            let mut tails = String::new();
+                            if held_unshared > 0 {
+                                tails.push_str(&format!(" · {held_unshared} not shared here"));
+                            }
+                            if private > 0 {
+                                tails.push_str(&format!(" · {private} private"));
+                            }
+                            let said = label(&summary);
+                            assert!(
+                                said.ends_with(&tails),
+                                "{thoughts} thoughts, {shared} shared, {published} published, {unconfirmed} unconfirmed, {held_unshared} held: {said:?} should end with {tails:?}"
+                            );
+                            // The label before the tails has none of them in it.
+                            let head = &said[..said.len() - tails.len()];
+                            assert!(!head.contains("not shared here"), "{said:?}");
+                            assert!(!head.contains("private"), "{said:?}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2197,9 +2351,13 @@ mod tests {
         );
         assert_eq!(
             first(&h.publishing[0]),
-            "publishing: authorized by you   auto-push: off"
+            "publishing: authorized in this clone   auto-push: off"
         );
-        assert_eq!(first(&h.publishing[1]), "publishing: authorized");
+        assert_eq!(
+            first(&h.publishing[1]),
+            "publishing: authorized   auto-push: off"
+        );
+        assert_eq!(first(&h.publishing[2]), "publishing: authorized");
         assert_eq!(h.waiting[0], "2 shared thoughts waiting to publish");
         assert_eq!(h.waiting[1], "2 waiting to publish");
     }
@@ -2230,7 +2388,7 @@ mod tests {
         let h = header_of(&RemoteView::Usable(&overview), Some(3));
         assert_eq!(
             first(&h.publishing[0]),
-            "publishing: authorized by you   auto-push: ON - every git push to this remote also publishes shared thoughts"
+            "publishing: authorized in this clone   auto-push: ON - every git push to this remote also publishes shared thoughts"
         );
         let loud: Vec<_> = h.publishing[0]
             .iter()
@@ -2678,11 +2836,11 @@ mod tests {
     fn sharing_a_parent_says_once_that_its_agents_prompts_and_results_go_with_it() {
         assert_eq!(
             shared_status(27, "origin", FutureSharePolicy::Private, false, 2, &U),
-            "27 thoughts marked shared for remote 'origin'; future thoughts are private. Not published yet (p). 2 agent conversations are not shared, but this session's thoughts include their prompts and results (→ to see)."
+            "27 thoughts marked shared for remote 'origin'; future thoughts are private. Not published yet (p). 2 agent conversations are not shared from here, but this session's thoughts include their prompts and results (→ to see)."
         );
         assert!(
             shared_status(27, "origin", FutureSharePolicy::Private, false, 1, &A).ends_with(
-                " 1 agent conversation is not shared, but this session's thoughts include its prompt and result (-> to see)."
+                " 1 agent conversation is not shared from here, but this session's thoughts include its prompt and result (-> to see)."
             )
         );
         assert!(
@@ -3156,6 +3314,7 @@ mod tests {
             thoughts: 5,
             shared: 0,
             published: 0,
+            unconfirmed: 0,
             held: 2,
             held_published: 1,
             future: false,
@@ -3188,6 +3347,7 @@ mod tests {
         let shared = LabelInput {
             shared: 5,
             published: 3,
+            unconfirmed: 1,
             held: 4,
             ..input
         };
@@ -3203,6 +3363,7 @@ mod tests {
         let mut summary = state(5, 2, 1);
         summary.imported = true;
         summary.share_future = Some(true);
+        summary.unconfirmed = 1;
         summary.held = 4;
         summary.held_published = 3;
         assert_eq!(
@@ -3211,6 +3372,7 @@ mod tests {
                 thoughts: 5,
                 shared: 2,
                 published: 1,
+                unconfirmed: 1,
                 held: 4,
                 held_published: 3,
                 future: true,
@@ -3714,13 +3876,18 @@ mod tests {
             // the list; `esc` never quits.
             "close a bar, a page or the remote list",
             "close a page or the remote list; quit from the list",
-            "○ private",
+            // What private means is what the label means by it.
+            "○ private: not shared from this clone for this remote, and the remote holds none of it.",
             "◐ shared · 2 waiting",
-            "● published",
+            "● published: everything shared is published.",
+            "◐ shared · future only: nothing shared yet; later thoughts are shared as they are captured.",
+            "● published · not shared here: the remote already holds it, and this clone has no share for it.",
+            "? unconfirmed · not shared here: a publish of it may have reached the remote; cvc privacy reconcile settles that.",
+            "· 3 not shared here: 3 more thoughts of a shared conversation that the remote holds but this clone does not share.",
+            "· 3 private: 3 more thoughts of a shared conversation that are not shared from here and that the remote holds none of.",
             "+future",
-            "not shared from this clone for this remote.",
             "Share, unshare, publish and authorize each wait for their typed phrase; no key does any of them by itself.",
-            "Two standing choices act later without a new phrase: +future shares new thoughts as they are captured, and auto-push (set only with cvc privacy set-auto-push) publishes shared thoughts at every git push to that remote.",
+            "Two standing choices act later without a new phrase: +future shares new thoughts as they are captured, and auto-push (set with cvc privacy set-auto-push, never from this view) publishes shared thoughts at every git push to that remote.",
             "Scrubbing and .thoughtignore can miss secrets; they are not a guarantee.",
             "Counts in the header are this clone's view; publish re-checks the remote first.",
             "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\".",

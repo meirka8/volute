@@ -400,7 +400,7 @@ fn an_authorization_is_recorded_only_by_its_phrase() {
     view.wait_for("Publishing to 'origin' is now authorized. Auto-push stays off.");
     assert!(is_authorized(&fixture, "origin"));
     assert!(!auto_push_is_on(&fixture, "origin"));
-    view.wait_for("publishing: authorized by you auto-push: off");
+    view.wait_for("publishing: authorized in this clone auto-push: off");
 
     // It authorizes and stops there: nothing is shared, nothing is asked next.
     view.wait_quietly(Duration::from_millis(700));

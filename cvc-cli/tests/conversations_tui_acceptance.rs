@@ -506,7 +506,7 @@ fn changing_the_remote_changes_every_state_column_and_the_consent_line() {
     let screen = view.flat();
     assert!(screen.contains("remote: origin"), "{screen}");
     assert!(
-        screen.contains("publishing: authorized by you auto-push: off"),
+        screen.contains("publishing: authorized in this clone auto-push: off"),
         "{screen}"
     );
     assert!(
@@ -567,7 +567,7 @@ fn changing_the_remote_changes_every_state_column_and_the_consent_line() {
     pick_remote(&mut view, &[Key::Up, Key::Up], "mirror");
     let screen = view.flat();
     assert!(
-        screen.contains("publishing: authorized by you auto-push: off"),
+        screen.contains("publishing: authorized in this clone auto-push: off"),
         "{screen}"
     );
     assert_eq!(
@@ -628,7 +628,7 @@ fn the_remote_flag_chooses_where_the_view_starts() {
     pick_remote(&mut view, &[], "origin");
     assert!(view
         .flat()
-        .contains("publishing: authorized by you auto-push: off"));
+        .contains("publishing: authorized in this clone auto-push: off"));
     assert!(view.quit().success());
     assert_terminal_restored(&view.session);
     assert_eq!(view.prompts_so_far(), 0);
@@ -696,7 +696,7 @@ fn a_remote_without_consent_offers_authorization_and_cannot_share_or_publish() {
     view.wait_for("Publishing to 'second' is now authorized. Auto-push stays off.");
     assert!(is_authorized(&fixture, "second"));
     assert!(!auto_push_is_on(&fixture, "second"));
-    view.wait_for("publishing: authorized by you auto-push: off");
+    view.wait_for("publishing: authorized in this clone auto-push: off");
     view.wait_quietly(Duration::from_millis(800));
     assert_eq!(view.prompts_so_far(), 2);
     let screen = view.flat();

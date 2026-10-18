@@ -43,8 +43,9 @@ enum Commands {
     /// conversations, most recent first, with their share state for one remote.
     /// The view can hand over to the usual typed-phrase prompts (the ones of
     /// `cvc share`, `cvc unshare`, `cvc push --manual` and `cvc privacy
-    /// acknowledge-sharing`) but cannot answer them: only what you type at the
-    /// prompt does, so keys alone never share or publish anything.
+    /// acknowledge-sharing`) and does not answer them; no key shares or
+    /// publishes by itself. Where auto-push is on, every git push to that
+    /// remote publishes shared thoughts.
     ///
     /// When standard input or output is not a terminal (a pipe, a redirect, a
     /// script), or with --plain, it prints the plain listing instead, which only
@@ -53,7 +54,7 @@ enum Commands {
         /// Remote to show share state for (default: origin)
         #[arg(long)]
         remote: Option<String>,
-        /// Show at most this many conversations (plain default: 20; the interactive view shows all unless set)
+        /// Show at most this many conversations (plain default: 20; the interactive view shows up to 10,000 unless set)
         #[arg(long)]
         limit: Option<usize>,
         /// Print the plain listing instead of the interactive view
@@ -504,8 +505,18 @@ mod hook_cli_tests {
             long.contains("hand over to the usual typed-phrase prompts"),
             "{long}"
         );
-        assert!(long.contains("cannot answer them"), "{long}");
-        assert!(long.contains("keys alone never share or publish"), "{long}");
+        assert!(long.contains("and does not answer them"), "{long}");
+        assert!(
+            long.contains("no key shares or publishes by itself"),
+            "{long}"
+        );
+        // And what a standing choice does without one.
+        assert!(
+            long.contains(
+                "Where auto-push is on, every git push to that remote publishes shared thoughts."
+            ),
+            "{long}"
+        );
         // And when it does not open.
         assert!(long.contains("not a terminal"), "{long}");
         assert!(
@@ -519,8 +530,10 @@ mod hook_cli_tests {
         );
         assert_eq!(
             argument_help("conversations", "limit").0,
-            "Show at most this many conversations (plain default: 20; the interactive view shows all unless set)"
+            "Show at most this many conversations (plain default: 20; the interactive view shows up to 10,000 unless set)"
         );
+        // The help names the number the view really starts with.
+        assert_eq!(commands::sync::SUMMARY_SCAN_LIMIT, 10_000);
         let (plain, long_plain) = argument_help("conversations", "plain");
         assert_eq!(
             plain,
