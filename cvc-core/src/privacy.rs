@@ -54,12 +54,26 @@ pub struct PrivacyStatus {
 /// An immutable description of the destination selected for one operation.  Do not
 /// re-read the git config after this is created: `pushurl` is deliberately allowed
 /// to differ from the fetch URL.
-#[derive(Debug, Clone)]
+///
+/// `effective_url` may embed credentials. `Debug` therefore leaves it out, and
+/// anything shown to a person uses [`display_location`] instead.
+#[derive(Clone)]
 pub struct RemoteDestination {
     pub name: String,
     pub effective_url: String,
     pub fingerprint: String,
     pub ref_name: String,
+}
+
+impl std::fmt::Debug for RemoteDestination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteDestination")
+            .field("name", &self.name)
+            .field("effective_url", &"<redacted>")
+            .field("fingerprint", &self.fingerprint)
+            .field("ref_name", &self.ref_name)
+            .finish()
+    }
 }
 
 pub fn remote_destination(repo: &git2::Repository, remote_name: &str) -> Result<RemoteDestination> {
@@ -113,6 +127,150 @@ pub fn common_git_dir(repo: &git2::Repository) -> PathBuf {
 }
 pub fn remote_fingerprint(repo: &git2::Repository, remote_name: &str) -> Result<String> {
     Ok(remote_destination(repo, remote_name)?.fingerprint)
+}
+
+/// Longest remote URL [`display_location`] will look at.
+const MAX_LOCATION_INPUT: usize = 2048;
+
+/// A form of a remote's effective push URL that is safe to put on a screen, or
+/// `None` when no such form can be established. It is display-only: nothing may
+/// be resolved, fetched or compared through it.
+///
+/// - `scheme://[userinfo@]host[:port]/path?query#fragment` becomes
+///   `host[:port]/path`. The user and the password or token, the query and the
+///   fragment are all dropped.
+/// - scp-like `[user@]host:path` becomes `host:path`.
+/// - a local path, or a `file://` URL, becomes the path.
+/// - anything else, including a string that does not parse, a host that is not
+///   plain, a `?` or `#` in a form that is not a URL, control or
+///   bidirectional-format characters, or a form in which the built-in secret
+///   scrubber still finds a secret, yields `None`.
+///
+/// The raw string is never returned as a fallback, and no error carries it.
+/// This is leak prevention for what a terminal shows; it is not a promise that a
+/// path component holds no sensitive text.
+pub fn display_location(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() || url.len() > MAX_LOCATION_INPUT {
+        return None;
+    }
+    let location = if url.contains("://") {
+        url_location(url)?
+    } else if is_windows_drive_path(url) {
+        url.to_owned()
+    } else if let Some((authority, path)) = split_scp_like(url) {
+        scp_location(authority, path)?
+    } else if url.contains('@') {
+        // Neither a URL nor `host:path`: more likely a mistyped one
+        // (`token@host/repo`) than a directory, so it is not shown.
+        return None;
+    } else {
+        url.to_owned()
+    };
+    // A parsed URL's query and fragment are already gone and its path is
+    // percent-encoded, so a raw `?` or `#` can only come from a form that has
+    // no query to strip (`host:path`, a local path). There it may well be one,
+    // so nothing is shown.
+    if location.is_empty()
+        || location.contains(['?', '#'])
+        || location.chars().any(is_unsafe_to_display)
+    {
+        return None;
+    }
+    // Defense in depth: whatever the scrubber would redact is not shown at all.
+    match scrub(&location) {
+        Ok(scrubbed) if scrubbed == location => Some(location),
+        _ => None,
+    }
+}
+
+fn url_location(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() == "file" {
+        return parsed.to_file_path().ok()?.to_str().map(str::to_owned);
+    }
+    let mut location = parsed
+        .host_str()
+        .filter(|host| !host.is_empty())?
+        .to_owned();
+    if let Some(port) = parsed.port() {
+        location.push(':');
+        location.push_str(&port.to_string());
+    }
+    let path = parsed.path();
+    if path != "/" {
+        location.push_str(path);
+    }
+    Some(location)
+}
+
+/// Splits `[user@]host:path` the way git recognizes it: the first `:` outside a
+/// bracketed IPv6 host, with no `/` before it.
+fn split_scp_like(value: &str) -> Option<(&str, &str)> {
+    let mut in_brackets = false;
+    for (index, character) in value.char_indices() {
+        match character {
+            '[' => in_brackets = true,
+            ']' => in_brackets = false,
+            '/' | '\\' if !in_brackets => return None,
+            ':' if !in_brackets => return Some((&value[..index], &value[index + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn scp_location(authority: &str, path: &str) -> Option<String> {
+    // Only the host survives: everything up to the last `@` is user information.
+    let host = authority.rsplit('@').next()?;
+    if path.is_empty() || !is_plain_host(host) {
+        return None;
+    }
+    // Git reads `user:secret@host:path` as host `user` and path
+    // `secret@host:path`; showing that would show the secret.
+    if path
+        .split('/')
+        .next()
+        .is_some_and(|first| first.contains('@'))
+    {
+        return None;
+    }
+    Some(format!("{host}:{path}"))
+}
+
+fn is_plain_host(host: &str) -> bool {
+    match host.strip_prefix('[') {
+        Some(rest) => rest.strip_suffix(']').is_some_and(|inner| {
+            !inner.is_empty()
+                && inner
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.'))
+        }),
+        None => {
+            !host.is_empty()
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        }
+    }
+}
+
+fn is_windows_drive_path(value: &str) -> bool {
+    let mut characters = value.chars();
+    matches!(
+        (characters.next(), characters.next(), characters.next()),
+        (Some(drive), Some(':'), Some('/' | '\\')) if drive.is_ascii_alphabetic()
+    )
+}
+
+/// Control characters, and the invisible or direction-changing format
+/// characters that can make text on a terminal read differently from what it is.
+fn is_unsafe_to_display(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'
+        )
 }
 fn read_privacy(repo: &git2::Repository) -> Result<PrivacyFile> {
     let path = privacy_path(repo)?;

@@ -122,9 +122,10 @@ pub async fn run(requested: Option<&str>, limit: Option<usize>, plain: bool) -> 
 /// nothing: consent is whatever `privacy.json` already records for the
 /// destination fingerprint, and only the typed challenges change that.
 ///
-/// It holds the fingerprint, not the destination itself, so no URL (which may
-/// embed credentials) is kept around or printed by a stray `{:?}`. To act on
-/// a remote, call [`RemoteOverview::resolve`], which re-resolves it the way
+/// It holds the fingerprint, not the destination itself, so no raw URL (which
+/// may embed credentials) is kept around or printed by a stray `{:?}`; the only
+/// trace of the URL is the sanitized `location`. To act on a remote, call
+/// [`RemoteOverview::resolve`], which re-resolves it the way
 /// `cvc share --remote <name>` would.
 #[allow(dead_code)] // Consumed by the interactive view (#112, Phase B).
 #[derive(Clone, Debug)]
@@ -136,6 +137,13 @@ pub(crate) struct RemoteOverview {
     /// destination, such as `remote has no push URL`. The reason is plain text
     /// meant for display.
     pub fingerprint: std::result::Result<String, String>,
+    /// Where the remote points, for display only: `host[:port]/path`,
+    /// `host:path` or a local path, with user information (the user and any
+    /// password or token), query and fragment removed. `None` when the remote
+    /// is unusable or no safe form exists (see `privacy::display_location`).
+    /// The raw URL is never a fallback. Do not resolve, compare or fetch
+    /// through it; the fingerprint is the identity.
+    pub location: Option<String>,
     /// Whether `cvc privacy acknowledge-sharing` was completed for exactly
     /// this fingerprint. `false` when `fingerprint` is an error or
     /// `consent_error` is set, so it never reads as consent that could not be
@@ -198,6 +206,7 @@ pub(crate) fn remote_overview(repo: &Repository) -> Result<Vec<RemoteOverview>> 
             Err(_) => RemoteOverview {
                 name: String::from_utf8_lossy(raw).into_owned(),
                 fingerprint: Err("remote name is not valid UTF-8".into()),
+                location: None,
                 sharing_consented: false,
                 auto_push: false,
                 consent_error: None,
@@ -207,7 +216,12 @@ pub(crate) fn remote_overview(repo: &Repository) -> Result<Vec<RemoteOverview>> 
 }
 
 fn overview_of(repo: &Repository, name: &str) -> RemoteOverview {
-    let fingerprint = privacy::remote_destination(repo, name)
+    let destination = privacy::remote_destination(repo, name);
+    let location = destination
+        .as_ref()
+        .ok()
+        .and_then(|destination| privacy::display_location(&destination.effective_url));
+    let fingerprint = destination
         .map(|destination| destination.fingerprint)
         .map_err(display_reason);
     let (sharing_consented, auto_push, consent_error) = match &fingerprint {
@@ -220,6 +234,7 @@ fn overview_of(repo: &Repository, name: &str) -> RemoteOverview {
     RemoteOverview {
         name: name.to_owned(),
         fingerprint,
+        location,
         sharing_consented,
         auto_push,
         consent_error,
@@ -295,6 +310,39 @@ mod tests {
             );
             assert!(!remote.sharing_consented && !remote.auto_push);
             assert_eq!(remote.consent_error, None);
+        }
+    }
+
+    #[test]
+    fn the_location_is_sanitized_and_no_raw_url_is_kept() {
+        let (_directory, repo) = repository_with(&[
+            (
+                "alpha",
+                "https://user:tok-3xample@example.invalid/o/a.git?x=1#f",
+            ),
+            ("beta", "git@example.invalid:o/b.git"),
+            (
+                "gamma",
+                "ssh://deploy:hunter-22@example.invalid:2222/o/c.git",
+            ),
+            ("delta", "/srv/repos/d.git"),
+        ]);
+        repo.remote_set_pushurl("gamma", Some("ssh://tok-9yz@push.example.invalid/o/c.git"))
+            .unwrap();
+        add_unusable_remotes(&repo);
+        let overview = remote_overview(&repo).unwrap();
+        let location = |name: &str| entry(&overview, name).location.as_deref();
+        assert_eq!(location("alpha"), Some("example.invalid/o/a.git"));
+        assert_eq!(location("beta"), Some("example.invalid:o/b.git"));
+        // The effective push URL is what is described, not the fetch URL.
+        assert_eq!(location("gamma"), Some("push.example.invalid/o/c.git"));
+        assert_eq!(location("delta"), Some("/srv/repos/d.git"));
+        assert_eq!(location("emptyurl"), None);
+        assert_eq!(location("blankurl"), None);
+        // Nothing of any credential survives, not even in `Debug`.
+        let debug = format!("{overview:?}");
+        for secret in ["tok-3xample", "hunter-22", "tok-9yz", "user:", "deploy"] {
+            assert!(!debug.contains(secret), "{secret} leaked: {debug}");
         }
     }
 

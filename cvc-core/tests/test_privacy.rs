@@ -511,3 +511,167 @@ fn share_snapshot_race_rejects_new_turn_without_sharing_it() {
         .unwrap()
         .is_empty());
 }
+
+fn shown(raw: &str) -> Option<String> {
+    cvc_core::privacy::display_location(raw)
+}
+
+#[test]
+fn display_location_keeps_host_port_and_path_of_scheme_urls_and_nothing_else() {
+    for (raw, expected) in [
+        ("https://user:tok@host/a/b.git", "host/a/b.git"),
+        ("https://tok@host/p?x=1#f", "host/p"),
+        ("https://us%40er:p%3Ass@host/a", "host/a"),
+        ("https://host/a/b.git?token=abc#frag", "host/a/b.git"),
+        ("ssh://git@host:22/p", "host:22/p"),
+        ("ssh://user:pw@host/p", "host/p"),
+        ("git://host/o/r.git", "host/o/r.git"),
+        (
+            "https://HOST.Example/Org/Repo.git",
+            "host.example/Org/Repo.git",
+        ),
+        ("https://host:8443", "host:8443"),
+        ("https://host", "host"),
+        ("https://host/", "host"),
+        ("ssh://host", "host"),
+        // The scheme's own default port is not shown.
+        ("https://host:443/p", "host/p"),
+        ("https://host/a%20b.git", "host/a%20b.git"),
+        (
+            "https://[2001:db8::1]:8443/r.git",
+            "[2001:db8::1]:8443/r.git",
+        ),
+        ("https://u:p@[::1]/r.git", "[::1]/r.git"),
+    ] {
+        assert_eq!(shown(raw).as_deref(), Some(expected), "{raw}");
+    }
+}
+
+#[test]
+fn display_location_drops_the_user_of_scp_like_remotes() {
+    for (raw, expected) in [
+        ("git@github.com:o/r.git", "github.com:o/r.git"),
+        ("github.com:o/r.git", "github.com:o/r.git"),
+        ("user@host.example:~/repo", "host.example:~/repo"),
+        ("git@[2001:db8::1]:o/r.git", "[2001:db8::1]:o/r.git"),
+        ("[::1]:path", "[::1]:path"),
+        ("a@b@host:p", "host:p"),
+    ] {
+        assert_eq!(shown(raw).as_deref(), Some(expected), "{raw}");
+    }
+}
+
+#[test]
+fn display_location_shows_local_paths_as_they_are() {
+    for (raw, expected) in [
+        ("/srv/r.git", "/srv/r.git"),
+        ("  /srv/r.git  ", "/srv/r.git"),
+        ("../sibling.git", "../sibling.git"),
+        ("relative/dir", "relative/dir"),
+        // A slash before the colon makes it a path, not host:path.
+        ("/srv/a:b/r.git", "/srv/a:b/r.git"),
+        ("C:\\repos\\x.git", "C:\\repos\\x.git"),
+        ("C:/repos/x.git", "C:/repos/x.git"),
+    ] {
+        assert_eq!(shown(raw).as_deref(), Some(expected), "{raw}");
+    }
+    #[cfg(unix)]
+    for (raw, expected) in [
+        ("file:///srv/r.git", "/srv/r.git"),
+        ("file:///srv/r%20x.git", "/srv/r x.git"),
+        ("file://localhost/srv/r.git", "/srv/r.git"),
+    ] {
+        assert_eq!(shown(raw).as_deref(), Some(expected), "{raw}");
+    }
+}
+
+#[test]
+fn display_location_refuses_what_it_cannot_show_safely() {
+    let secret_in_path = format!(
+        "https://host/{}",
+        "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
+    );
+    let too_long = format!("https://host/{}", "a".repeat(3000));
+    for raw in [
+        "",
+        "   ",
+        "http://",
+        "https://",
+        "https://[::1",
+        "https://host:notaport/p",
+        "://x",
+        "ht tp://x",
+        "mailto:someone@example.com",
+        // Git would read this as host `user` and path `secret@host:path`.
+        "user:secret@host:path",
+        // A query or fragment in a form that is not a URL has nothing to strip.
+        "git@host:o/r.git?x=1",
+        "/srv/r.git#frag",
+        // Not a URL, not host:path, and holds an `@`: shown as nothing.
+        "token@github.com/o/r",
+        "git@github.com",
+        "host:",
+        "ho st:path",
+        // Control and direction-changing characters.
+        "host:\u{1b}[31mred",
+        "host:line\nbreak",
+        "/srv/\u{202e}evil.git",
+        "file://server/share/r.git",
+        // The built-in scrubber would redact something in the form.
+        secret_in_path.as_str(),
+        too_long.as_str(),
+    ] {
+        assert_eq!(shown(raw), None, "{raw:?}");
+    }
+}
+
+#[test]
+fn display_location_never_shows_a_credential() {
+    let secrets = [
+        "s3cr3t-value",
+        "p%40ss",
+        "ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+        "hunter2",
+    ];
+    for secret in secrets {
+        for raw in [
+            format!("https://user:{secret}@host/r.git"),
+            format!("https://{secret}@host/r.git"),
+            format!("ssh://{secret}@host/r.git"),
+            format!("ssh://git:{secret}@host:2222/r.git"),
+            format!("{secret}@host:o/r.git"),
+            format!("git@host:o/r.git?token={secret}"),
+            format!("user:{secret}@host:o/r.git"),
+            format!("https://host/r.git?token={secret}"),
+            format!("https://host/r.git#{secret}"),
+            format!("https://user:{secret}@host:8443/r.git?x={secret}#{secret}"),
+            format!("https://user:{secret}@[::1]/r.git"),
+        ] {
+            if let Some(location) = shown(&raw) {
+                assert!(
+                    !location.contains(secret) && !location.contains('@'),
+                    "{raw} -> {location}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_remote_destination_never_prints_its_url() {
+    let destination = cvc_core::privacy::RemoteDestination {
+        name: "origin".into(),
+        effective_url: "https://user:tok-secret@host.example/o/r.git".into(),
+        fingerprint: "f".repeat(64),
+        ref_name: "refs/cvc/main".into(),
+    };
+    let debug = format!("{destination:?}");
+    assert!(
+        debug.contains("origin") && debug.contains(&"f".repeat(64)),
+        "{debug}"
+    );
+    assert!(!debug.contains("tok-secret"), "{debug}");
+    assert!(!debug.contains("host.example"), "{debug}");
+    // The URL is still there for the code that has to use it.
+    assert!(destination.effective_url.contains("tok-secret"));
+}
