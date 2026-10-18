@@ -27,6 +27,8 @@ The database, privacy/consent state, locks, and rewrite state live in `$(git rev
 
 Destination authority is isolated: a share, authorization, publication observation, or tombstone received from destination A has no authority for destination B. Remote evidence is recorded as an untrusted remote observation unless independently observed locally; it is not a permission grant.
 
+Conversations pulled from a remote can be shared and published to another remote, the same way Git lets you push to one remote what you pulled from another. Consent stays per destination: pulling from one remote authorizes nothing for another, so sharing a pulled conversation asks the usual `I SHARE` phrase, and publishing it asks that destination's publishing authorization and the `I PUBLISH` phrase. Publishing it again copies content that someone else captured, which can hold their prompts, file contents, command output and personal data, so review it first (see the [note on material that is not yours to publish](cvc-cli/README.md#share-and-publish) in the CLI reference).
+
 The scrubber uses bounded, high-confidence built-in detectors for several private-key, token, authorization, URL-credential, and credential-assignment forms, plus credential-bearing JSON keys. It is defense in depth, not proof that all secrets, PII, encodings, or provider-specific formats are found. Built-in protection cannot be disabled by policy.
 
 ## `.thoughtignore` location and syntax
