@@ -349,7 +349,7 @@ fn run_flow(ctx: &Context, screen: &mut Screen, model: &mut Model, flow: Flow) -
         Ok(report) => report,
         Err(error) => {
             let failure = classify_failure(&error);
-            if let FlowFailure::Other(reason) = &failure {
+            if let FlowFailure::Other(reason) | FlowFailure::OutcomeUnknown(reason) = &failure {
                 // Not one of the expected refusals: show it whole, on the main
                 // screen, and wait, so it can be read before the list returns.
                 print_failure(kind, reason, &dest);

@@ -1210,11 +1210,21 @@ pub fn failure_status(kind: FlowKind, failure: &FlowFailure, remote: &str) -> St
         }
         // A publish can stop on an error after the challenge was answered and
         // the push began: the remote may then hold some of it. Nothing here may
-        // say that nothing was sent.
-        (FlowFailure::Other(text), FlowKind::Publish) => format!(
-            "{} (error: {})",
-            publish_unfinished(remote),
-            text::sanitize(text::first_line(text))
+        // say that nothing was sent. `OutcomeUnknown` is such an error that is
+        // known to be one; the view never bundles a publish with a share, so
+        // only a publish produces it.
+        (FlowFailure::OutcomeUnknown(text), _) | (FlowFailure::Other(text), FlowKind::Publish) => {
+            format!(
+                "{} (error: {})",
+                publish_unfinished(remote),
+                text::sanitize(text::first_line(text))
+            )
+        }
+        // The view never runs a share and a publish as one flow, so this does
+        // not arise from it; the words are for the case that it ever does.
+        (FlowFailure::SharedButNotPublished(inner), _) => format!(
+            "The share was recorded, but publishing did not complete. {}",
+            failure_status(FlowKind::Publish, inner, remote)
         ),
         (FlowFailure::Other(text), kind) => {
             format!(
@@ -2697,6 +2707,59 @@ mod tests {
             say(FlowKind::Publish, FlowFailure::ConsentMissing),
             "Publishing to 'origin' is not authorized yet. Press p to set it up."
         );
+    }
+
+    #[test]
+    fn a_publish_whose_outcome_is_unknown_says_the_remote_may_hold_some_of_it() {
+        let unknown = FlowFailure::OutcomeUnknown(
+            "Git error: connection reset by peer\nsecond line\u{1b}[2J".to_owned(),
+        );
+        let said = failure_status(FlowKind::Publish, &unknown, "origin");
+        assert_eq!(
+            said,
+            "Publish to 'origin' did not complete; the remote may hold some of it. Run: cvc privacy reconcile --remote origin (error: Git error: connection reset by peer)"
+        );
+        // The words are the ones every other unfinished publish uses.
+        assert!(said.starts_with(&publish_unfinished("origin")));
+        assert!(!said.to_lowercase().contains("nothing was sent"));
+        // Control characters never reach the notice.
+        let escaped = failure_status(
+            FlowKind::Publish,
+            &FlowFailure::OutcomeUnknown("bad\u{1b}[2J".to_owned()),
+            "origin",
+        );
+        assert!(escaped.ends_with("(error: bad?[2J)"), "{escaped}");
+        // Whatever the kind, an unsettled outcome is never worded as a refusal.
+        for kind in [FlowKind::Share, FlowKind::Unshare, FlowKind::Authorize] {
+            assert!(failure_status(kind, &unknown, "origin").contains("the remote may hold some"));
+        }
+    }
+
+    #[test]
+    fn a_share_whose_publication_stopped_never_reads_as_nothing_recorded() {
+        let bundled = |inner| FlowFailure::SharedButNotPublished(Box::new(inner));
+        for (inner, ending) in [
+            (
+                FlowFailure::NotConfirmed,
+                "Not published: the typed phrase did not match. Nothing was sent to 'origin'.",
+            ),
+            (
+                FlowFailure::ConsentMissing,
+                "Publishing to 'origin' is not authorized yet. Press p to set it up.",
+            ),
+            (
+                FlowFailure::OutcomeUnknown("reset".to_owned()),
+                "Publish to 'origin' did not complete; the remote may hold some of it. Run: cvc privacy reconcile --remote origin (error: reset)",
+            ),
+        ] {
+            let said = failure_status(FlowKind::Share, &bundled(inner), "origin");
+            assert_eq!(
+                said,
+                format!("The share was recorded, but publishing did not complete. {ending}")
+            );
+            assert!(!said.contains("Nothing was changed"), "{said}");
+            assert!(!said.starts_with("Not shared"), "{said}");
+        }
     }
 
     #[test]

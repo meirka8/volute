@@ -61,8 +61,12 @@ fn share_push_without_auto_push_still_requires_the_publish_challenge() {
     session.write(b"no\n");
     let (status, output) = session.wait_exit();
     assert!(!status.success(), "{output}");
+    // The refusal is the publication's, and the error says the share stands:
+    // it must not read as the `I SHARE` phrase not matching.
     assert!(
-        output.contains("acknowledgement challenge did not match"),
+        output.contains(
+            "the share was recorded, but publishing did not complete: acknowledgement challenge did not match"
+        ),
         "{output}"
     );
     let remote = git2::Repository::open_bare(&fixture.remote).unwrap();

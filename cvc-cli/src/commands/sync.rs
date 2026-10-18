@@ -1,4 +1,6 @@
-use crate::commands::failure::{ChallengeNotConfirmed, SharingConsentMissing};
+use crate::commands::failure::{
+    BundledPublishFailed, ChallengeNotConfirmed, PublicationOutcomeUnknown, SharingConsentMissing,
+};
 use anyhow::{bail, Context, Result};
 use cvc_core::repository::RepositoryLayout;
 use cvc_core::{
@@ -273,12 +275,16 @@ pub(crate) fn share_conversation(
         }
     );
     if publish_after {
+        // The share is recorded from here on. Whatever stops the publication,
+        // the error must say so: an `I PUBLISH` phrase that does not match is
+        // otherwise indistinguishable from an `I SHARE` that did not.
         push_destination(
             repo,
             store,
             destination,
             PublicationTrigger::BundledWithShare,
-        )?;
+        )
+        .map_err(BundledPublishFailed::wrap)?;
     }
     Ok(ShareOutcome {
         snapshot_count: count,
@@ -631,39 +637,60 @@ fn push_destination(
         &status.remote_fingerprint,
         PublicationState::Pending,
     )?;
-    let result = match sync::push_temp_ref(repo, destination, candidate.ref_name()) {
-        Ok(()) => {
-            store.mark_publication(
-                new_ids,
-                &status.remote_fingerprint,
-                PublicationState::Published,
-            )?;
-            store.mark_remote_tombstones_published(&status.remote_fingerprint)?;
-            println!(
-                "{}",
-                describe_publication(
-                    &destination.name,
-                    new_interactions,
-                    &publication,
-                    PublicationPhase::Done
-                )
-            );
-            Ok(PublishOutcome::Published(publication))
-        }
-        Err(e) => {
-            // A failed transport is ambiguous: do not make content mutable until a
-            // later reconciliation proves the destination did not receive it.
-            store.mark_publication(
-                new_ids,
-                &status.remote_fingerprint,
-                PublicationState::Unknown,
-            )?;
-            Err(e.into())
-        }
-    };
+    let pushed = sync::push_temp_ref(repo, destination, candidate.ref_name());
     // `candidate` cleans up on success, errors, TTY cancellation, and unwinding.
+    let result = settle_push(store, new_ids, &status.remote_fingerprint, pushed).map(|()| {
+        println!(
+            "{}",
+            describe_publication(
+                &destination.name,
+                new_interactions,
+                &publication,
+                PublicationPhase::Done
+            )
+        );
+        PublishOutcome::Published(publication)
+    });
     drop(candidate);
     result
+}
+
+/// Records what a finished push means for the thoughts it carried, which were
+/// marked `pending` before it began. From here on every error is a
+/// [`PublicationOutcomeUnknown`]: the push has been attempted, so nothing the
+/// local records can still say settles what the destination holds.
+///
+/// - The push went through: they become `published`, and so do the tombstones it
+///   carried. If recording that fails the destination holds them, but the rows
+///   stay `pending` (or the tombstones unrecorded) until a reconciliation or the
+///   next push settles it.
+/// - The push failed: that is ambiguous, so they become `unknown` and the error
+///   is the transport's. Do not make content mutable until a later reconciliation
+///   proves the destination did not receive it. If marking them fails too, that
+///   error is returned instead and they stay `pending`.
+fn settle_push(
+    store: &CvcStore,
+    new_ids: &[InteractionId],
+    fingerprint: &str,
+    pushed: sync::Result<()>,
+) -> Result<()> {
+    match pushed {
+        Ok(()) => {
+            store
+                .mark_publication(new_ids, fingerprint, PublicationState::Published)
+                .map_err(PublicationOutcomeUnknown::new)?;
+            store
+                .mark_remote_tombstones_published(fingerprint)
+                .map_err(PublicationOutcomeUnknown::new)?;
+            Ok(())
+        }
+        Err(error) => {
+            store
+                .mark_publication(new_ids, fingerprint, PublicationState::Unknown)
+                .map_err(PublicationOutcomeUnknown::new)?;
+            Err(PublicationOutcomeUnknown::new(error).into())
+        }
+    }
 }
 /// Shown when the projection already equals the fetched remote baseline.
 fn nothing_to_publish_line(remote: &str, shared_total: usize) -> String {
@@ -1167,6 +1194,197 @@ mod publication_summary_tests {
                 prompt.challenge
             );
             assert!(prompt.challenge.starts_with("I PUBLISH "));
+        }
+    }
+}
+
+/// What a finished push does to the records of the thoughts it carried, with
+/// the transport's result handed in so each outcome can be had without a
+/// network.
+#[cfg(test)]
+mod settle_tests {
+    use super::settle_push;
+    use crate::commands::failure::{classify_failure, FlowFailure};
+    use chrono::Utc;
+    use cvc_core::db::CvcStore;
+    use cvc_core::models::{Author, Conversation, Interaction, InteractionId, PublicationState};
+    use cvc_core::privacy::{McpCapture, PreparedPolicy};
+    use cvc_core::sync::SyncError;
+    use rusqlite::{params, Connection};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    const FINGERPRINT: &str = "7777777777777777777777777777777777777777777777777777777777777777";
+
+    /// A store with two thoughts whose push has begun: both are `pending`.
+    struct Begun {
+        _directory: TempDir,
+        path: PathBuf,
+        store: CvcStore,
+        ids: Vec<InteractionId>,
+    }
+
+    impl Begun {
+        fn new() -> Self {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("index.db");
+            let store = CvcStore::open(&path).unwrap();
+            let ids: Vec<_> = (0..2)
+                .map(|_| {
+                    let id = InteractionId::new();
+                    store
+                        .capture_mcp(McpCapture::new(
+                            Conversation {
+                                id: "settling".into(),
+                                title: "settle fixture".into(),
+                                created_at: Utc::now(),
+                            },
+                            Interaction {
+                                id: id.clone(),
+                                conversation_id: "settling".into(),
+                                parent_id: None,
+                                timestamp: Utc::now(),
+                                author: Author::Agent,
+                                user_prompt: "fixture".into(),
+                                model_name: None,
+                                model_cot: None,
+                                model_response: None,
+                                source_request_id: None,
+                            },
+                            Vec::new(),
+                            Vec::new(),
+                            PreparedPolicy::built_ins_only(),
+                            "a".repeat(64),
+                        ))
+                        .unwrap();
+                    id
+                })
+                .collect();
+            store
+                .mark_publication(&ids, FINGERPRINT, PublicationState::Pending)
+                .unwrap();
+            Self {
+                _directory: directory,
+                path,
+                store,
+                ids,
+            }
+        }
+
+        /// The publication state of each thought for the destination.
+        fn states(&self) -> Vec<String> {
+            let connection = Connection::open(&self.path).unwrap();
+            self.ids
+                .iter()
+                .map(|id| {
+                    connection
+                        .query_row(
+                            "SELECT state FROM publications WHERE interaction_id = ?1 AND remote_fingerprint = ?2",
+                            params![id.as_str(), FINGERPRINT],
+                            |row| row.get(0),
+                        )
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        /// Makes recording a publication state fail, as a database that went
+        /// read-only or full would.
+        fn refuse_publication_updates(&self) {
+            Connection::open(&self.path)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER refuse_publication_updates BEFORE UPDATE ON publications
+                     BEGIN SELECT RAISE(ABORT, 'publication state is read-only'); END;",
+                )
+                .unwrap();
+        }
+
+        fn settle(&self, pushed: cvc_core::sync::Result<()>) -> anyhow::Result<()> {
+            settle_push(&self.store, &self.ids, FINGERPRINT, pushed)
+        }
+    }
+
+    #[test]
+    fn a_push_that_went_through_is_recorded_as_published() {
+        let begun = Begun::new();
+        assert_eq!(begun.states(), ["pending", "pending"]);
+        begun.settle(Ok(())).unwrap();
+        assert_eq!(begun.states(), ["published", "published"]);
+    }
+
+    #[test]
+    fn a_failed_transport_marks_the_thoughts_unknown_and_is_an_unknown_outcome() {
+        let begun = Begun::new();
+        let error = begun
+            .settle(Err(SyncError::Ref("transport boom".into())))
+            .unwrap_err();
+        assert_eq!(begun.states(), ["unknown", "unknown"]);
+        assert_eq!(
+            classify_failure(&error),
+            FlowFailure::OutcomeUnknown("Reference error: transport boom".into())
+        );
+        // Typing it changed nothing a command prints.
+        assert_eq!(format!("{error:#}"), "Reference error: transport boom");
+    }
+
+    #[test]
+    fn a_push_that_went_through_but_could_not_be_recorded_leaves_the_thoughts_pending() {
+        let begun = Begun::new();
+        begun.refuse_publication_updates();
+        let direct = begun
+            .store
+            .mark_publication(&begun.ids, FINGERPRINT, PublicationState::Published)
+            .unwrap_err();
+        let direct = format!("{:#}", anyhow::Error::from(direct));
+        assert!(
+            direct.contains("publication state is read-only"),
+            "{direct}"
+        );
+
+        let error = begun.settle(Ok(())).unwrap_err();
+        assert_eq!(begun.states(), ["pending", "pending"]);
+        assert_eq!(
+            classify_failure(&error),
+            FlowFailure::OutcomeUnknown(direct.clone())
+        );
+        assert_eq!(format!("{error:#}"), direct);
+    }
+
+    #[test]
+    fn tombstones_that_could_not_be_recorded_after_a_push_are_an_unknown_outcome_too() {
+        let begun = Begun::new();
+        Connection::open(&begun.path)
+            .unwrap()
+            .execute_batch("DROP TABLE tombstones")
+            .unwrap();
+        let error = begun.settle(Ok(())).unwrap_err();
+        // The thoughts themselves were recorded before the tombstones were.
+        assert_eq!(begun.states(), ["published", "published"]);
+        assert!(matches!(
+            classify_failure(&error),
+            FlowFailure::OutcomeUnknown(_)
+        ));
+    }
+
+    #[test]
+    fn a_failed_transport_that_cannot_be_recorded_is_still_an_unknown_outcome() {
+        let begun = Begun::new();
+        begun.refuse_publication_updates();
+        let error = begun
+            .settle(Err(SyncError::Ref("transport boom".into())))
+            .unwrap_err();
+        // They could not be marked `unknown`, so they stay `pending`; the error
+        // is the store's, as it was before it was typed.
+        assert_eq!(begun.states(), ["pending", "pending"]);
+        match classify_failure(&error) {
+            FlowFailure::OutcomeUnknown(message) => {
+                assert!(
+                    message.contains("publication state is read-only"),
+                    "{message}"
+                );
+            }
+            other => panic!("{other:?}"),
         }
     }
 }
