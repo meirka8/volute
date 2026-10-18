@@ -140,6 +140,106 @@ async fn test_commit_thought() {
     assert_eq!(interactions[0].user_prompt, "User query");
 }
 
+fn commit_thought_in(conversation_id: &str) -> serde_json::Value {
+    json!({
+        "name": "commit_thought",
+        "arguments": {
+            "reasoning": "Thinking process",
+            "task": "User query",
+            "conversation_id": conversation_id,
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_a_conversation_id_that_could_alter_what_a_terminal_shows_is_refused() {
+    let (dir, state) = make_state();
+    start_session(&state, "test-client").unwrap();
+
+    // The id becomes the conversation's title and is named in the phrase typed
+    // to share it, and the client chooses it. Every one of these is a control
+    // (Cc), format (Cf) or separator (Zl, Zp) character, in the middle of an
+    // id that is otherwise fine.
+    for id in [
+        "has\u{1b}[2Jescape",
+        "line\nbreak",
+        "carriage\rreturn",
+        "tab\there",
+        "nul\0byte",
+        "delete\u{7f}",
+        "c1\u{9b}control",
+        "bidi\u{202e}override",
+        "isolate\u{2066}isolate",
+        "zero\u{200b}width",
+        "soft\u{ad}hyphen",
+        "byte\u{feff}order",
+        "tag\u{e0041}character",
+        "line\u{2028}separator",
+        "paragraph\u{2029}separator",
+    ] {
+        let error = call_tool(commit_thought_in(id), state.clone())
+            .await
+            .expect_err(&format!("{id:?} was accepted"));
+        assert_eq!(error.code, -32602, "{id:?}");
+        assert!(
+            error.message.starts_with("Invalid 'conversation_id': "),
+            "{id:?}: {}",
+            error.message
+        );
+    }
+
+    // Nothing was recorded for any of them.
+    assert!(fixture_store(dir.path())
+        .get_floating_interactions()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn test_an_ordinary_conversation_id_is_still_recorded() {
+    let (dir, state) = make_state();
+    start_session(&state, "test-client").unwrap();
+
+    for id in ["client-session_42", "harness.session:7", "A1b2C3"] {
+        let res = call_tool(commit_thought_in(id), state.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{id:?} was refused: {}", error.message));
+        assert!(res["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Thought recorded"));
+    }
+    let recorded: Vec<String> = fixture_store(dir.path())
+        .get_floating_interactions()
+        .unwrap()
+        .into_iter()
+        .map(|interaction| interaction.conversation_id)
+        .collect();
+    for id in ["client-session_42", "harness.session:7", "A1b2C3"] {
+        assert!(recorded.iter().any(|recorded| recorded == id), "{id:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_spaces_and_other_printable_characters_are_not_refused_by_the_display_rule() {
+    let (_dir, state) = make_state();
+    start_session(&state, "test-client").unwrap();
+
+    // The rule added for ids that could alter what a terminal shows is only
+    // about control, format and separator characters. What else an id may hold
+    // is decided where the capture is made (core limits it to ASCII letters,
+    // digits and `-_.:`), and the refusal, if there is one, comes from there.
+    for id in ["my session 1", "Éclair ü ✓ שלום", "emoji 🚀"] {
+        if let Err(error) = call_tool(commit_thought_in(id), state.clone()).await {
+            assert!(
+                !error.message.starts_with("Invalid 'conversation_id'"),
+                "{id:?}: {}",
+                error.message
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_read_history() {
     let (_dir, state) = make_state();

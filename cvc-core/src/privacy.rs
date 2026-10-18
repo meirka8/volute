@@ -341,7 +341,11 @@ fn is_transport_helper(url: &str) -> bool {
 /// annotation anchors, the tag characters, and more), `Zl` and `Zp` (the line
 /// and paragraph separators). The categories come from the `regex` crate's
 /// Unicode tables, not from a list of ranges that could fall behind them.
-fn has_unsafe_display_char(text: &str) -> bool {
+///
+/// Public so that a front that takes text from outside and keeps it as a name
+/// (the MCP server, for a conversation id) applies the same rule as the checks
+/// here.
+pub fn has_unsafe_display_char(text: &str) -> bool {
     static UNSAFE: OnceLock<Regex> = OnceLock::new();
     UNSAFE
         .get_or_init(|| re(r"[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]"))

@@ -1,7 +1,7 @@
 use crate::server::{AppState, JsonRpcError};
 use chrono::Utc;
 use cvc_core::models::{Author, Conversation, Interaction, InteractionId};
-use cvc_core::privacy::{McpCapture, PreparedPolicy};
+use cvc_core::privacy::{self, McpCapture, PreparedPolicy};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -176,10 +176,23 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
 
     // Clients/harnesses that manage their own sessions can override the server's
     // default per-process session and chaining behavior.
-    let explicit_conversation_id = args
-        .get("conversation_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    //
+    // The id becomes the conversation's title ("Session <id>") and is shown in
+    // terminals, and it is named in the phrase that is typed to share or unshare
+    // the conversation. A client (a model, in effect) chooses it, so one that
+    // could make a terminal show something else, or nothing, is refused here:
+    // control, format and line- or paragraph-separator characters. Spaces and the
+    // other printable characters stay allowed.
+    let explicit_conversation_id = match args.get("conversation_id").and_then(|v| v.as_str()) {
+        Some(id) if privacy::has_unsafe_display_char(id) => {
+            return Err(JsonRpcError {
+                code: -32602,
+                message: "Invalid 'conversation_id': it contains a control, format, line-separator or paragraph-separator character (an escape or a line break, for instance). The id becomes the conversation's title and is shown in terminals; spaces and other printable characters are allowed.".to_string(),
+                data: None,
+            });
+        }
+        other => other.map(str::to_owned),
+    };
 
     let explicit_parent_id = match args.get("parent_id").and_then(|v| v.as_str()) {
         Some(s) => Some(s.parse::<InteractionId>().map_err(|e| JsonRpcError {
