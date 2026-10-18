@@ -201,7 +201,7 @@ pub async fn share(
     } else {
         FutureSharePolicy::Private
     };
-    share_conversation(&repo, &store, &destination, id, future, push)
+    share_conversation(&repo, &store, &destination, id, future, push).map(|_| ())
 }
 
 /// What `cvc share <conversation_id> --remote <destination.name>` does once the
@@ -222,6 +222,10 @@ pub async fn share(
 /// It does not check where the conversation came from either; callers that
 /// must not offer an imported conversation for sharing have to say so
 /// themselves.
+///
+/// On success it reports what it recorded, so a caller that is not a command
+/// line can word the result without parsing the output above. `cvc share`
+/// ignores it.
 pub(crate) fn share_conversation(
     repo: &Repository,
     store: &CvcStore,
@@ -229,7 +233,7 @@ pub(crate) fn share_conversation(
     id: &str,
     future: FutureSharePolicy,
     publish_after: bool,
-) -> Result<()> {
+) -> Result<ShareOutcome> {
     // Make the consent legible: title and activity range alongside the
     // snapshot count already embedded in the challenge below.
     if let Some(summary) = store
@@ -270,13 +274,27 @@ pub(crate) fn share_conversation(
             PublicationTrigger::BundledWithShare,
         )?;
     }
-    Ok(())
+    Ok(ShareOutcome {
+        snapshot_count: count,
+        future,
+    })
 }
+
+/// What a completed [`share_conversation`] recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ShareOutcome {
+    /// How many thoughts the shared snapshot covered: the count in the typed
+    /// challenge.
+    pub snapshot_count: usize,
+    /// Whether the conversation's future thoughts are shared as well.
+    pub future: FutureSharePolicy,
+}
+
 pub async fn unshare(id: &str, requested: Option<&str>) -> Result<()> {
     let (repo, store) = open(&env::current_dir()?)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
-    unshare_conversation(&repo, &store, &destination, id)
+    unshare_conversation(&repo, &store, &destination, id).map(|_| ())
 }
 
 /// What `cvc unshare <conversation_id> --remote <destination.name>` does once
@@ -286,19 +304,20 @@ pub async fn unshare(id: &str, requested: Option<&str>) -> Result<()> {
 /// nothing changes, while any turn of the conversation is pending, published
 /// or of unknown state there, because unsharing cannot recall content a
 /// destination may already hold.
+///
+/// On success it returns how many thoughts were made private, the number it
+/// prints; `cvc unshare` ignores it.
 pub(crate) fn unshare_conversation(
     repo: &Repository,
     store: &CvcStore,
     destination: &privacy::RemoteDestination,
     id: &str,
-) -> Result<()> {
+) -> Result<usize> {
     let _operation_lock = privacy::destination_operation_lock(repo, &destination.fingerprint)?;
     typed_acknowledgement(&format!("I UNSHARE {id} {}", destination.fingerprint))?;
-    println!(
-        "{} unpublished turn(s) made private.",
-        store.unshare_conversation_for_remote(id, &destination.fingerprint)?
-    );
-    Ok(())
+    let made_private = store.unshare_conversation_for_remote(id, &destination.fingerprint)?;
+    println!("{made_private} unpublished turn(s) made private.");
+    Ok(made_private)
 }
 pub async fn delete_local(id: &str) -> Result<()> {
     let (_, store) = open(&env::current_dir()?)?;
@@ -454,9 +473,9 @@ pub async fn push(requested: Option<&str>, manual: bool) -> Result<()> {
     // to manual publication; hooks use `auto_push` below.
     let destination = privacy::remote_destination(&repo, &name)?;
     if manual {
-        publish_manually(&repo, &store, &destination)
+        publish_manually(&repo, &store, &destination).map(|_| ())
     } else {
-        push_destination(&repo, &store, &destination, PublicationTrigger::Hook)
+        push_destination(&repo, &store, &destination, PublicationTrigger::Hook).map(|_| ())
     }
 }
 
@@ -466,11 +485,15 @@ pub async fn push(requested: Option<&str>, manual: bool) -> Result<()> {
 /// requires the typed `I PUBLISH <fingerprint> <candidate> <count>` challenge
 /// whatever the auto-push setting, and only then pushes. When nothing differs
 /// from the destination it says so and asks for no challenge.
+///
+/// On success it reports which of those happened, so a caller that is not a
+/// command line can word the result without parsing the output; `cvc push`
+/// ignores it.
 pub(crate) fn publish_manually(
     repo: &Repository,
     store: &CvcStore,
     destination: &privacy::RemoteDestination,
-) -> Result<()> {
+) -> Result<PublishOutcome> {
     push_destination(repo, store, destination, PublicationTrigger::Manual)
 }
 pub async fn auto_push_remote(cwd: &Path, requested: Option<&str>) -> Result<()> {
@@ -482,7 +505,24 @@ pub async fn auto_push_remote(cwd: &Path, requested: Option<&str>) -> Result<()>
         eprintln!("CVC: auto publication disabled for '{}'.", name);
         return Ok(());
     }
-    push_destination(&repo, &store, &destination, PublicationTrigger::Hook)
+    push_destination(&repo, &store, &destination, PublicationTrigger::Hook).map(|_| ())
+}
+
+/// How a publication attempt that did not fail ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PublishOutcome {
+    /// An automatic trigger found no auto-push grant for the destination and
+    /// did nothing. A manual publication never ends this way.
+    Skipped,
+    /// The projection already equals the destination's fetched baseline;
+    /// nothing was written, and no challenge was asked.
+    NothingNew {
+        /// Distinct non-tombstoned thoughts this clone shares with the
+        /// destination, all of which it already holds.
+        shared_total: usize,
+    },
+    /// The candidate was pushed, and these thoughts and records were added.
+    Published(sync::ProjectionPublication),
 }
 
 /// Why a publication is being attempted. Each trigger settles two decisions
@@ -527,7 +567,7 @@ fn push_destination(
     store: &CvcStore,
     destination: &privacy::RemoteDestination,
     trigger: PublicationTrigger,
-) -> Result<()> {
+) -> Result<PublishOutcome> {
     let _operation_lock = privacy::destination_operation_lock(repo, &destination.fingerprint)?;
     let status = privacy::privacy_status_for_fingerprint(repo, &destination.fingerprint)?;
     if !status.sharing_consented {
@@ -537,7 +577,7 @@ fn push_destination(
         .into());
     }
     if trigger.skips_without_auto_push() && !status.auto_push {
-        return Ok(());
+        return Ok(PublishOutcome::Skipped);
     }
     reconcile_destination(repo, store, destination)?;
     // Fetch first. The import returns exactly what it read from the tracking ref (or
@@ -552,7 +592,7 @@ fn push_destination(
                 "{}",
                 nothing_to_publish_line(&destination.name, shared_total)
             );
-            return Ok(());
+            return Ok(PublishOutcome::NothingNew { shared_total });
         }
         sync::ProjectionResult::Candidate {
             oid,
@@ -602,7 +642,7 @@ fn push_destination(
                     PublicationPhase::Done
                 )
             );
-            Ok(())
+            Ok(PublishOutcome::Published(publication))
         }
         Err(e) => {
             // A failed transport is ambiguous: do not make content mutable until a
