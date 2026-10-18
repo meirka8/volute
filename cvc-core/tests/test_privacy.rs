@@ -658,6 +658,291 @@ fn display_location_never_shows_a_credential() {
 }
 
 #[test]
+fn display_location_never_shows_a_host_other_than_the_one_git_contacts() {
+    // The `url` crate ends the authority at `?`, `#` and `\`; libgit2 ends it
+    // at the first `/` and takes the host after the last `@`. Each of these
+    // parses as host `github.com` and is contacted as `evil.example`.
+    for raw in [
+        "https://github.com?@evil.example/o/r.git",
+        "https://github.com#@evil.example/o/r.git",
+        "https://github.com\\@evil.example/o/r.git",
+        "ssh://github.com?@evil.example/o/r.git",
+        "ssh://github.com#@evil.example/o/r.git",
+        "ssh://github.com\\@evil.example/o/r.git",
+        "git://github.com?@evil.example/o/r.git",
+        "https://user@github.com?@evil.example/o/r.git",
+        "https://github.com:443?@evil.example:8443/o/r.git",
+        "https://github.com?x=1@evil.example/o/r.git",
+        "https://github.com#frag@evil.example",
+        "ssh+git://[::1]?@evil.example/r",
+        // The host that is shown must also be the one that is written: a
+        // normalized form (IDNA, percent-encoding, numeric) is not.
+        "https://%65xample.com/r",
+        "https://\u{430}pple.com/r",
+        "https://0x7f.1/r",
+        "https://2130706433/r",
+        "ssh://h%C3%B6st/r",
+        "ssh://github.com%40evil.example/r",
+        "https://[2001:0db8::1]/r",
+        // Nothing before the `://` may be anything but a scheme.
+        "ht tp://github.com/r",
+        "/srv/a://github.com/r",
+        "git@host:o/r://github.com/r",
+        // A `\` in a URL is a separator to one parser and a character to the
+        // other, so the path shown might not be the path used either.
+        "https://github.com/o\\r.git",
+        "file:///srv\\r.git",
+        // `file` has no host to contact, and only `localhost` means that.
+        "file://github.com/srv/r.git",
+        "file://user@/srv/r.git",
+    ] {
+        assert_eq!(shown(raw), None, "{raw}");
+    }
+    // The ordinary forms next to them are still shown.
+    for (raw, expected) in [
+        ("https://github.com/o/r.git", "github.com/o/r.git"),
+        ("https://user@github.com/o/r.git", "github.com/o/r.git"),
+        (
+            "https://user:tok@GitHub.COM:8443/o/r.git",
+            "github.com:8443/o/r.git",
+        ),
+        ("https://a%40b:c@github.com/o/r.git", "github.com/o/r.git"),
+        ("ssh://git@github.com:22/o/r.git", "github.com:22/o/r.git"),
+        ("ssh://git@[::1]:2222/o/r.git", "[::1]:2222/o/r.git"),
+        ("https://xn--80ak6aa92e.com/r", "xn--80ak6aa92e.com/r"),
+        ("https://github.com/o/r.git?x=1#frag", "github.com/o/r.git"),
+        ("https://user@github.com/?q=a@evil.example", "github.com"),
+    ] {
+        assert_eq!(shown(raw).as_deref(), Some(expected), "{raw}");
+    }
+}
+
+/// The host libgit2 contacts for `scheme://...` (util/net.c, `git_net_url_parse`
+/// and `url_parse_authority`): the authority ends at the first `/` and nowhere
+/// else, the host is what follows the last `@`, and a numeric port is not part
+/// of it. Lower-cased, since DNS names are not case sensitive.
+fn libgit2_host(raw: &str) -> Option<String> {
+    let authority = raw.split_once("://")?.1.split('/').next()?;
+    let host_port = authority.rsplit('@').next()?;
+    let host = match host_port.find(']') {
+        Some(end) => &host_port[..=end],
+        None => host_port
+            .rsplit_once(':')
+            .filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit()))
+            .map_or(host_port, |(host, _)| host),
+    };
+    Some(host.to_ascii_lowercase())
+}
+
+/// The host of a shown location, `host[:port][/path]`.
+fn shown_host(location: &str) -> String {
+    let end = if location.starts_with('[') {
+        location.find(']').map(|index| index + 1)
+    } else {
+        location.find([':', '/'])
+    };
+    location[..end.unwrap_or(location.len())].to_ascii_lowercase()
+}
+
+#[test]
+fn whatever_display_location_shows_the_host_it_shows_is_the_host_libgit2_contacts() {
+    // Every combination is a user-information part glued to a host, an `@`, a
+    // second host, and what can follow it. Each shown location costs a full
+    // scrub, so the sets are small and chosen to differ in what matters: a host
+    // name and an IPv6 literal, a special scheme and two that are not.
+    let mut shown_count = 0;
+    let mut refused_count = 0;
+    for scheme in ["https", "ssh", "git"] {
+        for first in ["github.com", "[::1]"] {
+            for glue in [
+                "", "?", "#", "\\", "?x=", "#y:", "\\u:", ":pw", ":", "%40", "%2F",
+            ] {
+                for second in ["evil.example", "[::1]"] {
+                    for port in ["", ":8443"] {
+                        for tail in ["", "/?q@evil.example/r"] {
+                            let raw = format!("{scheme}://{first}{glue}@{second}{port}{tail}");
+                            match shown(&raw) {
+                                Some(location) => {
+                                    shown_count += 1;
+                                    assert_eq!(
+                                        Some(shown_host(&location)),
+                                        libgit2_host(&raw),
+                                        "{raw} is shown as {location}"
+                                    );
+                                }
+                                None => refused_count += 1,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Both outcomes were exercised, so the check above is not vacuous.
+    assert!(shown_count > 50, "{shown_count} shown");
+    assert!(refused_count > 50, "{refused_count} refused");
+}
+
+#[test]
+fn display_location_shows_nothing_for_mistyped_forms_that_carry_a_credential() {
+    for secret in [
+        "hunter2",
+        "pw",
+        "p%40ss",
+        "ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+    ] {
+        for raw in [
+            // A single slash after the scheme is not a URL; git reads it as
+            // host `https` and a path.
+            format!("https:/user:{secret}@github.com/o/r.git"),
+            format!("git:/user:{secret}@host/r"),
+            format!("ssh:/git:{secret}@host/repo"),
+            format!("https:\\\\user:pa/{secret}@host\\repo"),
+            // A `/` in the user information of an scp-like remote.
+            format!("user:pa/{secret}@host:repo.git"),
+            format!("oauth2:{secret}/def@gitlab.com:group/repo.git"),
+            // A drive-letter lookalike.
+            format!("C:/oauth2:{secret}@github.com/repo"),
+            format!("C:\\oauth2:{secret}@github.com\\repo"),
+            // A path that reads as user information.
+            format!("https://github.com/x-access-token:{secret}@github.com/o/r.git"),
+            format!("host:path/with{secret}@host"),
+            format!("file:///tmp/x-access-token:{secret}@host/repo"),
+            // A transport helper's address is a command line.
+            format!("ext::sshpass -p {secret} ssh -l git host %S repo"),
+            format!("ext::git-remote-foo --auth={secret} %S"),
+            format!("gcrypt::rsync://user:{secret}@host/path"),
+            format!("persistent-https::https://user:{secret}@host/r"),
+            format!("foo::token:{secret}/host/repo"),
+        ] {
+            assert_eq!(shown(&raw), None, "{raw}");
+        }
+    }
+}
+
+#[test]
+fn display_location_refuses_transport_helper_addresses_only() {
+    for raw in [
+        "ext::sshpass -p hunter2 ssh -l git host %S repo",
+        "fd::7,8",
+        "foo::bar",
+        "a+b.c-d::x",
+        "9ext::x",
+        "EXT::x",
+        "::x",
+        "host::path",
+    ] {
+        assert_eq!(shown(raw), None, "{raw}");
+    }
+    // `::` elsewhere, and in an IPv6 host, is not a helper.
+    for (raw, expected) in [
+        ("host:a::b", "host:a::b"),
+        ("[::1]:path", "[::1]:path"),
+        ("git@[2001:db8::1]:o/r.git", "[2001:db8::1]:o/r.git"),
+        ("https://host/a::b", "host/a::b"),
+        ("/srv/a::b", "/srv/a::b"),
+    ] {
+        assert_eq!(shown(raw).as_deref(), Some(expected), "{raw}");
+    }
+}
+
+/// Every character of the Unicode general categories Cf, Zl and Zp that the
+/// previous hand-written list did not cover, and the ones it did.
+fn format_and_separator_characters() -> Vec<char> {
+    [
+        0x00ad..=0x00ad,
+        0x0600..=0x0605,
+        0x061c..=0x061c,
+        0x06dd..=0x06dd,
+        0x070f..=0x070f,
+        0x0890..=0x0891,
+        0x08e2..=0x08e2,
+        0x180e..=0x180e,
+        0x200b..=0x200f,
+        0x2028..=0x2029,
+        0x202a..=0x202e,
+        0x2060..=0x2064,
+        0x2066..=0x206f,
+        0xfeff..=0xfeff,
+        0xfff9..=0xfffb,
+        0x110bd..=0x110bd,
+        0x110cd..=0x110cd,
+        0x13430..=0x1343f,
+        0x1bca0..=0x1bca3,
+        0x1d173..=0x1d17a,
+        0xe0001..=0xe0001,
+        0xe0020..=0xe007f,
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(char::from_u32)
+    .collect()
+}
+
+#[test]
+fn display_location_refuses_every_control_format_and_separator_character() {
+    // `char::is_control` is exactly the category Cc.
+    let controls = (0..=0x10ffffu32)
+        .filter_map(char::from_u32)
+        .filter(|c| c.is_control());
+    let others = format_and_separator_characters();
+    let mut count = 0;
+    for c in controls.chain(others) {
+        count += 1;
+        for raw in [
+            // A local path, an scp-like remote, a URL in its host and in its path.
+            format!("/srv/a{c}b"),
+            format!("host:a{c}b"),
+            format!("https://host/a{c}b"),
+            format!("https://ho{c}st/b"),
+            // Parts of the string that are not shown are not looked at less.
+            format!("https://user{c}@host/b"),
+            format!("https://host/b?q={c}z"),
+            format!("https://host/b#{c}z"),
+            format!("ssh://host/b\u{200d}{c}"),
+        ] {
+            assert_eq!(shown(&raw), None, "U+{:04X} in {raw:?}", c as u32);
+        }
+    }
+    assert!(count > 200, "{count} characters were tried");
+    // The characters the issue names, once more by name.
+    for (name, c) in [
+        ("Arabic letter mark", '\u{061c}'),
+        ("line separator", '\u{2028}'),
+        ("paragraph separator", '\u{2029}'),
+        ("soft hyphen", '\u{00ad}'),
+        ("Mongolian vowel separator", '\u{180e}'),
+        ("interlinear annotation anchor", '\u{fff9}'),
+        ("interlinear annotation terminator", '\u{fffb}'),
+        ("tag latin capital letter a", '\u{e0041}'),
+        ("right-to-left override", '\u{202e}'),
+        ("zero width space", '\u{200b}'),
+        ("escape", '\u{1b}'),
+        ("next line", '\u{85}'),
+    ] {
+        assert_eq!(shown(&format!("host:repo{c}evil")), None, "{name}");
+        assert_eq!(shown(&format!("/srv/{c}x")), None, "{name}");
+    }
+}
+
+#[test]
+fn display_location_keeps_text_of_every_script_that_is_not_a_control() {
+    for raw in [
+        "/srv/r\u{e9}pos/caf\u{e9}.git",
+        "/srv/\u{65e5}\u{672c}\u{8a9e}/\u{2713}.git",
+        "/srv/\u{5e9}\u{5dc}\u{5d5}\u{5dd}/repo",
+        "/srv/\u{645}\u{631}\u{62d}\u{628}\u{627}/repo",
+        "/srv/emoji-\u{1f642}.git",
+        "host:\u{65e5}\u{672c}/repo",
+        // Variation selectors and combining marks are Mn, not Cf.
+        "/srv/a\u{fe0f}b",
+        "/srv/e\u{301}",
+    ] {
+        assert_eq!(shown(raw).as_deref(), Some(raw), "{raw}");
+    }
+}
+
+#[test]
 fn a_remote_destination_never_prints_its_url() {
     let destination = cvc_core::privacy::RemoteDestination {
         name: "origin".into(),
