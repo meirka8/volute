@@ -458,3 +458,147 @@ fn conversation_summaries_report_activity_and_destination_state() -> anyhow::Res
     let _ = older_second;
     Ok(())
 }
+
+fn summary_of(
+    store: &CvcStore,
+    destination: Option<&str>,
+    conversation: &str,
+) -> anyhow::Result<cvc_core::db::ConversationSummary> {
+    store
+        .list_conversation_summaries(destination, 100)?
+        .into_iter()
+        .find(|summary| summary.id == conversation)
+        .ok_or_else(|| anyhow::anyhow!("no summary for {conversation}"))
+}
+
+#[test]
+fn an_unshared_conversation_is_private_again_although_its_policy_row_remains() -> anyhow::Result<()>
+{
+    let store = CvcStore::open(":memory:")?;
+    let fingerprint = "7".repeat(64);
+    capture_with_worktree(&store, "round-trip", "a".repeat(64))?;
+    capture_with_worktree(&store, "round-trip", "a".repeat(64))?;
+
+    let before = summary_of(&store, Some(&fingerprint), "round-trip")?;
+    assert!(!before.shared);
+    assert_eq!(
+        (before.shared_count, before.published, before.unconfirmed),
+        (0, 0, 0)
+    );
+    assert_eq!(before.share_future, None);
+
+    let snapshot = store.share_snapshot("round-trip")?;
+    store.share_exact_snapshot(
+        "round-trip",
+        &fingerprint,
+        &snapshot,
+        FutureSharePolicy::Shared,
+    )?;
+    let shared = summary_of(&store, Some(&fingerprint), "round-trip")?;
+    assert!(shared.shared);
+    assert_eq!(shared.shared_count, 2);
+    assert_eq!(shared.share_future, Some(true));
+
+    assert_eq!(
+        store.unshare_conversation_for_remote("round-trip", &fingerprint)?,
+        2
+    );
+    // The conversation-level policy row survives an unshare, with future
+    // turns private. It is a policy, not a share: nothing is shared now.
+    let after = summary_of(&store, Some(&fingerprint), "round-trip")?;
+    assert!(!after.shared, "{after:?}");
+    assert_eq!(
+        (after.shared_count, after.published, after.unconfirmed),
+        (0, 0, 0)
+    );
+    assert_eq!(after.share_future, Some(false));
+
+    // It can be shared again, and shows as shared again.
+    let snapshot = store.share_snapshot("round-trip")?;
+    store.share_exact_snapshot(
+        "round-trip",
+        &fingerprint,
+        &snapshot,
+        FutureSharePolicy::Private,
+    )?;
+    let again = summary_of(&store, Some(&fingerprint), "round-trip")?;
+    assert!(again.shared);
+    assert_eq!(again.shared_count, 2);
+    Ok(())
+}
+
+#[test]
+fn share_state_counts_shared_interactions_only_and_honours_the_wildcard() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("index.db");
+    let store = CvcStore::open(&path)?;
+    let fingerprint = "7".repeat(64);
+    let other = "8".repeat(64);
+    let worktree = "a".repeat(64);
+    let ids: Vec<_> = (0..6)
+        .map(|_| capture_with_worktree(&store, "mixed", worktree.clone()))
+        .collect::<anyhow::Result<_>>()?;
+    let connection = Connection::open(&path)?;
+    let share = |id: &InteractionId, destination: &str| {
+        connection.execute(
+            "INSERT INTO interaction_shares(interaction_id, remote_fingerprint) VALUES(?1, ?2)",
+            rusqlite::params![id.as_str(), destination],
+        )
+    };
+    let publish = |id: &InteractionId, destination: &str, state: &str| {
+        connection.execute(
+            "INSERT INTO publications(interaction_id, remote_fingerprint, state, updated_at) VALUES(?1, ?2, ?3, 0)",
+            rusqlite::params![id.as_str(), destination, state],
+        )
+    };
+    // ids[0]: shared and published. ids[1]: shared, pending. ids[2]: shared
+    // through the wildcard only, unknown. ids[3]: shared both ways (counted
+    // once), never attempted. ids[4]: shared for another destination only.
+    // ids[5]: not shared, but published (as a pull records for what it imports).
+    share(&ids[0], &fingerprint)?;
+    publish(&ids[0], &fingerprint, "published")?;
+    share(&ids[1], &fingerprint)?;
+    publish(&ids[1], &fingerprint, "pending")?;
+    share(&ids[2], "*")?;
+    publish(&ids[2], &fingerprint, "unknown")?;
+    share(&ids[3], &fingerprint)?;
+    share(&ids[3], "*")?;
+    share(&ids[4], &other)?;
+    publish(&ids[4], &other, "published")?;
+    publish(&ids[5], &fingerprint, "published")?;
+
+    let summary = summary_of(&store, Some(&fingerprint), "mixed")?;
+    assert_eq!(summary.thoughts, 6);
+    assert!(summary.shared);
+    assert_eq!(
+        summary.shared_count, 4,
+        "ids 0-3, the wildcard counted once"
+    );
+    assert_eq!(
+        summary.published, 1,
+        "ids[5] is published but not shared, so it is not counted"
+    );
+    assert_eq!(summary.unconfirmed, 2, "pending and unknown");
+
+    // Another destination sees only its own share and publication.
+    let elsewhere = summary_of(&store, Some(&other), "mixed")?;
+    assert_eq!(
+        (
+            elsewhere.shared_count,
+            elsewhere.published,
+            elsewhere.unconfirmed
+        ),
+        (3, 1, 0),
+        "ids 2 and 3 through the wildcard, plus its own ids[4]"
+    );
+
+    // Without a destination nothing is shared, the wildcard included.
+    let neutral = summary_of(&store, None, "mixed")?;
+    assert!(!neutral.shared);
+    assert_eq!(
+        (neutral.shared_count, neutral.published, neutral.unconfirmed),
+        (0, 0, 0)
+    );
+    assert_eq!(neutral.share_future, None);
+    Ok(())
+}

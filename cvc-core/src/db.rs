@@ -279,7 +279,14 @@ pub struct CleanupReport {
 
 /// Read-only per-conversation activity summary for local display. The share
 /// and publication fields are scoped to one destination fingerprint and are
-/// informational only; they grant nothing.
+/// informational only; they grant nothing. Without a destination they are
+/// uniformly absent.
+///
+/// Share state is derived from the conversation's interactions, never from the
+/// conversation-level policy row, so it cannot outlive an unshare. "Shared for
+/// the destination" means the same as it does to
+/// [`CvcStore::projection_interaction_ids`]: an interaction share for that
+/// fingerprint or for the `'*'` wildcard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationSummary {
     pub id: String,
@@ -288,8 +295,27 @@ pub struct ConversationSummary {
     pub linked: i64,
     pub first_activity: i64,
     pub last_activity: i64,
+    /// Some interaction of the conversation is shared for the destination,
+    /// that is `shared_count > 0`.
     pub shared: bool,
+    /// How many of the conversation's interactions are currently shared for
+    /// the destination.
+    pub shared_count: i64,
+    /// How many of the shared interactions the destination is known to hold
+    /// (publication state `published`). It counts shared interactions only:
+    /// an imported interaction that a pull recorded as published at its source
+    /// is not counted until it is itself shared.
     pub published: i64,
+    /// How many of the shared interactions have an uncertain publication: a
+    /// push that began without concluding (`pending`) or failed ambiguously
+    /// (`unknown`). `cvc push --manual` and `cvc privacy reconcile` settle
+    /// them after a fresh fetch.
+    pub unconfirmed: i64,
+    /// What the destination holds for this conversation's future turns:
+    /// `Some(true)` shares them as they are captured, `Some(false)` keeps them
+    /// private (a share without `--future`, or an unshare), `None` when no
+    /// share decision was ever recorded for the destination.
+    pub share_future: Option<bool>,
 }
 
 /// Where an agent-harness transcript ingest resumes for one session. Purely a
@@ -315,6 +341,51 @@ pub struct HarnessBatchOutcome {
     /// Captures skipped because their id is locally tombstoned or was recorded
     /// concurrently.
     pub suppressed: usize,
+}
+
+/// "Shared for the destination `?1`": an interaction share for that
+/// fingerprint or for the `'*'` wildcard. This is the sharing test
+/// `projection_interaction_ids` applies, without its publication-state filter.
+/// No destination (`NULL`) shares nothing, wildcard included.
+const SHARED_FOR_DESTINATION: &str = "(?1 IS NOT NULL AND EXISTS (SELECT 1 FROM interaction_shares s WHERE s.interaction_id = i.id AND s.remote_fingerprint IN (?1, '*')))";
+
+/// The summary query up to its `tail` (`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`).
+/// `?1` is the destination fingerprint, or `NULL` for none. Every reader of
+/// summaries goes through this one statement, so no two of them can disagree
+/// about what "shared" or "published" means.
+fn conversation_summary_sql(tail: &str) -> String {
+    format!(
+        "SELECT c.id, c.title,
+                COUNT(i.id),
+                COALESCE(SUM(EXISTS(SELECT 1 FROM artifact_links a WHERE a.interaction_id = i.id)), 0),
+                COALESCE(MIN(i.timestamp), c.created_at),
+                COALESCE(MAX(i.timestamp), c.created_at),
+                COALESCE(SUM({SHARED_FOR_DESTINATION}), 0),
+                COALESCE(SUM({SHARED_FOR_DESTINATION} AND EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state = 'published')), 0),
+                COALESCE(SUM({SHARED_FOR_DESTINATION} AND EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state IN ('pending', 'unknown'))), 0),
+                (SELECT s.share_future FROM conversation_shares s WHERE s.conversation_id = c.id AND s.remote_fingerprint = ?1)
+         FROM conversations c
+         LEFT JOIN interactions i ON i.conversation_id = c.id
+         {tail}"
+    )
+}
+
+/// Maps a row of [`conversation_summary_sql`].
+fn map_summary_row(row: &Row) -> rusqlite::Result<ConversationSummary> {
+    let shared_count: i64 = row.get(6)?;
+    Ok(ConversationSummary {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        thoughts: row.get(2)?,
+        linked: row.get(3)?,
+        first_activity: row.get(4)?,
+        last_activity: row.get(5)?,
+        shared: shared_count > 0,
+        shared_count,
+        published: row.get(7)?,
+        unconfirmed: row.get(8)?,
+        share_future: row.get(9)?,
+    })
 }
 
 /// Maximum time a harness ingest waits for a busy shared database. Ingests are
@@ -2352,32 +2423,15 @@ impl CvcStore {
         destination_fingerprint: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ConversationSummary>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.title,
-                    COUNT(i.id),
-                    COALESCE(SUM(EXISTS(SELECT 1 FROM artifact_links a WHERE a.interaction_id = i.id)), 0),
-                    COALESCE(MIN(i.timestamp), c.created_at),
-                    COALESCE(MAX(i.timestamp), c.created_at),
-                    EXISTS(SELECT 1 FROM conversation_shares s WHERE s.conversation_id = c.id AND s.remote_fingerprint = ?1),
-                    COALESCE(SUM(EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state = 'published')), 0)
-             FROM conversations c
-             LEFT JOIN interactions i ON i.conversation_id = c.id
-             GROUP BY c.id, c.title
+        let mut stmt = self.conn.prepare(&conversation_summary_sql(
+            "GROUP BY c.id, c.title
              ORDER BY COALESCE(MAX(i.timestamp), c.created_at) DESC
              LIMIT ?2",
+        ))?;
+        let rows = stmt.query_map(
+            params![destination_fingerprint, limit as i64],
+            map_summary_row,
         )?;
-        let rows = stmt.query_map(params![destination_fingerprint, limit as i64], |row| {
-            Ok(ConversationSummary {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                thoughts: row.get(2)?,
-                linked: row.get(3)?,
-                first_activity: row.get(4)?,
-                last_activity: row.get(5)?,
-                shared: row.get(6)?,
-                published: row.get(7)?,
-            })
-        })?;
         let mut summaries = Vec::new();
         for summary in rows {
             summaries.push(summary?);
