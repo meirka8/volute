@@ -34,6 +34,16 @@ use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
 const MAX_ANSWER_BYTES: usize = 4096;
 
+/// Whether a typed acknowledgement can be protected from type-ahead: whether
+/// [`Terminal::discard_pending_input`] really discards what was queued before
+/// the prompt, and the answer is read unbuffered from the terminal itself.
+/// That is Unix only; on other platforms the fallback reads the shared, buffered
+/// stdin, so a pasted or typed-ahead line could answer a challenge that was
+/// never displayed.
+pub const fn protects_challenges_from_type_ahead() -> bool {
+    cfg!(unix)
+}
+
 /// Whether stdin and stdout are both terminals: the precondition for anything
 /// that asks a human to type, whether a consent challenge, the conversation
 /// picker, or the interactive conversations view. It is one definition so

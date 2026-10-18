@@ -54,13 +54,39 @@ pub(crate) fn display_destination(
 }
 
 /// Whether `cvc conversations` may start its interactive view instead of
-/// printing the plain listing: not when `--plain` was given, and only when
-/// stdin and stdout are both terminals. That is the very check
-/// (`tty::stdio_is_terminal`) that lets a consent challenge be asked at all,
-/// so a script, a pipe or an IDE tool never gets the interactive view and
-/// the view can never be a way around a challenge.
+/// printing the plain listing: not when `--plain` was given, only when stdin
+/// and stdout are both terminals, and only when `TERM` names a terminal that
+/// can redraw (set, and not `dumb`).
+///
+/// The terminal check is the very one (`tty::stdio_is_terminal`) that lets a
+/// consent challenge be asked at all, so a script, a pipe or an IDE tool never
+/// gets the interactive view and the view can never be a way around a
+/// challenge.
 pub(crate) fn interactive_ui_allowed(plain: bool) -> bool {
-    !plain && crate::tty::stdio_is_terminal()
+    !plain
+        && crate::tty::stdio_is_terminal()
+        && terminal_type_allows_ui(std::env::var_os("TERM").as_deref())
+}
+
+/// A full-screen view needs a terminal that can redraw. `TERM` is the Unix
+/// convention for saying so: unset, empty or `dumb` means it cannot. Windows
+/// consoles do not set `TERM`, so only an explicit `dumb` rules them out.
+fn terminal_type_allows_ui(term: Option<&std::ffi::OsStr>) -> bool {
+    match term {
+        Some(term) => !term.is_empty() && !term.eq_ignore_ascii_case("dumb"),
+        None => !cfg!(unix),
+    }
+}
+
+/// Whether the interactive view may run the actions that end in a typed
+/// challenge: share, unshare, publish and authorize sharing. Only where
+/// `tty.rs` can keep a challenge from being answered by type-ahead, which is
+/// Unix for v0.7.1: elsewhere its fallback reads the shared buffered stdin and
+/// cannot discard what was queued before the prompt, so the view there only
+/// browses and points at the matching `cvc` command instead of running it.
+#[allow(dead_code)] // Consumed by the interactive view (#112, Phase B).
+pub(crate) const fn consent_actions_allowed() -> bool {
+    crate::tty::protects_challenges_from_type_ahead()
 }
 
 /// `cvc conversations`. `limit` is `--limit` as given: the plain listing falls
@@ -287,6 +313,30 @@ mod tests {
     #[test]
     fn plain_never_allows_the_interactive_view() {
         assert!(!interactive_ui_allowed(true));
+    }
+
+    #[test]
+    fn the_terminal_type_must_be_able_to_redraw() {
+        use std::ffi::OsStr;
+        let allows = |term: &str| terminal_type_allows_ui(Some(OsStr::new(term)));
+        assert!(allows("xterm-256color"));
+        assert!(allows("linux"));
+        assert!(allows("screen"));
+        assert!(!allows("dumb"));
+        assert!(!allows("DUMB"));
+        assert!(!allows(""));
+        // Unset: no terminal type on Unix, where one is always set for a
+        // terminal; Windows consoles never set it.
+        assert_eq!(terminal_type_allows_ui(None), cfg!(not(unix)));
+    }
+
+    #[test]
+    fn consent_actions_need_type_ahead_protection() {
+        assert_eq!(consent_actions_allowed(), cfg!(unix));
+        assert_eq!(
+            consent_actions_allowed(),
+            crate::tty::protects_challenges_from_type_ahead()
+        );
     }
 
     #[test]

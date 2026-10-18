@@ -1,3 +1,4 @@
+use crate::commands::failure::{ChallengeNotConfirmed, SharingConsentMissing};
 use anyhow::{bail, Context, Result};
 use cvc_core::repository::RepositoryLayout;
 use cvc_core::{
@@ -144,7 +145,7 @@ fn typed_acknowledgement(challenge: &str) -> Result<()> {
     terminal.discard_pending_input()?;
     let answer = terminal.prompt_line(&format!("Type exactly '{challenge}' to continue: "))?;
     if answer != challenge {
-        bail!("acknowledgement challenge did not match");
+        return Err(ChallengeNotConfirmed.into());
     }
     Ok(())
 }
@@ -527,12 +528,13 @@ fn push_destination(
     destination: &privacy::RemoteDestination,
     trigger: PublicationTrigger,
 ) -> Result<()> {
-    let _operation_lock = privacy::destination_operation_lock(repo, &destination.fingerprint)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let status = privacy::privacy_status_for_fingerprint(repo, &destination.fingerprint)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let _operation_lock = privacy::destination_operation_lock(repo, &destination.fingerprint)?;
+    let status = privacy::privacy_status_for_fingerprint(repo, &destination.fingerprint)?;
     if !status.sharing_consented {
-        bail!("sharing consent is required for remote '{}'; run cvc privacy acknowledge-sharing --remote {}", destination.name, destination.name);
+        return Err(SharingConsentMissing {
+            remote: destination.name.clone(),
+        }
+        .into());
     }
     if trigger.skips_without_auto_push() && !status.auto_push {
         return Ok(());
