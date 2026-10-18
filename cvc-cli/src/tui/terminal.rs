@@ -41,7 +41,11 @@ pub fn restore_terminal() {
     if ACTIVE.swap(false, Ordering::SeqCst) {
         let mut out = io::stdout();
         let _ = disable_raw_mode();
-        let _ = execute!(out, DisableBracketedPaste, LeaveAlternateScreen, Show);
+        // One command at a time: a terminal that cannot do one of them (bracketed
+        // paste on an old Windows console, say) must not keep the rest from running.
+        let _ = execute!(out, DisableBracketedPaste);
+        let _ = execute!(out, LeaveAlternateScreen);
+        let _ = execute!(out, Show);
         let _ = out.flush();
     }
 }
@@ -49,12 +53,15 @@ pub fn restore_terminal() {
 fn enter_modes() -> io::Result<()> {
     enable_raw_mode()?;
     ACTIVE.store(true, Ordering::SeqCst);
-    // Bracketed paste makes a paste arrive as one event, which the view ignores,
-    // instead of as keys that could open a bar and walk through it.
-    if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste) {
+    if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
         restore_terminal();
         return Err(error);
     }
+    // Bracketed paste makes a paste arrive as one event, which the view ignores,
+    // instead of as keys that could open a bar and walk through it. A terminal
+    // that cannot do it is not a reason to refuse to run: it then has the
+    // protections that remain (a bar needs its own key, and a flow its phrase).
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
     Ok(())
 }
 

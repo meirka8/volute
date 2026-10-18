@@ -5,7 +5,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -304,6 +304,45 @@ impl PtySession {
             screen.rows().iter().any(|row| row.contains(needle))
         });
         self.screen()
+    }
+
+    /// Sends `signal` to the process.
+    pub fn signal(&self, signal: i32) {
+        // SAFETY: `kill` takes a process id and a signal number and touches no
+        // memory of ours.
+        let rc = unsafe { libc::kill(self.child.id() as libc::pid_t, signal) };
+        assert_eq!(rc, 0, "kill: {}", io::Error::last_os_error());
+    }
+
+    /// Whether the terminal is in the state a shell leaves it in (line editing
+    /// and echo on), as opposed to the raw mode a full-screen program sets.
+    /// Reads the attributes of the pty itself, so it can be asked while the
+    /// process runs and after it has gone.
+    pub fn terminal_is_cooked(&self) -> bool {
+        // SAFETY: `tcgetattr` fills the `termios` we pass it for a valid
+        // descriptor; an all-zero `termios` is a valid value to be overwritten.
+        let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::tcgetattr(self.master.as_raw_fd(), &mut attributes) };
+        assert_eq!(rc, 0, "tcgetattr: {}", io::Error::last_os_error());
+        attributes.c_lflag & (libc::ICANON | libc::ECHO) == (libc::ICANON | libc::ECHO)
+    }
+
+    /// Waits for exit and returns the status, keeping the session so that the
+    /// terminal can still be looked at.
+    pub fn wait_for_exit(&mut self) -> ExitStatus {
+        let deadline = Instant::now() + WAIT_LIMIT;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                // Give the reader a moment to drain what was written last.
+                std::thread::sleep(Duration::from_millis(100));
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                panic!("process did not exit:\n{}", self.output());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Waits for exit and returns the status with the full terminal output.

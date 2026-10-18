@@ -50,9 +50,14 @@ fn the_view_enters_the_alternate_screen_draws_its_header_and_quits_on_q() {
     assert!(screen.contains("Run: printf"), "{screen}");
     assert!(screen.contains("q quit"), "{screen}");
 
+    // While the view is up the terminal is in raw mode.
+    assert!(!session.terminal_is_cooked());
+
     session.write(b"q");
-    let (status, output) = session.wait_exit();
+    let status = session.wait_for_exit();
+    let output = session.output();
     assert!(status.success(), "{output}");
+    assert!(session.terminal_is_cooked(), "raw mode was left on");
     let entered = output.find(ENTER_ALTERNATE_SCREEN).unwrap();
     let left = output
         .rfind(LEAVE_ALTERNATE_SCREEN)
@@ -69,9 +74,31 @@ fn ctrl_c_quits_and_gives_the_terminal_back() {
 
     // In raw mode Ctrl-C is a key, not a signal.
     session.write(&[0x03]);
-    let (status, output) = session.wait_exit();
+    let status = session.wait_for_exit();
+    let output = session.output();
     assert!(status.success(), "{output}");
     assert!(output.contains(LEAVE_ALTERNATE_SCREEN), "{output:?}");
+    assert!(session.terminal_is_cooked(), "raw mode was left on");
+}
+
+#[test]
+fn a_terminate_signal_gives_the_terminal_back_and_still_ends_the_process() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let fixture = fixture_with_a_conversation();
+    let mut session =
+        PtySession::spawn_sized(tui_command(&fixture, &["conversations"]), b"", 120, 40);
+    session.wait_for_screen_text("CVC conversations");
+    assert!(!session.terminal_is_cooked());
+
+    session.signal(libc::SIGTERM);
+    let status = session.wait_for_exit();
+    let output = session.output();
+    // The process dies of the signal, as it would have without the view ...
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    // ... but not before the screen and the terminal modes were put back.
+    assert!(output.contains(LEAVE_ALTERNATE_SCREEN), "{output:?}");
+    assert!(session.terminal_is_cooked(), "raw mode was left on");
 }
 
 #[test]

@@ -668,7 +668,10 @@ impl Canvas<'_> {
             self.put(ca, y, "auto-push", auto_w, dim);
             y += 1;
         }
-        for (index, row) in rows.iter().enumerate() {
+        // A repository with more remotes than rows scrolls to keep the cursor in view.
+        let capacity = (bottom.saturating_sub(y) as usize).max(1);
+        let skip = (cursor + 1).saturating_sub(capacity);
+        for (index, row) in rows.iter().enumerate().skip(skip) {
             if y >= bottom {
                 break;
             }
@@ -1721,6 +1724,21 @@ mod tests {
         let broken = lines.iter().find(|l| l.contains("broken")).unwrap();
         assert!(broken.contains("remote has an empty push URL"), "{broken}");
         assert!(lines.last().unwrap().contains("enter select"));
+    }
+
+    #[test]
+    fn the_remote_picker_keeps_the_cursor_in_view_with_many_remotes() {
+        let remotes: Vec<_> = (0..30).map(|n| remote(&format!("remote-{n:02}"))).collect();
+        let mut model = model_of(conversations(), remotes, (60, 12), Glyphs::UNICODE);
+        model.handle_key(key(KeyCode::Char('r')));
+        let before = dump(&rendered(&model));
+        assert!(!before.contains("remote-29"), "{before}");
+        model.handle_key(key(KeyCode::End));
+        let after = rendered(&model);
+        assert!(contains(&after, "remote-29"), "{}", dump(&after));
+        for line in &after {
+            assert!(text::width(line) <= 60, "{line}");
+        }
     }
 
     #[test]
