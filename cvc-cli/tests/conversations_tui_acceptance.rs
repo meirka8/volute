@@ -805,20 +805,6 @@ fn without_a_remote_nothing_can_be_shared_or_published() {
 // 7. Blocked actions
 // ---------------------------------------------------------------------------
 
-/// A second clone of the repository that `fixture` is a clone of: its own
-/// directory and its own index, with the same remote as `origin`.
-fn another_clone_of(fixture: &Fixture) -> Fixture {
-    let clone = Fixture::new();
-    clone.git(&[
-        "remote",
-        "set-url",
-        "origin",
-        fixture.remote.to_str().unwrap(),
-    ]);
-    clone.cvc_ok(&["init"]);
-    clone
-}
-
 #[test]
 fn an_imported_conversation_is_read_only_in_the_view() {
     // One clone shares a conversation and publishes it ...

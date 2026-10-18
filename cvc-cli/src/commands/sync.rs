@@ -85,11 +85,18 @@ pub(crate) const SUMMARY_SCAN_LIMIT: usize = 10_000;
 /// a conversation explicitly — so this adds no path around the typed
 /// challenge that still follows. Returns `None` when the user aborts.
 ///
-/// A conversation the destination already holds but this clone does not share
-/// (a re-ingested session) is offered, with the state it reads as. An imported
-/// conversation is not offered: it came from a remote and is read-only here,
-/// exactly as in the interactive view. `cvc share <id>` still names any
-/// conversation, as it always has.
+/// A conversation is offered when it has a thought and none of it is shared for
+/// this destination, whatever else is true of it, each with the state it reads
+/// as. That includes a conversation the destination already holds but this
+/// clone does not share (a re-ingested session), which reads
+/// `[published, not shared here]`, and one pulled from a remote. A pulled
+/// conversation may be shared and published to another remote, as Git lets you
+/// push to one remote what you pulled from another: it reads
+/// `[published, not shared here]` for the remote it came from and, since this
+/// clone has no record of any other remote holding it, `[private]` for the
+/// others. Consent stays per destination, so the phrases asked are those of the
+/// destination chosen. The interactive view keeps a pulled conversation
+/// read-only; this picker, like `cvc share <id>`, does not.
 fn pick_unshared_conversation(
     store: &CvcStore,
     remote_name: &str,
@@ -103,7 +110,7 @@ fn pick_unshared_conversation(
     let candidates: Vec<_> = store
         .list_conversation_summaries(Some(fingerprint), SUMMARY_SCAN_LIMIT)?
         .into_iter()
-        .filter(|summary| !summary.shared && !summary.imported && summary.thoughts > 0)
+        .filter(|summary| !summary.shared && summary.thoughts > 0)
         .collect();
     let remote_name = sanitize_for_terminal(remote_name);
     if candidates.is_empty() {

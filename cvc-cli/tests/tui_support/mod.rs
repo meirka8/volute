@@ -309,6 +309,20 @@ pub fn add_a_second_remote(fixture: &Fixture) -> std::path::PathBuf {
     path
 }
 
+/// A second clone of the repository that `fixture` is a clone of: its own
+/// directory and its own index, with the same remote as `origin`.
+pub fn another_clone_of(fixture: &Fixture) -> Fixture {
+    let clone = Fixture::new();
+    clone.git(&[
+        "remote",
+        "set-url",
+        "origin",
+        fixture.remote.to_str().unwrap(),
+    ]);
+    clone.cvc_ok(&["init"]);
+    clone
+}
+
 // ---------------------------------------------------------------------------
 // The commands that set a state up
 // ---------------------------------------------------------------------------
