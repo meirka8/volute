@@ -1,6 +1,8 @@
-import { useMemo } from 'react';
+import { memo, useCallback, useLayoutEffect, useMemo, useRef } from 'react';
 import { AnimatePresence } from 'framer-motion';
 import { AlertTriangle, Brain, GitPullRequest } from 'lucide-react';
+import { parentToolNamesByNode, type ParentToolCall } from '../../lib/transcriptNode';
+import { NodeErrorBoundary } from './NodeErrorBoundary';
 import { TimelineNode } from './TimelineNode';
 import type { InteractionNode } from '../../types/cvc';
 
@@ -14,6 +16,46 @@ interface ShadowTimelineProps {
   notice?: string;
 }
 
+interface TimelineItemProps {
+  interaction: InteractionNode;
+  isSelected: boolean;
+  /** One function for the whole timeline, for as long as it lives; called with this step's id. */
+  onSelectInteraction: (id: string) => void;
+  parentToolNames: readonly ParentToolCall[] | null;
+}
+
+/**
+ * One step, guarded and memoised. A function component (not the boundary itself)
+ * is what AnimatePresence holds as its keyed child, exactly as when the child was
+ * TimelineNode.
+ *
+ * Every prop is a value that stays the same while its step does: the node, the
+ * list of the previous step's calls (made once per set of interactions), and the
+ * one select function. So selecting a step redraws the step that lost the
+ * selection and the one that gained it, and no other: a card can be thousands of
+ * elements, and drawing all of them again for a click on one is what made
+ * selection slow.
+ */
+const TimelineItem = memo(function TimelineItem({
+  interaction,
+  isSelected,
+  onSelectInteraction,
+  parentToolNames,
+}: TimelineItemProps) {
+  const id = interaction.id;
+  const onSelect = useCallback(() => onSelectInteraction(id), [onSelectInteraction, id]);
+  return (
+    <NodeErrorBoundary interaction={interaction}>
+      <TimelineNode
+        interaction={interaction}
+        isSelected={isSelected}
+        onSelect={onSelect}
+        parentToolNames={parentToolNames}
+      />
+    </NodeErrorBoundary>
+  );
+});
+
 export function ShadowTimeline({
   interactions,
   selectedInteractionId,
@@ -26,6 +68,16 @@ export function ShadowTimeline({
   const sortedInteractions = useMemo(() => {
     return [...interactions].sort((a, b) => b.timestamp - a.timestamp);
   }, [interactions]);
+  // What each step's previous step called, to check the results the step claims.
+  // The arrays inside stay the same objects for as long as `interactions` does.
+  const parentToolNames = useMemo(() => parentToolNamesByNode(interactions), [interactions]);
+  // The newest callback behind a function that never changes, so a parent that
+  // passes a new closure on every render does not redraw every step.
+  const latestSelect = useRef(onSelectInteraction);
+  useLayoutEffect(() => {
+    latestSelect.current = onSelectInteraction;
+  }, [onSelectInteraction]);
+  const selectInteraction = useCallback((id: string) => latestSelect.current?.(id), []);
 
   if (isLoading) {
     return (
@@ -67,11 +119,12 @@ export function ShadowTimeline({
       <div className="flex-1 overflow-y-auto">
         <AnimatePresence mode="popLayout">
           {sortedInteractions.map((interaction) => (
-            <TimelineNode
+            <TimelineItem
               key={interaction.id}
               interaction={interaction}
               isSelected={selectedInteractionId === interaction.id}
-              onSelect={() => onSelectInteraction?.(interaction.id)}
+              onSelectInteraction={selectInteraction}
+              parentToolNames={parentToolNames.get(interaction.id) ?? null}
             />
           ))}
         </AnimatePresence>

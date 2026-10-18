@@ -600,7 +600,7 @@ A visualization layer that sits alongside GitHub/GitLab. It can be a local web v
     
     - It filters the "Bag of Thoughts" for interactions linked to commits within the PR range.
         
-    - It reconstructs a timeline from linked code changes and stored interaction fields, including exposed or explicitly supplied reasoning when present.
+    - It reconstructs a timeline from linked code changes and stored interaction fields, including exposed or explicitly supplied reasoning when present. Nodes shaped like Claude Code harness captures are laid out as stimulus → reasoning → response → tool calls, and MCP, VS Code and `cvc run` nodes keep Thought / Action / Observation; the layout is inferred from node shape and is not a provenance signal.
         
 - **Value:** Reviewers see the available captured interaction context without needing to clone the repo or run special CLI commands. This is not a view into hidden model reasoning.
     

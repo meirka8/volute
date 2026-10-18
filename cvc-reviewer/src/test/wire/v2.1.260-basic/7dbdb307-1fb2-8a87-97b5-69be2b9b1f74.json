@@ -1,0 +1,17 @@
+{
+  "interaction": {
+    "id": "7dbdb307-1fb2-8a87-97b5-69be2b9b1f74",
+    "conversation_id": "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60",
+    "parent_id": "c8d6387b-1088-8c41-b825-eb3e2b05ebaf",
+    "timestamp": "2026-09-10T10:00:23Z",
+    "author": "system",
+    "user_prompt": "[tool_result Read]      1\tfixture-secret-content",
+    "model_name": "claude-fixture-1",
+    "model_cot": null,
+    "model_response": "All set.",
+    "source_request_id": "req_G"
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": []
+}

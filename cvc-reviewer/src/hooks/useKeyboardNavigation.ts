@@ -1,5 +1,15 @@
 import { useEffect, useCallback } from 'react';
 
+/**
+ * Things that already own the Space key when they have focus: Space activates a
+ * button, a link, a summary or a select, and scrolls or acts within anything else
+ * that is focusable (a card that selects itself, a block of code that scrolls).
+ * The page-wide Space shortcut must leave all of them alone: cancelling Space on
+ * a focused button stops it from activating, and marking the open file viewed as
+ * a side effect of operating a control is a surprise.
+ */
+const OWNS_SPACE = 'button, a[href], summary, select, [role="button"], [tabindex]:not([tabindex="-1"])';
+
 interface KeyboardNavigationOptions {
   onNext: () => void;          // j key
   onPrevious: () => void;      // k key
@@ -46,6 +56,7 @@ export function useKeyboardNavigation({
           onExpand();
           break;
         case ' ':
+          if (target.closest?.(OWNS_SPACE)) return;
           e.preventDefault();
           onMarkViewed();
           break;

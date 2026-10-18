@@ -1,0 +1,17 @@
+{
+  "interaction": {
+    "id": "c218f992-6967-8f01-b169-4f47dd21bad4",
+    "conversation_id": "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60",
+    "parent_id": "3ec4e81b-3ffc-8d60-b160-5c0b3a2407db",
+    "timestamp": "2026-09-10T10:00:10Z",
+    "author": "system",
+    "user_prompt": "[tool_result Bash] [main 1234abc] greet\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\n[tool_result Read] 127.0.0.1 localhost",
+    "model_name": "claude-fixture-1",
+    "model_cot": null,
+    "model_response": "Done.",
+    "source_request_id": "req_E"
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": []
+}

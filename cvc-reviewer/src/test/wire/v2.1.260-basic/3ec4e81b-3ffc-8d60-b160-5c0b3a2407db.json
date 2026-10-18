@@ -1,0 +1,34 @@
+{
+  "interaction": {
+    "id": "3ec4e81b-3ffc-8d60-b160-5c0b3a2407db",
+    "conversation_id": "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60",
+    "parent_id": "daa5ceb6-7e4d-8a1d-8632-c6b36b563250",
+    "timestamp": "2026-09-10T10:00:07Z",
+    "author": "system",
+    "user_prompt": "[tool_result Write] The file /work/repo/src/lib.rs has been updated successfully.",
+    "model_name": "claude-fixture-1",
+    "model_cot": null,
+    "model_response": null,
+    "source_request_id": "req_D"
+  },
+  "context_items": [],
+  "tool_executions": [
+    {
+      "id": 4,
+      "interaction_id": "3ec4e81b-3ffc-8d60-b160-5c0b3a2407db",
+      "tool_protocol": "native",
+      "tool_name": "Bash",
+      "arguments": "{\"command\":\"git commit -am greet\",\"description\":\"Commit the greeting\"}",
+      "status": "success"
+    },
+    {
+      "id": 5,
+      "interaction_id": "3ec4e81b-3ffc-8d60-b160-5c0b3a2407db",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/etc/hosts\"}",
+      "status": "success"
+    }
+  ],
+  "artifact_links": []
+}
