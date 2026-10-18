@@ -15,6 +15,9 @@ use std::process::Command;
 
 const ENTER_ALTERNATE_SCREEN: &str = "\x1b[?1049h";
 const LEAVE_ALTERNATE_SCREEN: &str = "\x1b[?1049l";
+/// Device status report: "where is the cursor?". A terminal answers it on
+/// stdin; a test terminal, and some real ones, never do.
+const ASK_CURSOR_POSITION: &str = "\x1b[6n";
 
 /// `cvc` as a person's terminal runs it: a terminal type that can redraw, a
 /// UTF-8 locale, and no `NO_COLOR` from the developer's environment.
@@ -58,6 +61,7 @@ fn the_view_enters_the_alternate_screen_draws_its_header_and_quits_on_q() {
     let output = session.output();
     assert!(status.success(), "{output}");
     assert!(session.terminal_is_cooked(), "raw mode was left on");
+    assert!(!output.contains(ASK_CURSOR_POSITION), "{output:?}");
     let entered = output.find(ENTER_ALTERNATE_SCREEN).unwrap();
     let left = output
         .rfind(LEAVE_ALTERNATE_SCREEN)
@@ -182,5 +186,35 @@ fn an_empty_repository_says_so_with_one_hint_and_never_takes_over_the_screen() {
     assert!(
         !output.contains("To record Claude Code sessions"),
         "{output}"
+    );
+}
+
+#[test]
+fn a_flow_brings_the_view_back_on_a_terminal_that_never_answers_cursor_queries() {
+    let fixture = fixture_with_a_conversation();
+    let mut session =
+        PtySession::spawn_sized(tui_command(&fixture, &["conversations"]), b"", 120, 40);
+    session.wait_for_screen_text("CVC conversations");
+
+    // The remote is not authorized, so `s` offers to authorize it, and Enter
+    // hands the terminal over to the phrase.
+    session.write(b"s");
+    session.wait_for_screen_text("is not authorized");
+    session.write(b"\r");
+    let phrase = session.wait_for_challenge(1);
+    assert!(phrase.starts_with("I AUTHORIZE SHARING "), "{phrase}");
+    session.write(b"not the phrase\n");
+
+    // The view is back with the result. Resuming used to ask the terminal where
+    // the cursor was and, unanswered, end the view with an error instead.
+    session.wait_for_screen_text("Not authorized: the typed phrase did not match.");
+    session.write(b"q");
+    let status = session.wait_for_exit();
+    let output = session.output();
+    assert!(status.success(), "{output}");
+    assert!(!output.contains(ASK_CURSOR_POSITION), "{output:?}");
+    assert!(
+        !output.contains("cursor position could not be read"),
+        "{output:?}"
     );
 }

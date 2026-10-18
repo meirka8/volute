@@ -110,7 +110,17 @@ impl Screen {
     /// nothing typed during or before a challenge acts in the list.
     pub fn resume(&mut self) -> io::Result<()> {
         enter_modes()?;
-        self.terminal.clear()?;
+        // A full repaint on the next draw. `Terminal::clear` would do it, but it
+        // first asks the terminal where the cursor is (`CSI 6 n`, answered on
+        // stdin) to put it back afterwards, and a terminal or a test harness that
+        // does not answer turns that into a two second wait and an error that
+        // ends the view. The view hides its cursor and has no use for the old
+        // position, so it clears by resizing to the size it already has: that
+        // erases the screen and forgets the previous frame, and asks nothing.
+        // Nothing else in the view reads the cursor either: it draws a full
+        // screen viewport, never an inline one, and calls no cursor query.
+        let size = self.terminal.size()?;
+        self.terminal.resize(size.into())?;
         discard_pending_input();
         Ok(())
     }
