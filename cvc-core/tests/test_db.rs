@@ -579,6 +579,11 @@ fn share_state_counts_shared_interactions_only_and_honours_the_wildcard() -> any
         "ids[5] is published but not shared, so it is not counted"
     );
     assert_eq!(summary.unconfirmed, 2, "pending and unknown");
+    assert_eq!(
+        (summary.held, summary.held_published),
+        (4, 2),
+        "ids 0, 1, 2 and 5 are held whether or not they are shared; 0 and 5 for certain"
+    );
 
     // Another destination sees only its own share and publication.
     let elsewhere = summary_of(&store, Some(&other), "mixed")?;
@@ -591,6 +596,11 @@ fn share_state_counts_shared_interactions_only_and_honours_the_wildcard() -> any
         (3, 1, 0),
         "ids 2 and 3 through the wildcard, plus its own ids[4]"
     );
+    assert_eq!(
+        (elsewhere.held, elsewhere.held_published),
+        (1, 1),
+        "the wildcard shares ids 2 and 3 there, but only ids[4] is held there"
+    );
 
     // Without a destination nothing is shared, the wildcard included.
     let neutral = summary_of(&store, None, "mixed")?;
@@ -600,6 +610,110 @@ fn share_state_counts_shared_interactions_only_and_honours_the_wildcard() -> any
         (0, 0, 0)
     );
     assert_eq!(neutral.share_future, None);
+    assert_eq!((neutral.held, neutral.held_published), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn a_conversation_the_destination_holds_is_held_whether_or_not_it_is_shared() -> anyhow::Result<()>
+{
+    let temp = TempDir::new()?;
+    let path = temp.path().join("index.db");
+    let store = CvcStore::open(&path)?;
+    let fingerprint = "7".repeat(64);
+    let other = "8".repeat(64);
+    let worktree = "a".repeat(64);
+    let connection = Connection::open(&path)?;
+    let publish = |id: &InteractionId, destination: &str, state: &str| {
+        connection.execute(
+            "INSERT INTO publications(interaction_id, remote_fingerprint, state, updated_at) VALUES(?1, ?2, ?3, 0)",
+            rusqlite::params![id.as_str(), destination, state],
+        )
+    };
+
+    // What a re-ingest after an index rebuild leaves: the interactions are
+    // captured again under their deterministic ids, the next fetch finds them at
+    // the destination and records them as published, and nobody shared them.
+    let reingested: Vec<_> = (0..3)
+        .map(|_| capture_with_worktree(&store, "reingested", worktree.clone()))
+        .collect::<anyhow::Result<_>>()?;
+    publish(&reingested[0], &fingerprint, "published")?;
+    publish(&reingested[1], &fingerprint, "pending")?;
+    publish(&reingested[2], &fingerprint, "unknown")?;
+    // Held, but nothing is known for certain: a push that did not conclude.
+    let unconfirmed: Vec<_> = (0..2)
+        .map(|_| capture_with_worktree(&store, "unconfirmed", worktree.clone()))
+        .collect::<anyhow::Result<_>>()?;
+    publish(&unconfirmed[0], &fingerprint, "pending")?;
+    publish(&unconfirmed[1], &fingerprint, "unknown")?;
+    // Another destination holds this one; this one has never seen it.
+    let elsewhere = capture_with_worktree(&store, "elsewhere", worktree.clone())?;
+    publish(&elsewhere, &other, "published")?;
+    // Nothing anywhere.
+    capture_with_worktree(&store, "untouched", worktree.clone())?;
+    // A pull marks what it imports as published, and imports are not shared.
+    let imported = capture_with_worktree(&store, "imported", worktree.clone())?;
+    publish(&imported, &fingerprint, "published")?;
+    connection.execute(
+        "UPDATE interactions SET capture_source='sync_import' WHERE id=?1",
+        [imported.as_str()],
+    )?;
+
+    let held = |conversation: &str, destination: Option<&str>| {
+        summary_of(&store, destination, conversation)
+            .map(|summary| (summary.held, summary.held_published))
+    };
+    for (conversation, expected) in [
+        ("reingested", (3, 1)),
+        ("unconfirmed", (2, 0)),
+        ("elsewhere", (0, 0)),
+        ("untouched", (0, 0)),
+        ("imported", (1, 1)),
+    ] {
+        assert_eq!(
+            held(conversation, Some(&fingerprint))?,
+            expected,
+            "{conversation}"
+        );
+        // Without a destination there is nothing to hold.
+        assert_eq!(held(conversation, None)?, (0, 0), "{conversation}");
+    }
+    assert_eq!(held("elsewhere", Some(&other))?, (1, 1));
+    assert_eq!(held("reingested", Some(&other))?, (0, 0));
+
+    // None of that is a share: the conversation reads as unshared, with nothing
+    // counted as shared, published or unconfirmed.
+    let summary = summary_of(&store, Some(&fingerprint), "reingested")?;
+    assert!(!summary.shared);
+    assert_eq!(
+        (summary.shared_count, summary.published, summary.unconfirmed),
+        (0, 0, 0)
+    );
+    assert!(summary_of(&store, Some(&fingerprint), "imported")?.imported);
+
+    // Sharing it moves the shared counts and leaves what is held alone.
+    let snapshot = store.share_snapshot("reingested")?;
+    store.share_exact_snapshot(
+        "reingested",
+        &fingerprint,
+        &snapshot,
+        FutureSharePolicy::Private,
+    )?;
+    let shared = summary_of(&store, Some(&fingerprint), "reingested")?;
+    assert_eq!(
+        (shared.shared_count, shared.published, shared.unconfirmed),
+        (3, 1, 2)
+    );
+    assert_eq!((shared.held, shared.held_published), (3, 1));
+
+    // The detail view reads the same row.
+    let details = store
+        .conversation_details("unconfirmed", Some(&fingerprint))?
+        .unwrap();
+    assert_eq!(
+        (details.summary.held, details.summary.held_published),
+        (2, 0)
+    );
     Ok(())
 }
 

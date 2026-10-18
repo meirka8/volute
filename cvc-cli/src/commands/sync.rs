@@ -81,6 +81,12 @@ pub(crate) const SUMMARY_SCAN_LIMIT: usize = 10_000;
 /// destination. TTY-only by construction — non-interactive callers must name
 /// a conversation explicitly — so this adds no path around the typed
 /// challenge that still follows. Returns `None` when the user aborts.
+///
+/// A conversation the destination already holds but this clone does not share
+/// (a re-ingested session) is offered, with the state it reads as. An imported
+/// conversation is not offered: it came from a remote and is read-only here,
+/// exactly as in the interactive view. `cvc share <id>` still names any
+/// conversation, as it always has.
 fn pick_unshared_conversation(
     store: &CvcStore,
     remote_name: &str,
@@ -94,7 +100,7 @@ fn pick_unshared_conversation(
     let candidates: Vec<_> = store
         .list_conversation_summaries(Some(fingerprint), SUMMARY_SCAN_LIMIT)?
         .into_iter()
-        .filter(|summary| !summary.shared && summary.thoughts > 0)
+        .filter(|summary| !summary.shared && !summary.imported && summary.thoughts > 0)
         .collect();
     if candidates.is_empty() {
         println!("No unshared conversations for remote '{remote_name}'.");

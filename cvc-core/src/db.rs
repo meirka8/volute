@@ -287,6 +287,15 @@ pub struct CleanupReport {
 /// the destination" means the same as it does to
 /// [`CvcStore::projection_interaction_ids`]: an interaction share for that
 /// fingerprint or for the `'*'` wildcard.
+///
+/// What the destination holds is a separate question from what this clone
+/// shares with it, and a reader must not answer the second for the first:
+/// "private" means no interaction is shared *and* the destination is not known
+/// or suspected to hold any ([`held`](Self::held)). A conversation can be held
+/// without being shared from here after an index rebuild or a re-ingest (Claude
+/// Code interaction ids are deterministic, so the next fetch finds the
+/// destination already holding them), and a pull records what it imports the
+/// same way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationSummary {
     pub id: String,
@@ -321,6 +330,17 @@ pub struct ConversationSummary {
     /// conversation with a single locally captured interaction is not imported,
     /// and neither is one with no interactions at all.
     pub imported: bool,
+    /// How many of the conversation's interactions the destination holds or may
+    /// hold: their publication state for it is `published`, `pending` or
+    /// `unknown`, whether or not they are shared from here. Unlike
+    /// [`published`](Self::published) and [`unconfirmed`](Self::unconfirmed) it
+    /// does not stop at the shared ones, so it is what tells a conversation the
+    /// destination holds from one it has never seen.
+    pub held: i64,
+    /// Of the held interactions, how many the destination is known to hold
+    /// (state `published`), shared from here or not. Zero means that nothing is
+    /// held for certain: every held interaction is still unconfirmed.
+    pub held_published: i64,
 }
 
 /// Longest list of context paths [`CvcStore::conversation_details`] returns.
@@ -462,7 +482,9 @@ fn conversation_summary_sql(tail: &str) -> String {
                 COALESCE(SUM({SHARED_FOR_DESTINATION} AND EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state = 'published')), 0),
                 COALESCE(SUM({SHARED_FOR_DESTINATION} AND EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state IN ('pending', 'unknown'))), 0),
                 (SELECT s.share_future FROM conversation_shares s WHERE s.conversation_id = c.id AND s.remote_fingerprint = ?1),
-                (COUNT(i.id) > 0 AND COUNT(i.id) = COALESCE(SUM(i.capture_source = 'sync_import'), 0))
+                (COUNT(i.id) > 0 AND COUNT(i.id) = COALESCE(SUM(i.capture_source = 'sync_import'), 0)),
+                COALESCE(SUM(EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state IN ('published', 'pending', 'unknown'))), 0),
+                COALESCE(SUM(EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state = 'published')), 0)
          FROM conversations c
          LEFT JOIN interactions i ON i.conversation_id = c.id
          {tail}"
@@ -495,6 +517,8 @@ fn map_summary_row(row: &Row) -> rusqlite::Result<ConversationSummary> {
         unconfirmed: row.get(8)?,
         share_future: row.get(9)?,
         imported: row.get(10)?,
+        held: row.get(11)?,
+        held_published: row.get(12)?,
     })
 }
 

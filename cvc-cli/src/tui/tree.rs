@@ -192,6 +192,8 @@ pub(crate) mod tests {
             unconfirmed: 0,
             share_future: None,
             imported: false,
+            held: 0,
+            held_published: 0,
         }
     }
 

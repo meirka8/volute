@@ -101,26 +101,61 @@ pub struct LabelInput {
     pub shared: i64,
     /// Of the shared thoughts, those the remote is known to hold (P).
     pub published: i64,
-    /// Thoughts the remote is known to hold or may hold (published, pending or
-    /// unknown), whether or not they are shared from here. A row is never
-    /// labeled `private` while this is above zero.
+    /// Thoughts the remote holds or may hold (published, pending or unknown),
+    /// whether or not they are shared from here (H). A row is never labeled
+    /// `private` while this is above zero.
     pub held: i64,
+    /// Of the held thoughts, those the remote is known to hold: published. Only
+    /// a row with one may be called `published` while nothing is shared from
+    /// here.
+    pub held_published: i64,
     /// Later thoughts are shared as they are captured.
     pub future: bool,
     /// Every thought of the conversation was imported from a remote.
     pub imported: bool,
 }
 
+/// Where a conversation stands with the selected remote, before it is put in
+/// words. The label and the badge that counts agents both read it, so the two
+/// cannot disagree about a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    /// Nothing is shared and the remote holds nothing of it.
+    Private,
+    /// Nothing is shared and the remote holds nothing of it yet, but later
+    /// thoughts are shared as they are captured.
+    FutureOnly,
+    /// Nothing is shared from here and the remote is known to hold some of it.
+    HeldPublished,
+    /// Nothing is shared from here and the remote may hold some of it, but no
+    /// publish of it is known to have concluded.
+    HeldUnconfirmed,
+    /// Something is shared and some of it is not yet published.
+    Waiting,
+    /// Everything shared is published.
+    Published,
+}
+
+impl Standing {
+    fn tone(self) -> Tone {
+        match self {
+            Standing::Private => Tone::Private,
+            Standing::FutureOnly | Standing::HeldUnconfirmed | Standing::Waiting => Tone::Waiting,
+            Standing::HeldPublished | Standing::Published => Tone::Published,
+        }
+    }
+}
+
 impl LabelInput {
     /// The input of a listed conversation. The one place that says where each
-    /// number comes from: until the store reports what a destination holds
-    /// beyond what is shared, a row holds what it has published.
+    /// number comes from.
     pub fn of(summary: &ConversationSummary) -> Self {
         Self {
             thoughts: summary.thoughts,
             shared: summary.shared_count,
             published: summary.published,
-            held: summary.published,
+            held: summary.held,
+            held_published: summary.held_published,
             future: summary.share_future == Some(true),
             imported: summary.imported,
         }
@@ -131,38 +166,61 @@ impl LabelInput {
         self.shared - self.published
     }
 
-    /// Whether the remote has, or may have, thoughts of this conversation that
-    /// are not shared from here: it holds them, so the row is not private.
-    fn held_unshared(&self) -> bool {
-        self.shared == 0 && self.held > 0
+    fn standing(&self) -> Standing {
+        if self.shared > 0 {
+            if self.waiting() > 0 {
+                Standing::Waiting
+            } else {
+                Standing::Published
+            }
+        } else if self.held > 0 {
+            if self.held_published > 0 {
+                Standing::HeldPublished
+            } else {
+                Standing::HeldUnconfirmed
+            }
+        } else if self.future {
+            Standing::FutureOnly
+        } else {
+            Standing::Private
+        }
     }
 
-    /// Which part of the story a row tells a badge counting agents.
+    /// Which part of the story a row tells a badge counting agents. A row that
+    /// is only later thoughts shared tells none: nothing waits, nothing is
+    /// private to decide about, and nothing is published.
     fn category(&self) -> Option<Tone> {
-        if self.waiting() > 0 {
-            Some(Tone::Waiting)
-        } else if self.imported && self.shared == 0 {
-            None
-        } else if self.shared == 0 && !self.held_unshared() {
-            Some(Tone::Private)
-        } else {
-            Some(Tone::Published)
+        if self.imported && self.shared == 0 {
+            return None;
+        }
+        match self.standing() {
+            Standing::FutureOnly => None,
+            standing => Some(standing.tone()),
         }
     }
 }
 
 /// The state column for one conversation and the remote it is shown for.
 ///
-/// With S shared, P published among those and T thoughts in all, W = S - P:
-/// nothing shared reads `private`; anything shared but not yet published reads
-/// `shared` with W `waiting`; everything shared and published reads
-/// `published`; thoughts that are not shared are counted in a `private` tail
-/// whenever any are shared, so `private` never stands alone for a conversation
-/// with a published thought. Thoughts the remote holds that are not shared from
-/// here read `on remote`, never `private`. `+future` follows when later
-/// thoughts are shared as they are captured. A conversation imported from a
-/// remote and not shared from here reads `imported`. Without a destination
-/// there is no share state to show, which reads as a dash.
+/// With S shared, P published among those, H held (published, pending or
+/// unknown, shared or not) and T thoughts in all, W = S - P:
+///
+/// - S = 0 and H = 0 reads `private`. A conversation whose later thoughts are
+///   shared as they are captured reads `shared · future only` instead.
+/// - Anything shared but not yet published reads `shared` with W `waiting`;
+///   everything shared and published reads `published`. Thoughts that are not
+///   shared are counted in a `private` tail whenever any are shared, so
+///   `private` never stands alone for a conversation with a published thought.
+/// - S = 0 and H > 0, which is what a re-ingested session reads (the remote
+///   holds it, nobody here shared it), reads `published · not shared here` when
+///   the remote is known to hold some of it, and `unconfirmed · not shared
+///   here` when every held thought is a publish that did not conclude. Never
+///   `private`, and never `published` without a published thought.
+///
+/// `+future` follows when later thoughts are shared as they are captured. A
+/// conversation imported from a remote and not shared from here reads
+/// `imported`. Without a destination there is no share state to show, which
+/// reads as a dash.
 pub fn state_label(
     summary: &ConversationSummary,
     has_destination: bool,
@@ -181,28 +239,27 @@ fn label_of(input: &LabelInput, has_destination: bool, g: &Glyphs) -> (String, T
     let waiting = input.waiting();
     let private_tail = input.thoughts - input.shared;
     let dot = g.dot();
-    let (mut label, tone) = if input.held_unshared() {
-        (
-            format!("{} on remote {dot} not shared here", g.published()),
-            Tone::Published,
-        )
-    } else if input.shared == 0 {
-        (format!("{} private", g.private()), Tone::Private)
-    } else if waiting > 0 {
-        (
-            format!("{} shared {dot} {waiting} waiting", g.waiting()),
-            Tone::Waiting,
-        )
-    } else {
-        (format!("{} published", g.published()), Tone::Published)
+    let standing = input.standing();
+    let mut label = match standing {
+        Standing::Private => format!("{} private", g.private()),
+        Standing::FutureOnly => format!("{} shared {dot} future only", g.waiting()),
+        Standing::HeldPublished => {
+            format!("{} published {dot} not shared here", g.published())
+        }
+        Standing::HeldUnconfirmed => {
+            format!("{} unconfirmed {dot} not shared here", g.unconfirmed())
+        }
+        Standing::Waiting => format!("{} shared {dot} {waiting} waiting", g.waiting()),
+        Standing::Published => format!("{} published", g.published()),
     };
     if input.shared > 0 && private_tail > 0 {
         label.push_str(&format!(" {dot} {private_tail} private"));
     }
-    if input.future {
+    // `future only` already says it.
+    if input.future && standing != Standing::FutureOnly {
         label.push_str(" +future");
     }
-    (label, tone)
+    (label, standing.tone())
 }
 
 /// The dim badge that ends a collapsed parent's row: how many agents are under
@@ -1837,6 +1894,16 @@ mod tests {
         s
     }
 
+    /// A conversation of `thoughts` thoughts, none shared from here, that the
+    /// remote holds `published` of for certain and `unconfirmed` of perhaps (a
+    /// publish that did not conclude).
+    fn held(thoughts: i64, published: i64, unconfirmed: i64) -> ConversationSummary {
+        let mut s = conversation("c", 0, 0, thoughts);
+        s.held = published + unconfirmed;
+        s.held_published = published;
+        s
+    }
+
     fn label(s: &ConversationSummary) -> String {
         state_label(s, true, &U).0
     }
@@ -1875,12 +1942,37 @@ mod tests {
         let mut s = state(27, 21, 19);
         s.share_future = Some(true);
         assert_eq!(label(&s), "◐ shared · 2 waiting · 6 private +future");
-        let mut s = state(27, 0, 0);
-        s.share_future = Some(true);
-        assert_eq!(label(&s), "○ private +future");
         let mut s = state(27, 27, 27);
         s.share_future = Some(false);
         assert_eq!(label(&s), "● published");
+        // With nothing shared yet there is no label to append it to; the label
+        // itself says it (see the `future only` test).
+        let mut s = state(27, 0, 0);
+        s.share_future = Some(true);
+        assert_eq!(label(&s), "◐ shared · future only");
+        // A row the remote holds keeps its own label and the suffix.
+        let mut s = held(27, 3, 0);
+        s.share_future = Some(true);
+        assert_eq!(label(&s), "● published · not shared here +future");
+    }
+
+    #[test]
+    fn later_thoughts_shared_with_nothing_shared_yet_read_future_only() {
+        let mut s = state(5, 0, 0);
+        s.share_future = Some(true);
+        assert_eq!(label(&s), "◐ shared · future only");
+        assert_eq!(state_label(&s, true, &U).1, Tone::Waiting);
+        assert_eq!(state_label(&s, true, &A).0, "~ shared - future only");
+        // Not future: private. Unknown: private. Without a destination: a dash.
+        s.share_future = Some(false);
+        assert_eq!(label(&s), "○ private");
+        s.share_future = None;
+        assert_eq!(label(&s), "○ private");
+        s.share_future = Some(true);
+        assert_eq!(state_label(&s, false, &U).0, "–");
+        // An imported conversation is imported, whatever else is set.
+        s.imported = true;
+        assert_eq!(label(&s), "imported");
     }
 
     #[test]
@@ -2743,18 +2835,67 @@ mod tests {
 
     #[test]
     fn a_row_the_remote_holds_is_never_labeled_private() {
-        // Nothing shared from here, but the remote holds some of it.
-        let held_only = state(5, 0, 3);
-        assert_eq!(label(&held_only), "● on remote · not shared here");
+        // Nothing shared from here, but the remote holds some of it for certain.
+        let held_only = held(5, 3, 0);
+        assert_eq!(label(&held_only), "● published · not shared here");
         assert_eq!(state_label(&held_only, true, &U).1, Tone::Published);
         let mut future = held_only.clone();
         future.share_future = Some(true);
-        assert_eq!(label(&future), "● on remote · not shared here +future");
+        assert_eq!(label(&future), "● published · not shared here +future");
         assert_eq!(
             state_label(&held_only, true, &A).0,
-            "* on remote - not shared here"
+            "* published - not shared here"
         );
+        // One published thought among unconfirmed ones is enough to say so.
+        assert_eq!(label(&held(5, 1, 3)), "● published · not shared here");
         assert_eq!(label(&state(5, 0, 0)), "○ private");
+    }
+
+    #[test]
+    fn a_row_held_only_by_publishes_that_did_not_conclude_is_never_called_published() {
+        let unconfirmed = held(5, 0, 2);
+        assert_eq!(label(&unconfirmed), "? unconfirmed · not shared here");
+        assert_eq!(state_label(&unconfirmed, true, &U).1, Tone::Waiting);
+        assert_eq!(
+            state_label(&unconfirmed, true, &A).0,
+            "? unconfirmed - not shared here"
+        );
+        let mut future = unconfirmed.clone();
+        future.share_future = Some(true);
+        assert_eq!(label(&future), "? unconfirmed · not shared here +future");
+    }
+
+    #[test]
+    fn nothing_the_remote_holds_reads_private_and_nothing_unproven_reads_published() {
+        // Every mix of held thoughts with nothing shared, in both glyph sets.
+        for thoughts in 1..=4 {
+            for published in 0..=thoughts {
+                for unconfirmed in 0..=(thoughts - published) {
+                    for glyphs in [&U, &A] {
+                        let summary = held(thoughts, published, unconfirmed);
+                        let (text, _) = state_label(&summary, true, glyphs);
+                        let case =
+                            format!("{published} published, {unconfirmed} unconfirmed: {text}");
+                        assert_eq!(
+                            text.contains("private"),
+                            published + unconfirmed == 0,
+                            "{case}"
+                        );
+                        assert_eq!(text.contains("published"), published > 0, "{case}");
+                        assert_eq!(
+                            text.contains("unconfirmed"),
+                            published == 0 && unconfirmed > 0,
+                            "{case}"
+                        );
+                        assert_eq!(
+                            text.contains("not shared here"),
+                            published + unconfirmed > 0,
+                            "{case}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2765,15 +2906,33 @@ mod tests {
             shared: 0,
             published: 0,
             held: 2,
+            held_published: 1,
             future: false,
             imported: false,
         };
         assert_eq!(
             label_of(&input, true, &U).0,
-            "● on remote · not shared here"
+            "● published · not shared here"
         );
-        let none_held = LabelInput { held: 0, ..input };
+        let unproven = LabelInput {
+            held_published: 0,
+            ..input
+        };
+        assert_eq!(
+            label_of(&unproven, true, &U).0,
+            "? unconfirmed · not shared here"
+        );
+        let none_held = LabelInput {
+            held: 0,
+            held_published: 0,
+            ..input
+        };
         assert_eq!(label_of(&none_held, true, &U).0, "○ private");
+        let future_only = LabelInput {
+            future: true,
+            ..none_held
+        };
+        assert_eq!(label_of(&future_only, true, &U).0, "◐ shared · future only");
         // Shared thoughts follow the table whatever else the remote holds.
         let shared = LabelInput {
             shared: 5,
@@ -2788,16 +2947,21 @@ mod tests {
             ..input
         };
         assert_eq!(label_of(&imported, true, &U).0, "imported");
+        // Each number comes from its own field of the summary: what is held is
+        // not what is published.
         let mut summary = state(5, 2, 1);
         summary.imported = true;
         summary.share_future = Some(true);
+        summary.held = 4;
+        summary.held_published = 3;
         assert_eq!(
             LabelInput::of(&summary),
             LabelInput {
                 thoughts: 5,
                 shared: 2,
                 published: 1,
-                held: 1,
+                held: 4,
+                held_published: 3,
                 future: true,
                 imported: true,
             }
@@ -2806,13 +2970,35 @@ mod tests {
 
     #[test]
     fn a_badge_does_not_count_a_row_the_remote_holds_as_private() {
-        let held = agent(0, 2);
+        let held_agent = held(4, 2, 0);
         let private = agent(0, 0);
         assert_eq!(
-            agents_badge(&[&held, &private], true, &U),
+            agents_badge(&[&held_agent, &private], true, &U),
             "+2 agents · 1 private"
         );
-        assert_eq!(agents_badge(&[&held], true, &U), "+1 agent · 1 published");
+        assert_eq!(
+            agents_badge(&[&held_agent], true, &U),
+            "+1 agent · 1 published"
+        );
+    }
+
+    #[test]
+    fn a_badge_never_calls_an_unproven_row_published_or_a_future_only_row_private() {
+        let unconfirmed = held(4, 0, 2);
+        let mut future_only = agent(0, 0);
+        future_only.share_future = Some(true);
+        let private = agent(0, 0);
+        // An unconfirmed row is unsettled, which the badge counts with waiting.
+        assert_eq!(
+            agents_badge(&[&unconfirmed], true, &U),
+            "+1 agent · 1 waiting"
+        );
+        // A row that is only later thoughts shared says nothing either way.
+        assert_eq!(agents_badge(&[&future_only], true, &U), "+1 agent");
+        assert_eq!(
+            agents_badge(&[&future_only, &private], true, &U),
+            "+2 agents · 1 private"
+        );
     }
 
     #[test]

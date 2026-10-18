@@ -11,6 +11,44 @@ use std::env;
 /// How many conversations the plain listing shows when `--limit` is absent.
 const PLAIN_DEFAULT_LIMIT: usize = 20;
 
+/// The bracketed share state of one listing line, for the destination the
+/// summary was read for.
+///
+/// - Something is shared from here: `[shared, N published]` when every thought
+///   is published, else `[shared, P/T published]`. P counts the shared thoughts
+///   the destination is known to hold.
+/// - Nothing is shared from here, but the destination holds, or may hold,
+///   thoughts of it (`held`): `[published, not shared here]` when it is known to
+///   hold some, `[unconfirmed, not shared here]` when every one of them is a
+///   publish that did not conclude. This is how a re-ingested session or an
+///   imported conversation reads. It is never `[private]`, which would send a
+///   person deciding whether to redact it looking in the wrong place.
+/// - Nothing is shared or held, but later thoughts are shared as they are
+///   captured: `[shared, future only]`.
+/// - Otherwise `[private]`.
+fn share_state(summary: &ConversationSummary) -> String {
+    if summary.shared {
+        if summary.published > 0 && summary.published == summary.thoughts {
+            format!("[shared, {} published]", summary.published)
+        } else {
+            format!(
+                "[shared, {}/{} published]",
+                summary.published, summary.thoughts
+            )
+        }
+    } else if summary.held > 0 {
+        if summary.held_published > 0 {
+            "[published, not shared here]".into()
+        } else {
+            "[unconfirmed, not shared here]".into()
+        }
+    } else if summary.share_future == Some(true) {
+        "[shared, future only]".into()
+    } else {
+        "[private]".into()
+    }
+}
+
 /// Renders one summary line. Kept width-stable so the picker and the listing
 /// read identically.
 pub(crate) fn render_line(summary: &ConversationSummary, with_destination: bool) -> String {
@@ -22,15 +60,8 @@ pub(crate) fn render_line(summary: &ConversationSummary, with_destination: bool)
     };
     let state = if !with_destination {
         String::new()
-    } else if summary.published > 0 && summary.published == summary.thoughts {
-        format!("  [shared, {} published]", summary.published)
-    } else if summary.shared {
-        format!(
-            "  [shared, {}/{} published]",
-            summary.published, summary.thoughts
-        )
     } else {
-        "  [private]".into()
+        format!("  {}", share_state(summary))
     };
     format!(
         "{}  {:>3} thought(s), {:>3} linked  {}{}\n      {}",
@@ -317,6 +348,109 @@ mod tests {
 
     fn fingerprint_of(repo: &Repository, name: &str) -> String {
         privacy::remote_destination(repo, name).unwrap().fingerprint
+    }
+
+    /// A conversation of four thoughts with no share, publication or hold.
+    fn summary() -> ConversationSummary {
+        ConversationSummary {
+            id: "c-1".into(),
+            title: "a title".into(),
+            thoughts: 4,
+            linked: 1,
+            first_activity: 1_700_000_000,
+            last_activity: 1_700_000_000,
+            shared: false,
+            shared_count: 0,
+            published: 0,
+            unconfirmed: 0,
+            share_future: None,
+            imported: false,
+            held: 0,
+            held_published: 0,
+        }
+    }
+
+    /// The same conversation with `shared` thoughts shared and `published` of
+    /// them published.
+    fn shared(shared: i64, published: i64) -> ConversationSummary {
+        ConversationSummary {
+            shared: shared > 0,
+            shared_count: shared,
+            published,
+            held: published,
+            held_published: published,
+            ..summary()
+        }
+    }
+
+    /// The same conversation, none of it shared, `published` thoughts of it held
+    /// for certain by the remote and `unconfirmed` more perhaps.
+    fn held(published: i64, unconfirmed: i64) -> ConversationSummary {
+        ConversationSummary {
+            held: published + unconfirmed,
+            held_published: published,
+            ..summary()
+        }
+    }
+
+    #[test]
+    fn what_is_shared_from_here_keeps_its_labels() {
+        assert_eq!(share_state(&shared(4, 4)), "[shared, 4 published]");
+        assert_eq!(share_state(&shared(4, 1)), "[shared, 1/4 published]");
+        assert_eq!(share_state(&shared(2, 0)), "[shared, 0/4 published]");
+        assert_eq!(share_state(&shared(2, 2)), "[shared, 2/4 published]");
+        // What else the remote holds changes nothing while something is shared.
+        let mut also_held = shared(2, 1);
+        also_held.held = 4;
+        also_held.held_published = 3;
+        also_held.share_future = Some(true);
+        assert_eq!(share_state(&also_held), "[shared, 1/4 published]");
+    }
+
+    #[test]
+    fn what_the_remote_holds_is_never_listed_as_private() {
+        assert_eq!(share_state(&summary()), "[private]");
+        // Held for certain, whether or not other held thoughts are unconfirmed.
+        assert_eq!(share_state(&held(4, 0)), "[published, not shared here]");
+        assert_eq!(share_state(&held(1, 3)), "[published, not shared here]");
+        // Held only by publishes that did not conclude: not called published.
+        assert_eq!(share_state(&held(0, 2)), "[unconfirmed, not shared here]");
+        // Later thoughts shared, nothing else: said so. Held outranks it.
+        let mut future = summary();
+        future.share_future = Some(true);
+        assert_eq!(share_state(&future), "[shared, future only]");
+        future.share_future = Some(false);
+        assert_eq!(share_state(&future), "[private]");
+        let mut both = held(1, 0);
+        both.share_future = Some(true);
+        assert_eq!(share_state(&both), "[published, not shared here]");
+
+        // Every mix of held thoughts with nothing shared.
+        for published in 0..=4 {
+            for unconfirmed in 0..=(4 - published) {
+                let label = share_state(&held(published, unconfirmed));
+                let case = format!("{published} published, {unconfirmed} unconfirmed: {label}");
+                assert_eq!(label == "[private]", published + unconfirmed == 0, "{case}");
+                assert_eq!(label.contains("published"), published > 0, "{case}");
+                assert_eq!(
+                    label.contains("unconfirmed"),
+                    published == 0 && unconfirmed > 0,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_carries_the_state_only_with_a_destination() {
+        let line = render_line(&held(1, 0), true);
+        assert!(
+            line.contains("c-1  [published, not shared here]\n"),
+            "{line}"
+        );
+        let line = render_line(&held(1, 0), false);
+        assert!(!line.contains('['), "{line}");
+        assert!(line.contains("c-1\n      a title"), "{line}");
     }
 
     #[test]

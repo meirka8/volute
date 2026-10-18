@@ -209,6 +209,12 @@ impl Glyphs {
     pub fn published(self) -> &'static str {
         self.pick("●", "*")
     }
+    /// The remote may hold it, but no publish of it is known to have concluded.
+    /// A question mark in both sets: it is already ASCII, and a lookalike glyph
+    /// would only blur what the word next to it says.
+    pub fn unconfirmed(self) -> &'static str {
+        self.pick("?", "?")
+    }
 }
 
 /// What the terminal is expected to handle, read once from the environment.
