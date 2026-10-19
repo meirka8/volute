@@ -6,7 +6,9 @@ This runbook is for maintainers and auditors of the public repository
 `check-release-version` rejects a tag unless it is exact stable
 `vMAJOR.MINOR.PATCH` before build or publishing. Prerelease and build metadata are
 unsupported until the workflow has proper npm dist-tag and VSCE prerelease handling.
-Do not release from an unmerged branch or by manually publishing a package.
+Do not release from an unmerged branch or by manually publishing a package. The one
+exception is [bootstrapping a new npm package name](#bootstrapping-a-new-npm-package-name),
+which publishes only an empty placeholder and is not a release.
 
 For contribution, DCO, and security-reporting rules, see
 [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and the
@@ -25,13 +27,17 @@ Repository administrators must configure the following before a release:
    credential in the **environment-scoped** `VSCE_PAT` secret for
    `vscode-marketplace`. The token authorizes publisher `volute`; never place its
    value, or any other secret value, in this document, source, issues, or logs.
-3. In npm, configure Trusted Publisher for public package `@volute_cvc/cvc-mcp` with
-   these exact fields: GitHub owner `meirka8`, repository `volute`, workflow filename
-   `release.yml`, environment `npm-publish`, and allowed action `npm publish`.
-   The allowed-action field is required by current npm documentation (June 2026). Set
-   npm Publishing access to **Require two-factor authentication and disallow tokens**,
-   revoke obsolete automation tokens, and keep package owners to the minimum needed.
-   Do not create a long-lived npm token.
+3. In npm, configure Trusted Publisher for both public packages, `@volute_cvc/cvc-mcp`
+   and `@volute_cvc/cvc`, with these exact fields, identical for the two: GitHub owner
+   `meirka8`, repository `volute`, workflow filename `release.yml`, environment
+   `npm-publish`, and allowed action `npm publish`.
+   The allowed-action field is required by current npm documentation (June 2026). For
+   each package, set npm Publishing access to **Require two-factor authentication and
+   disallow tokens**, revoke obsolete automation tokens, and keep package owners to the
+   minimum needed. Do not create a long-lived npm token. A package must already exist
+   before its Trusted Publisher can be configured; for a name that has never been
+   published, follow [Bootstrapping a new npm package name](#bootstrapping-a-new-npm-package-name)
+   first.
 4. Configure release tag signing on the ceremony machine. Release tags are
    SSH-signed as the dedicated release identity `Volute Release <dev@cvc.dev>`
    using the release signing key with fingerprint
@@ -56,6 +62,61 @@ The public repository's OIDC trusted-publishing flow automatically emits npm
 provenance. Accordingly, the workflow deliberately uses `npm publish` without a
 `--provenance` argument.
 
+## Bootstrapping a new npm package name
+
+The launcher is published under two names (`@volute_cvc/cvc-mcp` and `@volute_cvc/cvc`,
+both built from `npm/cvc-mcp`). A name that has never been published cannot be released
+by the workflow: Trusted Publisher is configured on a package that already exists, and
+the workflow holds no token that could create one. So a new name is set up once, by
+hand, before the first release that publishes it. Use this procedure for the next name
+too.
+
+This bootstrap is **not a release**. It publishes a placeholder at version `0.0.0` that
+contains no code and no `bin`, never a version of the product, so it does not conflict
+with the rule above against releasing by manually publishing a package. The first real
+version still comes from the release workflow, with provenance.
+
+A maintainer does this from their own signed-in npm session, which asks for two-factor
+authentication. Never create a token for it.
+
+1. Check the name is free: `npm view <name>` must fail with E404.
+2. In a scratch directory outside the repository, write a placeholder package: a
+   `package.json` with the exact new name, version `0.0.0`, a description saying it is
+   a placeholder and which version is the first real one, `license` `Apache-2.0`, the
+   repository metadata of the real package, and `publishConfig.access` `public`; a short
+   `README.md`; and the repository `LICENSE`. It must have no `bin`, no scripts, and no
+   other code.
+3. Publish it from that directory with `npm publish --access public` and complete the
+   two-factor prompt. This plain publish is enough; `npm stage publish` is not needed.
+4. npm creates a new package through staged publishing (GitHub changelog, 2026-10-02;
+   <https://docs.npmjs.com/staged-publishing>), as it did when `@volute_cvc/cvc` was
+   bootstrapped on 2026-10-19. npm immediately creates a public stub version
+   `0.0.0-stage` (description "Temporary package placeholder for staged publishing") so
+   that the name exists, and holds the real `0.0.0` until it is approved. The stub
+   belongs to npm and is harmless: it is a prerelease, so a default install never
+   selects it. Leave it alone; npm's documentation does not say whether it is ever
+   removed. Approve the staged `0.0.0` on npmjs.com (the package's **Staged Packages**
+   tab) or with `npm stage approve <stage-id>`; both ask for two-factor authentication.
+   If npm publishes the version directly instead, there is nothing to approve.
+5. Wait until `npm view <name>` shows version `0.0.0`. Until the approved version has
+   been released, `npm view` and `npm deprecate` report E404 for the name. That is
+   expected, not a failed publish.
+6. Deprecate the placeholder immediately, so nobody installs it:
+   `npm deprecate "<name>@0.0.0" "Placeholder with no code; use <first real version> or later."`
+7. Configure Trusted Publisher for the name with the exact fields from step 3 of the
+   one-time setup above (owner `meirka8`, repository `volute`, workflow `release.yml`,
+   environment `npm-publish`, allowed action `npm publish`). It can be configured once the
+   package exists.
+8. Set the package's Publishing access to **Require two-factor authentication and
+   disallow tokens**.
+9. Add the name to `PACKAGES` in `npm/cvc-mcp/scripts/stage-package.mjs`, with the README
+   its package page shows, through a normal reviewed PR, only after steps 1 to 8: the
+   release would otherwise try to publish a name it cannot create. Both workflows take
+   the names from that list, so no secret or workflow change is needed.
+
+The next release then publishes the first real version, through the `npm-publish`
+environment approval like any other.
+
 ## Prepare a release pull request
 
 Choose a stable SemVer version `X.Y.Z`; the tag will be `vX.Y.Z`. Start from current
@@ -75,7 +136,8 @@ listed lockfiles:
 3. `cvc-lsp/Cargo.toml`
 4. `cvc-mcp/Cargo.toml`
 5. `cvc-plugin/package.json` and `cvc-plugin/package-lock.json`
-6. `npm/cvc-mcp/package.json`
+6. `npm/cvc-mcp/package.json` (the version of both npm packages, `@volute_cvc/cvc-mcp`
+   and `@volute_cvc/cvc`, which is staged from it: there is no second manifest to bump)
 
 Also update `Cargo.lock`. The reviewer is tested by CI but is not separately
 version-published. Use the package manager to preserve lockfile consistency (for
@@ -113,14 +175,18 @@ node .github/scripts/generate-third-party-notices.mjs --check
 node .github/scripts/check-release-version.mjs vX.Y.Z
 ```
 
-CI's `npm-wrapper` job also fails if npm would rewrite `npm/cvc-mcp/package.json`
-while publishing. It checks this with `npm pkg fix` and a publish dry run on the same
-npm version that the release job pins. If that check fails, run `npm pkg fix` in
+CI's `npm-wrapper` job also fails if npm would rewrite the manifest of either published
+package while publishing: `npm/cvc-mcp/package.json` itself, or the `@volute_cvc/cvc`
+manifest that `npm/cvc-mcp/scripts/stage-package.mjs` derives from it (only the name
+differs). It checks both with `npm pkg fix` and a publish dry run on the same npm
+version that the release job pins, and it checks the registry lookup the release uses
+against the live registry. If a manifest check fails, run `npm pkg fix` in
 `npm/cvc-mcp` and commit the result.
 
 The last command in the block above is the release version gate: it requires the tag
 spelling and the four Cargo manifests, extension manifest, and npm wrapper manifest
-to match exactly. Inspect the resulting diff, including both lockfiles. Commit with
+to match exactly (the npm manifest is the one both npm names take their version from).
+Inspect the resulting diff, including both lockfiles. Commit with
 DCO sign-off, push the branch, and open a PR to `main`:
 
 ```bash
@@ -166,11 +232,25 @@ enforce a GitHub ruleset.
 ## Confirm external version availability
 
 Before tagging, check version `X.Y.Z` separately in the npm registry's package-version
-view for `@volute_cvc/cvc-mcp` and in the VS Code Marketplace listing for publisher
-`volute`. The remote Git tag check below does **not** check either external registry.
-If either version already exists, stop. If the registry or Marketplace is unavailable,
-ambiguous, or cannot be authenticated for inspection, fail closed: do not tag until its
-absence is confirmed in the relevant UI or registry response.
+view for each npm name, `@volute_cvc/cvc-mcp` and `@volute_cvc/cvc`, and in the VS Code
+Marketplace listing for publisher `volute`. The remote Git tag check below does **not**
+check any external registry. If any of the three versions already exists, stop. If the
+registry or Marketplace is unavailable, ambiguous, or cannot be authenticated for
+inspection, fail closed: do not tag until its absence is confirmed in the relevant UI or
+registry response.
+
+For the two npm names, this command does the lookup read-only, with the same code the
+release uses, and publishes nothing. Run it with npm 12.0.2, the version the release
+pins:
+
+```bash
+node npm/cvc-mcp/scripts/publish-convergent.mjs --version X.Y.Z --decide-only
+```
+
+It must report `would-publish` for both names. A `skip` means that name and version
+already exist, so stop. Any other error, including a network failure or a reply from an
+npm that words its errors differently, fails the command; treat that as unconfirmed
+absence and do not tag.
 
 ## Create the release tag
 
@@ -240,7 +320,12 @@ Before the GitHub Release is created, the workflow publishes GitHub build proven
 attestations for every staged release asset, including that manifest.
 
 Only after the GitHub Release succeeds do the isolated `publish-marketplace` and
-`publish-npm` jobs run through `vscode-marketplace` and `npm-publish`, respectively.
+`publish-npm` jobs run through `vscode-marketplace` and `npm-publish`, respectively. The
+`publish-npm` job publishes the launcher under both npm names, `@volute_cvc/cvc-mcp` and
+then `@volute_cvc/cvc`, so a single `npm-publish` approval covers both. They are built
+from the one source directory `npm/cvc-mcp`; `npm/cvc-mcp/scripts/stage-package.mjs`
+derives the second package (the same files, its own name and README) and holds the list
+of names.
 Complete every required release-environment approval, as defined by the protection
 rules, only after confirming the tag, commit, version gate, and artifacts.
 
@@ -270,23 +355,47 @@ After all jobs complete, verify:
   run. `gh attestation verify` validates that signature, identity, and digest using
   the GitHub/Sigstore trust model. Use both checks; neither removes the need to trust
   the repository, its workflow, and their configured GitHub protections.
-- npm shows `@volute_cvc/cvc-mcp@X.Y.Z` with Apache-2.0 license, the `meirka8/volute`
-  repository metadata, and provenance; inspect the actual npm tarball to confirm it
-  includes `LICENSE`. Only then, in an isolated disposable environment, run a launcher
-  smoke test with a throwaway home directory. The launcher publishes into `~/.cvc/bin`
-  and never downgrades, so on a machine that already holds a newer or locally built
-  `cvc` it would run that binary instead of X.Y.Z. Run the `cvc` bin, not `cvc-mcp`,
-  which ignores `--help`, starts the MCP server, and exits 1 outside a Git repository:
+- npm shows both `@volute_cvc/cvc-mcp@X.Y.Z` and `@volute_cvc/cvc@X.Y.Z` with
+  Apache-2.0 license, the `meirka8/volute` repository metadata, and provenance. For each
+  name, `npm view` reports them (the `predicateType` must be present):
 
   ```bash
-  smoke_home=$(mktemp -d)
-  HOME="$smoke_home" npx --yes --package @volute_cvc/cvc-mcp@X.Y.Z -- cvc --version
-  rm -rf "$smoke_home"
+  for name in @volute_cvc/cvc-mcp @volute_cvc/cvc; do
+    npm view "$name@X.Y.Z" name version license repository.url dist.attestations.provenance.predicateType
+  done
   ```
 
-  The output must be `cvc X.Y.Z`. Stderr also shows the launcher's download lines and
-  `Installed CVC X.Y.Z to <tmp>/.cvc/bin`. On Windows, set `USERPROFILE` instead of
-  `HOME`.
+  Inspect the actual npm tarball of each to confirm it includes `LICENSE`; the two list
+  the same files, and only `package.json` (the name) and `README.md` differ. Then, in an
+  isolated disposable environment, confirm that a global install of `@volute_cvc/cvc`
+  yields all three commands (`cvc`, `cvc-mcp`, and `cvc-lsp`; on Windows they are the
+  `.cmd` shims in the prefix directory itself), without running them:
+
+  ```bash
+  smoke_prefix=$(mktemp -d)
+  npm install --global --prefix "$smoke_prefix" @volute_cvc/cvc@X.Y.Z
+  ls "$smoke_prefix/bin"
+  rm -rf "$smoke_prefix"
+  ```
+
+  The listing must show `cvc`, `cvc-lsp`, and `cvc-mcp`. Then, still in a disposable
+  environment, run a launcher smoke test for each name with its own throwaway home
+  directory. The launcher publishes into `~/.cvc/bin` and never downgrades, so on a
+  machine that already holds a newer or locally built `cvc` it would run that binary
+  instead of X.Y.Z. Run the `cvc` bin, not `cvc-mcp`, which ignores `--help`, starts the
+  MCP server, and exits 1 outside a Git repository:
+
+  ```bash
+  for package in @volute_cvc/cvc-mcp @volute_cvc/cvc; do
+    smoke_home=$(mktemp -d)
+    HOME="$smoke_home" npx --yes --package "$package@X.Y.Z" -- cvc --version
+    rm -rf "$smoke_home"
+  done
+  ```
+
+  The output must be `cvc X.Y.Z` for both. Stderr also shows the launcher's download
+  lines and `Installed CVC X.Y.Z to <tmp>/.cvc/bin`. On Windows, set `USERPROFILE`
+  instead of `HOME`.
 - The VS Code Marketplace shows Apache-2.0 and all four target variants for publisher
   `volute` at the expected version.
 
@@ -324,6 +433,25 @@ publication is complete: a rerun is only needed to turn the run green, and it sk
 every target (it needs a fresh `vscode-marketplace` approval like any rerun). A target
 that instead shows a failed publish and is not listed is a real failure: follow the
 recovery above.
+
+npm publishing is convergent per package name. The `publish-npm` job stages both names
+from `npm/cvc-mcp` (`@volute_cvc/cvc-mcp`, then `@volute_cvc/cvc`) and, before it
+publishes anything, asks the registry whether each `name@X.Y.Z` already exists. It
+publishes only the names that are missing, in that order, and stops at the first
+failure. Only an `npm view` E404 means "not published"; any other lookup error (a network
+failure, a registry error, a reply it does not recognise) fails the job without
+publishing, because publishing on a guess is how a rerun would republish a name. If
+`npm publish` itself fails, the job asks the registry once more before believing it,
+since an upload that timed out can have succeeded. **Re-run failed jobs** is therefore
+the complete recovery when one name is out and the other is not, for example
+`@volute_cvc/cvc-mcp` published and `@volute_cvc/cvc` failed: the rerun logs
+`skip @volute_cvc/cvc-mcp@X.Y.Z: already on the registry` and publishes only the missing
+name. It needs a fresh `npm-publish` approval like any rerun. Do not publish the missing
+name by hand. Registry reads can briefly lag a publish; if a rerun fails because npm
+rejected a version that does exist, wait a few minutes, confirm with `npm view`, and
+rerun. To see what a rerun would do without publishing anything, run
+`node npm/cvc-mcp/scripts/publish-convergent.mjs --version X.Y.Z --decide-only`.
+
 For npm, preserve the Trusted Publisher workflow identity (`release.yml`); do not
 casually change npm trust. If the original artifacts or provenance cannot be preserved,
 release a new patch version. Document partial publication and repair forward. Public
