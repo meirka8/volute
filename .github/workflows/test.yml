@@ -143,40 +143,77 @@ jobs:
           node --check bin/cvc-mcp.js
           node --check bin/cvc.js
           node --check bin/cvc-lsp.js
+          node --check scripts/stage-package.mjs
+          node --check scripts/publish-convergent.mjs
       - name: Run wrapper tests
         working-directory: npm/cvc-mcp
         run: npm test
-      # Guard 1, independent of how npm words its warnings: if `npm pkg fix`
-      # changes the manifest, npm would also rewrite it while publishing. This
-      # must run before anything below modifies package.json.
-      - name: Verify npm would not rewrite the manifest
+      # The release asks the registry about each package name with `npm view`
+      # and tells "not published" (an E404) from every other failure by parsing
+      # npm's JSON error. The tests above feed it recorded npm output and replies
+      # from a local registry; this runs the same code against the live registry
+      # with the pinned npm, so a change in npm's output fails here instead of in
+      # the middle of a release.
+      # 999.0.0 is never published, so both names must come back as "would
+      # publish". --decide-only publishes nothing and needs no credentials.
+      - name: Check the registry lookup the release uses
         working-directory: npm/cvc-mcp
-        run: |
-          npm pkg fix
-          if ! git diff --exit-code -- package.json; then
-            echo "::error file=npm/cvc-mcp/package.json::npm would rewrite this manifest on publish. Run 'npm pkg fix' in npm/cvc-mcp and commit the result."
-            exit 1
-          fi
-      # Guard 2 replays the release publish without publishing, so a manifest
-      # npm auto-corrects fails the build before a tag exists. It also lists
-      # the tarball contents (running the prepack/postpack lifecycle scripts),
-      # which makes a separate `npm pack --dry-run` redundant. Needs no
-      # credentials: a dry run only reads the public registry.
-      - name: Dry-run the npm publish and fail on manifest corrections
+        run: node scripts/publish-convergent.mjs --version 999.0.0 --decide-only
+      # The launcher is published under more than one name. Both manifests are
+      # checked below, each staged by the same script the release uses
+      # (scripts/stage-package.mjs), which is the only place that derives the
+      # second package from the source directory; `--list` supplies the names, so
+      # none is repeated here.
+      #
+      # Guard 1, independent of how npm words its warnings: if `npm pkg fix`
+      # changes a manifest, npm would also rewrite it while publishing. Every
+      # name is checked and reported before the step fails.
+      - name: Verify npm would not rewrite either manifest
         working-directory: npm/cvc-mcp
         run: |
           set -euo pipefail
-          log="${RUNNER_TEMP}/npm-publish-dry-run.log"
-          # The committed version is always the last one published, and even a
-          # dry run refuses to publish over it. Use a throwaway prerelease that
-          # never exists on the registry; npm requires an explicit tag other
-          # than latest to publish a prerelease.
-          npm version "0.0.0-ci.${GITHUB_RUN_ID}" --no-git-tag-version
-          npm publish --dry-run --access public --tag ci-dry-run --registry=https://registry.npmjs.org/ 2>&1 | tee "$log"
-          if grep -qi 'auto-corrected' "$log"; then
-            echo "::error file=npm/cvc-mcp/package.json::npm auto-corrected the manifest while publishing. Run 'npm pkg fix' in npm/cvc-mcp and commit the result."
-            exit 1
-          fi
+          names="$(node scripts/stage-package.mjs --list)"
+          failed=0
+          for name in $names; do
+            dir="$(node scripts/stage-package.mjs "$name")"
+            before="${RUNNER_TEMP}/package.json.before"
+            cp "$dir/package.json" "$before"
+            (cd "$dir" && npm pkg fix)
+            if ! diff -u "$before" "$dir/package.json"; then
+              echo "::error file=npm/cvc-mcp/package.json::npm would rewrite the manifest of ${name} on publish. Run 'npm pkg fix' in npm/cvc-mcp and commit the result."
+              failed=1
+            fi
+          done
+          exit "$failed"
+      # Guard 2 replays the release publish of each name without publishing, so
+      # a manifest npm auto-corrects fails the build before a tag exists. It also
+      # lists the tarball contents (running the prepack/postpack lifecycle
+      # scripts), which makes a separate `npm pack --dry-run` redundant. Needs no
+      # credentials: a dry run only reads the public registry, and it passes for
+      # a name that is not on the registry yet. Every name is checked and
+      # reported before the step fails.
+      - name: Dry-run the npm publish of each package and fail on manifest corrections
+        working-directory: npm/cvc-mcp
+        run: |
+          set -euo pipefail
+          names="$(node scripts/stage-package.mjs --list)"
+          failed=0
+          for name in $names; do
+            log="${RUNNER_TEMP}/npm-publish-dry-run-${name##*/}.log"
+            # The committed version is always the last one published, and even a
+            # dry run refuses to publish over it. Use a throwaway prerelease that
+            # never exists on the registry; npm requires an explicit tag other
+            # than latest to publish a prerelease.
+            dir="$(node scripts/stage-package.mjs "$name" --version "0.0.0-ci.${GITHUB_RUN_ID}")"
+            if ! (cd "$dir" && npm publish --dry-run --access public --tag ci-dry-run --registry=https://registry.npmjs.org/) 2>&1 | tee "$log"; then
+              echo "::error file=npm/cvc-mcp/package.json::The npm publish dry run failed for ${name}."
+              failed=1
+            elif grep -qi 'auto-corrected' "$log"; then
+              echo "::error file=npm/cvc-mcp/package.json::npm auto-corrected the manifest of ${name} while publishing. Run 'npm pkg fix' in npm/cvc-mcp and commit the result."
+              failed=1
+            fi
+          done
+          exit "$failed"
 
   third-party-notices:
     name: Verify third-party notices

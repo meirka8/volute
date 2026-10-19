@@ -2,6 +2,8 @@
 
 Launcher for [Volute CVC](https://github.com/meirka8/volute) (Cognitive Version Control). CVC records AI-assisted development context — prompts, responses, integration-exposed reasoning, and tool metadata — alongside Git history, private by default.
 
+> **Using the `cvc` command line?** Install [`@volute_cvc/cvc`](https://www.npmjs.com/package/@volute_cvc/cvc) instead: `npm install --global @volute_cvc/cvc`. It is this same launcher published under a name for the CLI. This package, `@volute_cvc/cvc-mcp`, is still published with every release, so MCP client configurations that run `cvc-mcp` or `npx @volute_cvc/cvc-mcp` keep working unchanged.
+
 This package downloads the released CVC binaries for your platform and runs them. It provides three commands:
 
 - `cvc-mcp` — the MCP server, for coding agents that speak the Model Context Protocol.
@@ -23,6 +25,8 @@ Or install all three commands on your `PATH`:
 ```bash
 npm install --global @volute_cvc/cvc-mcp
 ```
+
+`@volute_cvc/cvc` provides the same three commands, so install one of the two globally, not both.
 
 Supported platforms: Linux x86-64, macOS x86-64, macOS ARM64, and Windows x86-64. Linux ARM64 is not published, and the launcher rejects an unsupported platform before downloading.
 
