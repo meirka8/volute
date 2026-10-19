@@ -8,6 +8,9 @@ fi
 
 echo "🧹 Cleaning up global cvc-mcp installation..."
 npm uninstall -g @volute_cvc/cvc-mcp || true
+# @volute_cvc/cvc ships the same three commands; npm refuses to install this
+# package over them (EEXIST) while that one is installed globally.
+npm uninstall -g @volute_cvc/cvc || true
 
 if [ "$LOCAL_INSTALL" = true ]; then
     echo "📦 Packing local npm package..."
