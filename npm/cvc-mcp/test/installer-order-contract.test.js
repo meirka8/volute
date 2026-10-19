@@ -54,11 +54,16 @@ test('install.ps1 moves the binaries into place in the launcher\'s order, cvc.ex
   const declared = quoted(required(installPs1, /\$Binaries = @\(([^)]*)\)/, '$Binaries', 'install.ps1')[1], '"');
   assert.deepEqual(order, publishOrder.map(name => `${name}.exe`));
   assert.deepEqual([...order].sort(), [...declared].sort(), 'every prepared binary is moved');
-  required(installPs1, /foreach \(\$Binary in \$MoveOrder\) \{ Move-Item /, 'the move loop over $MoveOrder', 'install.ps1');
+  // The moves live in Publish-CvcBinaries (so CI can exercise it in isolation);
+  // the installer must hand it $MoveOrder, and its move loop must run over it.
+  required(installPs1, /Publish-CvcBinaries -InstallDir \$InstallDir -MoveOrder \$MoveOrder -Prepared \$Prepared/, 'the Publish-CvcBinaries call with $MoveOrder', 'install.ps1');
+  required(installPs1, /function Publish-CvcBinaries[\s\S]*?foreach \(\$Binary in \$MoveOrder\) \{(?:(?!foreach)[\s\S])*?\[IO\.File\]::Move\(\$Prepared\[\$Binary\], \$Target\)/, 'the move loop over $MoveOrder in Publish-CvcBinaries', 'install.ps1');
 });
 
 test('install.ps1 releases the shared lock (finally block) before the PATH prompt', () => {
   const release = required(installPs1, /\nfinally \{[\s\S]*?\$InstallLock\.Dispose\(\)[\s\S]*?Remove-Item -LiteralPath \$InstallLockPath[\s\S]*?\n\}/, 'the finally block that releases the lock', 'install.ps1');
-  const prompt = required(installPs1, /Read-Host /, 'the PATH prompt', 'install.ps1');
+  // The prompt is the call site of Read-CvcPathConsent (its definition, which
+  // wraps Read-Host, sits earlier in the file).
+  const prompt = required(installPs1, /if \(\(Read-CvcPathConsent /, 'the PATH prompt', 'install.ps1');
   assert.ok(release.index < prompt.index);
 });
