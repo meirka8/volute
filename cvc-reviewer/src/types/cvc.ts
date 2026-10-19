@@ -64,7 +64,9 @@ export function validTombstone(value: unknown, pathId: string): value is CVCTomb
   const t = value as Record<string, unknown>;
   const allowed = new Set(["format", "version", "interaction_id", "deleted_at", "reason_code", "previous_node_oid"]);
   if (Object.keys(t).some((key) => !allowed.has(key))) return false;
-  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  // The RFC variant and any version RFC 9562 defines (1-8): the Claude Code harness writes version 8,
+  // every other producer version 4. Keep this in step with CANONICAL_TOMBSTONE_UUID (usePRInteractions.ts).
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   const oid = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
   return t.format === "cvc.tombstone/v1" && t.version === 1 &&
     typeof t.interaction_id === "string" && t.interaction_id === pathId && uuid.test(pathId) &&
