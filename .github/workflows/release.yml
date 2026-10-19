@@ -346,6 +346,10 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+      # Keep this pin in lockstep with the "Install the npm version used to
+      # publish" step of the npm-wrapper job in test.yml, which guards the
+      # launcher manifest against this exact npm before a release. The two
+      # files cannot share a variable, so bump both together.
       - name: Install npm 12.0.2 for trusted publishing
         run: npm install --global npm@12.0.2
       - name: Publish MCP npm wrapper
