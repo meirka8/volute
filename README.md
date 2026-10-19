@@ -23,7 +23,9 @@ npm install --global @volute_cvc/cvc
 cvc --version
 ```
 
-Or download the archive for your platform directly from [GitHub Releases](https://github.com/meirka8/volute/releases/latest):
+If you already installed `@volute_cvc/cvc-mcp` globally, run `npm uninstall --global @volute_cvc/cvc-mcp` first: the two packages provide the same commands, so npm reports `EEXIST`. MCP configurations that run `npx @volute_cvc/cvc-mcp` keep working.
+
+Alternatively, download the archive for your platform directly from [GitHub Releases](https://github.com/meirka8/volute/releases/latest):
 
 | Platform | Release asset |
 | --- | --- |
