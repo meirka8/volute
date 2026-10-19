@@ -142,6 +142,7 @@ jobs:
         run: |
           node --check bin/cvc-mcp.js
           node --check bin/cvc.js
+          node --check bin/cvc-lsp.js
       - name: Run wrapper tests
         working-directory: npm/cvc-mcp
         run: npm test

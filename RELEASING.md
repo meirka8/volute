@@ -108,7 +108,7 @@ cargo check --workspace --all-targets
 
 (cd cvc-plugin && npm ci && npm exec --no -- vsce --version && npm run check-types && npm run lint && npm run compile && xvfb-run -a npm test)
 (cd cvc-reviewer && npm ci && npm run lint && npm test -- --run && npm run build)
-(cd npm/cvc-mcp && node --check bin/cvc-mcp.js && node --check bin/cvc.js && npm test && npm pack --dry-run)
+(cd npm/cvc-mcp && node --check bin/cvc-mcp.js && node --check bin/cvc.js && node --check bin/cvc-lsp.js && npm test && npm pack --dry-run)
 node .github/scripts/generate-third-party-notices.mjs --check
 node .github/scripts/check-release-version.mjs vX.Y.Z
 ```

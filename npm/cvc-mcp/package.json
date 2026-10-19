@@ -4,7 +4,8 @@
   "description": "MCP server for CVC (Cognitive Version Control) for saving and reading git-linked AI work history",
   "bin": {
     "cvc-mcp": "bin/cvc-mcp.js",
-    "cvc": "bin/cvc.js"
+    "cvc": "bin/cvc.js",
+    "cvc-lsp": "bin/cvc-lsp.js"
   },
   "files": [
     "bin/*.js",
