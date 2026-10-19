@@ -110,7 +110,8 @@ authentication. Never create a token for it.
 8. Set the package's Publishing access to **Require two-factor authentication and
    disallow tokens**.
 9. Add the name to `PACKAGES` in `npm/cvc-mcp/scripts/stage-package.mjs`, with the README
-   its package page shows, through a normal reviewed PR, only after steps 1 to 8: the
+   its package page shows (and its own `description`, if it should differ from the
+   source manifest's), through a normal reviewed PR, only after steps 1 to 8: the
    release would otherwise try to publish a name it cannot create. Both workflows take
    the names from that list, so no secret or workflow change is needed.
 
@@ -178,9 +179,9 @@ node .github/scripts/check-release-version.mjs vX.Y.Z
 CI's `npm-wrapper` job also fails if npm would rewrite the manifest of either published
 package while publishing: `npm/cvc-mcp/package.json` itself, or the `@volute_cvc/cvc`
 manifest that `npm/cvc-mcp/scripts/stage-package.mjs` derives from it (only the name
-differs). It checks both with `npm pkg fix` and a publish dry run on the same npm
-version that the release job pins, and it checks the registry lookup the release uses
-against the live registry. If a manifest check fails, run `npm pkg fix` in
+and description differ). It checks both with `npm pkg fix` and a publish dry run on the
+same npm version that the release job pins, and it checks the registry lookup the
+release uses against the live registry. If a manifest check fails, run `npm pkg fix` in
 `npm/cvc-mcp` and commit the result.
 
 The last command in the block above is the release version gate: it requires the tag
@@ -324,8 +325,8 @@ Only after the GitHub Release succeeds do the isolated `publish-marketplace` and
 `publish-npm` job publishes the launcher under both npm names, `@volute_cvc/cvc-mcp` and
 then `@volute_cvc/cvc`, so a single `npm-publish` approval covers both. They are built
 from the one source directory `npm/cvc-mcp`; `npm/cvc-mcp/scripts/stage-package.mjs`
-derives the second package (the same files, its own name and README) and holds the list
-of names.
+derives the second package (the same files, its own name, description, and README)
+and holds the list of names.
 Complete every required release-environment approval, as defined by the protection
 rules, only after confirming the tag, commit, version gate, and artifacts.
 
@@ -366,10 +367,11 @@ After all jobs complete, verify:
   ```
 
   Inspect the actual npm tarball of each to confirm it includes `LICENSE`; the two list
-  the same files, and only `package.json` (the name) and `README.md` differ. Then, in an
-  isolated disposable environment, confirm that a global install of `@volute_cvc/cvc`
-  yields all three commands (`cvc`, `cvc-mcp`, and `cvc-lsp`; on Windows they are the
-  `.cmd` shims in the prefix directory itself), without running them:
+  the same files, and only `package.json` (the name and description) and `README.md`
+  differ. Then, in an isolated disposable environment, confirm that a global install of
+  `@volute_cvc/cvc` yields all three commands (`cvc`, `cvc-mcp`, and `cvc-lsp`; on
+  Windows they are the `.cmd` shims in the prefix directory itself), without running
+  them:
 
   ```bash
   smoke_prefix=$(mktemp -d)

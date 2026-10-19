@@ -2,10 +2,10 @@
 
 // The launcher is published under two names from one source directory. These
 // tests pin what scripts/stage-package.mjs promises: the second package differs
-// from the source in its name and its README and in nothing else, both expose
-// the same three commands, the third-party notices still reach both tarballs,
-// and the file the release-version gate checks is the file both names derive
-// their version from. Packing happens only in staged copies in temporary
+// from the source in its name, its description and its README and in nothing
+// else, both expose the same three commands, the third-party notices still reach
+// both tarballs, and the file the release-version gate checks is the file both
+// names derive their version from. Packing happens only in staged copies in temporary
 // directories, never in the source directory, because release.test.js packs
 // there and the two would race over THIRD-PARTY-NOTICES.md under `node --test`.
 
@@ -72,6 +72,34 @@ test('the names, in publish order, start with the one the source manifest carrie
   assert.deepEqual(packageNames(), ['@volute_cvc/cvc-mcp', '@volute_cvc/cvc']);
   assert.equal(PACKAGES[0].name, sourceManifest.name);
   assert.equal(PACKAGES[0].readme, 'README.md');
+  assert.equal(PACKAGES[0].description, undefined, 'the source name keeps the source manifest description');
+});
+
+test('@volute_cvc/cvc describes itself as the command-line launcher, not as an MCP server', async () => {
+  const { PACKAGES } = await loadStage();
+  const { description } = PACKAGES.find(entry => entry.name === '@volute_cvc/cvc');
+  assert.equal(typeof description, 'string');
+  assert.notEqual(description, sourceManifest.description);
+  assert.doesNotMatch(description, /\bMCP server\b/i);
+  assert.match(description, /^Command-line launcher for Volute CVC/);
+  for (const command of ['cvc', 'cvc-mcp', 'cvc-lsp']) assert.ok(description.includes(command), command);
+  assert.match(sourceManifest.description, /^MCP server for CVC/, 'the cvc-mcp description is untouched');
+});
+
+test('every staged manifest differs from the source only in name, description and version', async () => {
+  const { PACKAGES } = await loadStage();
+  for (const entry of PACKAGES) {
+    await withStaged(entry.name, {}, ({ dir }) => {
+      const staged = JSON.parse(fs.readFileSync(path.join(dir, 'package.json')));
+      assert.deepEqual(Object.keys(staged), Object.keys(sourceManifest), `${entry.name}: same keys, same order`);
+      assert.equal(staged.name, entry.name);
+      assert.equal(staged.description, entry.description ?? sourceManifest.description, `${entry.name}: description`);
+      assert.equal(staged.version, sourceManifest.version, `${entry.name}: the version comes from the one source manifest`);
+      for (const key of Object.keys(sourceManifest).filter(key => !['name', 'description', 'version'].includes(key))) {
+        assert.deepEqual(staged[key], sourceManifest[key], `${entry.name}: ${key}`);
+      }
+    });
+  }
 });
 
 test('staging the source name copies it byte for byte', async () => {
@@ -98,14 +126,19 @@ test('the staged package leaves out what is not part of the package', async () =
   });
 });
 
-test('@volute_cvc/cvc differs from the source in its name and its README and nothing else', async () => {
+test('@volute_cvc/cvc differs from the source in its name, description and README and nothing else', async () => {
+  const { PACKAGES } = await loadStage();
+  const { description } = PACKAGES.find(entry => entry.name === '@volute_cvc/cvc');
   await withStaged('@volute_cvc/cvc', {}, ({ dir, manifest }) => {
     assert.equal(manifest.name, '@volute_cvc/cvc');
+    assert.equal(manifest.description, description);
     const staged = JSON.parse(fs.readFileSync(path.join(dir, 'package.json')));
-    assert.deepEqual(staged, { ...sourceManifest, name: '@volute_cvc/cvc' });
+    assert.deepEqual(staged, { ...sourceManifest, name: '@volute_cvc/cvc', description });
     assert.deepEqual(Object.keys(staged), Object.keys(sourceManifest), 'same key order');
-    assert.deepEqual(changedLines(source('package.json'), fs.readFileSync(path.join(dir, 'package.json'))),
-      [['  "name": "@volute_cvc/cvc-mcp",', '  "name": "@volute_cvc/cvc",']]);
+    assert.deepEqual(changedLines(source('package.json'), fs.readFileSync(path.join(dir, 'package.json'))), [
+      ['  "name": "@volute_cvc/cvc-mcp",', '  "name": "@volute_cvc/cvc",'],
+      [`  "description": ${JSON.stringify(sourceManifest.description)},`, `  "description": ${JSON.stringify(description)},`],
+    ]);
     assert.equal(staged.version, sourceManifest.version, 'the version comes from the one source manifest');
 
     assert.deepEqual(fs.readFileSync(path.join(dir, 'README.md')), source('readmes/cvc.md'));
@@ -119,10 +152,16 @@ test('@volute_cvc/cvc differs from the source in its name and its README and not
 });
 
 test('--version stamps the version and only the version', async () => {
+  const { PACKAGES } = await loadStage();
+  const { description } = PACKAGES.find(entry => entry.name === '@volute_cvc/cvc');
   await withStaged('@volute_cvc/cvc', { version: '0.0.0-ci.123' }, ({ dir }) => {
     const staged = JSON.parse(fs.readFileSync(path.join(dir, 'package.json')));
-    assert.deepEqual(staged, { ...sourceManifest, name: '@volute_cvc/cvc', version: '0.0.0-ci.123' });
-    assert.equal(changedLines(source('package.json'), fs.readFileSync(path.join(dir, 'package.json'))).length, 2);
+    assert.deepEqual(staged, { ...sourceManifest, name: '@volute_cvc/cvc', description, version: '0.0.0-ci.123' });
+    assert.equal(changedLines(source('package.json'), fs.readFileSync(path.join(dir, 'package.json'))).length, 3, 'name, description, version');
+  });
+  await withStaged('@volute_cvc/cvc-mcp', { version: '0.0.0-ci.123' }, ({ dir }) => {
+    assert.deepEqual(changedLines(source('package.json'), fs.readFileSync(path.join(dir, 'package.json'))),
+      [[`  "version": ${JSON.stringify(sourceManifest.version)},`, '  "version": "0.0.0-ci.123",']], 'cvc-mcp: only the version, name and description untouched');
   });
   await withStaged('@volute_cvc/cvc-mcp', { version: sourceManifest.version }, ({ dir }) => {
     assert.deepEqual(fs.readFileSync(path.join(dir, 'package.json')), source('package.json'), 'restamping the same version is a no-op');

@@ -361,7 +361,8 @@ jobs:
       # @volute_cvc/cvc, so one npm-publish approval covers both. The script
       # takes the names from npm/cvc-mcp/scripts/stage-package.mjs, which also
       # builds the second package from the single source directory (same files,
-      # its own name and README). CI dry-runs both through the same script.
+      # its own name, description and README). CI dry-runs both through the same
+      # script.
       #
       # Convergent, like the Marketplace publish above: for each name the
       # script asks the registry whether name@version already exists, skips it

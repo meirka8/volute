@@ -4,11 +4,12 @@
 // The launcher is published under two names: @volute_cvc/cvc-mcp (the name MCP
 // client configurations already use) and @volute_cvc/cvc (the name for the CLI).
 // npm/cvc-mcp stays the single source. This script is the only place that knows
-// how the names differ: the name, and which README the package page shows. It
-// stages a copy of the source with that transformation applied and prints the
-// copy's directory, so a release and CI publish, pack and dry-run exactly the
-// same thing. It also owns the list of names (and their publish order), so
-// neither workflow hard-codes them.
+// how the names differ: the name, which README the package page shows, and
+// optionally the description npm lists the package under. It stages a copy of
+// the source with that transformation applied and prints the copy's directory,
+// so a release and CI publish, pack and dry-run exactly the same thing. It also
+// owns the list of names (and their publish order), so neither workflow
+// hard-codes them.
 //
 // Why a copy rather than editing package.json in place: both names are
 // published from one checkout, and an in-place edit would leave the source
@@ -36,12 +37,18 @@ const SOURCE_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
  * Every published name, in publish order, with the README its package page
- * shows (a path inside the source directory). The source manifest carries the
- * first name; every other name is derived from it.
+ * shows (a path inside the source directory) and, optionally, its own
+ * `description`. The source manifest carries the first name, with its own
+ * description and README, so that entry sets no description; every other name is
+ * derived from the source, and an entry without a description keeps the source's.
  */
 export const PACKAGES = Object.freeze([
   Object.freeze({ name: '@volute_cvc/cvc-mcp', readme: 'README.md' }),
-  Object.freeze({ name: '@volute_cvc/cvc', readme: 'readmes/cvc.md' }),
+  Object.freeze({
+    name: '@volute_cvc/cvc',
+    readme: 'readmes/cvc.md',
+    description: 'Command-line launcher for Volute CVC (Cognitive Version Control): provides the cvc, cvc-mcp and cvc-lsp commands',
+  }),
 ]);
 
 export const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$/;
@@ -116,8 +123,14 @@ export function stagePackage(name, { version, out, sourceDir = SOURCE_DIR } = {}
   });
   copyFileSync(join(sourceDir, entry.readme), join(dir, 'README.md'));
 
-  const staged = { ...manifest, name, ...(version === undefined ? {} : { version }) };
-  writeFileSync(join(dir, 'package.json'), staged.name === manifest.name && staged.version === manifest.version ? raw : serialize(staged, raw));
+  const staged = {
+    ...manifest,
+    name,
+    ...(entry.description === undefined ? {} : { description: entry.description }),
+    ...(version === undefined ? {} : { version }),
+  };
+  const unchanged = ['name', 'description', 'version'].every(key => staged[key] === manifest[key]);
+  writeFileSync(join(dir, 'package.json'), unchanged ? raw : serialize(staged, raw));
   return { root, dir, manifest: staged };
 }
 
