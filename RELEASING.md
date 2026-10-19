@@ -293,11 +293,24 @@ while its artifacts remain available. Never republish a successful channel.
 Marketplace publishing is convergent: the publish step queries the Marketplace for the
 targets already live at the release version, publishes only the missing ones, retries
 transient gallery timeouts (re-checking liveness before each retry, since a timed-out
-upload can succeed server-side), and fails only if a target is still missing, naming
-it. **Re-run failed jobs** is therefore the complete recovery for a partial
+upload can succeed server-side), then waits up to 10 minutes, polling every 30 seconds,
+for the listing to show every target. It fails only if a target is still not listed,
+naming it. **Re-run failed jobs** is therefore the complete recovery for a partial
 publication while the run's artifacts remain available. Only if a rerun still reports
 targets missing, publish exactly those targets through a reviewed, channel-specific
 recovery.
+The gallery indexes an accepted upload asynchronously, so a publish that succeeded can
+take several minutes to be listed (v0.7.0 took about four). If the job is still red
+but its log shows `Published volute.cvc (<target>) vX.Y.Z.` for the missing targets and
+the error says they were accepted but not yet listed, that is gallery propagation
+delay, not a failed publication. Confirm with
+`cd cvc-plugin && npm ci && npm exec --no -- vsce show volute.cvc --json`, which uses
+the `vsce` pinned in `cvc-plugin/package-lock.json`, and look for the release version
+under each of the four `targetPlatform` values. If all four are listed, the
+publication is complete: a rerun is only needed to turn the run green, and it skips
+every target (it needs a fresh `vscode-marketplace` approval like any rerun). A target
+that instead shows a failed publish and is not listed is a real failure: follow the
+recovery above.
 For npm, preserve the Trusted Publisher workflow identity (`release.yml`); do not
 casually change npm trust. If the original artifacts or provenance cannot be preserved,
 release a new patch version. Document partial publication and repair forward. Public

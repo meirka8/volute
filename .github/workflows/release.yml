@@ -297,7 +297,10 @@ jobs:
     runs-on: ubuntu-latest
     environment: vscode-marketplace
     # Bounded retries with backoff can legitimately take a while under gallery latency.
-    timeout-minutes: 45
+    # Worst case, every publish waits out the gallery's ~3 min socket timeout: 4 targets
+    # x 3 attempts x 3 min, 4 x 90 s of backoff and the liveness re-checks (~44 min),
+    # then the 10 min listing wait and ~2 min of job setup: ~56 min, so 60.
+    timeout-minutes: 60
     needs: [check-release-version, create-release]
     permissions:
       contents: read
@@ -321,9 +324,11 @@ jobs:
         working-directory: cvc-plugin
         run: npm ci
       # Convergent: skips targets already live at this version, retries
-      # transient gallery timeouts (re-checking liveness first), and fails only
-      # if a target is still missing, so "Re-run failed jobs" completes a
-      # partial publication instead of tripping over "version exists".
+      # transient gallery timeouts (re-checking liveness first), then waits up to
+      # 10 minutes for the listing to show every target, because the gallery
+      # indexes an accepted upload asynchronously. It fails only if a target is
+      # still unlisted after that, so "Re-run failed jobs" completes a partial
+      # publication instead of tripping over "version exists".
       - name: Publish VSIX files to VS Code Marketplace
         working-directory: cvc-plugin
         env:
