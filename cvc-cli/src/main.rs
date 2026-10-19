@@ -118,7 +118,7 @@ enum HarnessCommands {
     /// Install lifecycle hooks in this checkout's local harness settings
     Install {
         harness: HarnessKind,
-        /// Absolute path of the cvc binary the hooks run (default: this executable)
+        /// Absolute path of the cvc binary the hooks run (default: this executable, or ~/.cvc/bin/cvc when this is the npm launcher's versioned cache copy and that file is at least as new)
         #[arg(long)]
         binary: Option<PathBuf>,
     },

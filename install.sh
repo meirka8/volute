@@ -127,9 +127,17 @@ for binary in cvc cvc-mcp cvc-lsp; do
   cp "$STAGE/$binary" "$PUBLISH_STAGE/$binary"
   chmod 0755 "$PUBLISH_STAGE/$binary"
 done
-for binary in cvc cvc-mcp cvc-lsp; do
+# cvc moves into place LAST: the npm launcher probes `cvc --version` without
+# the lock, so a new cvc must imply its siblings are already new.
+for binary in cvc-lsp cvc-mcp cvc; do
   mv -f "$PUBLISH_STAGE/$binary" "$INSTALL_DIR/$binary"
 done
+# Release the shared lock now so the interactive PATH prompt below does not
+# block the npm launcher from publishing. The trap still covers failure paths.
+rmdir "$PUBLISH_STAGE" 2>/dev/null || rm -rf "$PUBLISH_STAGE"
+PUBLISH_STAGE=
+rmdir "$LOCK_DIR" 2>/dev/null || true
+LOCK_DIR=
 
 echo ""
 echo "Success! CVC installed to $INSTALL_DIR"

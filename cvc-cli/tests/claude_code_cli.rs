@@ -4,6 +4,7 @@
 //! end to end through the binary, including hook mode on stdin.
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
@@ -194,6 +195,138 @@ fn harness_install_is_gated_idempotent_and_excluded_from_git() {
     let stdout = fixture.cvc_ok(&["harness", "uninstall", "claude-code"]);
     assert!(stdout.contains("Removed 3"), "{stdout}");
     assert!(!settings_path.exists());
+}
+
+/// A `cvc` that came through the npm launcher runs from its versioned cache.
+/// Hooks must point at the stable `~/.cvc/bin/cvc` once the launcher has
+/// published it, so an upgrade applies without reinstalling the hooks, and
+/// must never point at a file that does not exist.
+#[test]
+fn harness_install_from_the_launcher_cache_prefers_the_stable_binary() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let cache = fixture.home.join(".cvc/mcp-cache/v0.7.0-test/cvc");
+    let stable = fixture.home.join(".cvc/bin/cvc");
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_cvc"), &cache).unwrap();
+    let settings_path = fixture.repo.join(".claude/settings.local.json");
+    // Runs `harness <args>` as `program`; the stdout must contain `expected`.
+    let run = |program: &PathBuf, args: &[&str], expected: &str| {
+        let output = fixture.command(program).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(stdout.contains(expected), "{stdout}");
+        (stdout, String::from_utf8_lossy(&output.stderr).into_owned())
+    };
+    let install = ["harness", "install", "claude-code"];
+    let migration_line = format!(
+        "hooks now run {}, which upgrades replace in place",
+        stable.display()
+    );
+    let using_line = format!(
+        "using {} instead of the launcher's versioned cache, so upgrades reach the hooks without a reinstall",
+        stable.display()
+    );
+
+    // The launcher has not published the stable binary yet (the 0.7.0 state):
+    // the cache copy is recorded, with a warning that it will not follow
+    // upgrades.
+    let (stdout, stderr) = run(&cache, &install, "installed");
+    assert!(!stdout.contains("instead of the launcher"), "{stdout}");
+    assert!(!stdout.contains("hooks now run"), "{stdout}");
+    assert!(
+        stderr.contains(&format!(
+            "warning: {} does not exist, so the hooks point at the launcher's versioned cache and will not follow upgrades",
+            stable.display()
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("run `cvc harness install claude-code` again once it exists (the launcher retries publishing on each launch)"),
+        "{stderr}"
+    );
+    let settings = fs::read_to_string(&settings_path).unwrap();
+    assert!(settings.contains("mcp-cache"), "{settings}");
+
+    // The launcher runs from its cache precisely when it declined to publish,
+    // so a stable file may be an older release. v0.6.0 has no `ingest`
+    // subcommand and reports its version on stderr with exit 1: hooks steered
+    // onto it would fail on every run, so the cache copy is kept.
+    fs::create_dir_all(stable.parent().unwrap()).unwrap();
+    fs::write(&stable, "#!/bin/sh\necho 'cvc 0.6.0' >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&stable, fs::Permissions::from_mode(0o755)).unwrap();
+    let (stdout, stderr) = run(&cache, &install, "already present");
+    assert!(!stdout.contains("instead of the launcher"), "{stdout}");
+    assert!(
+        stderr.contains(&format!(
+            "warning: {} reports 0.6.0, older than this cvc {}, so the hooks point at the launcher's versioned cache and will not follow upgrades",
+            stable.display(),
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("run `cvc harness install claude-code` again after the launcher has published this release to ~/.cvc/bin (it retries on each launch)"),
+        "{stderr}"
+    );
+    let settings = fs::read_to_string(&settings_path).unwrap();
+    assert!(settings.contains("mcp-cache"), "{settings}");
+    assert!(!settings.contains(stable.to_str().unwrap()), "{settings}");
+    fs::remove_file(&stable).unwrap();
+
+    // The launcher publishes the binary and the shim now runs it from there.
+    // Re-running the install migrates the cache-path entries in place and says
+    // so.
+    fs::create_dir_all(stable.parent().unwrap()).unwrap();
+    if fs::hard_link(&cache, &stable).is_err() {
+        fs::copy(&cache, &stable).unwrap();
+    }
+    let (stdout, stderr) = run(&stable, &install, "updated");
+    assert!(stdout.contains(&migration_line), "{stdout}");
+    assert!(!stdout.contains("instead of the launcher"), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let settings = fs::read_to_string(&settings_path).unwrap();
+    assert!(settings.contains(stable.to_str().unwrap()), "{settings}");
+    assert!(!settings.contains("mcp-cache"), "{settings}");
+
+    // Idempotent, and the migration line is not repeated.
+    let (stdout, _) = run(&stable, &install, "already present");
+    assert!(!stdout.contains("hooks now run"), "{stdout}");
+    assert_eq!(fs::read_to_string(&settings_path).unwrap(), settings);
+
+    // A fresh install from the stable binary is not a migration either.
+    run(
+        &stable,
+        &["harness", "uninstall", "claude-code"],
+        "Removed 3",
+    );
+    let (stdout, _) = run(&stable, &install, "installed");
+    assert!(!stdout.contains("hooks now run"), "{stdout}");
+
+    // An explicit --binary overrides the preference, even for the cache copy.
+    let explicit = ["harness", "install", "claude-code", "--binary"];
+    let cache_arg = cache.to_str().unwrap();
+    let (stdout, stderr) = run(&cache, &[&explicit[..], &[cache_arg]].concat(), "updated");
+    assert!(!stdout.contains("instead of the launcher"), "{stdout}");
+    assert!(!stdout.contains("hooks now run"), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let settings = fs::read_to_string(&settings_path).unwrap();
+    assert!(settings.contains("mcp-cache"), "{settings}");
+    assert!(!settings.contains(stable.to_str().unwrap()), "{settings}");
+
+    // Without --binary the cache copy is steered to the stable path again.
+    let (stdout, stderr) = run(&cache, &install, "updated");
+    assert!(stdout.contains(&using_line), "{stdout}");
+    assert!(!stdout.contains("hooks now run"), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let settings = fs::read_to_string(&settings_path).unwrap();
+    assert!(settings.contains(stable.to_str().unwrap()), "{settings}");
+    assert!(!settings.contains("mcp-cache"), "{settings}");
 }
 
 #[test]
