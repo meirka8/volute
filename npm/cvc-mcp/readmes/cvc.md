@@ -15,7 +15,7 @@ Or run it once without installing: `npx @volute_cvc/cvc --version`.
 
 The first run downloads the release that matches this package's version, so it needs network access once. Supported platforms: Linux x86-64, macOS x86-64, macOS ARM64, and Windows x86-64. Linux ARM64 is not published, and the launcher rejects an unsupported platform before downloading.
 
-Install this package or `@volute_cvc/cvc-mcp` globally, not both. They provide the same three commands, and npm does not link a command that another globally installed package already provides.
+Install this package or `@volute_cvc/cvc-mcp` globally, not both. They provide the same three commands, so npm stops the second install with an `EEXIST` error.
 
 ## Commands
 

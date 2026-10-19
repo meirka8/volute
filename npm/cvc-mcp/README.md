@@ -26,7 +26,7 @@ Or install all three commands on your `PATH`:
 npm install --global @volute_cvc/cvc-mcp
 ```
 
-`@volute_cvc/cvc` provides the same three commands, so install one of the two globally, not both.
+`@volute_cvc/cvc` provides the same three commands, so install one of the two globally, not both: npm stops the second install with an `EEXIST` error.
 
 Supported platforms: Linux x86-64, macOS x86-64, macOS ARM64, and Windows x86-64. Linux ARM64 is not published, and the launcher rejects an unsupported platform before downloading.
 

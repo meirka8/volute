@@ -12,11 +12,18 @@ CVC records only data exposed or supplied by its integrations. It does not retri
 - `cvc-lsp`: the language server used by editor integrations.
 - `cvc-plugin`: VS Code extension for the supported local VS Code chat-session workflow.
 - `cvc-reviewer`: client-side React reviewer for GitHub-hosted CVC data.
-- `npm/cvc-mcp`: npm launcher package for released CVC binaries.
+- `npm/cvc-mcp`: npm launcher package for released CVC binaries, published as `@volute_cvc/cvc` and `@volute_cvc/cvc-mcp`.
 
 ## Install a release
 
-Download the archive for your platform directly from [GitHub Releases](https://github.com/meirka8/volute/releases/latest):
+Install the launcher from npm. On first run it downloads the release for your platform, verifies it, and keeps `cvc`, `cvc-mcp`, and `cvc-lsp` in `~/.cvc/bin`:
+
+```bash
+npm install --global @volute_cvc/cvc
+cvc --version
+```
+
+Or download the archive for your platform directly from [GitHub Releases](https://github.com/meirka8/volute/releases/latest):
 
 | Platform | Release asset |
 | --- | --- |
