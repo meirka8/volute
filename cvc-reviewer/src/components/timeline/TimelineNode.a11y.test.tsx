@@ -1,15 +1,17 @@
 /**
- * Keyboard and assistive-technology behaviour of the transcript layout: every
- * control is a real button that says what it does and whether it is open,
- * keyboard activation of a control never selects the card, and the card itself
- * still selects on a click, Enter or Space.
+ * Keyboard and assistive-technology behaviour of the cards: every control is a real
+ * button that says what it does and whether it is open, keyboard activation of a
+ * control never selects the card, the card is a list item named by its header and
+ * holds no control inside another, and what selects it is the header, a toggle
+ * button that Enter and Space press (a click anywhere on the card selects it too,
+ * for the mouse).
  */
 import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TimelineNode } from './TimelineNode';
 import { installDomStubs, restoreDomStubs } from '../../test/domStubs';
-import { generatedLink, makeNode, toolCall } from '../../test/fixtures';
+import { generatedLink, makeNode, mcpNode, toolCall } from '../../test/fixtures';
 import type { InteractionNode } from '../../types/cvc';
 
 vi.mock('framer-motion', async () => (await import('../../test/motionStub')).framerMotionStub);
@@ -49,7 +51,11 @@ function renderSink(onSelect: () => void = () => {}) {
   return { ...view, card: view.container.firstElementChild as HTMLElement };
 }
 
-const buttonsIn = (card: HTMLElement): HTMLButtonElement[] => Array.from(card.querySelectorAll('button'));
+/** The controls inside a card that open and close its parts: every button but the header, which selects the card. */
+const buttonsIn = (card: HTMLElement): HTMLButtonElement[] => Array.from(card.querySelectorAll('button:not([aria-pressed])'));
+
+/** The header of a card: the toggle button that selects it. */
+const headerOf = (card: HTMLElement): HTMLButtonElement => card.querySelector('button[aria-pressed]') as HTMLButtonElement;
 
 /** Opens every toggle, newly revealed ones included. */
 function expandAll(card: HTMLElement) {
@@ -92,6 +98,9 @@ describe('the controls of a transcript card', () => {
     const { card } = renderSink();
     expandAll(card);
     expect(card.querySelectorAll('[role="button"], [role="link"], [role="switch"], [role="checkbox"], a[href]')).toHaveLength(0);
+    // The card is not one either.
+    expect(card).not.toHaveAttribute('role');
+    expect(card).not.toHaveAttribute('tabindex');
     // Everything focusable is a button or a scrollable block of text.
     const focusable = Array.from(card.querySelectorAll('[tabindex]')).map((el) => el.tagName);
     for (const tag of focusable) expect(['PRE', 'DIV'], 'only scrolling blocks are focusable besides buttons').toContain(tag);
@@ -217,21 +226,60 @@ describe('keyboard use of a control', () => {
 });
 
 describe('selecting the card', () => {
-  it('happens on Enter or Space with the card focused, and the page does not scroll for Space', () => {
+  it('is done by the header: a toggle button, which a browser presses for Enter and for Space', () => {
     const onSelect = vi.fn();
     const { card } = renderSink(onSelect);
-    expect(card).toHaveAttribute('role', 'button');
-    expect(card).toHaveAttribute('tabindex', '0');
+    const header = headerOf(card);
+    expect(header.tagName).toBe('BUTTON');
+    expect(header).toHaveAttribute('type', 'button');
+    expect(header).toHaveAttribute('aria-pressed', 'false');
 
-    expect(fireEvent.keyDown(card, { key: 'Enter' })).toBe(false); // handled, so cancelled
-    expect(fireEvent.keyDown(card, { key: ' ' })).toBe(false);
-    expect(onSelect).toHaveBeenCalledTimes(2);
+    // Enter and Space are not cancelled, so the browser turns them into the click that follows...
+    expect(fireEvent.keyDown(header, { key: 'Enter' })).toBe(true);
+    expect(fireEvent.keyDown(header, { key: ' ' })).toBe(true);
+    expect(fireEvent.keyUp(header, { key: ' ' })).toBe(true);
+    expect(onSelect).not.toHaveBeenCalled();
+    // ...and that click selects, once.
+    fireEvent.click(header);
+    expect(onSelect).toHaveBeenCalledTimes(1);
+  });
 
-    // Anything else is left alone.
-    for (const key of ['a', 'Tab', 'Escape', 'ArrowDown', 'Shift']) {
-      expect(fireEvent.keyDown(card, { key })).toBe(true);
+  it('is not done by the card: it has no key handling, no role and no place in the tab order', () => {
+    const onSelect = vi.fn();
+    const { card } = renderSink(onSelect);
+    expect(card.tagName).toBe('LI');
+    expect(card).not.toHaveAttribute('role');
+    expect(card).not.toHaveAttribute('tabindex');
+    expect(card).not.toHaveAttribute('aria-pressed');
+    for (const key of ['Enter', ' ', 'a', 'Tab', 'Escape', 'ArrowDown', 'Shift']) {
+      // Nothing is handled, so nothing is cancelled and nothing is selected.
+      expect(fireEvent.keyDown(card, { key }), key).toBe(true);
     }
-    expect(onSelect).toHaveBeenCalledTimes(2);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('is reached first through the header: it is the first thing in the card that Tab stops at', () => {
+    const { card } = renderSink();
+    const stops = Array.from(card.querySelectorAll<HTMLElement>('button, [tabindex="0"]'));
+    expect(stops[0]).toBe(headerOf(card));
+    expect(card.firstElementChild).toBe(headerOf(card));
+  });
+
+  it('is done by the header even while text in the card is selected, which holds back the mouse click on the body only', () => {
+    const onSelect = vi.fn();
+    const { card } = renderSink(onSelect);
+    const range = document.createRange();
+    range.selectNodeContents(within(card).getByText(/response 1/));
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    try {
+      fireEvent.click(within(card).getByText(/response 1/)); // the end of a drag across the text
+      expect(onSelect).not.toHaveBeenCalled();
+      fireEvent.click(headerOf(card)); // Enter or Space on the header
+      expect(onSelect).toHaveBeenCalledTimes(1);
+    } finally {
+      window.getSelection()!.removeAllRanges();
+    }
   });
 
   it('happens on a click anywhere in the body of the card', () => {
@@ -258,6 +306,7 @@ describe('selecting the card', () => {
       expect(element, label).not.toBeNull();
       fireEvent.click(element!);
       expected++;
+      // Once for each, whether it went through the card or the header: the header's own click is not also the card's.
       expect(onSelect, label).toHaveBeenCalledTimes(expected);
     }
   });
@@ -273,11 +322,131 @@ describe('selecting the card', () => {
     expect(onSelect).not.toHaveBeenCalled();
   });
 
-  it('reflects whether the node is selected in aria-pressed', () => {
+  it('is reflected by the header in aria-pressed, and only by the header', () => {
     const { rerender, card } = renderSink();
-    expect(card).toHaveAttribute('aria-pressed', 'false');
+    expect(headerOf(card)).toHaveAttribute('aria-pressed', 'false');
     rerender(<TimelineNode interaction={kitchenSink} isSelected />);
-    expect(card).toHaveAttribute('aria-pressed', 'true');
+    expect(headerOf(card)).toHaveAttribute('aria-pressed', 'true');
+    expect(card.querySelectorAll('[aria-pressed]')).toHaveLength(1);
+    expect(card).not.toHaveAttribute('aria-pressed');
+  });
+});
+
+describe('the structure of a card', () => {
+  const NODES: Array<[string, InteractionNode]> = [
+    ['transcript', kitchenSink],
+    ['MCP (triad)', mcpNode],
+  ];
+  const stamp = (node: InteractionNode) => `<${new Date(node.timestamp).toISOString()}>`;
+  const renderInList = (node: InteractionNode, props: { isSelected?: boolean; onSelect?: () => void } = {}) => {
+    const view = render(
+      <ol aria-label="Interactions">
+        <TimelineNode interaction={node} {...props} />
+      </ol>,
+    );
+    return { ...view, card: view.container.querySelector('li') as HTMLElement };
+  };
+
+  /** Anything a person can operate, which must not sit inside anything else a person can operate. */
+  const CONTROLS =
+    'button, a[href], input, select, textarea, summary, [role="button"], [role="link"], [role="checkbox"], [role="switch"], [role="tab"], [role="menuitem"], [role="option"]';
+
+  it('is a list item in a list, with the role and the count a screen reader reads out', () => {
+    const { card } = renderInList(kitchenSink);
+    expect(screen.getByRole('list', { name: 'Interactions' })).toBeInTheDocument();
+    expect(screen.getAllByRole('listitem').includes(card)).toBe(true);
+  });
+
+  it('is named by its speaker and its time, short enough to say in a list of thousands, and not by all it contains', () => {
+    for (const [label, node] of NODES) {
+      const { card, unmount } = renderInList(node);
+      const name = label === 'transcript' ? `AI step ${stamp(node)}` : `AI Agent ${stamp(node)}`;
+      expect(card, label).toHaveAccessibleName(name);
+      expect(card.getAttribute('aria-labelledby')!.split(' '), label).toHaveLength(2);
+      for (const id of card.getAttribute('aria-labelledby')!.split(' ')) {
+        const target = document.getElementById(id);
+        expect(target, `${label}: #${id}`).not.toBeNull();
+        expect(card.contains(target), `${label}: #${id} is in the card`).toBe(true);
+      }
+      expect(card.textContent!.length, label).toBeGreaterThan(name.length * 3); // there is far more in it than its name
+      unmount();
+    }
+  });
+
+  it('has a header whose name is the words in it, in order: who spoke, what it shows, when, and the model', () => {
+    const expected: Record<string, string> = {
+      transcript: `AI step Tool results 1 tool call failed ${stamp(kitchenSink)} claude-test-1`,
+      'MCP (triad)': `AI Agent Review required ${stamp(mcpNode)} agent`,
+    };
+    for (const [label, node] of NODES) {
+      const { card, unmount } = renderInList(node);
+      expect(headerOf(card), label).toHaveAccessibleName(expected[label]);
+      unmount();
+    }
+  });
+
+  it('has a header that is a toggle button holding the speaker, the model and the time', () => {
+    for (const [label, node] of NODES) {
+      const { card, unmount } = renderInList(node);
+      const header = headerOf(card);
+      expect(header, label).toBeInTheDocument();
+      expect(header.textContent, label).toContain(stamp(node));
+      expect(header.textContent, label).toContain(node.model_name!);
+      expect(header, label).toHaveAccessibleName(expect.stringContaining(stamp(node)));
+      expect(header, label).toHaveAccessibleName(expect.stringContaining(node.model_name!));
+      expect(header, label).toHaveAccessibleName(expect.stringMatching(/^AI (step|Agent) /));
+      expect(within(card).getByRole('button', { pressed: false, name: /^AI (step|Agent) / }), label).toBe(header);
+      unmount();
+    }
+  });
+
+  it('shows the nested controls to assistive technology, as buttons in the card, none of them hidden', () => {
+    const { card } = renderInList(kitchenSink);
+    expandAll(card);
+    const buttons = within(card).getAllByRole('button');
+    expect(buttons.length).toBeGreaterThan(9);
+    for (const button of buttons) expect(button.closest('[aria-hidden="true"]')).toBeNull();
+    // The header is one of them; the others report whether they are open, and have names of their own.
+    expect(buttons).toContain(headerOf(card));
+    expect(within(card).getAllByRole('button', { expanded: true }).length).toBeGreaterThan(8);
+    expect(within(card).getByRole('button', { name: 'Hide subagent prompt' })).toBeInTheDocument();
+  });
+
+  it('holds no control inside another control, whether its parts are closed or open, in either layout', () => {
+    for (const [label, node] of NODES) {
+      const { card, unmount } = renderInList(node);
+      for (const state of ['closed', 'open']) {
+        if (state === 'open') {
+          expandAll(card);
+          const why = within(card).queryByRole('button', { name: 'Why?' });
+          if (why) fireEvent.click(why);
+        }
+        expect(card.matches(CONTROLS), `${label}: the card itself is not a control`).toBe(false);
+        const controls = Array.from(card.querySelectorAll<HTMLElement>(CONTROLS));
+        expect(controls.length, `${label} ${state}`).toBeGreaterThan(0);
+        for (const control of controls) {
+          expect(
+            control.parentElement!.closest(CONTROLS),
+            `${label} ${state}: <${control.tagName.toLowerCase()}> "${control.textContent!.slice(0, 30)}" is inside another control`,
+          ).toBeNull();
+        }
+        // A block that scrolls is reached by keyboard too, but is not a control and must not be inside a button.
+        for (const region of Array.from(card.querySelectorAll('[tabindex="0"]'))) {
+          expect(region.closest('button'), `${label} ${state}: a focusable block inside a button`).toBeNull();
+        }
+      }
+      unmount();
+    }
+  });
+
+  it('puts only phrasing content in the header, the one button that holds more than text', () => {
+    for (const [label, node] of NODES) {
+      const { card, unmount } = renderInList(node);
+      const header = headerOf(card);
+      const blocks = header.querySelectorAll('div, p, ul, ol, li, pre, h1, h2, h3, h4, h5, h6, table, section, article');
+      expect(blocks, label).toHaveLength(0);
+      unmount();
+    }
   });
 });
 

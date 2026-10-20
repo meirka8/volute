@@ -5,6 +5,13 @@
  * they did before the Claude Code transcript layout existed (issue #105). The
  * snapshots below were recorded against the pre-change `TimelineNode`; a diff
  * here means the triad markup changed and needs a deliberate decision.
+ *
+ * One such decision has been made, for issue #135: the card became a list item
+ * named by its header, and the header became the button that selects it (so the
+ * card no longer is a button that holds buttons). The snapshots were recorded
+ * again for that, and for it only: the wrapper and the header changed, and the
+ * Thought, Action and Observation panes, the "Why?" panel and the commit chips
+ * inside the card are as they were.
  */
 import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -19,6 +26,7 @@ import {
   mcpNodeNoReasoning,
   runNode,
 } from '../../test/fixtures';
+import { renumberIds } from '../../test/markup';
 import type { InteractionNode } from '../../types/cvc';
 
 vi.mock('framer-motion', async () => (await import('../../test/motionStub')).framerMotionStub);
@@ -32,11 +40,14 @@ afterEach(() => {
 /**
  * Serializable copy of the rendered card. Icon path data is dropped (the class
  * names still say which icon was used) so an icon-library bump does not break
- * a test that is about our own markup.
+ * a test that is about our own markup. The ids that point at each other (the
+ * card's name) are renumbered in order, since React counts them up across the
+ * whole run; what points at what is kept.
  */
 function snapshotOf(container: HTMLElement): Element {
   const clone = container.firstElementChild!.cloneNode(true) as Element;
   clone.querySelectorAll('svg').forEach((svg) => svg.replaceChildren());
+  renumberIds(clone);
   return clone;
 }
 
@@ -145,25 +156,26 @@ describe('TimelineNode triad layout: labels and behaviour', () => {
     expect(screen.queryByRole('button', { name: 'Why?' })).not.toBeInTheDocument();
   });
 
-  it('selects on click and on Enter or Space, but not for keys pressed in nested controls', () => {
+  it('selects on a click on the header (which Enter or Space on it make) and in the body, but not for keys in nested controls', () => {
     const onSelect = vi.fn();
     renderNode(mcpNode, { onSelect });
-    const card = screen.getAllByRole('button')[0];
+    const header = screen.getByRole('button', { pressed: false });
 
-    fireEvent.click(card);
+    fireEvent.click(header);
     expect(onSelect).toHaveBeenCalledTimes(1);
 
-    fireEvent.keyDown(card, { key: 'Enter' });
-    fireEvent.keyDown(card, { key: ' ' });
-    expect(onSelect).toHaveBeenCalledTimes(3);
+    fireEvent.click(screen.getByText('Thought'));
+    expect(onSelect).toHaveBeenCalledTimes(2);
 
     fireEvent.keyDown(screen.getByRole('button', { name: 'Why?' }), { key: 'Enter' });
-    expect(onSelect).toHaveBeenCalledTimes(3);
+    expect(onSelect).toHaveBeenCalledTimes(2);
   });
 
-  it('reflects selection in aria-pressed', () => {
+  it('reflects selection in aria-pressed, on the header', () => {
     renderNode(mcpNode, { isSelected: true });
-    expect(screen.getAllByRole('button')[0]).toHaveAttribute('aria-pressed', 'true');
+    const header = screen.getByRole('button', { pressed: true });
+    expect(header).toHaveTextContent('AI Agent');
+    expect(screen.queryByRole('button', { pressed: false, name: /^AI Agent/ })).not.toBeInTheDocument();
   });
 
   it('offers "Show more" once the thought overflows its clamp, and toggles it', async () => {

@@ -4,11 +4,12 @@
  * to build once.
  *
  * These tests use the REAL framer-motion, not the stub the other timeline tests
- * use: AnimatePresence in "popLayout" mode hands each child a `ref`, and whether a
- * memoised child still bails out under it is exactly what ships.
+ * use: whether a memoised card still bails out in the tree that ships is what they
+ * are about. (The cards no longer animate through framer-motion, only the panel a
+ * card opens does, so this is about the memoisation, not about the library.)
  */
 import '@testing-library/jest-dom/vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShadowTimeline } from './ShadowTimeline';
 import { installDomStubs, restoreDomStubs } from '../../test/domStubs';
@@ -67,8 +68,9 @@ describe('selecting a step', () => {
     forget();
     rerender(<ShadowTimeline interactions={steps} selectedInteractionId={steps[4].id} onSelectInteraction={select} />);
     expect([...drawn.ids].sort()).toEqual([steps[1].id, steps[4].id].sort());
+    // The header of a card is the button that says whether it is selected.
     expect(screen.getAllByRole('button', { pressed: true })).toHaveLength(1);
-    expect(screen.getByRole('button', { pressed: true })).toHaveTextContent('Step 4');
+    expect(screen.getByRole('button', { pressed: true }).closest('li')).toHaveTextContent('Step 4');
   });
 
   it('redraws only the step that gained it when nothing had been selected, and only the one that lost it when cleared', () => {
@@ -103,9 +105,10 @@ describe('selecting a step', () => {
     expect(second).toHaveBeenCalledWith(steps[3].id);
     expect(first).not.toHaveBeenCalled();
 
-    // ...and the keyboard reaches it the same way.
-    fireEvent.keyDown(screen.getByText('Step 5').closest('[role="button"]')!, { key: 'Enter' });
+    // ...and the keyboard reaches it the same way, through the header (a browser turns Enter into this click).
+    fireEvent.click(within(screen.getByText('Step 5').closest('li')!).getByRole('button', { pressed: false }));
     expect(second).toHaveBeenLastCalledWith(steps[5].id);
+    expect(second).toHaveBeenCalledTimes(2);
   });
 
   it('does not fail when the parent passes no function', () => {

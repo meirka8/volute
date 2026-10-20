@@ -15,6 +15,7 @@ import { diffRows } from '../../lib/lineDiff';
 import { failedToolCount, nodeLayout, parseStimulus } from '../../lib/transcriptNode';
 import { installDomStubs, restoreDomStubs } from '../../test/domStubs';
 import * as fixtures from '../../test/fixtures';
+import { withoutIds } from '../../test/markup';
 import { makeNode, rawToolCall, toolCall } from '../../test/fixtures';
 import type { InteractionNode, ToolExecution } from '../../types/cvc';
 
@@ -402,13 +403,18 @@ describe('Edit diffs of unusual text', () => {
     expect(Array.from(card.querySelectorAll('ins')).map((el) => el.textContent)).toEqual(['+B']);
   });
 
-  it('keeps markup-like and control characters in the diff as text', () => {
-    const old = '<img src=x onerror=alert(1)>‮\u0000';
+  // Changed with the hidden-character tokens (#135): the right-to-left override and the NUL in this text are
+  // drawn as tokens (⟨U+202E⟩, ⟨U+0000⟩) instead of being put on the page raw; the markup is still only text.
+  it('keeps markup-like text in the diff as text, and draws the control characters in it as tokens', () => {
+    const old = '<img src=x onerror=alert(1)>\u202E\u0000';
     const { container } = edit({ old_string: old, new_string: '&lt;script&gt;' });
     const [card] = toolCardsOf(cardOf(container));
     expect(card.querySelector('img, script')).toBeNull();
-    expect(card.querySelector('del')!.textContent).toBe(`-${old}`);
+    expect(card.querySelector('del')!.textContent).toBe('-<img src=x onerror=alert(1)>⟨U+202E⟩⟨U+0000⟩');
     expect(card.querySelector('ins')!.textContent).toBe('+&lt;script&gt;');
+    // Neither character is in the text of the page any more.
+    expect(card.textContent).not.toContain(String.fromCharCode(0x0000));
+    expect(card.textContent).not.toContain(String.fromCharCode(0x202e));
   });
 });
 
@@ -596,7 +602,7 @@ describe('re-rendering and strict mode', () => {
   });
 
   it('renders the same card every time: nothing depends on randomness or the clock', () => {
-    const normalise = (html: string) => html.replace(/ (id|aria-controls)="[^"]*"/g, '');
+    const normalise = withoutIds;
     for (const node of [fixtures.promptStep, fixtures.failingStep, fixtures.agentStep, fixtures.serverToolStep]) {
       const first = render(<TimelineNode interaction={node} />);
       const a = normalise(first.container.innerHTML);

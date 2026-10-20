@@ -1,8 +1,10 @@
 import { useId, useMemo, useState } from 'react';
 import { clsx } from 'clsx';
 import { useIsClamped } from '../../hooks/useIsClamped';
+import type { HiddenMode } from '../../lib/hiddenChars';
 import { displayText, exceedsLines } from '../../lib/textLines';
 import { ExpandToggle } from './ExpandToggle';
+import { HiddenText } from './HiddenText';
 
 // Literal class names, so Tailwind's scanner finds them.
 const CLAMP_CLASS = {
@@ -15,6 +17,11 @@ interface ClampedTextProps {
   text: string;
   /** How many lines to show before "Show more". */
   lines?: keyof typeof CLAMP_CLASS;
+  /**
+   * How hidden and bidirectional characters are treated: `prose` (the default)
+   * for text a person or the model wrote, `strict` for text shown as code.
+   */
+  mode?: HiddenMode;
   className?: string;
 }
 
@@ -28,7 +35,7 @@ interface ClampedTextProps {
  * with more explicit line breaks than the clamp is known to be cut off without
  * measuring, which also keeps the control available where layout is not computed.
  */
-export function ClampedText({ text, lines = 4, className }: ClampedTextProps) {
+export function ClampedText({ text, lines = 4, mode = 'prose', className }: ClampedTextProps) {
   const [expanded, setExpanded] = useState(false);
   const [element, setElement] = useState<HTMLElement | null>(null);
   const shown = useMemo(() => displayText(text), [text]);
@@ -43,7 +50,7 @@ export function ClampedText({ text, lines = 4, className }: ClampedTextProps) {
         ref={setElement}
         className={clsx('whitespace-pre-wrap break-words', !expanded && CLAMP_CLASS[lines], className)}
       >
-        {shown}
+        <HiddenText text={shown} mode={mode} />
       </p>
       {(canExpand || expanded) && (
         <ExpandToggle

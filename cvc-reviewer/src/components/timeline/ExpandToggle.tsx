@@ -12,8 +12,9 @@ interface ExpandToggleProps {
  * The "Show more" / "Show less" control used across the transcript layout.
  *
  * It is a real button, and it stops the click from reaching the timeline card,
- * which is itself a button that selects the node. (Keyboard activation needs no
- * such guard: the card ignores key events that come from nested controls.)
+ * which selects the step on a click anywhere on it. (Keyboard activation needs no
+ * such guard: the card has no key handling at all, and the header, a button of its
+ * own, is what selects it from the keyboard.)
  */
 export function ExpandToggle({
   expanded,

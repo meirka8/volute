@@ -207,6 +207,24 @@ body,
     box-shadow: var(--selected-card-shadow);
 }
 
+/* A card whose step is new to the timeline fades in and slides a little. */
+@keyframes rr-card-enter {
+    from {
+        opacity: 0;
+        transform: translateX(20px);
+    }
+}
+
+.rr-card-enter {
+    animation: rr-card-enter 150ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .rr-card-enter {
+        animation: none;
+    }
+}
+
 .rr-toolbar {
     background: var(--toolbar-bg);
 }

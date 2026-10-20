@@ -14,7 +14,9 @@ import {
   type StimulusOrigin,
 } from '../../lib/transcriptNode';
 import type { InteractionNode, ToolExecution } from '../../types/cvc';
+import { CardHeader, type CardSelection } from './CardHeader';
 import { ClampedText } from './ClampedText';
+import { HiddenCharsNotice, HiddenText } from './HiddenText';
 import { RENDER_LIMITS } from './limits';
 import { ShowMore } from './ShowMore';
 import { StimulusPane } from './StimulusPane';
@@ -46,6 +48,7 @@ interface HeaderProps {
   interaction: InteractionNode;
   origin: StimulusOrigin;
   failedTools: number;
+  selection: CardSelection;
 }
 
 /**
@@ -54,29 +57,28 @@ interface HeaderProps {
  * the assistant's. The outcome is shown only as far as it is recorded: a count of
  * failed tool calls, never a "green check".
  */
-function TranscriptHeader({ interaction, origin, failedTools }: HeaderProps) {
+function TranscriptHeader({ interaction, origin, failedTools, selection }: HeaderProps) {
   const modelName = typeof interaction.model_name === 'string' && interaction.model_name !== '' ? interaction.model_name : null;
   return (
-    <div className="mb-4 flex items-start gap-3">
-      <div className="flex h-9 w-9 items-center justify-center rounded-full bg-canvas/80">
-        <HeaderIcon author={interaction.author} />
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="font-medium text-ink">{headerLabel(interaction.author)}</span>
-          <span className={BADGE_NEUTRAL}>{origin}</span>
+    <CardHeader
+      selection={selection}
+      icon={<HeaderIcon author={interaction.author} />}
+      speaker={headerLabel(interaction.author)}
+      badges={
+        <>
+          <span className={BADGE_NEUTRAL}>{origin}</span>{' '}
           {failedTools > 0 && (
-            <span className={BADGE_DANGER} title={FAILURE_CHIP_TITLE}>
-              {failedTools === 1 ? '1 tool call failed' : `${failedTools} tool calls failed`}
-            </span>
+            <>
+              <span className={BADGE_DANGER} title={FAILURE_CHIP_TITLE}>
+                {failedTools === 1 ? '1 tool call failed' : `${failedTools} tool calls failed`}
+              </span>{' '}
+            </>
           )}
-          <span className="text-xs text-muted">{formatTimestamp(interaction.timestamp)}</span>
-        </div>
-        {modelName && (
-          <div className="mt-1 break-words text-xs uppercase tracking-[0.16em] text-muted">{modelName}</div>
-        )}
-      </div>
-    </div>
+        </>
+      }
+      time={formatTimestamp(interaction.timestamp)}
+      model={modelName ? <HiddenText text={modelName} mode="strict" /> : null}
+    />
   );
 }
 
@@ -131,6 +133,8 @@ interface TranscriptNodeBodyProps {
    * `toolResultsMatchParent`).
    */
   parentToolNames?: readonly ParentToolCall[] | null;
+  /** What the header needs to select the card and to name it. */
+  selection: CardSelection;
   /** Rendered last, inside the same spacing container (the artifact-link chips both layouts share). */
   children?: ReactNode;
 }
@@ -140,7 +144,7 @@ interface TranscriptNodeBodyProps {
  * the order the step happened: what it reacted to, its reasoning, what it said,
  * and what it did.
  */
-export function TranscriptNodeBody({ interaction, parentToolNames = null, children }: TranscriptNodeBodyProps) {
+export function TranscriptNodeBody({ interaction, parentToolNames = null, selection, children }: TranscriptNodeBodyProps) {
   const author = interaction.author;
   // Only a human can interrupt: elsewhere "[Request interrupted by user" is just output.
   const segments = useMemo(
@@ -156,7 +160,8 @@ export function TranscriptNodeBody({ interaction, parentToolNames = null, childr
 
   return (
     <>
-      <TranscriptHeader interaction={interaction} origin={origin} failedTools={failedToolCount(interaction)} />
+      <TranscriptHeader interaction={interaction} origin={origin} failedTools={failedToolCount(interaction)} selection={selection} />
+      <HiddenCharsNotice />
       <div className="space-y-3" data-layout="transcript">
         <StimulusPane
           segments={segments}

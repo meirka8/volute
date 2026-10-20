@@ -4,6 +4,7 @@ import { MAX_DIFF_LINES, planDiff, type DiffRow } from '../../lib/lineDiff';
 import { displayText, shouldCollapse } from '../../lib/textLines';
 import { CollapsibleCode } from './CollapsibleCode';
 import { ExpandToggle } from './ExpandToggle';
+import { HiddenText } from './HiddenText';
 
 interface TextDiffProps {
   oldText: string;
@@ -40,7 +41,9 @@ function DiffLine({ row }: { row: DiffRow }) {
       >
         {sign}
       </span>
-      <span>{row.text}</span>
+      <span>
+        <HiddenText text={row.text} mode="strict" />
+      </span>
     </>
   );
 

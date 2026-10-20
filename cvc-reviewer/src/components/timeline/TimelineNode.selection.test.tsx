@@ -2,7 +2,8 @@
  * Selecting a node, and selecting text. Dragging across text to copy it ends in a
  * click on the card; that click must not also select the node (which would move
  * the diff pane under the reader's hands). The rule applies to both layouts and
- * changes no markup.
+ * changes no markup. The header of the card is a button and selects whatever text is
+ * selected: Enter or Space on it must always work, so it is not held back.
  */
 import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
@@ -10,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TimelineNode } from './TimelineNode';
 import { installDomStubs, restoreDomStubs } from '../../test/domStubs';
 import { failingStep, mcpNode, promptStep } from '../../test/fixtures';
+import { withoutIds } from '../../test/markup';
 import type { InteractionNode } from '../../types/cvc';
 
 vi.mock('framer-motion', async () => (await import('../../test/motionStub')).framerMotionStub);
@@ -40,9 +42,10 @@ function selectBetween(anchor: Node, focus: Node) {
   selection.setBaseAndExtent(anchor, 0, focus, 1);
 }
 
+/** A layout, a node of it, and the text of a label in the BODY of the card (not in its header, which is a button). */
 const LAYOUTS: Array<[string, InteractionNode, string]> = [
   ['triad', mcpNode, 'Thought'],
-  ['transcript', promptStep, 'AI step'],
+  ['transcript', promptStep, 'Response'],
 ];
 
 describe.each(LAYOUTS)('a %s card', (_layout, node, heading) => {
@@ -54,7 +57,7 @@ describe.each(LAYOUTS)('a %s card', (_layout, node, heading) => {
         <p data-testid="outside">text outside the card</p>
       </div>,
     );
-    const card = view.container.querySelector('[role="button"][aria-pressed]') as HTMLElement;
+    const card = view.container.querySelector('li') as HTMLElement;
     return { ...view, card, onSelect: onSelect as ReturnType<typeof vi.fn> };
   };
 
@@ -122,11 +125,27 @@ describe.each(LAYOUTS)('a %s card', (_layout, node, heading) => {
     expect(onSelect).toHaveBeenCalledTimes(1);
   });
 
-  it('is still selected from the keyboard while text is selected: only the mouse click is held back', () => {
+  it('is still selected from the keyboard while text is selected: only the mouse click on the body is held back', () => {
     const { card, onSelect } = setup();
     selectContentsOf(within(card).getByText(heading));
+    const header = card.querySelector('button[aria-pressed]') as HTMLElement;
+    // Enter and Space on a button are turned into a click by the browser.
+    fireEvent.click(header);
+    fireEvent.click(header);
+    expect(onSelect).toHaveBeenCalledTimes(2);
+    // The card itself takes no keys.
     fireEvent.keyDown(card, { key: 'Enter' });
     fireEvent.keyDown(card, { key: ' ' });
+    expect(onSelect).toHaveBeenCalledTimes(2);
+  });
+
+  it('is selected once by a click on its header, not once by the header and again by the card', () => {
+    const { card, onSelect } = setup();
+    fireEvent.click(card.querySelector('button[aria-pressed]')!);
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    // ...also on the text inside the header.
+    const speaker = card.querySelector('button[aria-pressed] [id]')!;
+    fireEvent.click(speaker);
     expect(onSelect).toHaveBeenCalledTimes(2);
   });
 
@@ -159,7 +178,7 @@ describe('the card, as markup', () => {
     const html = (selected: boolean) => {
       const { container, unmount } = render(<TimelineNode interaction={mcpNode} />);
       if (selected) selectContentsOf(within(container).getByText('Thought'));
-      const markup = container.innerHTML;
+      const markup = withoutIds(container.innerHTML);
       unmount();
       window.getSelection()!.removeAllRanges();
       return markup;

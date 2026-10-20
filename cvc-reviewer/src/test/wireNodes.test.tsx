@@ -383,7 +383,8 @@ describe.each(ALL_KEYS)('wire node %s', (key) => {
     const onSelect = vi.fn();
     const { container } = renderNode(nodeFor(key), onSelect);
     const card = cardOf(container);
-    for (const toggle of card.querySelectorAll('button')) fireEvent.click(toggle);
+    // Every control that opens or closes a part of the card (the header, a button too, is the one that selects it).
+    for (const toggle of card.querySelectorAll('button:not([aria-pressed])')) fireEvent.click(toggle);
     expect(onSelect).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByText('AI step'));

@@ -1,6 +1,6 @@
-import { memo, useCallback, useLayoutEffect, useMemo, useRef } from 'react';
-import { AnimatePresence } from 'framer-motion';
+import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { AlertTriangle, Brain, GitPullRequest } from 'lucide-react';
+import { useWindowedList } from '../../hooks/useWindowedList';
 import { parentToolNamesByNode, type ParentToolCall } from '../../lib/transcriptNode';
 import { NodeErrorBoundary } from './NodeErrorBoundary';
 import { TimelineNode } from './TimelineNode';
@@ -22,39 +22,119 @@ interface TimelineItemProps {
   /** One function for the whole timeline, for as long as it lives; called with this step's id. */
   onSelectInteraction: (id: string) => void;
   parentToolNames: readonly ParentToolCall[] | null;
+  /** The steps the timeline has drawn before. A card for one of those is not animated in again. */
+  seen: RefObject<ReadonlySet<string>>;
+  /** Where this step is among all of them (from 1) and how many there are, when the list is windowed. */
+  position?: number;
+  setSize?: number;
 }
 
 /**
- * One step, guarded and memoised. A function component (not the boundary itself)
- * is what AnimatePresence holds as its keyed child, exactly as when the child was
- * TimelineNode.
+ * One step, guarded and memoised.
  *
  * Every prop is a value that stays the same while its step does: the node, the
- * list of the previous step's calls (made once per set of interactions), and the
- * one select function. So selecting a step redraws the step that lost the
- * selection and the one that gained it, and no other: a card can be thousands of
- * elements, and drawing all of them again for a click on one is what made
- * selection slow.
+ * list of the previous step's calls (made once per set of interactions), the one
+ * select function, and the set of steps already seen. So selecting a step redraws
+ * the step that lost the selection and the one that gained it, and no other: a card
+ * can be thousands of elements, and drawing all of them again for a click on one is
+ * what made selection slow.
  */
 const TimelineItem = memo(function TimelineItem({
   interaction,
   isSelected,
   onSelectInteraction,
   parentToolNames,
+  seen,
+  position,
+  setSize,
 }: TimelineItemProps) {
   const id = interaction.id;
   const onSelect = useCallback(() => onSelectInteraction(id), [onSelectInteraction, id]);
+  const listPosition = useMemo(
+    () => (position === undefined || setSize === undefined ? undefined : { position, size: setSize }),
+    [position, setSize],
+  );
+  // A card plays its entrance when its step is new to the timeline. One that a scroll brings
+  // back into the window is not arriving, and would otherwise flicker in as the reader scrolls.
+  const [enter] = useState(() => !seen.current.has(id));
   return (
-    <NodeErrorBoundary interaction={interaction}>
+    <NodeErrorBoundary interaction={interaction} listPosition={listPosition}>
       <TimelineNode
         interaction={interaction}
         isSelected={isSelected}
         onSelect={onSelect}
         parentToolNames={parentToolNames}
+        enter={enter}
+        listPosition={listPosition}
       />
     </NodeErrorBoundary>
   );
 });
+
+const NO_STEPS: ReadonlySet<string> = new Set();
+
+interface TimelineListProps {
+  /** Every step, newest first. */
+  interactions: readonly InteractionNode[];
+  parentToolNames: ReadonlyMap<string, readonly ParentToolCall[] | null>;
+  selectedInteractionId?: string | null;
+  onSelectInteraction: (id: string) => void;
+}
+
+/**
+ * The scrolling list of steps. A long one is windowed (see `useWindowedList`): only
+ * the cards near the viewport are mounted, with padding as tall as the cards left
+ * out above and below them, so the scrollbar and the scroll position are those of
+ * the whole list. Everything about the list as a whole (the order, the parent of
+ * each step, the selection, the count in the header) is worked out by the caller
+ * over every step; this only chooses which cards to put on the page.
+ */
+function TimelineList({ interactions, parentToolNames, selectedInteractionId, onSelectInteraction }: TimelineListProps) {
+  const ids = useMemo(() => interactions.map((interaction) => interaction.id), [interactions]);
+  const { win, windowed, scrollerRef, listRef } = useWindowedList(ids);
+  // The steps of this list, for each card to ask whether its step came with it. Noted a frame after the
+  // list is drawn, not at once: the cards drawn while it settles (the window grows by a card once the
+  // heights are measured) belong to the same arrival and should fade in with the rest.
+  const seen = useRef<ReadonlySet<string>>(NO_STEPS);
+  useLayoutEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      seen.current = new Set(ids);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [ids]);
+
+  const mounted = windowed ? interactions.slice(win.start, win.end) : interactions;
+  return (
+    // The browser's own scroll anchoring is off for a windowed list: the list holds the reader's place itself.
+    <div ref={scrollerRef} className="flex-1 overflow-y-auto" style={windowed ? { overflowAnchor: 'none' } : undefined}>
+      {/*
+        The steps are a list, named for the people who hear it read out. It is `flow-root` so that it is a block
+        formatting context: the margins of the cards stay inside it and add up as the windowing assumes. The role
+        is written out because a list with its bullets removed is not announced as one by every screen reader.
+      */}
+      <ol
+        ref={listRef}
+        role="list"
+        aria-label="Interactions linked to this PR"
+        className="flow-root"
+        style={windowed ? { paddingTop: win.before, paddingBottom: win.after } : undefined}
+      >
+        {mounted.map((interaction, offset) => (
+          <TimelineItem
+            key={interaction.id}
+            interaction={interaction}
+            isSelected={selectedInteractionId === interaction.id}
+            onSelectInteraction={onSelectInteraction}
+            parentToolNames={parentToolNames.get(interaction.id) ?? null}
+            seen={seen}
+            position={windowed ? win.start + offset + 1 : undefined}
+            setSize={windowed ? interactions.length : undefined}
+          />
+        ))}
+      </ol>
+    </div>
+  );
+}
 
 export function ShadowTimeline({
   interactions,
@@ -116,19 +196,12 @@ export function ShadowTimeline({
     <div className="h-full flex flex-col">
       <TimelineHeader prTitle={prTitle} count={interactions.length} notice={notice} />
 
-      <div className="flex-1 overflow-y-auto">
-        <AnimatePresence mode="popLayout">
-          {sortedInteractions.map((interaction) => (
-            <TimelineItem
-              key={interaction.id}
-              interaction={interaction}
-              isSelected={selectedInteractionId === interaction.id}
-              onSelectInteraction={selectInteraction}
-              parentToolNames={parentToolNames.get(interaction.id) ?? null}
-            />
-          ))}
-        </AnimatePresence>
-      </div>
+      <TimelineList
+        interactions={sortedInteractions}
+        parentToolNames={parentToolNames}
+        selectedInteractionId={selectedInteractionId}
+        onSelectInteraction={selectInteraction}
+      />
     </div>
   );
 }

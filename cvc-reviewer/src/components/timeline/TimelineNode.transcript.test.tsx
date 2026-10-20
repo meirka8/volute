@@ -682,18 +682,22 @@ describe('controls', () => {
     expect(toggle).toHaveAttribute('aria-expanded', 'false');
   });
 
-  it('ignores key events from nested controls but still selects on Enter or Space on the card', () => {
+  it('ignores key events from nested controls; the header selects on the click a browser makes of Enter or Space', () => {
     const onSelect = vi.fn();
     renderNode(failingStep, onSelect);
-    const card = screen.getAllByRole('button')[0];
+    const header = screen.getByRole('button', { pressed: false });
     const toggle = screen.getByRole('button', { name: /^Tool results/ });
 
     fireEvent.keyDown(toggle, { key: 'Enter' });
     fireEvent.keyDown(toggle, { key: ' ' });
     expect(onSelect).not.toHaveBeenCalled();
 
-    fireEvent.keyDown(card, { key: 'Enter' });
-    fireEvent.keyDown(card, { key: ' ' });
+    // The header is a button: the key presses are left to the browser, which clicks it.
+    expect(fireEvent.keyDown(header, { key: 'Enter' })).toBe(true);
+    expect(fireEvent.keyDown(header, { key: ' ' })).toBe(true);
+    expect(onSelect).not.toHaveBeenCalled();
+    fireEvent.click(header);
+    fireEvent.click(header);
     expect(onSelect).toHaveBeenCalledTimes(2);
   });
 

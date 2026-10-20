@@ -1,17 +1,17 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
 exports[`TimelineNode triad layout: DOM snapshots > MCP node with reasoning 1`] = `
-<div
-  aria-pressed="false"
+<li
+  aria-labelledby="id-1 id-2"
   class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
-  role="button"
-  tabindex="0"
 >
-  <div
-    class="mb-4 flex items-start gap-3"
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
   >
-    <div
-      class="flex h-9 w-9 items-center justify-center rounded-full bg-canvas/80"
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
     >
       <svg
         aria-hidden="true"
@@ -26,36 +26,41 @@ exports[`TimelineNode triad layout: DOM snapshots > MCP node with reasoning 1`] 
         width="16"
         xmlns="http://www.w3.org/2000/svg"
       />
-    </div>
-    <div
-      class="flex-1 min-w-0"
+    </span>
+    <span
+      class="min-w-0 flex-1"
     >
-      <div
+      <span
         class="flex flex-wrap items-center gap-2"
       >
         <span
           class="font-medium text-ink"
+          id="id-1"
         >
           AI Agent
         </span>
+         
         <span
           class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-warning/20 bg-warning/10 text-warning"
         >
           Review required
         </span>
+         
         <span
           class="text-xs text-muted"
+          id="id-2"
         >
           &lt;2026-03-02T09:15:00.000Z&gt;
         </span>
-      </div>
-      <div
-        class="mt-1 text-xs uppercase tracking-[0.16em] text-muted"
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
       >
         agent
-      </div>
-    </div>
-  </div>
+      </span>
+    </span>
+  </button>
   <div
     class="space-y-3"
   >
@@ -165,21 +170,21 @@ exports[`TimelineNode triad layout: DOM snapshots > MCP node with reasoning 1`] 
       </span>
     </div>
   </div>
-</div>
+</li>
 `;
 
 exports[`TimelineNode triad layout: DOM snapshots > MCP node with the "Why?" panel open 1`] = `
-<div
-  aria-pressed="false"
+<li
+  aria-labelledby="id-1 id-2"
   class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
-  role="button"
-  tabindex="0"
 >
-  <div
-    class="mb-4 flex items-start gap-3"
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
   >
-    <div
-      class="flex h-9 w-9 items-center justify-center rounded-full bg-canvas/80"
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
     >
       <svg
         aria-hidden="true"
@@ -194,36 +199,41 @@ exports[`TimelineNode triad layout: DOM snapshots > MCP node with the "Why?" pan
         width="16"
         xmlns="http://www.w3.org/2000/svg"
       />
-    </div>
-    <div
-      class="flex-1 min-w-0"
+    </span>
+    <span
+      class="min-w-0 flex-1"
     >
-      <div
+      <span
         class="flex flex-wrap items-center gap-2"
       >
         <span
           class="font-medium text-ink"
+          id="id-1"
         >
           AI Agent
         </span>
+         
         <span
           class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-warning/20 bg-warning/10 text-warning"
         >
           Review required
         </span>
+         
         <span
           class="text-xs text-muted"
+          id="id-2"
         >
           &lt;2026-03-02T09:15:00.000Z&gt;
         </span>
-      </div>
-      <div
-        class="mt-1 text-xs uppercase tracking-[0.16em] text-muted"
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
       >
         agent
-      </div>
-    </div>
-  </div>
+      </span>
+    </span>
+  </button>
   <div
     class="space-y-3"
   >
@@ -354,21 +364,21 @@ src/net/retry.ts, src/net/client.ts
       </span>
     </div>
   </div>
-</div>
+</li>
 `;
 
 exports[`TimelineNode triad layout: DOM snapshots > MCP node without reasoning 1`] = `
-<div
-  aria-pressed="false"
+<li
+  aria-labelledby="id-1 id-2"
   class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
-  role="button"
-  tabindex="0"
 >
-  <div
-    class="mb-4 flex items-start gap-3"
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
   >
-    <div
-      class="flex h-9 w-9 items-center justify-center rounded-full bg-canvas/80"
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
     >
       <svg
         aria-hidden="true"
@@ -383,36 +393,41 @@ exports[`TimelineNode triad layout: DOM snapshots > MCP node without reasoning 1
         width="16"
         xmlns="http://www.w3.org/2000/svg"
       />
-    </div>
-    <div
-      class="flex-1 min-w-0"
+    </span>
+    <span
+      class="min-w-0 flex-1"
     >
-      <div
+      <span
         class="flex flex-wrap items-center gap-2"
       >
         <span
           class="font-medium text-ink"
+          id="id-1"
         >
           AI Agent
         </span>
+         
         <span
           class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-warning/20 bg-warning/10 text-warning"
         >
           Review required
         </span>
+         
         <span
           class="text-xs text-muted"
+          id="id-2"
         >
           &lt;2026-03-02T09:15:00.000Z&gt;
         </span>
-      </div>
-      <div
-        class="mt-1 text-xs uppercase tracking-[0.16em] text-muted"
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
       >
         agent
-      </div>
-    </div>
-  </div>
+      </span>
+    </span>
+  </button>
   <div
     class="space-y-3"
   >
@@ -467,21 +482,21 @@ exports[`TimelineNode triad layout: DOM snapshots > MCP node without reasoning 1
       </p>
     </div>
   </div>
-</div>
+</li>
 `;
 
 exports[`TimelineNode triad layout: DOM snapshots > VS Code / LSP node 1`] = `
-<div
-  aria-pressed="false"
+<li
+  aria-labelledby="id-1 id-2"
   class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
-  role="button"
-  tabindex="0"
 >
-  <div
-    class="mb-4 flex items-start gap-3"
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
   >
-    <div
-      class="flex h-9 w-9 items-center justify-center rounded-full bg-canvas/80"
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
     >
       <svg
         aria-hidden="true"
@@ -496,36 +511,41 @@ exports[`TimelineNode triad layout: DOM snapshots > VS Code / LSP node 1`] = `
         width="16"
         xmlns="http://www.w3.org/2000/svg"
       />
-    </div>
-    <div
-      class="flex-1 min-w-0"
+    </span>
+    <span
+      class="min-w-0 flex-1"
     >
-      <div
+      <span
         class="flex flex-wrap items-center gap-2"
       >
         <span
           class="font-medium text-ink"
+          id="id-1"
         >
           User
         </span>
+         
         <span
           class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-success/20 bg-success/10 text-success"
         >
           Green check
         </span>
+         
         <span
           class="text-xs text-muted"
+          id="id-2"
         >
           &lt;2026-03-02T09:15:00.000Z&gt;
         </span>
-      </div>
-      <div
-        class="mt-1 text-xs uppercase tracking-[0.16em] text-muted"
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
       >
         example-model-1
-      </div>
-    </div>
-  </div>
+      </span>
+    </span>
+  </button>
   <div
     class="space-y-3"
   >
@@ -580,21 +600,21 @@ exports[`TimelineNode triad layout: DOM snapshots > VS Code / LSP node 1`] = `
       </p>
     </div>
   </div>
-</div>
+</li>
 `;
 
 exports[`TimelineNode triad layout: DOM snapshots > agent node that carries tool executions 1`] = `
-<div
-  aria-pressed="false"
+<li
+  aria-labelledby="id-1 id-2"
   class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
-  role="button"
-  tabindex="0"
 >
-  <div
-    class="mb-4 flex items-start gap-3"
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
   >
-    <div
-      class="flex h-9 w-9 items-center justify-center rounded-full bg-canvas/80"
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
     >
       <svg
         aria-hidden="true"
@@ -609,36 +629,41 @@ exports[`TimelineNode triad layout: DOM snapshots > agent node that carries tool
         width="16"
         xmlns="http://www.w3.org/2000/svg"
       />
-    </div>
-    <div
-      class="flex-1 min-w-0"
+    </span>
+    <span
+      class="min-w-0 flex-1"
     >
-      <div
+      <span
         class="flex flex-wrap items-center gap-2"
       >
         <span
           class="font-medium text-ink"
+          id="id-1"
         >
           AI Agent
         </span>
+         
         <span
           class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-danger/20 bg-danger/10 text-danger"
         >
           Critical alert
         </span>
+         
         <span
           class="text-xs text-muted"
+          id="id-2"
         >
           &lt;2026-03-02T09:15:00.000Z&gt;
         </span>
-      </div>
-      <div
-        class="mt-1 text-xs uppercase tracking-[0.16em] text-muted"
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
       >
         agent
-      </div>
-    </div>
-  </div>
+      </span>
+    </span>
+  </button>
   <div
     class="space-y-3"
   >
@@ -698,21 +723,21 @@ exports[`TimelineNode triad layout: DOM snapshots > agent node that carries tool
       </p>
     </div>
   </div>
-</div>
+</li>
 `;
 
 exports[`TimelineNode triad layout: DOM snapshots > cvc run node 1`] = `
-<div
-  aria-pressed="false"
+<li
+  aria-labelledby="id-1 id-2"
   class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
-  role="button"
-  tabindex="0"
 >
-  <div
-    class="mb-4 flex items-start gap-3"
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
   >
-    <div
-      class="flex h-9 w-9 items-center justify-center rounded-full bg-canvas/80"
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
     >
       <svg
         aria-hidden="true"
@@ -727,36 +752,41 @@ exports[`TimelineNode triad layout: DOM snapshots > cvc run node 1`] = `
         width="16"
         xmlns="http://www.w3.org/2000/svg"
       />
-    </div>
-    <div
-      class="flex-1 min-w-0"
+    </span>
+    <span
+      class="min-w-0 flex-1"
     >
-      <div
+      <span
         class="flex flex-wrap items-center gap-2"
       >
         <span
           class="font-medium text-ink"
+          id="id-1"
         >
           System
         </span>
+         
         <span
           class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-success/20 bg-success/10 text-success"
         >
           Green check
         </span>
+         
         <span
           class="text-xs text-muted"
+          id="id-2"
         >
           &lt;2026-03-02T09:15:00.000Z&gt;
         </span>
-      </div>
-      <div
-        class="mt-1 text-xs uppercase tracking-[0.16em] text-muted"
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
       >
         process-shim
-      </div>
-    </div>
-  </div>
+      </span>
+    </span>
+  </button>
   <div
     class="space-y-3"
   >
@@ -814,21 +844,21 @@ warning: unused variable \`x\` in src/lib.rs
       </p>
     </div>
   </div>
-</div>
+</li>
 `;
 
 exports[`TimelineNode triad layout: DOM snapshots > node with nothing recorded and an external author 1`] = `
-<div
-  aria-pressed="false"
+<li
+  aria-labelledby="id-1 id-2"
   class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
-  role="button"
-  tabindex="0"
 >
-  <div
-    class="mb-4 flex items-start gap-3"
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
   >
-    <div
-      class="flex h-9 w-9 items-center justify-center rounded-full bg-canvas/80"
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
     >
       <svg
         aria-hidden="true"
@@ -843,31 +873,35 @@ exports[`TimelineNode triad layout: DOM snapshots > node with nothing recorded a
         width="16"
         xmlns="http://www.w3.org/2000/svg"
       />
-    </div>
-    <div
-      class="flex-1 min-w-0"
+    </span>
+    <span
+      class="min-w-0 flex-1"
     >
-      <div
+      <span
         class="flex flex-wrap items-center gap-2"
       >
         <span
           class="font-medium text-ink"
+          id="id-1"
         >
           External
         </span>
+         
         <span
           class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-success/20 bg-success/10 text-success"
         >
           Green check
         </span>
+         
         <span
           class="text-xs text-muted"
+          id="id-2"
         >
           &lt;2026-03-02T09:15:00.000Z&gt;
         </span>
-      </div>
-    </div>
-  </div>
+      </span>
+    </span>
+  </button>
   <div
     class="space-y-3"
   >
@@ -922,21 +956,21 @@ exports[`TimelineNode triad layout: DOM snapshots > node with nothing recorded a
       </p>
     </div>
   </div>
-</div>
+</li>
 `;
 
 exports[`TimelineNode triad layout: DOM snapshots > selected card 1`] = `
-<div
-  aria-pressed="true"
+<li
+  aria-labelledby="id-1 id-2"
   class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors rr-selected-card border-action bg-action/10"
-  role="button"
-  tabindex="0"
 >
-  <div
-    class="mb-4 flex items-start gap-3"
+  <button
+    aria-pressed="true"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
   >
-    <div
-      class="flex h-9 w-9 items-center justify-center rounded-full bg-canvas/80"
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
     >
       <svg
         aria-hidden="true"
@@ -951,36 +985,41 @@ exports[`TimelineNode triad layout: DOM snapshots > selected card 1`] = `
         width="16"
         xmlns="http://www.w3.org/2000/svg"
       />
-    </div>
-    <div
-      class="flex-1 min-w-0"
+    </span>
+    <span
+      class="min-w-0 flex-1"
     >
-      <div
+      <span
         class="flex flex-wrap items-center gap-2"
       >
         <span
           class="font-medium text-ink"
+          id="id-1"
         >
           AI Agent
         </span>
+         
         <span
           class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-warning/20 bg-warning/10 text-warning"
         >
           Review required
         </span>
+         
         <span
           class="text-xs text-muted"
+          id="id-2"
         >
           &lt;2026-03-02T09:15:00.000Z&gt;
         </span>
-      </div>
-      <div
-        class="mt-1 text-xs uppercase tracking-[0.16em] text-muted"
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
       >
         agent
-      </div>
-    </div>
-  </div>
+      </span>
+    </span>
+  </button>
   <div
     class="space-y-3"
   >
@@ -1090,5 +1129,5 @@ exports[`TimelineNode triad layout: DOM snapshots > selected card 1`] = `
       </span>
     </div>
   </div>
-</div>
+</li>
 `;

@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShadowTimeline } from './ShadowTimeline';
 import { displayText } from '../../lib/textLines';
 import { installDomStubs, restoreDomStubs } from '../../test/domStubs';
+import { withoutIds } from '../../test/markup';
 import {
   failingStep,
   injectionHumanStep,
@@ -32,7 +33,9 @@ afterEach(() => {
 const NOTE_PATTERN = /Shown undivided: the tool results named here don't match the previous step's tool calls/;
 const FAILED_CARD = 'This step could not be displayed.';
 
-const cardsOf = (container: HTMLElement) => Array.from(container.querySelectorAll<HTMLElement>('[role="button"][aria-pressed]'));
+/** The cards drawn: the list items that have a header to select them (not the one for a step that could not be drawn). */
+const cardsOf = (container: HTMLElement) =>
+  Array.from(container.querySelectorAll<HTMLElement>('ol > li')).filter((item) => item.querySelector('button[aria-pressed]') !== null);
 
 // ---------------------------------------------------------------------------
 // Real nodes, written by the shipped producer (see ../../test/wire/README.md)
@@ -95,7 +98,7 @@ describe('the parent of each step, from parent_id', () => {
   });
 
   it('leaves the triad cards exactly as they were, parent or no parent', () => {
-    const normalise = (html: string) => html.replace(/ (id|aria-controls)="[^"]*"/g, '');
+    const normalise = withoutIds;
     const triadCards = (container: HTMLElement) =>
       cardsOf(container)
         .filter((card) => card.textContent!.includes('Thought'))

@@ -18,7 +18,7 @@ const count = (value: number) => value.toLocaleString('en-US');
  * list of a million items cannot be turned into a million elements by a click.
  *
  * It is a real button, and it stops the click from reaching the timeline card,
- * which is itself a button that selects the node. It reveals more; it is not a
+ * which selects the step on a click anywhere on it. It reveals more; it is not a
  * toggle, so it has no expanded state.
  */
 export function ShowMore({ remaining, page, one, many, onShow }: ShowMoreProps) {

@@ -1,5 +1,6 @@
 import { useId, useMemo, useState } from 'react';
 import { clsx } from 'clsx';
+import type { HiddenMode } from '../../lib/hiddenChars';
 import {
   cutAtCodePoint,
   exceedsCharBudget,
@@ -8,6 +9,7 @@ import {
   WRAPPED_CHAR_BUDGET,
 } from '../../lib/textLines';
 import { ExpandToggle } from './ExpandToggle';
+import { HiddenText } from './HiddenText';
 
 /** A count as the controls say it: "8,192 lines". */
 const count = (value: number) => value.toLocaleString('en-US');
@@ -26,6 +28,12 @@ interface CollapsibleCodeProps {
    * scrolls sideways is focusable, so it is a named region; a wrapping one is not.
    */
   label?: string;
+  /**
+   * How hidden and bidirectional characters are treated: `strict` (the default,
+   * for commands, paths and tool output) or `prose` for text a person wrote.
+   * Either way they are drawn as visible tokens, never raw (see `HiddenText`).
+   */
+  mode?: HiddenMode;
   className?: string;
 }
 
@@ -33,14 +41,23 @@ interface CollapsibleCodeProps {
  * A monospace block with real line breaks, collapsed to `maxLines` lines when
  * that hides at least a few lines (see `shouldCollapse`). A block that WRAPS is
  * also cut to a length budget (see `WRAPPED_CHAR_BUDGET`), because it grows with
- * its text however few lines it has. Text is rendered as a plain text node;
- * whitespace is preserved and nothing is interpreted.
+ * its text however few lines it has. Text is rendered as a plain text node (with
+ * its hidden characters drawn as tokens, when it has any); whitespace is preserved
+ * and nothing is interpreted.
  *
  * Scrolling blocks are focusable so keyboard users can scroll them, and are
- * named regions so a screen reader says what they hold; the card around them
- * ignores key events that originate here.
+ * named regions so a screen reader says what they hold. A key pressed in one is
+ * for the block (the card around it takes no keys, and the page-wide Space
+ * shortcut leaves it alone).
  */
-export function CollapsibleCode({ text, maxLines = 12, wrap = false, label = 'Text', className }: CollapsibleCodeProps) {
+export function CollapsibleCode({
+  text,
+  maxLines = 12,
+  wrap = false,
+  label = 'Text',
+  mode = 'strict',
+  className,
+}: CollapsibleCodeProps) {
   const [expanded, setExpanded] = useState(false);
   const id = useId();
   const lines = useMemo(() => splitDisplayLines(text), [text]);
@@ -69,7 +86,7 @@ export function CollapsibleCode({ text, maxLines = 12, wrap = false, label = 'Te
           wrap ? 'whitespace-pre-wrap break-words' : 'overflow-x-auto whitespace-pre',
         )}
       >
-        {shown}
+        <HiddenText text={shown} mode={mode} />
       </pre>
       {collapsible && (
         <ExpandToggle

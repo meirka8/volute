@@ -15,6 +15,7 @@ import {
 import type { InteractionNode } from '../../types/cvc';
 import { ClampedText } from './ClampedText';
 import { CollapsibleCode } from './CollapsibleCode';
+import { HiddenText } from './HiddenText';
 import { RENDER_LIMITS } from './limits';
 import { ShowMore } from './ShowMore';
 import { BADGE_DANGER, PANE_LABEL } from './styles';
@@ -64,7 +65,9 @@ function ToolResultItem({ result }: { result: ToolResultSegment }) {
   return (
     <OutputBox>
       <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="min-w-0 break-words font-mono text-xs font-semibold text-ink">{toolTitle(result.tool)}</span>
+        <span className="min-w-0 break-words font-mono text-xs font-semibold text-ink">
+          <HiddenText text={toolTitle(result.tool)} mode="strict" />
+        </span>
         {result.isError && <span className={clsx(BADGE_DANGER, 'ml-auto shrink-0')}>error</span>}
       </div>
       {result.text === '' ? (
@@ -104,7 +107,7 @@ function ToolResultsGroup({ results, defaultOpen }: { results: ToolResultsItem[]
   return (
     <div className="min-w-0">
       <SummaryToggle open={open} controls={id} onToggle={() => setOpen((value) => !value)} hasError={hasError}>
-        {summary}
+        <HiddenText text={summary} mode="strict" />
       </SummaryToggle>
       {open && (
         <div id={id} className="mt-2 space-y-2">
@@ -161,7 +164,12 @@ function NoteBlock({ label, text }: { label: string | null; text: string }) {
   return (
     <div className="min-w-0">
       {label && <div className={clsx(PANE_LABEL, 'text-muted')}>{label}</div>}
-      <ClampedText text={text} lines={3} className={clsx('font-mono text-xs leading-relaxed text-muted', label && 'mt-1')} />
+      <ClampedText
+        text={text}
+        lines={3}
+        mode="strict"
+        className={clsx('font-mono text-xs leading-relaxed text-muted', label && 'mt-1')}
+      />
     </div>
   );
 }

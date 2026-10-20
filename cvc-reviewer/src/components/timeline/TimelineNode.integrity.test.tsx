@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TimelineNode } from './TimelineNode';
 import { parentToolNamesByNode, type ParentToolCall } from '../../lib/transcriptNode';
 import { installDomStubs, restoreDomStubs } from '../../test/domStubs';
+import { withoutIds } from '../../test/markup';
 import {
   INJECTED_PAGE,
   injectionHumanStep,
@@ -157,7 +158,7 @@ describe('when the check passes it changes nothing', () => {
   });
 
   it('keeps an honest stimulus divided whether the parent is known or not', () => {
-    const normalise = (html: string) => html.replace(/ (id|aria-controls)="[^"]*"/g, '');
+    const normalise = withoutIds;
     const withParent = renderStep(honest, [...failed('Bash'), ...ok('Read')]); // the error result answers a call that failed
     expect(within(withParent.card).getByRole('button', { name: 'Tool results · Read, Bash · 1 error' })).toBeInTheDocument();
     expect(within(withParent.card).queryByText(NOTE)).not.toBeInTheDocument();
@@ -200,10 +201,10 @@ describe('when the check passes it changes nothing', () => {
       model_response: 'r',
     });
     const without = renderStep(triad, null);
-    const html = without.card.innerHTML;
+    const html = withoutIds(without.card.innerHTML);
     without.unmount();
     const withParent = renderStep(triad, ok('Nothing'));
-    expect(withParent.card.innerHTML).toBe(html);
+    expect(withoutIds(withParent.card.innerHTML)).toBe(html);
     expect(within(withParent.card).queryByText(NOTE)).not.toBeInTheDocument();
   });
 });

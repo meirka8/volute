@@ -13,6 +13,7 @@ import type { ToolExecution } from '../../types/cvc';
 import { ClampedText } from './ClampedText';
 import { CollapsibleCode } from './CollapsibleCode';
 import { ExpandToggle } from './ExpandToggle';
+import { HiddenText } from './HiddenText';
 import { RENDER_LIMITS } from './limits';
 import { ShowMore } from './ShowMore';
 import { TextDiff } from './TextDiff';
@@ -26,7 +27,7 @@ function Chips({ chips }: { chips: string[] }) {
     <ul className="mt-2 flex flex-wrap gap-1.5">
       {chips.map((chip, index) => (
         <li key={index} className={clsx(CHIP, 'break-all')}>
-          {chip}
+          <HiddenText text={chip} mode="strict" />
         </li>
       ))}
     </ul>
@@ -34,12 +35,21 @@ function Chips({ chips }: { chips: string[] }) {
 }
 
 /** A file path or similar identifier. Long unbroken text must not widen the pane. */
-function Path({ children }: { children: ReactNode }) {
-  return <div className="break-all font-mono text-xs text-muted">{children}</div>;
+function Path({ text }: { text: string }) {
+  return (
+    <div className="break-all font-mono text-xs text-muted">
+      <HiddenText text={text} mode="strict" />
+    </div>
+  );
 }
 
-function Caption({ children }: { children: ReactNode }) {
-  return <p className="mb-2 break-words text-xs text-muted">{children}</p>;
+/** What the model said a call was for: a sentence, so prose. */
+function Caption({ text }: { text: string }) {
+  return (
+    <p className="mb-2 break-words text-xs text-muted">
+      <HiddenText text={text} mode="prose" />
+    </p>
+  );
 }
 
 /**
@@ -54,7 +64,9 @@ function FieldRow({ field }: { field: ToolField }) {
   if (field.unrenderable) {
     return (
       <div className="flex min-w-0 gap-2">
-        <dt className="shrink-0 font-mono text-muted">{field.key}</dt>
+        <dt className="shrink-0 font-mono text-muted">
+          <HiddenText text={field.key} mode="strict" />
+        </dt>
         <dd className="min-w-0 italic text-muted">(too deeply nested to display)</dd>
       </div>
     );
@@ -62,7 +74,9 @@ function FieldRow({ field }: { field: ToolField }) {
   if (field.block) {
     return (
       <div className="min-w-0">
-        <dt className="break-all font-mono text-muted">{field.key}</dt>
+        <dt className="break-all font-mono text-muted">
+          <HiddenText text={field.key} mode="strict" />
+        </dt>
         <dd className="mt-1">
           <CollapsibleCode text={field.value} wrap />
           {field.omitted ? <Muted className="mt-1">{`… ${count(field.omitted)} more characters not shown`}</Muted> : null}
@@ -72,8 +86,12 @@ function FieldRow({ field }: { field: ToolField }) {
   }
   return (
     <div className="flex min-w-0 gap-2">
-      <dt className="shrink-0 font-mono text-muted">{field.key}</dt>
-      <dd className="min-w-0 break-words font-mono text-ink">{field.value}</dd>
+      <dt className="shrink-0 font-mono text-muted">
+        <HiddenText text={field.key} mode="strict" />
+      </dt>
+      <dd className="min-w-0 break-words font-mono text-ink">
+        <HiddenText text={field.value} mode="strict" />
+      </dd>
     </div>
   );
 }
@@ -104,7 +122,9 @@ function TodoStatus({ status }: { status: string }) {
   return (
     <span className="mt-0.5 shrink-0">
       {icon}
-      <span className="sr-only">{`${status.replaceAll('_', ' ')}: `}</span>
+      <span className="sr-only">
+        <HiddenText text={`${status.replaceAll('_', ' ')}: `} mode="strict" />
+      </span>
     </span>
   );
 }
@@ -119,10 +139,12 @@ function TodoList({ todos }: { todos: Extract<ToolCallView, { kind: 'todos' }>['
             <TodoStatus status={todo.status} />
             <span className="min-w-0">
               <span className={clsx('break-words', todo.status === 'completed' && 'text-muted line-through')}>
-                {todo.content}
+                <HiddenText text={todo.content} mode="prose" />
               </span>
               {todo.activeForm !== undefined && (
-                <span className="block break-words text-[11px] text-muted">{todo.activeForm}</span>
+                <span className="block break-words text-[11px] text-muted">
+                  <HiddenText text={todo.activeForm} mode="prose" />
+                </span>
               )}
             </span>
           </li>
@@ -145,7 +167,7 @@ function EditList({ view }: { view: Extract<ToolCallView, { kind: 'edit' }> }) {
                 {view.edits.length > 1 && <span>{`Edit ${index + 1} of ${view.edits.length}`}</span>}
                 {edit.chips.map((chip) => (
                   <span key={chip} className={CHIP}>
-                    {chip}
+                    <HiddenText text={chip} mode="strict" />
                   </span>
                 ))}
               </div>
@@ -167,7 +189,7 @@ function PromptDisclosure({ prompt }: { prompt: string }) {
     <div className="min-w-0">
       {open && (
         <div id={id}>
-          <CollapsibleCode text={prompt} wrap maxLines={12} />
+          <CollapsibleCode text={prompt} wrap maxLines={12} mode="prose" />
         </div>
       )}
       <ExpandToggle
@@ -186,7 +208,7 @@ function ToolCallBodyView({ view }: { view: ToolCallView }) {
     case 'command':
       return (
         <>
-          {view.caption && <Caption>{view.caption}</Caption>}
+          {view.caption && <Caption text={view.caption} />}
           {view.command === '' ? <Muted>Empty command.</Muted> : <CollapsibleCode text={view.command} label="Command" />}
           <Chips chips={view.chips} />
         </>
@@ -195,7 +217,7 @@ function ToolCallBodyView({ view }: { view: ToolCallView }) {
     case 'edit':
       return (
         <>
-          <Path>{view.filePath}</Path>
+          <Path text={view.filePath} />
           <Chips chips={view.chips} />
           <EditList view={view} />
         </>
@@ -204,7 +226,7 @@ function ToolCallBodyView({ view }: { view: ToolCallView }) {
     case 'file_content':
       return (
         <>
-          <Path>{view.filePath}</Path>
+          <Path text={view.filePath} />
           <Chips chips={view.chips} />
           <div className="mt-2">
             {view.content === '' ? (
@@ -221,7 +243,9 @@ function ToolCallBodyView({ view }: { view: ToolCallView }) {
         <>
           <div className="flex min-w-0 items-baseline gap-2">
             <span className="shrink-0 text-[11px] uppercase tracking-[0.14em] text-muted">{view.label}</span>
-            <span className="min-w-0 break-all font-mono text-xs text-ink">{view.value}</span>
+            <span className="min-w-0 break-all font-mono text-xs text-ink">
+              <HiddenText text={view.value} mode="strict" />
+            </span>
           </div>
           {view.detail && (
             <ClampedText text={view.detail} lines={3} className="mt-2 text-xs leading-relaxed text-muted" />
@@ -233,7 +257,7 @@ function ToolCallBodyView({ view }: { view: ToolCallView }) {
     case 'delegation':
       return (
         <>
-          {view.caption && <Caption>{view.caption}</Caption>}
+          {view.caption && <Caption text={view.caption} />}
           <Chips chips={view.chips} />
           <PromptDisclosure prompt={view.prompt} />
         </>
@@ -316,7 +340,9 @@ export function ToolCallCard({ exec }: { exec: ToolExecution }) {
   return (
     <div className="min-w-0 rounded-2xl bg-canvas/75 px-3 py-2.5" data-status={outcome}>
       <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="min-w-0 break-words font-mono text-xs font-semibold text-ink">{view.title}</span>
+        <span className="min-w-0 break-words font-mono text-xs font-semibold text-ink">
+          <HiddenText text={view.title} mode="strict" />
+        </span>
         <OutcomeBadge outcome={outcome} />
       </div>
       <ToolCallBodyView view={view} />

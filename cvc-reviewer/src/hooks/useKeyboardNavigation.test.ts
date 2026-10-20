@@ -50,8 +50,8 @@ describe('Space', () => {
   it.each([
     ['a button', '<button id="t">Show more</button>'],
     ['a button\'s own child', '<button><span id="t">Show more</span></button>'],
-    ['a card that is a role=button', '<div role="button" tabindex="0" id="t">card</div>'],
-    ['something inside such a card', '<div role="button" tabindex="0"><p><em id="t">text</em></p></div>'],
+    ['an element with the role of a button', '<div role="button" tabindex="0" id="t">custom button</div>'],
+    ['something inside such an element', '<div role="button" tabindex="0"><p><em id="t">text</em></p></div>'],
     ['a block of code that scrolls', '<pre tabindex="0" id="t">code</pre>'],
     ['a diff region', '<div tabindex="0" role="region" aria-label="Diff" id="t"><div>line</div></div>'],
     ['a link', '<a href="#x" id="t">link</a>'],
