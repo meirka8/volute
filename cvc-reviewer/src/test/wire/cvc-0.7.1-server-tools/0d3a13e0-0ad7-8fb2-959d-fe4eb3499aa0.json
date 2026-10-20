@@ -1,0 +1,33 @@
+{
+  "interaction": {
+    "id": "0d3a13e0-0ad7-8fb2-959d-fe4eb3499aa0",
+    "conversation_id": "5e0d6a42-7b1c-4d3e-9a8f-1c2b3d4e5f60",
+    "parent_id": "ac5cc79b-a8ab-843a-83b2-2094b61f9da2",
+    "timestamp": "2026-10-10T11:09:59Z",
+    "author": "system",
+    "user_prompt": "[tool_result mcp__github__create_issue] Created issue #42 (sent with Authorization: [CVC_REDACTED:v1:authorization:ce876d0c-504f-4b9f-acdf-d41b30d48a2e])",
+    "model_name": "claude-fixture-edge",
+    "model_cot": null,
+    "model_response": "Issue created. Searching the web.\n\n[web_search_tool_result]\n\nFound docs.",
+    "source_request_id": "req_E2"
+  },
+  "context_items": [],
+  "tool_executions": [
+    {
+      "id": 2,
+      "interaction_id": "0d3a13e0-0ad7-8fb2-959d-fe4eb3499aa0",
+      "tool_protocol": "server",
+      "tool_name": "server:web_search",
+      "arguments": "{\"query\":\"cvc wire format\"}",
+      "status": "success"
+    }
+  ],
+  "artifact_links": [
+    {
+      "interaction_id": "0d3a13e0-0ad7-8fb2-959d-fe4eb3499aa0",
+      "git_commit_hash": "1592e36ec872906d052ded03f8bfae470b19eb26",
+      "link_type": "generated",
+      "linked_by": "fixture@example.invalid"
+    }
+  ]
+}

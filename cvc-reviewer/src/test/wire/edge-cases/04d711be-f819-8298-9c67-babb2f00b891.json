@@ -1,0 +1,17 @@
+{
+  "interaction": {
+    "id": "04d711be-f819-8298-9c67-babb2f00b891",
+    "conversation_id": "5e0d6a42-7b1c-4d3e-9a8f-1c2b3d4e5f60",
+    "parent_id": "add98e0a-844d-8c31-ad8a-8366ea0f4e7f",
+    "timestamp": "2026-10-10T12:20:05Z",
+    "author": "human",
+    "user_prompt": "Try again\r\nsecond line\ttabbed\n\n[tool_result unknown-tool] orphan output with no matching tool_use",
+    "model_name": "claude-fixture-edge",
+    "model_cot": null,
+    "model_response": "Recovered.",
+    "source_request_id": "req_E7"
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": []
+}

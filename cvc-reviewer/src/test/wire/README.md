@@ -1,0 +1,10 @@
+# Wire fixtures
+
+Interaction blobs exactly as the Claude Code harness wrote them.
+
+- `v2.1.260-basic/` and `edge-cases/` are from the shipped cvc 0.7.0 binary. `v2.1.260-basic/` was ingested from the repo's public synthetic transcript `cvc-core/tests/fixtures/claude-code/v2.1.260/basic.jsonl`; `edge-cases/` from one synthetic transcript written for these tests (redaction markers, truncation, a server-side tool, unanswered tool calls).
+- `cvc-0.7.1-server-tools/` is from the harness with the change for issue #134, which records a server-side tool call (`server:<name>`) with `tool_protocol` `server` and the status its result block reported; 0.7.0 recorded `native` and `failure` for every one of them (Design.md §10.5, "Server-side tools"). The files were produced by that patched harness from synthetic transcripts: `8fc40ad6…` (seven server-side calls, four successes and three failures, and a Read) and its follow-up `94705671…` from `cvc-core/tests/fixtures/claude-code/v2.1.300/server-tools.jsonl`, and `0d3a13e0…`, the edge-case step above recorded again, so it has the same id as the file in `edge-cases/`. Both files are kept: the old one is what a 0.7.0 capture of the step looks like (the search is `native` and `failure`, shown as "server-side · result not recorded"), the new one what a capture records now (the search is `server` and `success`).
+
+The only edit is that local paths were replaced by `/work/repo`; files are named `<fixture>/<interaction id>.json` and are kept byte for byte, so do not reformat them.
+They hold no real data: the only address is `fixture@example.invalid`, and redacted values appear only as `[CVC_REDACTED:v1:...]` markers. The one temp-looking path is `/tmp/notes.txt` in `cvc-0.7.1-server-tools/8fc40ad6…`: a path inside the provider's code-execution sandbox, written into the synthetic transcript, not a path on any machine. `../wireNodes.test.tsx` allows that string in that file and nothing else of its kind.
+`../wireNodes.test.tsx` loads every file in this directory, so a new file needs an entry there.

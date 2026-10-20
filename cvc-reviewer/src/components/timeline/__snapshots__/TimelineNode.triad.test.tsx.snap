@@ -1,0 +1,1133 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`TimelineNode triad layout: DOM snapshots > MCP node with reasoning 1`] = `
+<li
+  aria-labelledby="id-1 id-2"
+  class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
+>
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
+  >
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
+    >
+      <svg
+        aria-hidden="true"
+        class="lucide lucide-bot text-action"
+        fill="none"
+        height="16"
+        stroke="currentColor"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        stroke-width="2"
+        viewBox="0 0 24 24"
+        width="16"
+        xmlns="http://www.w3.org/2000/svg"
+      />
+    </span>
+    <span
+      class="min-w-0 flex-1"
+    >
+      <span
+        class="flex flex-wrap items-center gap-2"
+      >
+        <span
+          class="font-medium text-ink"
+          id="id-1"
+        >
+          AI Agent
+        </span>
+         
+        <span
+          class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-warning/20 bg-warning/10 text-warning"
+        >
+          Review required
+        </span>
+         
+        <span
+          class="text-xs text-muted"
+          id="id-2"
+        >
+          &lt;2026-03-02T09:15:00.000Z&gt;
+        </span>
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
+      >
+        agent
+      </span>
+    </span>
+  </button>
+  <div
+    class="space-y-3"
+  >
+    <div
+      class="rr-thought rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Thought
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-serif text-sm leading-relaxed text-ink line-clamp-4"
+      >
+        Refactor the retry helper in src/net/retry.ts so it backs off exponentially.
+      </p>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Action
+      </div>
+      <div
+        class="mt-2 space-y-2"
+      >
+        <div
+          class="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink"
+        >
+          generated a1b2c3d
+        </div>
+      </div>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="flex items-center justify-between gap-3"
+      >
+        <div
+          class="text-[11px] font-semibold uppercase tracking-[0.18em] text-success"
+        >
+          Observation
+        </div>
+        <button
+          class="flex items-center gap-1.5 rounded-full border border-line bg-canvas/80 px-3 py-1 text-[11px] font-medium text-action transition-colors hover:bg-surface"
+        >
+          <svg
+            aria-hidden="true"
+            class="lucide lucide-chevron-right"
+            fill="none"
+            height="12"
+            stroke="currentColor"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            viewBox="0 0 24 24"
+            width="12"
+            xmlns="http://www.w3.org/2000/svg"
+          />
+          <span>
+            Why?
+          </span>
+        </button>
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-mono text-xs leading-relaxed text-ink line-clamp-4"
+      >
+        Replaced the fixed delay with a capped exponential backoff and added a unit test for the cap.
+      </p>
+    </div>
+    <div
+      class="flex flex-wrap gap-1.5"
+    >
+      <span
+        aria-label="Original generated: commit a1b2c3d. Generated from the original CVC link."
+        class="inline-flex items-center gap-1 rounded-full bg-canvas/80 px-3 py-1 text-xs text-muted border border-line text-muted"
+        title="Generated from the original CVC link."
+      >
+        <svg
+          aria-hidden="true"
+          class="lucide lucide-git-commit-horizontal"
+          fill="none"
+          height="10"
+          stroke="currentColor"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          stroke-width="2"
+          viewBox="0 0 24 24"
+          width="10"
+          xmlns="http://www.w3.org/2000/svg"
+        />
+        <span
+          class="font-mono"
+        >
+          a1b2c3d
+        </span>
+        <span
+          class="text-muted/80"
+        >
+          (
+          Original generated
+          )
+        </span>
+      </span>
+    </div>
+  </div>
+</li>
+`;
+
+exports[`TimelineNode triad layout: DOM snapshots > MCP node with the "Why?" panel open 1`] = `
+<li
+  aria-labelledby="id-1 id-2"
+  class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
+>
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
+  >
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
+    >
+      <svg
+        aria-hidden="true"
+        class="lucide lucide-bot text-action"
+        fill="none"
+        height="16"
+        stroke="currentColor"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        stroke-width="2"
+        viewBox="0 0 24 24"
+        width="16"
+        xmlns="http://www.w3.org/2000/svg"
+      />
+    </span>
+    <span
+      class="min-w-0 flex-1"
+    >
+      <span
+        class="flex flex-wrap items-center gap-2"
+      >
+        <span
+          class="font-medium text-ink"
+          id="id-1"
+        >
+          AI Agent
+        </span>
+         
+        <span
+          class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-warning/20 bg-warning/10 text-warning"
+        >
+          Review required
+        </span>
+         
+        <span
+          class="text-xs text-muted"
+          id="id-2"
+        >
+          &lt;2026-03-02T09:15:00.000Z&gt;
+        </span>
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
+      >
+        agent
+      </span>
+    </span>
+  </button>
+  <div
+    class="space-y-3"
+  >
+    <div
+      class="rr-thought rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Thought
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-serif text-sm leading-relaxed text-ink line-clamp-4"
+      >
+        Refactor the retry helper in src/net/retry.ts so it backs off exponentially.
+      </p>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Action
+      </div>
+      <div
+        class="mt-2 space-y-2"
+      >
+        <div
+          class="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink"
+        >
+          generated a1b2c3d
+        </div>
+      </div>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="flex items-center justify-between gap-3"
+      >
+        <div
+          class="text-[11px] font-semibold uppercase tracking-[0.18em] text-success"
+        >
+          Observation
+        </div>
+        <button
+          class="flex items-center gap-1.5 rounded-full border border-line bg-canvas/80 px-3 py-1 text-[11px] font-medium text-action transition-colors hover:bg-surface"
+        >
+          <svg
+            aria-hidden="true"
+            class="lucide lucide-chevron-down"
+            fill="none"
+            height="12"
+            stroke="currentColor"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            viewBox="0 0 24 24"
+            width="12"
+            xmlns="http://www.w3.org/2000/svg"
+          />
+          <span>
+            Why?
+          </span>
+        </button>
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-mono text-xs leading-relaxed text-ink line-clamp-4"
+      >
+        Replaced the fixed delay with a capped exponential backoff and added a unit test for the cap.
+      </p>
+      <div
+        class="overflow-hidden"
+      >
+        <div
+          class="rr-thought mt-3 rounded-[1.25rem] p-3"
+        >
+          <div
+            class="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+          >
+            Decision Factors
+          </div>
+          <pre
+            class="overflow-x-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-muted"
+          >
+            The helper retries at a fixed interval. A capped exponential backoff with jitter avoids retry storms.
+
+Context Summary:
+src/net/retry.ts, src/net/client.ts
+          </pre>
+        </div>
+      </div>
+    </div>
+    <div
+      class="flex flex-wrap gap-1.5"
+    >
+      <span
+        aria-label="Original generated: commit a1b2c3d. Generated from the original CVC link."
+        class="inline-flex items-center gap-1 rounded-full bg-canvas/80 px-3 py-1 text-xs text-muted border border-line text-muted"
+        title="Generated from the original CVC link."
+      >
+        <svg
+          aria-hidden="true"
+          class="lucide lucide-git-commit-horizontal"
+          fill="none"
+          height="10"
+          stroke="currentColor"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          stroke-width="2"
+          viewBox="0 0 24 24"
+          width="10"
+          xmlns="http://www.w3.org/2000/svg"
+        />
+        <span
+          class="font-mono"
+        >
+          a1b2c3d
+        </span>
+        <span
+          class="text-muted/80"
+        >
+          (
+          Original generated
+          )
+        </span>
+      </span>
+    </div>
+  </div>
+</li>
+`;
+
+exports[`TimelineNode triad layout: DOM snapshots > MCP node without reasoning 1`] = `
+<li
+  aria-labelledby="id-1 id-2"
+  class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
+>
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
+  >
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
+    >
+      <svg
+        aria-hidden="true"
+        class="lucide lucide-bot text-action"
+        fill="none"
+        height="16"
+        stroke="currentColor"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        stroke-width="2"
+        viewBox="0 0 24 24"
+        width="16"
+        xmlns="http://www.w3.org/2000/svg"
+      />
+    </span>
+    <span
+      class="min-w-0 flex-1"
+    >
+      <span
+        class="flex flex-wrap items-center gap-2"
+      >
+        <span
+          class="font-medium text-ink"
+          id="id-1"
+        >
+          AI Agent
+        </span>
+         
+        <span
+          class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-warning/20 bg-warning/10 text-warning"
+        >
+          Review required
+        </span>
+         
+        <span
+          class="text-xs text-muted"
+          id="id-2"
+        >
+          &lt;2026-03-02T09:15:00.000Z&gt;
+        </span>
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
+      >
+        agent
+      </span>
+    </span>
+  </button>
+  <div
+    class="space-y-3"
+  >
+    <div
+      class="rr-thought rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Thought
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-serif text-sm leading-relaxed text-ink line-clamp-4"
+      >
+        Rename the config loader to match the new module layout.
+      </p>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Action
+      </div>
+      <div
+        class="mt-2 space-y-2"
+      >
+        <div
+          class="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink"
+        >
+          No recorded tool execution.
+        </div>
+      </div>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="flex items-center justify-between gap-3"
+      >
+        <div
+          class="text-[11px] font-semibold uppercase tracking-[0.18em] text-success"
+        >
+          Observation
+        </div>
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-mono text-xs leading-relaxed text-ink line-clamp-4"
+      >
+        Renamed loadConfig to readConfig and updated its three call sites.
+      </p>
+    </div>
+  </div>
+</li>
+`;
+
+exports[`TimelineNode triad layout: DOM snapshots > VS Code / LSP node 1`] = `
+<li
+  aria-labelledby="id-1 id-2"
+  class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
+>
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
+  >
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
+    >
+      <svg
+        aria-hidden="true"
+        class="lucide lucide-user text-ink"
+        fill="none"
+        height="16"
+        stroke="currentColor"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        stroke-width="2"
+        viewBox="0 0 24 24"
+        width="16"
+        xmlns="http://www.w3.org/2000/svg"
+      />
+    </span>
+    <span
+      class="min-w-0 flex-1"
+    >
+      <span
+        class="flex flex-wrap items-center gap-2"
+      >
+        <span
+          class="font-medium text-ink"
+          id="id-1"
+        >
+          User
+        </span>
+         
+        <span
+          class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-success/20 bg-success/10 text-success"
+        >
+          Green check
+        </span>
+         
+        <span
+          class="text-xs text-muted"
+          id="id-2"
+        >
+          &lt;2026-03-02T09:15:00.000Z&gt;
+        </span>
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
+      >
+        example-model-1
+      </span>
+    </span>
+  </button>
+  <div
+    class="space-y-3"
+  >
+    <div
+      class="rr-thought rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Thought
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-serif text-sm leading-relaxed text-ink line-clamp-4"
+      >
+        Explain what parse_header returns when the input has no trailing newline.
+      </p>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Action
+      </div>
+      <div
+        class="mt-2 space-y-2"
+      >
+        <div
+          class="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink"
+        >
+          No recorded tool execution.
+        </div>
+      </div>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="flex items-center justify-between gap-3"
+      >
+        <div
+          class="text-[11px] font-semibold uppercase tracking-[0.18em] text-success"
+        >
+          Observation
+        </div>
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-mono text-xs leading-relaxed text-ink line-clamp-4"
+      >
+        It returns (name, value) with the value trimmed, and an empty value when there is no colon.
+      </p>
+    </div>
+  </div>
+</li>
+`;
+
+exports[`TimelineNode triad layout: DOM snapshots > agent node that carries tool executions 1`] = `
+<li
+  aria-labelledby="id-1 id-2"
+  class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
+>
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
+  >
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
+    >
+      <svg
+        aria-hidden="true"
+        class="lucide lucide-bot text-action"
+        fill="none"
+        height="16"
+        stroke="currentColor"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        stroke-width="2"
+        viewBox="0 0 24 24"
+        width="16"
+        xmlns="http://www.w3.org/2000/svg"
+      />
+    </span>
+    <span
+      class="min-w-0 flex-1"
+    >
+      <span
+        class="flex flex-wrap items-center gap-2"
+      >
+        <span
+          class="font-medium text-ink"
+          id="id-1"
+        >
+          AI Agent
+        </span>
+         
+        <span
+          class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-danger/20 bg-danger/10 text-danger"
+        >
+          Critical alert
+        </span>
+         
+        <span
+          class="text-xs text-muted"
+          id="id-2"
+        >
+          &lt;2026-03-02T09:15:00.000Z&gt;
+        </span>
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
+      >
+        agent
+      </span>
+    </span>
+  </button>
+  <div
+    class="space-y-3"
+  >
+    <div
+      class="rr-thought rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Thought
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-serif text-sm leading-relaxed text-ink line-clamp-4"
+      >
+        Fix the failing import in src/app.ts.
+      </p>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Action
+      </div>
+      <div
+        class="mt-2 space-y-2"
+      >
+        <div
+          class="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink"
+        >
+          Bash {"command":"npm run build"}
+        </div>
+        <div
+          class="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink"
+        >
+          Edit {"file_path":"/repo/src/app.ts","old_string":"a","new_string":"b"}
+        </div>
+      </div>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="flex items-center justify-between gap-3"
+      >
+        <div
+          class="text-[11px] font-semibold uppercase tracking-[0.18em] text-success"
+        >
+          Observation
+        </div>
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-mono text-xs leading-relaxed text-ink line-clamp-4"
+      >
+        The import path was stale; I updated it and the build passes.
+      </p>
+    </div>
+  </div>
+</li>
+`;
+
+exports[`TimelineNode triad layout: DOM snapshots > cvc run node 1`] = `
+<li
+  aria-labelledby="id-1 id-2"
+  class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
+>
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
+  >
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
+    >
+      <svg
+        aria-hidden="true"
+        class="lucide lucide-terminal text-warning"
+        fill="none"
+        height="16"
+        stroke="currentColor"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        stroke-width="2"
+        viewBox="0 0 24 24"
+        width="16"
+        xmlns="http://www.w3.org/2000/svg"
+      />
+    </span>
+    <span
+      class="min-w-0 flex-1"
+    >
+      <span
+        class="flex flex-wrap items-center gap-2"
+      >
+        <span
+          class="font-medium text-ink"
+          id="id-1"
+        >
+          System
+        </span>
+         
+        <span
+          class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-success/20 bg-success/10 text-success"
+        >
+          Green check
+        </span>
+         
+        <span
+          class="text-xs text-muted"
+          id="id-2"
+        >
+          &lt;2026-03-02T09:15:00.000Z&gt;
+        </span>
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
+      >
+        process-shim
+      </span>
+    </span>
+  </button>
+  <div
+    class="space-y-3"
+  >
+    <div
+      class="rr-thought rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Thought
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-serif text-sm leading-relaxed text-ink line-clamp-4"
+      >
+        cargo test --workspace
+      </p>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Action
+      </div>
+      <div
+        class="mt-2 space-y-2"
+      >
+        <div
+          class="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink"
+        >
+          No recorded tool execution.
+        </div>
+      </div>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="flex items-center justify-between gap-3"
+      >
+        <div
+          class="text-[11px] font-semibold uppercase tracking-[0.18em] text-success"
+        >
+          Observation
+        </div>
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-mono text-xs leading-relaxed text-ink line-clamp-4"
+      >
+        test result: ok. 12 passed; 0 failed
+
+[STDERR]
+warning: unused variable \`x\` in src/lib.rs
+      </p>
+    </div>
+  </div>
+</li>
+`;
+
+exports[`TimelineNode triad layout: DOM snapshots > node with nothing recorded and an external author 1`] = `
+<li
+  aria-labelledby="id-1 id-2"
+  class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70"
+>
+  <button
+    aria-pressed="false"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
+  >
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
+    >
+      <svg
+        aria-hidden="true"
+        class="lucide lucide-external-link text-muted"
+        fill="none"
+        height="16"
+        stroke="currentColor"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        stroke-width="2"
+        viewBox="0 0 24 24"
+        width="16"
+        xmlns="http://www.w3.org/2000/svg"
+      />
+    </span>
+    <span
+      class="min-w-0 flex-1"
+    >
+      <span
+        class="flex flex-wrap items-center gap-2"
+      >
+        <span
+          class="font-medium text-ink"
+          id="id-1"
+        >
+          External
+        </span>
+         
+        <span
+          class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-success/20 bg-success/10 text-success"
+        >
+          Green check
+        </span>
+         
+        <span
+          class="text-xs text-muted"
+          id="id-2"
+        >
+          &lt;2026-03-02T09:15:00.000Z&gt;
+        </span>
+      </span>
+    </span>
+  </button>
+  <div
+    class="space-y-3"
+  >
+    <div
+      class="rr-thought rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Thought
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-serif text-sm leading-relaxed text-ink line-clamp-4"
+      >
+        No explicit thought was recorded for this step.
+      </p>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Action
+      </div>
+      <div
+        class="mt-2 space-y-2"
+      >
+        <div
+          class="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink"
+        >
+          No recorded tool execution.
+        </div>
+      </div>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="flex items-center justify-between gap-3"
+      >
+        <div
+          class="text-[11px] font-semibold uppercase tracking-[0.18em] text-success"
+        >
+          Observation
+        </div>
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-mono text-xs leading-relaxed text-ink line-clamp-4"
+      >
+        No recorded observation.
+      </p>
+    </div>
+  </div>
+</li>
+`;
+
+exports[`TimelineNode triad layout: DOM snapshots > selected card 1`] = `
+<li
+  aria-labelledby="id-1 id-2"
+  class="mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors rr-selected-card border-action bg-action/10"
+>
+  <button
+    aria-pressed="true"
+    class="mb-4 flex w-full cursor-pointer items-start gap-3 rounded-xl text-left"
+    type="button"
+  >
+    <span
+      class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-canvas/80"
+    >
+      <svg
+        aria-hidden="true"
+        class="lucide lucide-bot text-action"
+        fill="none"
+        height="16"
+        stroke="currentColor"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        stroke-width="2"
+        viewBox="0 0 24 24"
+        width="16"
+        xmlns="http://www.w3.org/2000/svg"
+      />
+    </span>
+    <span
+      class="min-w-0 flex-1"
+    >
+      <span
+        class="flex flex-wrap items-center gap-2"
+      >
+        <span
+          class="font-medium text-ink"
+          id="id-1"
+        >
+          AI Agent
+        </span>
+         
+        <span
+          class="rounded-full px-2.5 py-1 text-[11px] font-medium border border-warning/20 bg-warning/10 text-warning"
+        >
+          Review required
+        </span>
+         
+        <span
+          class="text-xs text-muted"
+          id="id-2"
+        >
+          &lt;2026-03-02T09:15:00.000Z&gt;
+        </span>
+      </span>
+       
+      <span
+        class="mt-1 block break-words text-xs uppercase tracking-[0.16em] text-muted"
+      >
+        agent
+      </span>
+    </span>
+  </button>
+  <div
+    class="space-y-3"
+  >
+    <div
+      class="rr-thought rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Thought
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-serif text-sm leading-relaxed text-ink line-clamp-4"
+      >
+        Refactor the retry helper in src/net/retry.ts so it backs off exponentially.
+      </p>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="text-[11px] font-semibold uppercase tracking-[0.18em] text-action"
+      >
+        Action
+      </div>
+      <div
+        class="mt-2 space-y-2"
+      >
+        <div
+          class="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink"
+        >
+          generated a1b2c3d
+        </div>
+      </div>
+    </div>
+    <div
+      class="rr-code rounded-[1.25rem] p-4"
+    >
+      <div
+        class="flex items-center justify-between gap-3"
+      >
+        <div
+          class="text-[11px] font-semibold uppercase tracking-[0.18em] text-success"
+        >
+          Observation
+        </div>
+        <button
+          class="flex items-center gap-1.5 rounded-full border border-line bg-canvas/80 px-3 py-1 text-[11px] font-medium text-action transition-colors hover:bg-surface"
+        >
+          <svg
+            aria-hidden="true"
+            class="lucide lucide-chevron-right"
+            fill="none"
+            height="12"
+            stroke="currentColor"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            viewBox="0 0 24 24"
+            width="12"
+            xmlns="http://www.w3.org/2000/svg"
+          />
+          <span>
+            Why?
+          </span>
+        </button>
+      </div>
+      <p
+        class="mt-2 whitespace-pre-wrap font-mono text-xs leading-relaxed text-ink line-clamp-4"
+      >
+        Replaced the fixed delay with a capped exponential backoff and added a unit test for the cap.
+      </p>
+    </div>
+    <div
+      class="flex flex-wrap gap-1.5"
+    >
+      <span
+        aria-label="Original generated: commit a1b2c3d. Generated from the original CVC link."
+        class="inline-flex items-center gap-1 rounded-full bg-canvas/80 px-3 py-1 text-xs text-muted border border-line text-muted"
+        title="Generated from the original CVC link."
+      >
+        <svg
+          aria-hidden="true"
+          class="lucide lucide-git-commit-horizontal"
+          fill="none"
+          height="10"
+          stroke="currentColor"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          stroke-width="2"
+          viewBox="0 0 24 24"
+          width="10"
+          xmlns="http://www.w3.org/2000/svg"
+        />
+        <span
+          class="font-mono"
+        >
+          a1b2c3d
+        </span>
+        <span
+          class="text-muted/80"
+        >
+          (
+          Original generated
+          )
+        </span>
+      </span>
+    </div>
+  </div>
+</li>
+`;

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useId, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   User,
@@ -10,12 +10,32 @@ import {
   GitCommit
 } from 'lucide-react';
 import { clsx } from 'clsx';
+import { formatTimestamp } from '../../lib/formatTimestamp';
+import { hiddenAsText } from '../../lib/hiddenChars';
+import { nodeLayout, type ParentToolCall } from '../../lib/transcriptNode';
 import type { InteractionNode } from '../../types/cvc';
+import { CardHeader, type CardSelection } from './CardHeader';
+import { HiddenCharsNotice, HiddenCharsScope, HiddenText } from './HiddenText';
+import { TranscriptNodeBody } from './TranscriptNodeBody';
 
 interface TimelineNodeProps {
   interaction: InteractionNode;
   isSelected?: boolean;
   onSelect?: () => void;
+  /**
+   * The tool calls this node's PREVIOUS step made (name, and whether each failed),
+   * or null when that step is not loaded. Used by the transcript layout to check
+   * the tool results its stimulus claims; the triad layout ignores it.
+   */
+  parentToolNames?: readonly ParentToolCall[] | null;
+  /** Fade the card in. Set for a step that is new to the timeline, not for one scrolled into view. */
+  enter?: boolean;
+  /**
+   * Where the card is in the list, when the list does not put every step on the page
+   * (it is windowed): the card's place among all of them (from 1) and how many there
+   * are, so assistive technology can say "3 of 10,000" and not "3 of 12".
+   */
+  listPosition?: { position: number; size: number };
 }
 
 function getAuthorIcon(author: InteractionNode['author']) {
@@ -46,16 +66,6 @@ function getAuthorLabel(author: InteractionNode['author']) {
     default:
       return 'Unknown';
   }
-}
-
-function formatTimestamp(timestamp: number): string {
-  const date = new Date(timestamp);
-  return date.toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
 }
 
 /**
@@ -152,11 +162,12 @@ function confidence(link: InteractionNode['artifact_links'][number]) {
   }
 }
 
-export function TimelineNode({
-  interaction,
-  isSelected = false,
-  onSelect,
-}: TimelineNodeProps) {
+/**
+ * Thought / Action / Observation: the layout written for MCP `commit_thought`
+ * records. It also renders VS Code/LSP, `cvc run` and legacy nodes, and must keep
+ * doing so exactly as before (see TimelineNode.triad.test.tsx).
+ */
+function TriadNodeBody({ interaction, selection }: { interaction: InteractionNode; selection: CardSelection }) {
   const [isReasoningExpanded, setIsReasoningExpanded] = useState(false);
   const [isThoughtExpanded, setIsThoughtExpanded] = useState(false);
   const [isObservationExpanded, setIsObservationExpanded] = useState(false);
@@ -221,55 +232,21 @@ export function TimelineNode({
   }, [isObservationExpanded, observationElement, observationText]);
 
   return (
-    <motion.div
-      layout
-      initial={{ opacity: 0, x: 20 }}
-      animate={{ opacity: 1, x: 0 }}
-      exit={{ opacity: 0, x: -20 }}
-      transition={{ duration: 0.15 }}
-        className={clsx(
-        'mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors',
-        isSelected
-          ? 'rr-selected-card border-action bg-action/10'
-          : 'border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70'
-      )}
-      onClick={onSelect}
-      role="button"
-      tabIndex={0}
-      aria-pressed={isSelected}
-      onKeyDown={(e) => {
-        // Nested controls own their keyboard activation; their Enter/Space
-        // events must not select the card as a side effect.
-        if (e.target !== e.currentTarget) return;
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          onSelect?.();
+    <>
+      <CardHeader
+        selection={selection}
+        icon={getAuthorIcon(interaction.author)}
+        speaker={getAuthorLabel(interaction.author)}
+        badges={
+          <>
+            <span className={clsx('rounded-full px-2.5 py-1 text-[11px] font-medium', signal.className)}>{signal.label}</span>{' '}
+          </>
         }
-      }}
-    >
-      <div className="mb-4 flex items-start gap-3">
-        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-canvas/80">
-          {getAuthorIcon(interaction.author)}
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="font-medium text-ink">
-              {getAuthorLabel(interaction.author)}
-            </span>
-            <span className={clsx('rounded-full px-2.5 py-1 text-[11px] font-medium', signal.className)}>
-              {signal.label}
-            </span>
-            <span className="text-xs text-muted">
-              {formatTimestamp(interaction.timestamp)}
-            </span>
-          </div>
-          {interaction.model_name && (
-            <div className="mt-1 text-xs uppercase tracking-[0.16em] text-muted">
-              {interaction.model_name}
-            </div>
-          )}
-        </div>
-      </div>
+        time={formatTimestamp(interaction.timestamp)}
+        model={interaction.model_name ? <HiddenText text={interaction.model_name} mode="strict" /> : null}
+      />
+
+      <HiddenCharsNotice />
 
       <div className="space-y-3">
         <div className="rr-thought rounded-[1.25rem] p-4">
@@ -281,7 +258,7 @@ export function TimelineNode({
               !isThoughtExpanded && 'line-clamp-4'
             )}
           >
-            {thoughtText}
+            <HiddenText text={thoughtText} mode="prose" />
           </p>
           {(isThoughtTruncated || isThoughtExpanded) && (
             <button
@@ -301,7 +278,7 @@ export function TimelineNode({
           <div className="mt-2 space-y-2">
             {actionLines.map((line, index) => (
               <div key={`${index}-${line}`} className="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink">
-                {line}
+                <HiddenText text={line} mode="strict" />
               </div>
             ))}
           </div>
@@ -330,7 +307,7 @@ export function TimelineNode({
               !isObservationExpanded && 'line-clamp-4'
             )}
           >
-            {observationText}
+            <HiddenText text={observationText} mode="strict" />
           </p>
           {(isObservationTruncated || isObservationExpanded) && (
             <button
@@ -358,7 +335,10 @@ export function TimelineNode({
                     Decision Factors
                   </div>
                   <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-muted">
-                    {hasReasoning ? interaction.model_cot : 'No recorded decision factors for this AI step.'}
+                    <HiddenText
+                      text={hasReasoning ? interaction.model_cot! : 'No recorded decision factors for this AI step.'}
+                      mode="prose"
+                    />
                   </pre>
                 </div>
               </motion.div>
@@ -366,30 +346,108 @@ export function TimelineNode({
           </AnimatePresence>
         </div>
 
-        {interaction.artifact_links && interaction.artifact_links.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
-           {interaction.artifact_links.map((link) => {
-             const confidenceInfo = confidence(link);
-             return (
-            <span
-              key={link.derivation_event?.event_id ?? `${link.git_commit_hash}-${link.link_type}-${link.linked_by ?? ''}`}
-              className={clsx(
-                'inline-flex items-center gap-1 rounded-full bg-canvas/80 px-3 py-1 text-xs text-muted',
-                confidenceInfo.className,
-              )}
-              aria-label={`${confidenceInfo.label}: commit ${link.git_commit_hash.substring(0, 7)}. ${confidenceInfo.detail}`}
-              title={confidenceInfo.detail}
-            >
-              <GitCommit size={10} />
-              <span className="font-mono">{link.git_commit_hash.substring(0, 7)}</span>
-              <span className="text-muted/80">
-                ({confidenceInfo.label})
-              </span>
-            </span>
-          )})}
-          </div>
-        )}
+        <ArtifactLinkChips links={interaction.artifact_links} />
       </div>
-    </motion.div>
+    </>
+  );
+}
+
+/** The commits linked to a node, with how confident the link is. Shared by both layouts. */
+function ArtifactLinkChips({ links }: { links: InteractionNode['artifact_links'] }) {
+  if (!links || links.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {links.map((link) => {
+        const confidenceInfo = confidence(link);
+        return (
+          <span
+            key={link.derivation_event?.event_id ?? `${link.git_commit_hash}-${link.link_type}-${link.linked_by ?? ''}`}
+            className={clsx(
+              'inline-flex items-center gap-1 rounded-full bg-canvas/80 px-3 py-1 text-xs text-muted',
+              confidenceInfo.className,
+            )}
+            aria-label={hiddenAsText(
+              `${confidenceInfo.label}: commit ${link.git_commit_hash.substring(0, 7)}. ${confidenceInfo.detail}`,
+              'strict',
+            )}
+            title={hiddenAsText(confidenceInfo.detail, 'strict')}
+          >
+            <GitCommit size={10} />
+            <span className="font-mono">
+              <HiddenText text={link.git_commit_hash.substring(0, 7)} mode="strict" />
+            </span>
+            <span className="text-muted/80">
+              ({confidenceInfo.label})
+            </span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Whether the user has text selected inside `card`. Dragging across text to copy
+ * it ends in a click on the card, which must not also select the node.
+ */
+function hasSelectionInside(card: HTMLElement): boolean {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) return false;
+  return (
+    (selection.anchorNode !== null && card.contains(selection.anchorNode)) ||
+    (selection.focusNode !== null && card.contains(selection.focusNode))
+  );
+}
+
+/**
+ * One step in the timeline: a list item, named by the speaker and the time in its
+ * header, that holds the step's contents and, inside them, the controls that open
+ * and close its parts.
+ *
+ * The card is not itself interactive. Selecting it is the job of the header, a real
+ * toggle button (see `CardHeader`), which is what Tab reaches and Enter or Space
+ * presses; a card that were a button could not hold the other buttons. For the
+ * mouse, a click anywhere on the card selects it too, unless the reader was
+ * selecting text (dragging across it ends in a click on the card). That click
+ * handler is a convenience for pointers, so it needs no key handler and no place in
+ * the tab order: everything it does a keyboard user does through the header.
+ */
+export function TimelineNode({
+  interaction,
+  isSelected = false,
+  onSelect,
+  parentToolNames = null,
+  enter = false,
+  listPosition,
+}: TimelineNodeProps) {
+  const baseId = useId();
+  const selection: CardSelection = { pressed: isSelected, onSelect, speakerId: `${baseId}-speaker`, timeId: `${baseId}-time` };
+  return (
+    <li
+      aria-labelledby={`${selection.speakerId} ${selection.timeId}`}
+      aria-posinset={listPosition?.position}
+      aria-setsize={listPosition?.size}
+      className={clsx(
+        'mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors',
+        enter && 'rr-card-enter',
+        isSelected
+          ? 'rr-selected-card border-action bg-action/10'
+          : 'border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70'
+      )}
+      onClick={(e) => {
+        if (hasSelectionInside(e.currentTarget)) return;
+        onSelect?.();
+      }}
+    >
+      <HiddenCharsScope>
+        {nodeLayout(interaction) === 'transcript' ? (
+          <TranscriptNodeBody interaction={interaction} parentToolNames={parentToolNames} selection={selection}>
+            <ArtifactLinkChips links={interaction.artifact_links} />
+          </TranscriptNodeBody>
+        ) : (
+          <TriadNodeBody interaction={interaction} selection={selection} />
+        )}
+      </HiddenCharsScope>
+    </li>
   );
 }

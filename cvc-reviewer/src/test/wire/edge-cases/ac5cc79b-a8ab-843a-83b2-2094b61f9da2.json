@@ -1,0 +1,33 @@
+{
+  "interaction": {
+    "id": "ac5cc79b-a8ab-843a-83b2-2094b61f9da2",
+    "conversation_id": "5e0d6a42-7b1c-4d3e-9a8f-1c2b3d4e5f60",
+    "parent_id": null,
+    "timestamp": "2026-10-10T11:00:01Z",
+    "author": "human",
+    "user_prompt": "Please deploy using the key [CVC_REDACTED:v1:aws_access_key:e73194ba-b4bd-4b57-8580-ccac333f43f6] and [CVC_REDACTED:v1:secret_assignment:62543faa-a5cc-40e0-8bf0-0430db1f4e4d] clone [CVC_REDACTED:v1:url_credentials:cd36faac-703b-4b35-bd13-8c9edb8687a5]example.invalid/repo.git, and mention [CVC_REDACTED:v1:policy_literal:358ceded-eed2-456e-9466-0dfcb5f18ea5].\n\nSecond block of the same prompt.\n\n[image]\n\n[document]",
+    "model_name": "claude-fixture-edge",
+    "model_cot": "Plan step one: file the issue.\n\nPlan step two: then search the web.",
+    "model_response": "I'll create an issue.\n\nSecond text block.\n\n[mystery]",
+    "source_request_id": "req_E1"
+  },
+  "context_items": [],
+  "tool_executions": [
+    {
+      "id": 1,
+      "interaction_id": "ac5cc79b-a8ab-843a-83b2-2094b61f9da2",
+      "tool_protocol": "mcp",
+      "tool_name": "mcp__github__create_issue",
+      "arguments": "{\"body\":\"[CVC_REDACTED:v1:secret_assignment:50b55807-265f-4ed3-9717-9b67f927cb57]\",\"labels\":[\"bug\"],\"title\":\"Deploy\"}",
+      "status": "success"
+    }
+  ],
+  "artifact_links": [
+    {
+      "interaction_id": "ac5cc79b-a8ab-843a-83b2-2094b61f9da2",
+      "git_commit_hash": "e71bb6d8fa5dab0f0cb60d3bbba2d231c601beb6",
+      "link_type": "generated",
+      "linked_by": "fixture@example.invalid"
+    }
+  ]
+}

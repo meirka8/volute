@@ -651,7 +651,11 @@ pub struct ToolExecution {
     pub id: Option<i64>, // Database ID
     pub interaction_id: InteractionId,
 
-    pub tool_protocol: String, // 'mcp', 'native'
+    /// What ran the tool: `mcp` (an MCP server), `native` (the harness) or
+    /// `server` (the model provider; the status is the one its result block
+    /// reported). Free text in storage and on the wire: readers must tolerate
+    /// values they do not know.
+    pub tool_protocol: String,
     pub tool_name: String,
     pub arguments: String, // JSON string
 

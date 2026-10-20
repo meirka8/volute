@@ -49,7 +49,7 @@ CVC records each Claude Code session from the transcript Claude Code writes, thr
 2. `cvc privacy acknowledge-capture` — the one-time local capture acknowledgement. It is an interactive typed challenge, and passive capture stays off until it is granted.
 3. `cvc harness install claude-code` — write the capture hooks into this checkout's `.claude/settings.local.json`, using the absolute path of the `cvc` you just ran. By default the installer scripts and the npm launcher put `cvc` in `~/.cvc/bin` and replace it in place on upgrade (the launcher on its next run), so hooks that point there follow upgrades.
 4. Start a *new* Claude Code session. A session already running does not pick up the new hooks.
-5. Work as usual, then `cvc conversations` to see the captured sessions and `cvc log` for detail.
+5. Work as usual, then `cvc conversations` to see the captured sessions (in a terminal it opens an interactive view: `q` quits, and `--plain` prints the plain listing; see [Browse and share interactively](cvc-cli/README.md#browse-and-share-interactively)) and `cvc log` for detail.
 
 Step 3 also covers worktrees you create later. It records which `cvc` to run and adds CVC to Git's `post-checkout` hook. After that, `git worktree add` (and Claude Code's worktree option) gives the new worktree the same hooks, so its sessions are captured too. This holds only while the capture acknowledgement from step 2 stands. Worktrees that already exist are not changed: run step 3 in each one (the command lists them). If you set up hooks with v0.7.0, run step 3 once more in your main checkout to turn this on.
 
