@@ -435,8 +435,9 @@ function slotKey(name: string, failed: boolean): string {
  *
  * Server-side calls (names starting `server:`) have no slot at all: their results
  * arrive inside the assistant's own message and are never a user-side result
- * (cvc 0.7.0, cvc-core/src/claude_code/transcript.rs), so a
- * `[tool_result server:...]` marker can never be the capture's own.
+ * (cvc-core/src/claude_code/transcript.rs), whatever protocol and status the call
+ * was recorded with, so a `[tool_result server:...]` marker can never be the
+ * capture's own.
  *
  * The harness writes tool results as `[tool_result <Tool>] ...`, and so can any
  * text inside a tool's output (a fetched web page, a file the model read). When
@@ -495,8 +496,9 @@ export function parentToolNamesByNode(
 
 /**
  * How many of the node's tool executions failed, interrupted calls included.
- * Server-side tools are not counted: the harness records them as failed only
- * because their result is never seen (see `toolOutcome`).
+ * A server-side call written by cvc 0.7.0 is not counted: that version recorded
+ * every one as failed only because their result is never seen. One recorded with
+ * the `server` protocol is, when its recorded status is a failure (see `toolOutcome`).
  */
 export function failedToolCount(node: Pick<InteractionNode, 'tool_executions'>): number {
   if (!Array.isArray(node.tool_executions)) return 0;

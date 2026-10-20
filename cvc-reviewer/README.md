@@ -96,10 +96,12 @@ cards show what the call asked for, not necessarily the change that reached the 
 Tool results are marked in the text itself, so a fetched web page can imitate the markers.
 Each result must match a call of the previous step by tool name and by whether it failed, or
 the stimulus is shown undivided, with a note; if that step is not in the timeline, it is
-divided by its markers, unchecked. A result claiming a server-side call never matches, as
-their results are not recorded. A `[meta]` or `[compaction summary]` part after tool results
-is drawn inside them as plain output, marker and all, not as **Context** or
-**Compaction summary**. No check catches every imitation, because the markers are plain text.
+divided by its markers, unchecked. A result claiming a server-side call never matches: the
+model provider runs those calls and delivers their results inside the assistant's own
+message, so the capture never writes a tool result for them. A `[meta]` or
+`[compaction summary]` part after tool results is drawn inside them as plain output, marker
+and all, not as **Context** or **Compaction summary**. No check catches every imitation,
+because the markers are plain text.
 
 In a step a person started, only the last `[Request interrupted by user…]` line starts a
 prompt, and only if no tool result follows it; otherwise the text stays together, and the
@@ -110,10 +112,17 @@ The Reviewer infers this layout from the shape of the node, because the synced r
 not say which tool captured it. It is a display choice, not a provenance or trust signal.
 MCP, VS Code and `cvc run` nodes keep the Thought / Action / Observation layout.
 
-Server-side tools (for example web search run by the model provider) show
-**server-side · result not recorded**: the v0.7.0 harness does not see their results, so how
-they ended is unknown and they are not counted as failed. Content the capture does not
-record appears as a bracketed placeholder such as `[image]` or `[web_search_tool_result]`.
+Server-side tools (for example web search, web fetch or code execution run by the model
+provider) are listed as `web_search (server-side)` and so on. Newer captures record how each
+one ended, as its result block in the same response reported it, and the Reviewer shows that:
+**success** or **failed**, and a failed one is counted in **N tool calls failed** (a result block
+that reported an error or a non-zero return code, or none arriving in the response; hover the
+badge for the wording). Captures from v0.7.0 recorded every server-side call as failed whatever
+happened, so for those the Reviewer shows **server-side · result not recorded** and does not
+count them as failed. It tells the two apart by the tool protocol the capture recorded: `server`
+for a recorded outcome, `native` for v0.7.0. Only the outcome is recorded, never the result's
+content: that appears as a bracketed placeholder such as `[web_search_tool_result]`, as other
+content the capture does not record does (`[image]`).
 Where the capture hit a limit, the step says so:
 **Arguments not recorded: N bytes exceeded the capture limit** replaces tool arguments too
 large to keep, and `…[cvc: truncated N bytes]` marks where text was cut. Privacy redactions

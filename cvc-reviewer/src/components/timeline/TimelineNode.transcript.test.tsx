@@ -25,6 +25,7 @@ import {
   promptStep,
   rawToolCall,
   rejectedToolStep,
+  serverToolRecordedStep,
   serverToolStep,
   toolCall,
   truncatedArgsStep,
@@ -77,6 +78,7 @@ describe('transcript header', () => {
     ['MCP tool', mcpToolStep],
     ['rejected tool call', rejectedToolStep],
     ['server-side tool', serverToolStep],
+    ['server-side tool with a recorded outcome', serverToolRecordedStep],
     ['no-argument tool', nullArgsStep],
     ['Windows line endings', crlfStep],
     ['image placeholders', imagePromptStep],
@@ -531,8 +533,9 @@ describe('tool calls', () => {
 });
 
 describe('server-side tools', () => {
-  // cvc 0.7.0 records every server-side tool as `failure`: its result never
-  // arrives as a user-side tool_result. That must not read as a failure.
+  // cvc 0.7.0 records every server-side tool as `failure` (protocol `native`): its result never
+  // arrives as a user-side tool_result. That must not read as a failure. (A harness that keeps the
+  // outcome records protocol `server` and the status of the result block: see the tests below.)
   it('shows a recorded failure of a server-side tool as unknown, not as failed', () => {
     renderNode(serverToolStep);
     const card = toolCard('web_search (server-side)');
@@ -575,6 +578,44 @@ describe('server-side tools', () => {
   it('shows placeholders for unrecorded blocks in the response as plain text', () => {
     renderNode(serverToolStep);
     expect(screen.getByText(/\[web_search_tool_result\]/)).toBeInTheDocument();
+  });
+
+  describe('recorded with the server protocol, as a harness that keeps the outcome writes them', () => {
+    const cardsOf = () => Array.from(document.querySelectorAll<HTMLElement>('[data-status]'));
+
+    it('shows each outcome as recorded, and counts the failures: a code execution, a search with no result, and the Bash', () => {
+      renderNode(serverToolRecordedStep);
+      expect(cardsOf().map((card) => [card.firstElementChild!.firstElementChild!.textContent, card.getAttribute('data-status')])).toEqual([
+        ['web_search (server-side)', 'success'],
+        ['web_fetch (server-side)', 'success'],
+        ['bash_code_execution (server-side)', 'failure'],
+        ['web_search (server-side)', 'failure'],
+        ['Bash', 'failure'],
+      ]);
+      expect(screen.getByText('3 tool calls failed')).toBeInTheDocument();
+      expect(screen.queryByText('server-side · result not recorded')).not.toBeInTheDocument();
+    });
+
+    it('shows the same step as 0.7.0 recorded it as one unrecorded search, with the Bash the only failure', () => {
+      renderNode(serverToolStep);
+      expect(screen.getByText('1 tool call failed')).toBeInTheDocument();
+      expect(cardsOf().map((card) => card.getAttribute('data-status'))).toEqual(['unrecorded', 'failure']);
+    });
+
+    it('keeps the arguments the call was made with, as rows like any other server-side call', () => {
+      renderNode(serverToolRecordedStep);
+      const [search, fetch, execution] = cardsOf();
+      expect(within(search).getByText('exponential backoff with jitter')).toBeInTheDocument();
+      expect(within(fetch).getByText('https://example.invalid/backoff')).toBeInTheDocument();
+      expect(within(execution).getByText('false')).toBeInTheDocument();
+    });
+
+    it('shows the placeholders the response was given in place of the result blocks, as plain text', () => {
+      renderNode(serverToolRecordedStep);
+      for (const placeholder of ['[web_search_tool_result]', '[web_fetch_tool_result]', '[bash_code_execution_tool_result]']) {
+        expect(screen.getByText(new RegExp(placeholder.replace(/[[\]]/g, '\\$&')))).toBeInTheDocument();
+      }
+    });
   });
 });
 

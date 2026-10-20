@@ -4,6 +4,7 @@ import { clsx } from 'clsx';
 import { usePaged } from '../../hooks/usePaged';
 import {
   describeToolCall,
+  ranProviderSide,
   toolOutcome,
   type ToolCallView,
   type ToolField,
@@ -289,14 +290,29 @@ function ToolCallBodyView({ view }: { view: ToolCallView }) {
   }
 }
 
-function OutcomeBadge({ outcome }: { outcome: ToolOutcome }) {
+/**
+ * What a recorded outcome means for a call the model provider ran (`tool_protocol`
+ * `server`): the status is the one its result block reported, which is not what the
+ * local session saw. Neutral on purpose: it names no vendor and claims nothing the
+ * record does not say.
+ */
+const PROVIDER_SIDE = "Ran on the model provider's side, not in the local session.";
+const PROVIDER_SIDE_SUCCESS = `${PROVIDER_SIDE} The outcome is the one its result block reported: it reported no error.`;
+const PROVIDER_SIDE_FAILURE = `${PROVIDER_SIDE} Recorded as failed: its result block reported an error or a non-zero return code, or no result block arrived in the same response.`;
+
+function OutcomeBadge({ outcome, providerSide }: { outcome: ToolOutcome; providerSide: boolean }) {
   switch (outcome) {
     case 'failure':
-      // `failure` also covers calls interrupted before a result arrived.
+      // `failure` also covers calls interrupted before a result arrived, and, for a call
+      // the provider ran, a result block that never came or reported an error.
       return (
         <span
           className={clsx(BADGE_DANGER, 'ml-auto shrink-0')}
-          title="The tool reported an error, or no result was recorded (for example, the call was interrupted)."
+          title={
+            providerSide
+              ? PROVIDER_SIDE_FAILURE
+              : 'The tool reported an error, or no result was recorded (for example, the call was interrupted).'
+          }
         >
           failed
         </span>
@@ -316,7 +332,11 @@ function OutcomeBadge({ outcome }: { outcome: ToolOutcome }) {
         </span>
       );
     case 'success':
-      return <span className={clsx(BADGE_SUCCESS, 'ml-auto shrink-0')}>success</span>;
+      return (
+        <span className={clsx(BADGE_SUCCESS, 'ml-auto shrink-0')} title={providerSide ? PROVIDER_SIDE_SUCCESS : undefined}>
+          success
+        </span>
+      );
     case 'unknown':
       return (
         <span
@@ -336,6 +356,7 @@ function OutcomeBadge({ outcome }: { outcome: ToolOutcome }) {
 export function ToolCallCard({ exec }: { exec: ToolExecution }) {
   const view = useMemo(() => describeToolCall(exec), [exec]);
   const outcome = toolOutcome(exec);
+  const providerSide = ranProviderSide(exec);
 
   return (
     <div className="min-w-0 rounded-2xl bg-canvas/75 px-3 py-2.5" data-status={outcome}>
@@ -343,7 +364,7 @@ export function ToolCallCard({ exec }: { exec: ToolExecution }) {
         <span className="min-w-0 break-words font-mono text-xs font-semibold text-ink">
           <HiddenText text={view.title} mode="strict" />
         </span>
-        <OutcomeBadge outcome={outcome} />
+        <OutcomeBadge outcome={outcome} providerSide={providerSide} />
       </div>
       <ToolCallBodyView view={view} />
       {view.extras.length > 0 && (

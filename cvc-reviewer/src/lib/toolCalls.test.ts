@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { describeToolCall, isServerSideTool, parseToolArguments, toolOutcome, toolTitle } from './toolCalls';
-import { rawToolCall, toolCall } from '../test/fixtures';
+import {
+  describeToolCall,
+  isServerSideTool,
+  parseToolArguments,
+  ranProviderSide,
+  toolOutcome,
+  toolTitle,
+  type ToolOutcome,
+} from './toolCalls';
+import { rawToolCall, serverToolCall, toolCall } from '../test/fixtures';
 
 describe('parseToolArguments', () => {
   it('parses a JSON object, with real newlines in its strings', () => {
@@ -566,6 +574,102 @@ describe('toolOutcome: the exact shape cvc 0.7.0 writes for a server-side call',
   it('believes a success whatever the name and protocol', () => {
     expect(toolOutcome(toolCall('server:web_search', {}, 'success'))).toBe('success');
     expect(toolOutcome(serverCall({ status: 'success', tool_protocol: 'mcp' }))).toBe('success');
+  });
+});
+
+describe('toolOutcome: protocol x status x name', () => {
+  // Every combination that matters, written out. A server-side call is recorded in one of two shapes: cvc 0.7.0 wrote
+  // protocol "native" and status "failure" whatever happened, which is no outcome; a harness that keeps the outcome
+  // writes protocol "server" and the status its result block reported, which is believed.
+  const rows: Array<[name: string, protocol: string | undefined, status: string, expected: ToolOutcome]> = [
+    // The exact shape 0.7.0 wrote, for every kind of server-side tool: not an outcome.
+    ['server:web_search', 'native', 'failure', 'unrecorded'],
+    ['server:web_fetch', 'native', 'failure', 'unrecorded'],
+    ['server:code_execution', 'native', 'failure', 'unrecorded'],
+    ['server:bash_code_execution', 'native', 'failure', 'unrecorded'],
+    ['server:text_editor_code_execution', 'native', 'failure', 'unrecorded'],
+    // The outcome a harness that keeps it writes: believed, a failure included.
+    ['server:web_search', 'server', 'success', 'success'],
+    ['server:web_search', 'server', 'failure', 'failure'],
+    ['server:web_fetch', 'server', 'success', 'success'],
+    ['server:web_fetch', 'server', 'failure', 'failure'],
+    ['server:code_execution', 'server', 'success', 'success'],
+    ['server:code_execution', 'server', 'failure', 'failure'],
+    ['server:bash_code_execution', 'server', 'success', 'success'],
+    ['server:bash_code_execution', 'server', 'failure', 'failure'],
+    ['server:text_editor_code_execution', 'server', 'success', 'success'],
+    ['server:text_editor_code_execution', 'server', 'failure', 'failure'],
+    // A success is a success under any protocol, even one 0.7.0 never wrote.
+    ['server:web_search', 'native', 'success', 'success'],
+    ['server:web_search', 'mcp', 'success', 'success'],
+    // The protocol decides, not the name: "server" is believed on any name, and a bare "server:" is no server-side name.
+    ['Bash', 'server', 'success', 'success'],
+    ['Bash', 'server', 'failure', 'failure'],
+    ['server:', 'server', 'failure', 'failure'],
+    ['server:', 'native', 'failure', 'failure'],
+    // Tools the harness and MCP servers run: as recorded.
+    ['Bash', 'native', 'success', 'success'],
+    ['Bash', 'native', 'failure', 'failure'],
+    ['mcp__srv__tool', 'mcp', 'success', 'success'],
+    ['mcp__srv__tool', 'mcp', 'failure', 'failure'],
+    // A server-side name that is not the 0.7.0 shape: a failure is a failure (no protocol, an empty or other one, another case).
+    ['server:web_search', 'mcp', 'failure', 'failure'],
+    ['server:web_search', 'other', 'failure', 'failure'],
+    ['server:web_search', '', 'failure', 'failure'],
+    ['server:web_search', undefined, 'failure', 'failure'],
+    ['server:web_search', 'Native', 'failure', 'failure'],
+    ['server:web_search', 'SERVER', 'failure', 'failure'],
+    ['Server:web_search', 'native', 'failure', 'failure'],
+    [' server:web_search', 'native', 'failure', 'failure'],
+    ['mcp__server__web_search', 'native', 'failure', 'failure'],
+  ];
+
+  it.each(rows)('%s recorded as protocol %s with status %s is %s', (name, protocol, status, expected) => {
+    expect(toolOutcome({ tool_name: name, tool_protocol: protocol, status: status as 'success' | 'failure' })).toBe(expected);
+  });
+
+  it('is "unrecorded" for exactly one row of the table: a server-side name, native, failure', () => {
+    expect(rows.filter(([, , , expected]) => expected === 'unrecorded').map(([name, protocol, status]) => [protocol, status, name.startsWith('server:')])).toEqual(
+      Array.from({ length: 5 }, () => ['native', 'failure', true]),
+    );
+  });
+
+  it.each(['native', 'server', 'mcp', 'other', '', undefined])(
+    'keeps any status that is neither "success" nor "failure" unknown, for protocol %s and for a server-side name or not',
+    (protocol) => {
+      for (const name of ['server:web_search', 'Bash']) {
+        for (const status of ['pending', '', 'SUCCESS', 'Failure', 'unknown', undefined, null, 0, true]) {
+          expect(
+            toolOutcome({ tool_name: name, tool_protocol: protocol, status: status as unknown as 'success' }),
+            `${name} / ${String(protocol)} / ${String(status)}`,
+          ).toBe('unknown');
+        }
+      }
+    },
+  );
+
+  it('reads the same from the fixtures that stand for the two recordings', () => {
+    expect(toolOutcome(toolCall('server:web_search', {}, 'failure'))).toBe('unrecorded'); // as 0.7.0 wrote it
+    expect(toolOutcome(serverToolCall('web_search', {}, 'failure'))).toBe('failure');
+    expect(toolOutcome(serverToolCall('web_search', {}, 'success'))).toBe('success');
+    expect(toolOutcome(serverToolCall('web_search', {}))).toBe('success');
+  });
+});
+
+describe('ranProviderSide', () => {
+  it('is true only for the protocol "server"', () => {
+    expect(ranProviderSide(serverToolCall('web_search', {}))).toBe(true);
+    expect(ranProviderSide({ tool_protocol: 'server' })).toBe(true);
+    for (const protocol of ['native', 'mcp', 'Server', 'SERVER', ' server', 'server ', 'servers', '', undefined]) {
+      expect(ranProviderSide({ tool_protocol: protocol }), String(protocol)).toBe(false);
+    }
+    // A server-side NAME is not enough: that is what 0.7.0 wrote under the protocol "native".
+    expect(ranProviderSide(toolCall('server:web_search', {}))).toBe(false);
+  });
+
+  it('is false for something that is not a tool execution at all', () => {
+    for (const junk of [null, undefined]) expect(ranProviderSide(junk)).toBe(false);
+    expect(ranProviderSide({} as { tool_protocol?: string })).toBe(false);
   });
 });
 

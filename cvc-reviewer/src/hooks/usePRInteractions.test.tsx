@@ -43,10 +43,18 @@ const TEMPORAL_COMMIT_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 /** An id of the canonical shape with its version and variant nibbles chosen (each is one hex digit). */
 const idWith = (version: string, variant: string) => `123e4567-e89b-${version}2d3-${variant}456-426614174000`;
 
-/** Every real node id the shipped harness wrote (see src/test/wire/README.md). */
-const REAL_WIRE_IDS = Object.values(
-  import.meta.glob<string>("../test/wire/*/*.json", { eager: true, query: "?raw", import: "default" }),
-).map((raw) => (JSON.parse(raw) as { interaction: { id: string } }).interaction.id);
+/**
+ * Every real node id the shipped harness wrote (see src/test/wire/README.md), each once: the
+ * edge-case step that holds a server-side search was recorded twice, by the 0.7.0 harness and
+ * again by the one that records server-side outcomes, and is one interaction.
+ */
+const REAL_WIRE_IDS = [
+  ...new Set(
+    Object.values(import.meta.glob<string>("../test/wire/*/*.json", { eager: true, query: "?raw", import: "default" })).map(
+      (raw) => (JSON.parse(raw) as { interaction: { id: string } }).interaction.id,
+    ),
+  ),
+];
 
 /** What Git reports for one tombstone: its shard directory, then its blob. */
 function tombstoneEntries(id: string, shard = id.slice(0, 2)) {

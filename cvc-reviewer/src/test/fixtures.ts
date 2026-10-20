@@ -45,6 +45,21 @@ export function toolCall(
   };
 }
 
+/**
+ * A tool the model provider ran, as a harness after #134 records it: a `server:` name,
+ * `tool_protocol` `server`, and the status its result block reported (`failure` when the
+ * block reported an error, or never arrived). Keys are sorted, as the producer writes them.
+ * A 0.7.0 capture of the same call is `toolCall('server:<name>', ..., 'failure')`: protocol
+ * `native`, and `failure` whatever happened.
+ */
+export function serverToolCall(
+  name: string,
+  input: unknown,
+  status: ToolExecution['status'] = 'success',
+): ToolExecution {
+  return { tool_protocol: 'server', tool_name: `server:${name}`, arguments: JSON.stringify(sortKeys(input)), status };
+}
+
 /** A tool execution with hand-written arguments text (legacy or hostile data). */
 export function rawToolCall(
   name: string,
@@ -390,8 +405,10 @@ export const rejectedToolStep = makeNode({
 });
 
 /**
- * A server-side tool. The 0.7.0 harness never sees its result, so it records
- * `failure` for it; the genuinely failed Bash call is the only failure.
+ * A server-side tool as the 0.7.0 harness records it. The harness never sees its
+ * result, so it records `failure` with protocol `native`, whatever happened; the
+ * genuinely failed Bash call is the only failure. (See `serverToolRecordedStep`
+ * for the same step from a harness that records the outcome.)
  */
 export const serverToolStep = makeNode({
   id: harnessId(12),
@@ -402,6 +419,30 @@ export const serverToolStep = makeNode({
   model_response: 'Searching the web.\n\n[web_search_tool_result]',
   tool_executions: [
     wireToolCall('server:web_search', { query: 'exponential backoff with jitter' }, 'failure'),
+    wireToolCall('Bash', { command: 'false' }, 'failure'),
+  ],
+});
+
+/**
+ * The step of `serverToolStep` as a harness after #134 records it: each server-side
+ * call has protocol `server` and the status its result block reported. A search and a
+ * fetch that worked are successes, a code execution with a non-zero return code and a
+ * search whose result never arrived are failures, and so is the Bash call: three
+ * failures in all, each counted, and none of them "result not recorded".
+ */
+export const serverToolRecordedStep = makeNode({
+  id: harnessId(25),
+  author: 'system',
+  timestamp: minutesIn(23),
+  model_name: CLAUDE_MODEL,
+  user_prompt: '[tool_result Bash] ok',
+  model_response:
+    'Searching the web.\n\n[web_search_tool_result]\n\n[web_fetch_tool_result]\n\n[bash_code_execution_tool_result]',
+  tool_executions: [
+    serverToolCall('web_search', { query: 'exponential backoff with jitter' }, 'success'),
+    serverToolCall('web_fetch', { url: 'https://example.invalid/backoff' }, 'success'),
+    serverToolCall('bash_code_execution', { command: 'false' }, 'failure'),
+    serverToolCall('web_search', { query: 'never answered' }, 'failure'),
     wireToolCall('Bash', { command: 'false' }, 'failure'),
   ],
 });

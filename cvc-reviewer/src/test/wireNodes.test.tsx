@@ -1,8 +1,9 @@
 /**
  * The transcript layout against nodes the real producer wrote.
  *
- * `./wire/` holds interaction blobs written by the shipped cvc 0.7.0 binary's
- * Claude Code harness (see `./wire/README.md`). The hand-written fixtures in
+ * `./wire/` holds interaction blobs written by the Claude Code harness: the shipped
+ * cvc 0.7.0 binary's, and, for server-side tools, the one that records the outcome
+ * its result block reported (see `./wire/README.md`). The hand-written fixtures in
  * `fixtures.ts` follow what we believe the wire looks like; these files are what
  * it does look like, so they catch a gap between the two.
  */
@@ -85,6 +86,12 @@ const E4_TRUNCATED_RESULTS = 'edge-cases/a5eb6e77-a1d9-85d4-93d0-fe978a93e042';
 const E7_CRLF = 'edge-cases/04d711be-f819-8298-9c67-babb2f00b891';
 const E8_NO_STIMULUS = 'edge-cases/a3c1e9a5-9640-88c9-b751-233c60810621';
 
+// A harness that records the outcome of a server-side call (#134): `tool_protocol` "server" and the status
+// the provider's own result block reported. S3 is the same step as E2, recorded again.
+const S1_SERVER_TOOLS = 'cvc-0.7.1-server-tools/8fc40ad6-0885-8c48-8d10-ddec124a3a0a';
+const S2_SERVER_FOLLOW_UP = 'cvc-0.7.1-server-tools/94705671-dba9-8399-8430-839c3fb758d0';
+const S3_SERVER_SEARCH = 'cvc-0.7.1-server-tools/0d3a13e0-0ad7-8fb2-959d-fe4eb3499aa0';
+
 type Outcome = 'success' | 'failure' | 'unrecorded';
 
 interface Expected {
@@ -129,6 +136,24 @@ const EXPECTED: Record<string, Expected> = {
   [E4_TRUNCATED_RESULTS]: { origin: 'Tool results', tools: [['Bash', 'success']], failed: 0 },
   [E7_CRLF]: { origin: 'Prompt', tools: [], failed: 0 },
   [E8_NO_STIMULUS]: { origin: 'No stimulus recorded', tools: [], failed: 0 },
+  // The outcomes the provider's result blocks reported: a success is a success and a failure is counted.
+  // The step is a prompt asking for seven server-side calls and a Read; the third `web_search` never got a result block.
+  [S1_SERVER_TOOLS]: {
+    origin: 'Prompt',
+    tools: [
+      ['web_search (server-side)', 'success'],
+      ['web_search (server-side)', 'failure'],
+      ['web_fetch (server-side)', 'success'],
+      ['bash_code_execution (server-side)', 'success'],
+      ['bash_code_execution (server-side)', 'failure'],
+      ['text_editor_code_execution (server-side)', 'success'],
+      ['web_search (server-side)', 'failure'],
+      ['Read', 'success'],
+    ],
+    failed: 3,
+  },
+  [S2_SERVER_FOLLOW_UP]: { origin: 'Tool results', tools: [['web_search (server-side)', 'success']], failed: 0 },
+  [S3_SERVER_SEARCH]: { origin: 'Tool results', tools: [['web_search (server-side)', 'success']], failed: 0 },
 };
 
 const ALL_KEYS = Object.keys(EXPECTED);
@@ -237,26 +262,51 @@ describe('wire fixtures', () => {
     }
   });
 
+  // What a leaked developer machine or a pasted credential would look like. Guards the next file added to ./wire/.
+  const FORBIDDEN: Array<[string, RegExp]> = [
+    ['a home directory', /\/home\/|\/Users\/|C:\\\\Users|\/root\//],
+    ['a mounted or temp path', /\/run\/media|\/tmp\/|\/var\/folders|\/\.claude\//],
+    ['an AWS access key id', /\b(AKIA|ASIA)[0-9A-Z]{16}\b/],
+    ['a GitHub token', /\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/],
+    ['a private key block', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+    ['a Slack token', /\bxox[abprs]-[A-Za-z0-9-]{10,}/],
+    ['a JWT', /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./],
+    ['a bearer credential', /bearer\s+[A-Za-z0-9._~+/=-]{16,}/i],
+    ['credentials inside a URL', /[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/i],
+  ];
+
+  // One string is allowed, in one file: `/tmp/notes.txt` is a path inside the provider's code-execution
+  // sandbox, written into the repo's own synthetic transcript
+  // (cvc-core/tests/fixtures/claude-code/v2.1.300/server-tools.jsonl) and so into the file recorded from it,
+  // which is kept as the producer wrote it. It is not a path on any machine; any other temp path, or this one
+  // in any other file, still fails.
+  const SANDBOX_PATH = '/tmp/notes.txt';
+  const SANDBOX_FILES = new Set([S1_SERVER_TOOLS]);
+
+  /** What `raw`, the text of the fixture `key`, leaks, by name. */
+  function leaksIn(key: string, raw: string): string[] {
+    const scanned = SANDBOX_FILES.has(key) ? raw.replaceAll(SANDBOX_PATH, '<sandbox path>') : raw;
+    return FORBIDDEN.filter(([, pattern]) => pattern.test(scanned)).map(([what]) => what);
+  }
+
   it('hold no local paths, personal addresses or secret-shaped strings', () => {
-    // Guards the next file added to ./wire/. The patterns are what a leaked
-    // developer machine or a pasted credential would look like.
-    const forbidden: Array<[string, RegExp]> = [
-      ['a home directory', /\/home\/|\/Users\/|C:\\\\Users|\/root\//],
-      ['a mounted or temp path', /\/run\/media|\/tmp\/|\/var\/folders|\/\.claude\//],
-      ['an AWS access key id', /\b(AKIA|ASIA)[0-9A-Z]{16}\b/],
-      ['a GitHub token', /\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/],
-      ['a private key block', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
-      ['a Slack token', /\bxox[abprs]-[A-Za-z0-9-]{10,}/],
-      ['a JWT', /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./],
-      ['a bearer credential', /bearer\s+[A-Za-z0-9._~+/=-]{16,}/i],
-      ['credentials inside a URL', /[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/i],
-    ];
     for (const [key, raw] of RAW_BY_KEY) {
-      for (const [what, pattern] of forbidden) {
-        expect(raw, `${key} contains ${what}`).not.toMatch(pattern);
-      }
+      expect(leaksIn(key, raw), key).toEqual([]);
       const addresses = raw.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) ?? [];
       for (const address of addresses) expect(address, key).toBe('fixture@example.invalid');
+    }
+  });
+
+  it('allow the sandbox path in the one file that holds it, and nothing else of its kind', () => {
+    expect(RAW_BY_KEY.get(S1_SERVER_TOOLS), 'the exception is in use: remove it when the file stops holding the path').toContain(SANDBOX_PATH);
+    expect(leaksIn(S1_SERVER_TOOLS, `{"path":"${SANDBOX_PATH}"}`)).toEqual([]);
+    // Any other temp path, in that file or another, and that path in another file, is a leak.
+    expect(leaksIn(S1_SERVER_TOOLS, '{"path":"/tmp/other.txt"}')).toEqual(['a mounted or temp path']);
+    expect(leaksIn(S1_SERVER_TOOLS, `{"path":"${SANDBOX_PATH}","cwd":"/tmp/work"}`)).toEqual(['a mounted or temp path']);
+    expect(leaksIn(S1_SERVER_TOOLS, '{"path":"/run/media/someone/disk"}')).toEqual(['a mounted or temp path']);
+    expect(leaksIn(S1_SERVER_TOOLS, '{"path":"/home/someone/repo"}')).toEqual(['a home directory']);
+    for (const key of [E1_REDACTIONS, S2_SERVER_FOLLOW_UP, S3_SERVER_SEARCH]) {
+      expect(leaksIn(key, `{"path":"${SANDBOX_PATH}"}`), key).toEqual(['a mounted or temp path']);
     }
   });
 
@@ -524,6 +574,130 @@ describe('what the producer wrote, as a reviewer sees it', () => {
       within(card).getByText(/^Created issue #42 \(sent with Authorization: \[CVC_REDACTED:v1:authorization:[0-9a-f-]{36}\]\)$/),
     ).toBeInTheDocument();
     expect(within(card).getByText(/\[web_search_tool_result\]/)).toBeInTheDocument();
+  });
+
+  describe('server-side tools recorded by a harness that keeps the outcome (cvc-0.7.1-server-tools)', () => {
+    const SERVER_FILES = [S1_SERVER_TOOLS, S2_SERVER_FOLLOW_UP, S3_SERVER_SEARCH];
+    /** The cards of a node, with the badge each one shows, in call order. */
+    const badgesOf = (card: HTMLElement) =>
+      Array.from(card.querySelectorAll<HTMLElement>('[data-status]')).map((el) => [
+        el.firstElementChild!.firstElementChild!.textContent,
+        el.firstElementChild!.lastElementChild!.textContent,
+      ]);
+    const PROVIDER_SIDE = "Ran on the model provider's side, not in the local session.";
+    const SUCCESS_TIP = `${PROVIDER_SIDE} The outcome is the one its result block reported: it reported no error.`;
+    const FAILURE_TIP = `${PROVIDER_SIDE} Recorded as failed: its result block reported an error or a non-zero return code, or no result block arrived in the same response.`;
+
+    it('are recorded with the protocol "server" and the status of the result block, and the 0.7.0 recording is not', () => {
+      const statuses = (key: string) => nodeFor(key).tool_executions.map((tool) => [tool.tool_protocol, tool.tool_name, tool.status]);
+      expect(statuses(S1_SERVER_TOOLS)).toEqual([
+        ['server', 'server:web_search', 'success'],
+        ['server', 'server:web_search', 'failure'],
+        ['server', 'server:web_fetch', 'success'],
+        ['server', 'server:bash_code_execution', 'success'],
+        ['server', 'server:bash_code_execution', 'failure'],
+        ['server', 'server:text_editor_code_execution', 'success'],
+        ['server', 'server:web_search', 'failure'],
+        ['native', 'Read', 'success'],
+      ]);
+      expect(statuses(S2_SERVER_FOLLOW_UP)).toEqual([['server', 'server:web_search', 'success']]);
+      expect(statuses(S3_SERVER_SEARCH)).toEqual([['server', 'server:web_search', 'success']]);
+      // The same call, as 0.7.0 wrote it: the protocol the harness itself uses, and a failure whatever happened.
+      expect(statuses(E2_SERVER_TOOL)).toEqual([['native', 'server:web_search', 'failure']]);
+      expect(nodeFor(S3_SERVER_SEARCH).tool_executions[0].arguments).toBe(nodeFor(E2_SERVER_TOOL).tool_executions[0].arguments);
+    });
+
+    it('record the outcome and never the result: only placeholders reach the text of the step', () => {
+      for (const key of SERVER_FILES) {
+        const raw = RAW_BY_KEY.get(key)!;
+        expect(raw, key).not.toMatch(/THIRD-PARTY|encrypted_content|page_age|web_search_result|stdout|stderr/);
+      }
+      const response = nodeFor(S1_SERVER_TOOLS).model_response!;
+      expect(response.match(/\[[a-z_]+_tool_result\]/g)).toEqual([
+        '[web_search_tool_result]',
+        '[web_search_tool_result]',
+        '[web_fetch_tool_result]',
+        '[bash_code_execution_tool_result]',
+        '[bash_code_execution_tool_result]',
+        '[text_editor_code_execution_tool_result]',
+      ]);
+    });
+
+    it('shows each recorded outcome as recorded: successes as success, failures as failed', () => {
+      const { container } = renderNode(nodeFor(S1_SERVER_TOOLS));
+      expect(badgesOf(cardOf(container))).toEqual([
+        ['web_search (server-side)', 'success'],
+        ['web_search (server-side)', 'failed'],
+        ['web_fetch (server-side)', 'success'],
+        ['bash_code_execution (server-side)', 'success'],
+        ['bash_code_execution (server-side)', 'failed'],
+        ['text_editor_code_execution (server-side)', 'success'],
+        ['web_search (server-side)', 'failed'],
+        ['Read', 'success'],
+      ]);
+    });
+
+    it('counts the three recorded failures in the header, and says what the count leaves out', () => {
+      const { container } = renderNode(nodeFor(S1_SERVER_TOOLS));
+      const chip = within(headerOf(cardOf(container))).getByText('3 tool calls failed');
+      expect(chip).toHaveAttribute(
+        'title',
+        'Tool calls that reported an error or have no recorded result, such as an interrupted call. Server-side calls that cvc 0.7.0 recorded as failed without knowing how they ended are not counted.',
+      );
+      expect(failedToolCount(nodeFor(S1_SERVER_TOOLS))).toBe(3);
+    });
+
+    it('never says "result not recorded" about a call recorded with the protocol "server"', () => {
+      for (const key of SERVER_FILES) {
+        const { container, unmount } = renderNode(nodeFor(key));
+        const card = cardOf(container);
+        expandAll(card);
+        expect(card.textContent, key).not.toContain('result not recorded');
+        expect(card.querySelector('[data-status="unrecorded"]'), key).toBeNull();
+        expect(card.querySelector('[data-status="unknown"]'), key).toBeNull();
+        unmount();
+      }
+    });
+
+    it('says, on the badge of a call the provider ran, that it ran there and where its outcome comes from', () => {
+      const { container } = renderNode(nodeFor(S1_SERVER_TOOLS));
+      const card = cardOf(container);
+      const succeeded = [0, 2, 3, 5].map((index) => Array.from(card.querySelectorAll<HTMLElement>('[data-status]'))[index]);
+      for (const call of succeeded) expect(within(call).getByText('success')).toHaveAttribute('title', SUCCESS_TIP);
+      const failed = [1, 4, 6].map((index) => Array.from(card.querySelectorAll<HTMLElement>('[data-status]'))[index]);
+      for (const call of failed) expect(within(call).getByText('failed')).toHaveAttribute('title', FAILURE_TIP);
+      // The Read the harness itself ran has no such note, and neither tip names a vendor.
+      expect(within(toolCard(card, 'Read')).getByText('success')).not.toHaveAttribute('title');
+      expect(`${SUCCESS_TIP} ${FAILURE_TIP}`).not.toMatch(/anthropic|claude|openai/i);
+    });
+
+    it('shows the web search 0.7.0 recorded as unrecorded, and the same step recorded again as a success', () => {
+      const old = renderNode(nodeFor(E2_SERVER_TOOL));
+      expect(toolCardsOf(cardOf(old.container))).toEqual([['web_search (server-side)', 'unrecorded']]);
+      expect(within(cardOf(old.container)).getByText('server-side · result not recorded')).toBeInTheDocument();
+      old.unmount();
+
+      const recorded = renderNode(nodeFor(S3_SERVER_SEARCH));
+      const card = cardOf(recorded.container);
+      expect(toolCardsOf(card)).toEqual([['web_search (server-side)', 'success']]);
+      expect(within(card).queryByText('server-side · result not recorded')).not.toBeInTheDocument();
+      expect(within(toolCard(card, 'web_search (server-side)')).getByText('cvc wire format')).toBeInTheDocument();
+    });
+
+    it('lists the two steps of the conversation in order, each checked against the step before it', () => {
+      // S2 answers S1: its stimulus is the Read result, and the server-side calls of S1 have no result to match.
+      const nodes = [nodeFor(S1_SERVER_TOOLS), nodeFor(S2_SERVER_FOLLOW_UP)];
+      expect(nodes[1].parent_id).toBe(nodes[0].id);
+      const { container } = render(<ShadowTimeline interactions={nodes} />);
+      expect(screen.queryByText(/Shown undivided/)).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Tool results · Read' })).toBeInTheDocument();
+      const cards = Array.from(container.querySelectorAll<HTMLElement>('ol > li'));
+      expect(cards).toHaveLength(2);
+      // Newest first: the follow-up has no failure, the first step three.
+      expect(within(cards[0]).queryByText(/tool calls? failed/)).not.toBeInTheDocument();
+      expect(within(cards[1]).getByText('3 tool calls failed')).toBeInTheDocument();
+      expect(screen.getAllByText(/tool calls? failed/)).toHaveLength(1);
+    });
   });
 
   describe('a step with truncated arguments, redacted fields and unanswered calls', () => {

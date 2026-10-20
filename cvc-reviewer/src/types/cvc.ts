@@ -28,6 +28,11 @@ export interface ContextItem {
 }
 
 export interface ToolExecution {
+  /**
+   * What ran the tool: `mcp` (an MCP server), `native` (the harness) or `server` (the model
+   * provider, with the status its result block reported). Free text on the wire: a value not
+   * listed here is not an error.
+   */
   tool_protocol: string;
   tool_name: string;
   arguments: string;

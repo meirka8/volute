@@ -24,7 +24,7 @@ import { ToolCallCard } from './ToolCallCard';
 import { BADGE_DANGER, BADGE_NEUTRAL, PANE_LABEL } from './styles';
 
 const FAILURE_CHIP_TITLE =
-  'Tool calls that reported an error or have no recorded result, such as an interrupted call. Server-side tools are not counted.';
+  'Tool calls that reported an error or have no recorded result, such as an interrupted call. Server-side calls that cvc 0.7.0 recorded as failed without knowing how they ended are not counted.';
 
 /**
  * The header's name for a step. A harness node is written by the harness from a

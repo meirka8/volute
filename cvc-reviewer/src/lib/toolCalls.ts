@@ -79,15 +79,34 @@ export function parseToolArguments(raw: string | null | undefined): ParsedArgume
 /** Tools the model provider runs are recorded as `server:<name>`, e.g. `server:web_search`. */
 export const SERVER_PREFIX = 'server:';
 
+/**
+ * The `tool_protocol` of a call the capture records from the provider's own result
+ * block, with the status that block reported. (Free text on the wire: a reader
+ * tolerates values it does not know; this is the one that carries a recorded
+ * outcome for a server-side call.)
+ */
+export const SERVER_PROTOCOL = 'server';
+
 export function isServerSideTool(toolName: string): boolean {
   return typeof toolName === 'string' && toolName.startsWith(SERVER_PREFIX) && toolName.length > SERVER_PREFIX.length;
+}
+
+/**
+ * Whether the capture recorded this call as run on the model provider's side, with
+ * the outcome its result block reported (`tool_protocol` `server`). This says how
+ * the status was obtained, which is why the card explains it; the outcome itself
+ * comes from `toolOutcome`.
+ */
+export function ranProviderSide(exec: { tool_protocol?: string } | null | undefined): boolean {
+  return exec?.tool_protocol === SERVER_PROTOCOL;
 }
 
 /**
  * What is known about how a tool call ended.
  *
  * - `success` and `failure`: as recorded;
- * - `unrecorded`: a server-side call recorded as `failure`, which is not an outcome (below);
+ * - `unrecorded`: a server-side call written by cvc 0.7.0, which recorded `failure`
+ *   for every one of them, which is not an outcome (below);
  * - `unknown`: the recorded status is neither `success` nor `failure` (data from
  *   before blobs were validated).
  */
@@ -96,18 +115,25 @@ export type ToolOutcome = 'success' | 'failure' | 'unrecorded' | 'unknown';
 /**
  * The outcome of a recorded tool call.
  *
- * PRODUCER LIMITATION (cvc 0.7.0, Claude Code harness): a server-side tool's
- * result arrives inside the assistant message, never as a user-side
- * `tool_result` (see `server_tool_use` in cvc-core/src/claude_code/transcript.rs).
- * The harness takes a call's status from that user-side result, so it records
- * every such call as `failure` whatever happened. That `failure` is an artefact
- * of what was captured, not an outcome, so it is reported as `unrecorded` and
- * kept out of failure counts.
+ * A server-side tool (one the model provider runs, recorded as `server:<name>`)
+ * delivers its result inside the assistant's own message, never as a user-side
+ * `tool_result` (see `server_tool_use` in cvc-core/src/claude_code/transcript.rs and
+ * Design.md). Two generations of capture record such a call:
  *
- * Only the exact shape 0.7.0 writes gets this treatment: a name starting with
- * `server:` AND `tool_protocol` `native`. A call of that name recorded as
- * `success` is believed, and any other status (legacy, unvalidated data) is
- * `unknown`: never shown as a success and never counted as a failure.
+ * - cvc 0.7.0 took every call's status from a user-side result that a server-side
+ *   call never has, so it recorded `failure` for all of them, whatever happened, with
+ *   `tool_protocol` `native`. That `failure` is an artefact of what was captured, not
+ *   an outcome, so it is `unrecorded` and kept out of failure counts.
+ * - Later versions take the status from the call's result block in the same message
+ *   and record the call with `tool_protocol` `server`. That status is believed: `success`
+ *   is a success, and `failure` a real failure (the block reported an error or a
+ *   non-zero return code, or no block arrived), counted like any other.
+ *
+ * Only the exact shape 0.7.0 writes gets the `unrecorded` treatment: a name starting
+ * with `server:` AND `tool_protocol` `native`, recorded as `failure`. A call of that
+ * name with any other protocol is believed, as is any call recorded as `success`;
+ * any other status (legacy, unvalidated data) is `unknown`: never shown as a success
+ * and never counted as a failure.
  */
 export function toolOutcome(
   exec: Pick<ToolExecution, 'tool_name' | 'status'> & { tool_protocol?: string },

@@ -23,6 +23,7 @@ import {
   mcpNodeNoReasoning,
   rawToolCall,
   runNode,
+  serverToolCall,
   toolCall,
 } from '../test/fixtures';
 import type { InteractionNode } from '../types/cvc';
@@ -577,7 +578,7 @@ describe('failedToolCount', () => {
     ).toBe(2);
   });
 
-  it('does not count server-side tools, which the harness always records as failed', () => {
+  it('does not count a server-side call written by cvc 0.7.0, which recorded every one as failed', () => {
     expect(
       failedToolCount({
         tool_executions: [
@@ -587,6 +588,31 @@ describe('failedToolCount', () => {
         ],
       }),
     ).toBe(1);
+  });
+
+  it('counts a server-side call recorded with the server protocol when, and only when, its status is a failure', () => {
+    expect(
+      failedToolCount({
+        tool_executions: [
+          serverToolCall('web_search', { query: 'x' }, 'success'),
+          serverToolCall('web_search', { query: 'y' }, 'failure'),
+          serverToolCall('bash_code_execution', { command: 'false' }, 'failure'),
+          serverToolCall('web_fetch', { url: 'https://example.com' }, 'success'),
+        ],
+      }),
+    ).toBe(2);
+  });
+
+  it('counts the two generations side by side as each deserves: the recorded failure, not the artefact', () => {
+    expect(
+      failedToolCount({
+        tool_executions: [
+          toolCall('server:web_search', { query: 'as 0.7.0 wrote it' }, 'failure'),
+          serverToolCall('web_search', { query: 'as recorded' }, 'failure'),
+          toolCall('Bash', {}, 'failure'),
+        ],
+      }),
+    ).toBe(2);
   });
 });
 

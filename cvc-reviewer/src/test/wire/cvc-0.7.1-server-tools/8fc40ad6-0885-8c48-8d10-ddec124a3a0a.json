@@ -1,0 +1,92 @@
+{
+  "interaction": {
+    "id": "8fc40ad6-0885-8c48-8d10-ddec124a3a0a",
+    "conversation_id": "2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d",
+    "parent_id": null,
+    "timestamp": "2026-10-18T09:00:01Z",
+    "author": "human",
+    "user_prompt": "Look things up, run the checks in the sandbox, and read lib.rs",
+    "model_name": "claude-fixture-3",
+    "model_cot": null,
+    "model_response": "Searching and fetching.\n\n[web_search_tool_result]\n\n[web_search_tool_result]\n\n[web_fetch_tool_result]\n\n[bash_code_execution_tool_result]\n\n[bash_code_execution_tool_result]\n\n[text_editor_code_execution_tool_result]",
+    "source_request_id": "req_A"
+  },
+  "context_items": [
+    {
+      "id": 4,
+      "interaction_id": "8fc40ad6-0885-8c48-8d10-ddec124a3a0a",
+      "file_path": "src/lib.rs",
+      "git_blob_sha": null,
+      "dirty_patch": null,
+      "start_line": null,
+      "end_line": null
+    }
+  ],
+  "tool_executions": [
+    {
+      "id": 11,
+      "interaction_id": "8fc40ad6-0885-8c48-8d10-ddec124a3a0a",
+      "tool_protocol": "server",
+      "tool_name": "server:web_search",
+      "arguments": "{\"query\":\"fixture query\"}",
+      "status": "success"
+    },
+    {
+      "id": 12,
+      "interaction_id": "8fc40ad6-0885-8c48-8d10-ddec124a3a0a",
+      "tool_protocol": "server",
+      "tool_name": "server:web_search",
+      "arguments": "{\"query\":\"second query\"}",
+      "status": "failure"
+    },
+    {
+      "id": 13,
+      "interaction_id": "8fc40ad6-0885-8c48-8d10-ddec124a3a0a",
+      "tool_protocol": "server",
+      "tool_name": "server:web_fetch",
+      "arguments": "{\"url\":\"https://example.invalid/page\"}",
+      "status": "success"
+    },
+    {
+      "id": 14,
+      "interaction_id": "8fc40ad6-0885-8c48-8d10-ddec124a3a0a",
+      "tool_protocol": "server",
+      "tool_name": "server:bash_code_execution",
+      "arguments": "{\"command\":\"echo ok\"}",
+      "status": "success"
+    },
+    {
+      "id": 15,
+      "interaction_id": "8fc40ad6-0885-8c48-8d10-ddec124a3a0a",
+      "tool_protocol": "server",
+      "tool_name": "server:bash_code_execution",
+      "arguments": "{\"command\":\"false\"}",
+      "status": "failure"
+    },
+    {
+      "id": 16,
+      "interaction_id": "8fc40ad6-0885-8c48-8d10-ddec124a3a0a",
+      "tool_protocol": "server",
+      "tool_name": "server:text_editor_code_execution",
+      "arguments": "{\"command\":\"view\",\"path\":\"/tmp/notes.txt\"}",
+      "status": "success"
+    },
+    {
+      "id": 17,
+      "interaction_id": "8fc40ad6-0885-8c48-8d10-ddec124a3a0a",
+      "tool_protocol": "server",
+      "tool_name": "server:web_search",
+      "arguments": "{\"query\":\"never answered\"}",
+      "status": "failure"
+    },
+    {
+      "id": 18,
+      "interaction_id": "8fc40ad6-0885-8c48-8d10-ddec124a3a0a",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/work/repo/src/lib.rs\"}",
+      "status": "success"
+    }
+  ],
+  "artifact_links": []
+}
