@@ -563,9 +563,9 @@ fn a_committed_settings_file_is_declined_and_left_exactly_as_committed() {
     assert!(run.success, "{}", run.stderr);
     assert_eq!(
         run.cvc_lines(),
-        vec![format!(
-            "CVC: Claude Code hooks not installed in this worktree: `.claude/settings.local.json` is tracked by Git in this checkout; CVC writes a machine-specific path there and will not modify a tracked file (untrack it with `git rm --cached .claude/settings.local.json`)"
-        )],
+        vec![
+            "CVC: Claude Code hooks not installed in this worktree: `.claude/settings.local.json` is tracked by Git in this checkout; CVC writes a machine-specific path there and will not modify a tracked file (untrack it with `git rm --cached .claude/settings.local.json`)".to_string()
+        ],
         "{}",
         run.all()
     );
