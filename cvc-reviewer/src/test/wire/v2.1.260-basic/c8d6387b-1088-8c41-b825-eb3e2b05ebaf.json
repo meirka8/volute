@@ -1,0 +1,36 @@
+{
+  "interaction": {
+    "id": "c8d6387b-1088-8c41-b825-eb3e2b05ebaf",
+    "conversation_id": "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60",
+    "parent_id": "c218f992-6967-8f01-b169-4f47dd21bad4",
+    "timestamp": "2026-09-10T10:00:21Z",
+    "author": "system",
+    "user_prompt": "[compaction summary]\nThis session is being continued from a previous conversation. Summary: a greeting was added.",
+    "model_name": "claude-fixture-1",
+    "model_cot": null,
+    "model_response": "Continuing.",
+    "source_request_id": "req_F"
+  },
+  "context_items": [
+    {
+      "id": 4,
+      "interaction_id": "c8d6387b-1088-8c41-b825-eb3e2b05ebaf",
+      "file_path": "secret/key.txt",
+      "git_blob_sha": null,
+      "dirty_patch": null,
+      "start_line": null,
+      "end_line": null
+    }
+  ],
+  "tool_executions": [
+    {
+      "id": 6,
+      "interaction_id": "c8d6387b-1088-8c41-b825-eb3e2b05ebaf",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/work/repo/secret/key.txt\"}",
+      "status": "success"
+    }
+  ],
+  "artifact_links": []
+}

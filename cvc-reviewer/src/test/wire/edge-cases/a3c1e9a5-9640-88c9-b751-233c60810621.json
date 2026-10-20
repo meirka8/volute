@@ -1,0 +1,17 @@
+{
+  "interaction": {
+    "id": "a3c1e9a5-9640-88c9-b751-233c60810621",
+    "conversation_id": "5e0d6a42-7b1c-4d3e-9a8f-1c2b3d4e5f60",
+    "parent_id": null,
+    "timestamp": "2026-10-10T12:30:00Z",
+    "author": "system",
+    "user_prompt": "[no stimulus recorded]",
+    "model_name": "claude-fixture-edge",
+    "model_cot": null,
+    "model_response": "Resumed without a recorded prompt.",
+    "source_request_id": "req_E8"
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": []
+}

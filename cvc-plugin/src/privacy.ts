@@ -1,7 +1,14 @@
 import type { PrivacyStatus } from "./lsp/protocol";
 
-/** Only UUIDs are safe to include in the normal extension output channel. */
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+/**
+ * Only UUIDs are safe to include in the normal extension output channel: the RFC variant and any
+ * version RFC 9562 defines (1-8). Producers differ in the version: the Claude Code harness writes
+ * version 8 (a deterministic id), every other producer version 4. Keep this in step with the
+ * Reviewer's two tombstone patterns: `CANONICAL_TOMBSTONE_UUID` in
+ * cvc-reviewer/src/hooks/usePRInteractions.ts and the pattern in `validTombstone` in
+ * cvc-reviewer/src/types/cvc.ts.
+ */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function isSafeInteractionId(value: unknown): value is string {
   return typeof value === "string" && UUID_PATTERN.test(value);

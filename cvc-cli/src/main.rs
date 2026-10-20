@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 mod commands;
+mod terminal_text;
 mod tty;
+mod tui;
 
 #[derive(Parser)]
 #[command(name = "cvc")]
@@ -35,24 +37,46 @@ enum Commands {
         #[command(subcommand)]
         command: PrivacyCommands,
     },
-    /// List conversations with activity and per-destination share state
+    /// Browse conversations and their per-destination share state
+    ///
+    /// In a terminal this opens an interactive view of the captured
+    /// conversations, most recent first, with their share state for one remote.
+    /// The view can hand over to the usual typed-phrase prompts (the ones of
+    /// `cvc share`, `cvc unshare`, `cvc push --manual` and `cvc privacy
+    /// acknowledge-sharing`) and does not answer them; no key shares or
+    /// publishes by itself. Where auto-push is on, every git push to that
+    /// remote publishes shared thoughts.
+    ///
+    /// When standard input or output is not a terminal (a pipe, a redirect, a
+    /// script), or with --plain, it prints the plain listing instead, which only
+    /// reads.
     Conversations {
+        /// Remote to show share state for (default: origin)
         #[arg(long)]
         remote: Option<String>,
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
+        /// Show at most this many conversations (plain default: 20; the interactive view shows up to 10,000 unless set)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Print the plain listing instead of the interactive view
+        ///
+        /// Use it in scripts, and in any tool that runs cvc under a
+        /// pseudo-terminal: that looks like a terminal, so without --plain the
+        /// tool would get the interactive view.
+        #[arg(long)]
+        plain: bool,
     },
     /// Share a conversation explicitly; with no id, pick one interactively
     Share {
         conversation_id: Option<String>,
         #[arg(long)]
         remote: Option<String>,
+        /// Also share thoughts added to this conversation later
         #[arg(long)]
         future: bool,
         #[arg(long)]
         push: bool,
     },
-    /// Stop sharing unpublished turns in a conversation
+    /// Make a conversation's shared thoughts private again for a remote; refused once any of it has been published, or while a publish of it is unfinished
     Unshare {
         conversation_id: String,
         #[arg(long)]
@@ -184,14 +208,34 @@ fn main() -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) if advisory_hook => {
-            eprintln!("CVC Hook Warning: advisory hook skipped: {error}");
+            eprintln!(
+                "CVC Hook Warning: advisory hook skipped: {}",
+                error_text(&error, false)
+            );
             std::process::ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("{error:#}");
+            eprintln!("{}", error_text(&error, true));
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// An error as it is printed, with its causes (`outer: inner`) when `chain` is
+/// set. What it says can come from outside: the text of a remote's error
+/// reaches it, a value that was refused is quoted in it, and a stored title or
+/// id can be named in it. None of that may carry anything that acts on the
+/// terminal, so every control and format character is replaced, a line feed
+/// excepted: an error is several lines when it has several (the usage that
+/// follows a command-line mistake), and a line feed cannot redraw what came
+/// before it.
+fn error_text(error: &anyhow::Error, chain: bool) -> String {
+    let text = if chain {
+        format!("{error:#}")
+    } else {
+        error.to_string()
+    };
+    terminal_text::sanitize_lines_for_terminal(&text).into_owned()
 }
 
 async fn dispatch(cli: Cli) -> Result<()> {
@@ -252,9 +296,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 commands::sync::reconcile(remote.as_deref()).await?
             }
         },
-        Commands::Conversations { remote, limit } => {
-            commands::conversations::run(remote.as_deref(), limit).await?
-        }
+        Commands::Conversations {
+            remote,
+            limit,
+            plain,
+        } => commands::conversations::run(remote.as_deref(), limit, plain).await?,
         Commands::Share {
             conversation_id,
             remote,
@@ -382,6 +428,165 @@ mod hook_cli_tests {
         ])
         .is_err());
         assert!(Cli::try_parse_from(["cvc", "harness", "install", "cursor"]).is_err());
+    }
+
+    #[test]
+    fn conversations_limit_is_optional_and_plain_is_a_flag() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Commands::Conversations {
+                remote,
+                limit,
+                plain,
+            } => (remote, limit, plain),
+            _ => panic!("not the conversations command: {args:?}"),
+        };
+        assert_eq!(parse(&["cvc", "conversations"]), (None, None, false));
+        assert_eq!(
+            parse(&["cvc", "conversations", "--limit", "5"]),
+            (None, Some(5), false)
+        );
+        assert_eq!(
+            parse(&[
+                "cvc",
+                "conversations",
+                "--plain",
+                "--remote",
+                "upstream",
+                "--limit",
+                "0"
+            ]),
+            (Some("upstream".to_owned()), Some(0), true)
+        );
+        assert!(Cli::try_parse_from(["cvc", "conversations", "--limit", "many"]).is_err());
+        assert!(Cli::try_parse_from(["cvc", "conversations", "--plain=maybe"]).is_err());
+    }
+
+    /// The help of the `conversations`, `share` and `unshare` commands, as the
+    /// person reading `--help` gets it.
+    fn rendered_help(command: &str) -> String {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        cli.find_subcommand_mut(command)
+            .unwrap_or_else(|| panic!("no {command} command"))
+            .render_long_help()
+            .to_string()
+    }
+
+    fn argument_help(command: &str, argument: &str) -> (String, Option<String>) {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        let argument = cli
+            .find_subcommand(command)
+            .and_then(|command| command.get_arguments().find(|a| a.get_id() == argument))
+            .unwrap_or_else(|| panic!("no --{argument} on {command}"))
+            .clone();
+        (
+            argument.get_help().expect("it has help").to_string(),
+            argument.get_long_help().map(|help| help.to_string()),
+        )
+    }
+
+    #[test]
+    fn the_conversations_help_explains_the_view_and_the_listing() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        let conversations = cli.find_subcommand("conversations").unwrap();
+        assert_eq!(
+            conversations.get_about().unwrap().to_string(),
+            "Browse conversations and their per-destination share state"
+        );
+        let long = rendered_help("conversations");
+        // What the view is, and that it adds no way to consent.
+        assert!(
+            long.contains("In a terminal this opens an interactive view"),
+            "{long}"
+        );
+        assert!(
+            long.contains("hand over to the usual typed-phrase prompts"),
+            "{long}"
+        );
+        assert!(long.contains("and does not answer them"), "{long}");
+        assert!(
+            long.contains("no key shares or publishes by itself"),
+            "{long}"
+        );
+        // And what a standing choice does without one.
+        assert!(
+            long.contains(
+                "Where auto-push is on, every git push to that remote publishes shared thoughts."
+            ),
+            "{long}"
+        );
+        // And when it does not open.
+        assert!(long.contains("not a terminal"), "{long}");
+        assert!(
+            long.contains("with --plain, it prints the plain listing instead"),
+            "{long}"
+        );
+
+        assert_eq!(
+            argument_help("conversations", "remote").0,
+            "Remote to show share state for (default: origin)"
+        );
+        assert_eq!(
+            argument_help("conversations", "limit").0,
+            "Show at most this many conversations (plain default: 20; the interactive view shows up to 10,000 unless set)"
+        );
+        // The help names the number the view really starts with.
+        assert_eq!(commands::sync::SUMMARY_SCAN_LIMIT, 10_000);
+        let (plain, long_plain) = argument_help("conversations", "plain");
+        assert_eq!(
+            plain,
+            "Print the plain listing instead of the interactive view"
+        );
+        let long_plain = long_plain.expect("--plain has a long help");
+        assert!(long_plain.contains("scripts"), "{long_plain}");
+        assert!(long_plain.contains("pseudo-terminal"), "{long_plain}");
+    }
+
+    #[test]
+    fn the_share_and_unshare_help_say_what_they_do_and_refuse() {
+        assert_eq!(
+            argument_help("share", "future").0,
+            "Also share thoughts added to this conversation later"
+        );
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        assert_eq!(
+            cli.find_subcommand("unshare")
+                .unwrap()
+                .get_about()
+                .unwrap()
+                .to_string(),
+            "Make a conversation's shared thoughts private again for a remote; refused once any of it has been published, or while a publish of it is unfinished"
+        );
+        // The help of a command that exists to stop sharing must not promise
+        // more than it does: it cannot recall what a remote already holds.
+        let unshare = rendered_help("unshare");
+        assert!(
+            unshare.contains("refused once any of it has been published"),
+            "{unshare}"
+        );
+    }
+
+    #[test]
+    fn a_printed_error_cannot_act_on_the_terminal_but_keeps_its_lines() {
+        let error = anyhow::anyhow!("remote said: \u{1b}[2J\u{1b}]0;pwned\u{7}\r\u{202e}gnp")
+            .context("push failed\nsecond line");
+        // ESC, BEL, the carriage return and the right-to-left override are each
+        // one `?`; the line feed between the two lines of the message stays.
+        assert_eq!(
+            error_text(&error, true),
+            "push failed\nsecond line: remote said: ?[2J?]0;pwned???gnp"
+        );
+        // Only the outermost message when the chain is not asked for.
+        assert_eq!(error_text(&error, false), "push failed\nsecond line");
+        // Text without such characters, several lines included, is unchanged.
+        let plain = anyhow::anyhow!("שלום – café ✓\nUsage: cvc <COMMAND>");
+        assert_eq!(
+            error_text(&plain, true),
+            "שלום – café ✓\nUsage: cvc <COMMAND>"
+        );
     }
 
     #[test]

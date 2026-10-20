@@ -1,0 +1,26 @@
+{
+  "interaction": {
+    "id": "94705671-dba9-8399-8430-839c3fb758d0",
+    "conversation_id": "2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d",
+    "parent_id": "8fc40ad6-0885-8c48-8d10-ddec124a3a0a",
+    "timestamp": "2026-10-18T09:00:17Z",
+    "author": "system",
+    "user_prompt": "[tool_result Read]      1\tfn main() {}",
+    "model_name": "claude-fixture-3",
+    "model_cot": null,
+    "model_response": "Summary of the lookups.\n\n[web_search_tool_result]",
+    "source_request_id": "req_B"
+  },
+  "context_items": [],
+  "tool_executions": [
+    {
+      "id": 19,
+      "interaction_id": "94705671-dba9-8399-8430-839c3fb758d0",
+      "tool_protocol": "server",
+      "tool_name": "server:web_search",
+      "arguments": "{\"query\":\"follow up\"}",
+      "status": "success"
+    }
+  ],
+  "artifact_links": []
+}

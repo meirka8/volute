@@ -40,6 +40,18 @@
 //! matching `tool_result`. That granularity is what lets hook-driven
 //! ingestion place reasoning into the database before a mid-session commit's
 //! post-commit hook runs.
+//!
+//! # Provider-side (server) tools
+//!
+//! A tool the model provider runs (web search, web fetch, code execution, ...)
+//! is a `server_tool_use` block, recorded as a `server:<name>` execution with
+//! `tool_protocol` `server`. No user-side `tool_result` ever follows such a
+//! call: the API delivers its result inside the same assistant message, as a
+//! block whose type ends in `_tool_result` and whose `tool_use_id` names the
+//! call. The status is read from that block (`server_result_status`); a call
+//! with no result block in its response is a failure, like any other
+//! interrupted call. Only a `[<block type>]` placeholder reaches the response
+//! text, never the result's content, which is third-party text.
 use crate::models::{Author, ContextItem, InteractionId, ToolExecution, ToolStatus};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -70,6 +82,12 @@ const MAX_TOOL_ARGUMENTS_TOTAL_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TITLE_BYTES: usize = 120;
 /// Claude Code records this title before a session has a real one.
 const PLACEHOLDER_TITLE: &str = "New session";
+/// A tool the model provider runs is recorded as `server:<name>`.
+const SERVER_TOOL_PREFIX: &str = "server:";
+/// `tool_protocol` of every provider-side tool execution. Unlike `native` with
+/// a `server:` name (0.7.0, which never read a result), it means the status was
+/// taken from the result block the API delivered inside the response.
+const TOOL_PROTOCOL_SERVER: &str = "server";
 
 #[derive(Debug, Error)]
 pub enum TranscriptError {
@@ -194,8 +212,22 @@ pub enum AssistantBlock {
     Thinking(String),
     ToolUse {
         id: String,
+        /// `server:<name>` for a provider-side call.
         name: String,
         input: Value,
+        /// A provider-side call (`server_tool_use`): its result is a block of
+        /// the same assistant message, never a user-side `tool_result`.
+        server: bool,
+    },
+    /// The result of a provider-side call, delivered inside the assistant
+    /// message as a block whose type ends in `_tool_result`. Only the outcome
+    /// and a placeholder naming the block type are kept, never the content,
+    /// which is third-party text.
+    ServerToolResult {
+        tool_use_id: String,
+        /// `[<block type>]`, the text this block adds to the response.
+        placeholder: String,
+        status: ToolStatus,
     },
     /// A block of a type this parser does not record: the type name only.
     Unrecorded(String),
@@ -581,8 +613,9 @@ fn parse_assistant_content(
                             .get("name")
                             .and_then(Value::as_str)
                             .ok_or_else(|| malformed(offset, "tool_use has no name"))?;
-                        let name = if block_type == "server_tool_use" {
-                            format!("server:{name}")
+                        let server = block_type == "server_tool_use";
+                        let name = if server {
+                            format!("{SERVER_TOOL_PREFIX}{name}")
                         } else {
                             name.to_owned()
                         };
@@ -590,14 +623,36 @@ fn parse_assistant_content(
                             id: id.to_owned(),
                             name,
                             input: block.get("input").cloned().unwrap_or(Value::Null),
+                            server,
                         });
                     }
-                    // Server-side tool results are delivered inside the
-                    // assistant message; record that they happened.
-                    "web_search_tool_result"
-                    | "web_fetch_tool_result"
-                    | "code_execution_tool_result" => {
-                        blocks.push(AssistantBlock::Text(format!("[{block_type}]")))
+                    // The result of a provider-side call is delivered inside the
+                    // assistant message, as a block of some `<kind>_tool_result`
+                    // type (web search, web fetch, every code execution flavour,
+                    // tool search, ...) naming its call. Matching by shape keeps
+                    // types added later from falling out of the outcome rule.
+                    result_type if result_type.ends_with("_tool_result") => {
+                        match block.get("tool_use_id").and_then(Value::as_str) {
+                            Some(tool_use_id) => blocks.push(AssistantBlock::ServerToolResult {
+                                tool_use_id: tool_use_id.to_owned(),
+                                placeholder: format!("[{result_type}]"),
+                                status: server_result_status(result_type, block),
+                            }),
+                            // Without a call to match, the outcome is unusable. The
+                            // types recognized before outcomes were read keep the
+                            // placeholder they always had; any other stays an
+                            // unrecorded block.
+                            None if matches!(
+                                result_type,
+                                "web_search_tool_result"
+                                    | "web_fetch_tool_result"
+                                    | "code_execution_tool_result"
+                            ) =>
+                            {
+                                blocks.push(AssistantBlock::Text(format!("[{result_type}]")))
+                            }
+                            None => blocks.push(AssistantBlock::Unrecorded(result_type.to_owned())),
+                        }
                     }
                     // Kept as a placeholder naming the type, never its content;
                     // the planner reports it. See the module docs.
@@ -613,6 +668,47 @@ fn parse_assistant_content(
         }
     }
     Ok(blocks)
+}
+
+/// The outcome a provider-side tool result reports.
+///
+/// Errors do not raise in the API: the block's `content` is then a single error
+/// object carrying an `error_code` (its `type` is `<kind>_error`), where a
+/// success holds the result itself (a list of hits for web search). A code
+/// execution that ran but exited non-zero is a failure too, as Claude Code marks
+/// a local Bash call that exits non-zero, and so is a block that flags itself
+/// `is_error`. Only this structure is read, never the result's text.
+fn server_result_status(block_type: &str, block: &Value) -> ToolStatus {
+    if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+        return ToolStatus::Failure;
+    }
+    let Some(content) = block.get("content").and_then(Value::as_object) else {
+        return ToolStatus::Success;
+    };
+    let reports_error = content.contains_key("error_code")
+        || content
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.ends_with("_error"));
+    let exited_non_zero = matches!(
+        block_type,
+        "bash_code_execution_tool_result" | "code_execution_tool_result"
+    ) && content.get("return_code").is_some_and(is_non_zero_integer);
+    if reports_error || exited_non_zero {
+        ToolStatus::Failure
+    } else {
+        ToolStatus::Success
+    }
+}
+
+/// Only an integer other than zero counts; anything else (a string, a float, a
+/// missing code) says nothing about the exit.
+fn is_non_zero_integer(value: &Value) -> bool {
+    value
+        .as_i64()
+        .map(|code| code != 0)
+        .or_else(|| value.as_u64().map(|code| code != 0))
+        .unwrap_or(false)
 }
 
 /// Deterministic interaction identity for one response of one session, so
@@ -689,6 +785,15 @@ pub struct Plan {
 struct Group {
     key: String,
     positions: Vec<usize>,
+}
+
+/// One tool call a response made.
+struct ToolCall<'a> {
+    id: &'a str,
+    name: &'a str,
+    input: &'a Value,
+    /// Provider-side: answered by a result block inside the response itself.
+    server: bool,
 }
 
 enum Stimulus<'a> {
@@ -773,22 +878,58 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
     for group in &groups {
         let first = group.positions[0];
         let last = *group.positions.last().expect("group has entries");
-        let tool_uses: Vec<(&str, &str, &Value)> = group
-            .positions
-            .iter()
-            .flat_map(|position| match &entries[*position].payload {
-                Payload::Assistant(message) => message.blocks.as_slice(),
-                _ => &[],
-            })
+        let group_blocks = || {
+            group
+                .positions
+                .iter()
+                .flat_map(|position| match &entries[*position].payload {
+                    Payload::Assistant(message) => message.blocks.as_slice(),
+                    _ => &[],
+                })
+        };
+        let tool_uses: Vec<ToolCall<'_>> = group_blocks()
             .filter_map(|block| match block {
-                AssistantBlock::ToolUse { id, name, input } => {
-                    Some((id.as_str(), name.as_str(), input))
-                }
+                AssistantBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    server,
+                } => Some(ToolCall {
+                    id: id.as_str(),
+                    name: name.as_str(),
+                    input,
+                    server: *server,
+                }),
                 _ => None,
             })
             .collect();
+        // A provider-side call is answered by a block of its own response, so
+        // its outcome is looked up in this group only; the first block naming
+        // a call wins, as with user-side results.
+        let mut server_outcomes: HashMap<&str, &ToolStatus> = HashMap::new();
+        for block in group_blocks() {
+            if let AssistantBlock::ServerToolResult {
+                tool_use_id,
+                status,
+                ..
+            } = block
+            {
+                server_outcomes
+                    .entry(tool_use_id.as_str())
+                    .or_insert(status);
+            }
+        }
         let has_successor = last + 1 < entries.len();
-        let results_complete = tool_uses.iter().all(|(id, _, _)| results.contains_key(id));
+        // A provider-side call counts as answered once its result block is
+        // there; without one the response stays open until the conversation
+        // moves on, instead of recording a failure for a result still to come.
+        let results_complete = tool_uses.iter().all(|call| {
+            if call.server {
+                server_outcomes.contains_key(call.id)
+            } else {
+                results.contains_key(call.id)
+            }
+        });
         let moved_on = entries[last + 1..]
             .iter()
             .any(|entry| match &entry.payload {
@@ -860,13 +1001,7 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
         let parent_id =
             parent_group.map(|index| derived_interaction_id(input.session_id, &groups[index].key));
 
-        let placeholders: Vec<String> = group
-            .positions
-            .iter()
-            .flat_map(|position| match &entries[*position].payload {
-                Payload::Assistant(message) => message.blocks.as_slice(),
-                _ => &[],
-            })
+        let placeholders: Vec<String> = group_blocks()
             .filter_map(|block| match block {
                 AssistantBlock::Unrecorded(kind) => Some(format!("[{kind}]")),
                 _ => None,
@@ -886,6 +1021,9 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
                         AssistantBlock::Text(text) => texts.push(text.as_str()),
                         AssistantBlock::Thinking(text) => thoughts.push(text.as_str()),
                         AssistantBlock::ToolUse { .. } => {}
+                        AssistantBlock::ServerToolResult { placeholder, .. } => {
+                            texts.push(placeholder.as_str())
+                        }
                         AssistantBlock::Unrecorded(kind) => {
                             unrecorded_blocks.push(kind.clone());
                             if let Some(placeholder) = next_placeholder.next() {
@@ -903,16 +1041,26 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
         let mut tool_executions = Vec::with_capacity(tool_uses.len());
         let mut context_items: Vec<ContextItem> = Vec::new();
         let mut commit_candidates: Vec<String> = Vec::new();
-        for (tool_id, name, tool_input) in &tool_uses {
-            let status = match results.get(tool_id) {
-                Some(result) if !result.is_error => ToolStatus::Success,
-                // Errors and results that never arrived (interrupted or the
-                // session ended) are both failures from the model's view.
-                _ => ToolStatus::Failure,
+        for call in &tool_uses {
+            let status = if call.server {
+                // The result block of this response says how it went; none
+                // means the call never finished (interrupted, or the session
+                // ended), as for a user-side call without a result.
+                server_outcomes
+                    .get(call.id)
+                    .map_or(ToolStatus::Failure, |outcome| (*outcome).clone())
+            } else {
+                match results.get(call.id) {
+                    Some(result) if !result.is_error => ToolStatus::Success,
+                    // Errors and results that never arrived (interrupted or the
+                    // session ended) are both failures from the model's view.
+                    _ => ToolStatus::Failure,
+                }
             };
-            if status == ToolStatus::Success {
-                if let Some(result) = results.get(tool_id) {
-                    for candidate in commit_candidates_from_tool(name, tool_input, &result.content)
+            if status == ToolStatus::Success && !call.server {
+                if let Some(result) = results.get(call.id) {
+                    for candidate in
+                        commit_candidates_from_tool(call.name, call.input, &result.content)
                     {
                         if !commit_candidates.contains(&candidate) {
                             commit_candidates.push(candidate);
@@ -923,16 +1071,18 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
             tool_executions.push(ToolExecution {
                 id: None,
                 interaction_id: id.clone(),
-                tool_protocol: if name.starts_with("mcp__") {
+                tool_protocol: if call.server {
+                    TOOL_PROTOCOL_SERVER.to_owned()
+                } else if call.name.starts_with("mcp__") {
                     "mcp".to_owned()
                 } else {
                     "native".to_owned()
                 },
-                tool_name: (*name).to_owned(),
-                arguments: bounded_arguments(tool_input, &mut budget),
+                tool_name: call.name.to_owned(),
+                arguments: bounded_arguments(call.input, &mut budget),
                 status,
             });
-            if let Some(item) = context_item_for(name, tool_input, input, &id) {
+            if let Some(item) = context_item_for(call.name, call.input, input, &id) {
                 let duplicate = context_items.iter().any(|existing| {
                     existing.file_path == item.file_path
                         && existing.start_line == item.start_line
@@ -1384,5 +1534,491 @@ mod tests {
         assert_eq!(worktree_relative("src/lib.rs", root, &aliases), None);
         assert_eq!(worktree_relative("/work/repo", root, &aliases), None);
         assert_eq!(worktree_relative("/work/repo/../x", root, &aliases), None);
+    }
+
+    // ---- provider-side (server) tool calls (public issue 134) ------------------
+
+    const SERVER_SESSION: &str = "server-tools";
+
+    fn entry_line(
+        kind: &str,
+        uuid: &str,
+        parent: Option<&str>,
+        request: Option<&str>,
+        message: serde_json::Value,
+    ) -> String {
+        let mut entry = serde_json::json!({
+            "parentUuid": parent,
+            "isSidechain": false,
+            "type": kind,
+            "uuid": uuid,
+            "timestamp": "2026-10-18T09:00:00.000Z",
+            "sessionId": SERVER_SESSION,
+            "version": "2.1.300",
+            "cwd": "/work/repo",
+            "message": message,
+        });
+        if let Some(request) = request {
+            entry["requestId"] = serde_json::json!(request);
+        }
+        entry.to_string()
+    }
+
+    fn user_line(uuid: &str, parent: Option<&str>, content: serde_json::Value) -> String {
+        let message = serde_json::json!({"role": "user", "content": content});
+        entry_line("user", uuid, parent, None, message)
+    }
+
+    fn assistant_line(
+        uuid: &str,
+        parent: &str,
+        request: &str,
+        blocks: serde_json::Value,
+    ) -> String {
+        let message = serde_json::json!({
+            "model": "claude-fixture-3", "id": "msg_x", "type": "message",
+            "role": "assistant", "content": blocks
+        });
+        entry_line("assistant", uuid, Some(parent), Some(request), message)
+    }
+
+    /// A chained entry that is not a message, such as Claude Code's attachments.
+    fn attachment_line(uuid: &str, parent: &str) -> String {
+        serde_json::json!({
+            "parentUuid": parent, "isSidechain": false, "type": "attachment",
+            "attachment": {"type": "environment"}, "uuid": uuid,
+            "timestamp": "2026-10-18T09:00:00.000Z", "sessionId": SERVER_SESSION,
+            "version": "2.1.300", "cwd": "/work/repo"
+        })
+        .to_string()
+    }
+
+    fn plan_lines(lines: &[String], final_mode: bool) -> Plan {
+        let text = lines.join("\n") + "\n";
+        let window = parse_window(text.as_bytes(), 0, SERVER_SESSION, false).unwrap();
+        plan(
+            &window.lines,
+            0,
+            &PlanInput {
+                session_id: SERVER_SESSION,
+                worktree_root: Path::new("/work/repo"),
+                path_aliases: &[],
+                final_mode,
+            },
+        )
+    }
+
+    /// The single response whose content is `blocks`, after a plain prompt.
+    fn respond(blocks: serde_json::Value) -> PlannedInteraction {
+        let lines = [
+            user_line("u1", None, serde_json::json!("go")),
+            assistant_line("s1", "u1", "req_A", blocks),
+        ];
+        let mut planned = plan_lines(&lines, true);
+        assert_eq!(planned.interactions.len(), 1);
+        planned.interactions.remove(0)
+    }
+
+    /// Status recorded for one provider-side call answered by a `kind` block
+    /// with `content`, after checking what else the capture holds.
+    fn server_outcome(kind: &str, content: serde_json::Value) -> ToolStatus {
+        let planned = respond(serde_json::json!([
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "probe", "input": {}},
+            {"type": kind, "tool_use_id": "srvtoolu_1", "content": content}
+        ]));
+        assert_eq!(planned.tool_executions.len(), 1);
+        assert_eq!(planned.tool_executions[0].tool_name, "server:probe");
+        assert_eq!(planned.tool_executions[0].tool_protocol, "server");
+        assert_eq!(
+            planned.model_response.as_deref(),
+            Some(format!("[{kind}]").as_str())
+        );
+        assert!(planned.unrecorded_blocks.is_empty(), "{planned:?}");
+        planned.tool_executions[0].status.clone()
+    }
+
+    #[test]
+    fn a_successful_server_call_is_recorded_as_a_server_success() {
+        let planned = respond(serde_json::json!([
+            {"type": "text", "text": "Searching."},
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+             "input": {"query": "fixture query"}},
+            {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [
+                {"type": "web_search_result", "url": "https://example.invalid/a",
+                 "title": "THIRD-PARTY-TITLE", "encrypted_content": "THIRD-PARTY-OPAQUE",
+                 "page_age": null}
+            ]},
+            {"type": "text", "text": "Found it."}
+        ]));
+        assert_eq!(planned.tool_executions.len(), 1);
+        let call = &planned.tool_executions[0];
+        assert_eq!(call.tool_name, "server:web_search");
+        assert_eq!(call.tool_protocol, "server");
+        assert_eq!(call.status, ToolStatus::Success);
+        assert_eq!(call.arguments, r#"{"query":"fixture query"}"#);
+        // The block adds its placeholder in order, and nothing of what the
+        // provider fetched for the model.
+        assert_eq!(
+            planned.model_response.as_deref(),
+            Some("Searching.\n\n[web_search_tool_result]\n\nFound it.")
+        );
+        assert!(planned.unrecorded_blocks.is_empty());
+        let captured = format!("{planned:?}");
+        assert!(!captured.contains("THIRD-PARTY"), "{captured}");
+        assert!(!captured.contains("example.invalid/a"), "{captured}");
+    }
+
+    #[test]
+    fn an_errored_server_call_is_recorded_as_a_failure() {
+        // The API reports errors as a single error object in `content`, not as
+        // a raised error: `error_code`, typed `<kind>_error`.
+        for (kind, content) in [
+            (
+                "web_search_tool_result",
+                serde_json::json!({"type": "web_search_tool_result_error",
+                                   "error_code": "max_uses_exceeded"}),
+            ),
+            (
+                "web_fetch_tool_result",
+                serde_json::json!({"type": "web_fetch_tool_error",
+                                   "error_code": "url_not_accessible"}),
+            ),
+            (
+                "tool_search_tool_result",
+                serde_json::json!({"type": "tool_search_tool_result_error",
+                                   "error_code": "invalid_pattern"}),
+            ),
+            // Either marker alone is enough.
+            (
+                "web_search_tool_result",
+                serde_json::json!({"error_code": "unavailable"}),
+            ),
+            (
+                "web_search_tool_result",
+                serde_json::json!({"type": "web_search_tool_result_error"}),
+            ),
+        ] {
+            assert_eq!(
+                server_outcome(kind, content.clone()),
+                ToolStatus::Failure,
+                "{content}"
+            );
+        }
+        // A list of hits (even an empty one) and a fetched page are successes.
+        assert_eq!(
+            server_outcome("web_search_tool_result", serde_json::json!([])),
+            ToolStatus::Success
+        );
+        assert_eq!(
+            server_outcome(
+                "web_fetch_tool_result",
+                serde_json::json!({"type": "web_fetch_result", "url": "https://example.invalid/p",
+                                   "content": {"type": "document"}})
+            ),
+            ToolStatus::Success
+        );
+    }
+
+    #[test]
+    fn code_execution_status_follows_the_exit_code() {
+        let ran = |kind: &str, code: serde_json::Value| {
+            server_outcome(
+                kind,
+                serde_json::json!({"type": "bash_code_execution_result", "stdout": "",
+                                   "stderr": "", "return_code": code, "content": []}),
+            )
+        };
+        let bash = "bash_code_execution_tool_result";
+        let python = "code_execution_tool_result";
+        assert_eq!(ran(bash, serde_json::json!(0)), ToolStatus::Success);
+        assert_eq!(ran(bash, serde_json::json!(2)), ToolStatus::Failure);
+        assert_eq!(ran(bash, serde_json::json!(-9)), ToolStatus::Failure);
+        assert_eq!(ran(python, serde_json::json!(0)), ToolStatus::Success);
+        assert_eq!(ran(python, serde_json::json!(1)), ToolStatus::Failure);
+        // Only an integer says how the command exited.
+        assert_eq!(ran(bash, serde_json::Value::Null), ToolStatus::Success);
+        assert_eq!(ran(bash, serde_json::json!("2")), ToolStatus::Success);
+        assert_eq!(ran(bash, serde_json::json!(2.5)), ToolStatus::Success);
+        // An execution that could not run is an error object, not an exit code.
+        assert_eq!(
+            server_outcome(
+                bash,
+                serde_json::json!({"type": "bash_code_execution_tool_result_error",
+                                   "error_code": "execution_time_exceeded"})
+            ),
+            ToolStatus::Failure
+        );
+
+        // The output of a command never becomes a commit candidate.
+        let planned = respond(serde_json::json!([
+            {"type": "server_tool_use", "id": "srvtoolu_2", "name": "bash_code_execution",
+             "input": {"command": "git commit -m x"}},
+            {"type": bash, "tool_use_id": "srvtoolu_2", "content": {
+                "type": "bash_code_execution_result", "stdout": "[main 1a2b3c4] x",
+                "stderr": "", "return_code": 0, "content": []}}
+        ]));
+        assert_eq!(planned.tool_executions[0].status, ToolStatus::Success);
+        assert!(planned.commit_candidates.is_empty());
+        assert!(!format!("{planned:?}").contains("1a2b3c4"));
+    }
+
+    #[test]
+    fn text_editor_results_succeed_unless_they_report_an_error() {
+        let kind = "text_editor_code_execution_tool_result";
+        for content in [
+            serde_json::json!({"type": "text_editor_code_execution_view_result",
+                               "content": "line", "file_type": "text", "num_lines": 1,
+                               "start_line": 1, "total_lines": 1}),
+            serde_json::json!({"type": "text_editor_code_execution_create_result",
+                               "is_file_update": false}),
+            serde_json::json!({"type": "text_editor_code_execution_str_replace_result",
+                               "lines": ["x"], "new_lines": 1, "new_start": 1,
+                               "old_lines": 1, "old_start": 1}),
+        ] {
+            assert_eq!(
+                server_outcome(kind, content.clone()),
+                ToolStatus::Success,
+                "{content}"
+            );
+        }
+        assert_eq!(
+            server_outcome(
+                kind,
+                serde_json::json!({"type": "text_editor_code_execution_tool_result_error",
+                                   "error_code": "file_not_found"})
+            ),
+            ToolStatus::Failure
+        );
+    }
+
+    #[test]
+    fn a_block_flagging_itself_as_an_error_is_a_failure() {
+        // The MCP connector's result blocks carry `is_error` beside `content`.
+        let planned = respond(serde_json::json!([
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "probe", "input": {}},
+            {"type": "future_tool_result", "tool_use_id": "srvtoolu_1", "is_error": true,
+             "content": [{"type": "text", "text": "boom"}]}
+        ]));
+        assert_eq!(planned.tool_executions[0].status, ToolStatus::Failure);
+        assert!(!format!("{planned:?}").contains("boom"));
+    }
+
+    #[test]
+    fn a_server_call_without_a_result_block_is_a_failure() {
+        let planned = respond(serde_json::json!([
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+             "input": {"query": "never answered"}},
+            // A result for some other call does not answer this one.
+            {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_other", "content": []},
+            {"type": "text", "text": "Done."}
+        ]));
+        assert_eq!(planned.tool_executions.len(), 1);
+        assert_eq!(planned.tool_executions[0].tool_protocol, "server");
+        assert_eq!(planned.tool_executions[0].status, ToolStatus::Failure);
+        assert_eq!(
+            planned.model_response.as_deref(),
+            Some("[web_search_tool_result]\n\nDone.")
+        );
+    }
+
+    #[test]
+    fn a_server_result_answers_only_calls_of_its_own_response() {
+        let lines = [
+            user_line("u1", None, serde_json::json!("go")),
+            assistant_line(
+                "s1",
+                "u1",
+                "req_A",
+                serde_json::json!([{"type": "server_tool_use", "id": "srvtoolu_x",
+                                    "name": "web_search", "input": {"query": "a"}}]),
+            ),
+            assistant_line(
+                "s2",
+                "s1",
+                "req_B",
+                serde_json::json!([
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_x", "content": []},
+                    {"type": "server_tool_use", "id": "srvtoolu_y", "name": "web_search",
+                     "input": {"query": "b"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_y", "content": []}
+                ]),
+            ),
+        ];
+        let planned = plan_lines(&lines, true).interactions;
+        assert_eq!(planned.len(), 2);
+        assert_eq!(planned[0].tool_executions[0].status, ToolStatus::Failure);
+        assert_eq!(planned[1].tool_executions.len(), 1);
+        assert_eq!(planned[1].tool_executions[0].status, ToolStatus::Success);
+    }
+
+    #[test]
+    fn client_tools_beside_server_calls_keep_their_own_rules() {
+        let lines = [
+            user_line("u1", None, serde_json::json!("go")),
+            assistant_line(
+                "s1",
+                "u1",
+                "req_A",
+                serde_json::json!([
+                    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+                     "input": {"query": "q"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                    {"type": "tool_use", "id": "toolu_bash", "name": "Bash",
+                     "input": {"command": "false"}},
+                    {"type": "tool_use", "id": "toolu_mcp", "name": "mcp__srv__do", "input": {}},
+                    {"type": "tool_use", "id": "toolu_read", "name": "Read",
+                     "input": {"file_path": "/work/repo/src/lib.rs"}}
+                ]),
+            ),
+            user_line(
+                "u2",
+                Some("s1"),
+                serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "toolu_bash", "content": "1",
+                     "is_error": true},
+                    {"type": "tool_result", "tool_use_id": "toolu_mcp", "content": "ok",
+                     "is_error": false},
+                    // A user-side result cannot overrule the provider's own.
+                    {"type": "tool_result", "tool_use_id": "srvtoolu_1", "content": "no",
+                     "is_error": true}
+                ]),
+            ),
+        ];
+        let planned = plan_lines(&lines, true).interactions;
+        assert_eq!(planned.len(), 1);
+        let summary: Vec<_> = planned[0]
+            .tool_executions
+            .iter()
+            .map(|call| {
+                (
+                    call.tool_name.as_str(),
+                    call.tool_protocol.as_str(),
+                    call.status.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("server:web_search", "server", ToolStatus::Success),
+                ("Bash", "native", ToolStatus::Failure),
+                ("mcp__srv__do", "mcp", ToolStatus::Success),
+                // No result at all: interrupted.
+                ("Read", "native", ToolStatus::Failure),
+            ]
+        );
+        // Only the client Read became file context.
+        assert_eq!(planned[0].context_items.len(), 1);
+        assert_eq!(planned[0].context_items[0].file_path, "src/lib.rs");
+    }
+
+    #[test]
+    fn result_blocks_are_recognized_by_their_shape() {
+        let blocks = parse_assistant_content(
+            &serde_json::json!([
+                {"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1",
+                 "content": {"type": "tool_search_tool_search_result", "tool_references": []}},
+                {"type": "future_tool_result", "tool_use_id": "srvtoolu_2", "content": []},
+                // Without a string id there is no call to answer: the three
+                // types known before keep their placeholder, others are
+                // unrecorded, and so is a bare `tool_result`.
+                {"type": "web_fetch_tool_result", "content": []},
+                {"type": "web_search_tool_result", "tool_use_id": 7, "content": []},
+                {"type": "other_tool_result", "content": []},
+                {"type": "tool_result", "tool_use_id": "srvtoolu_3", "content": []}
+            ]),
+            0,
+        )
+        .unwrap();
+        assert!(matches!(
+            &blocks[0],
+            AssistantBlock::ServerToolResult { tool_use_id, placeholder, status }
+                if tool_use_id == "srvtoolu_1"
+                    && placeholder == "[tool_search_tool_result]"
+                    && *status == ToolStatus::Success
+        ));
+        assert!(matches!(
+            &blocks[1],
+            AssistantBlock::ServerToolResult { tool_use_id, placeholder, .. }
+                if tool_use_id == "srvtoolu_2" && placeholder == "[future_tool_result]"
+        ));
+        assert!(
+            matches!(&blocks[2], AssistantBlock::Text(text) if text == "[web_fetch_tool_result]")
+        );
+        assert!(
+            matches!(&blocks[3], AssistantBlock::Text(text) if text == "[web_search_tool_result]")
+        );
+        assert!(
+            matches!(&blocks[4], AssistantBlock::Unrecorded(kind) if kind == "other_tool_result")
+        );
+        assert!(matches!(&blocks[5], AssistantBlock::Unrecorded(kind) if kind == "tool_result"));
+
+        // Recognized results are not "unrecorded"; the others still are.
+        let planned = respond(serde_json::json!([
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "tool_search", "input": {}},
+            {"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+            {"type": "future_tool_result", "content": []}
+        ]));
+        assert_eq!(
+            planned.unrecorded_blocks,
+            vec!["future_tool_result".to_owned()]
+        );
+        assert_eq!(
+            planned.model_response.as_deref(),
+            Some("[tool_search_tool_result]\n\n[future_tool_result]")
+        );
+    }
+
+    #[test]
+    fn an_unanswered_server_call_does_not_close_its_response_early() {
+        let prompt = user_line("u1", None, serde_json::json!("go"));
+        let call = assistant_line(
+            "s1",
+            "u1",
+            "req_A",
+            serde_json::json!([{"type": "server_tool_use", "id": "srvtoolu_1",
+                                "name": "web_search", "input": {"query": "q"}}]),
+        );
+        let result = assistant_line(
+            "s2",
+            "s1",
+            "req_A",
+            serde_json::json!([{"type": "web_search_tool_result",
+                                "tool_use_id": "srvtoolu_1", "content": []}]),
+        );
+        let thanks = user_line("u2", Some("s2"), serde_json::json!("thanks"));
+
+        // Something follows the call, but its result may still be on the way:
+        // recording a failure now would be permanent.
+        let waiting = plan_lines(
+            &[prompt.clone(), call.clone(), attachment_line("a1", "s1")],
+            false,
+        );
+        assert!(waiting.interactions.is_empty());
+        assert_eq!(waiting.pending_responses, 1);
+
+        // The conversation moving on closes it, with the outcome it reported...
+        let answered = plan_lines(&[prompt.clone(), call.clone(), result, thanks], false);
+        assert_eq!(answered.pending_responses, 0);
+        assert_eq!(answered.interactions.len(), 1);
+        assert_eq!(
+            answered.interactions[0].tool_executions[0].status,
+            ToolStatus::Success
+        );
+
+        // ...or, with no result ever, as a failure.
+        let abandoned = plan_lines(
+            &[
+                prompt,
+                call,
+                user_line("u2", Some("s1"), serde_json::json!("thanks")),
+            ],
+            false,
+        );
+        assert_eq!(abandoned.pending_responses, 0);
+        assert_eq!(
+            abandoned.interactions[0].tool_executions[0].status,
+            ToolStatus::Failure
+        );
     }
 }

@@ -122,9 +122,7 @@ This is the heart of CVC Reviewer. It visualizes the `refs/cvc/main` data linked
 
 - **Node Representation:**
     
-    - _User Node:_ Avatar + Prompt Text (Truncated).
-        
-    - _Model Node:_ Icon + Response Summary.
+    - _Layout:_ Each interaction is one card: Thought / Action / Observation for MCP, VS Code and `cvc run` records, or an "AI step" (stimulus → reasoning → response → tool calls) for harness-shaped records.
         
     - _Optional Data:_ Reasoning is shown only when the source supplied, exposed, and stored it; hidden model reasoning is not assumed.
         

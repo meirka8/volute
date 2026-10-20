@@ -279,7 +279,23 @@ pub struct CleanupReport {
 
 /// Read-only per-conversation activity summary for local display. The share
 /// and publication fields are scoped to one destination fingerprint and are
-/// informational only; they grant nothing.
+/// informational only; they grant nothing. Without a destination they are
+/// uniformly absent.
+///
+/// Share state is derived from the conversation's interactions, never from the
+/// conversation-level policy row, so it cannot outlive an unshare. "Shared for
+/// the destination" means the same as it does to
+/// [`CvcStore::projection_interaction_ids`]: an interaction share for that
+/// fingerprint or for the `'*'` wildcard.
+///
+/// What the destination holds is a separate question from what this clone
+/// shares with it, and a reader must not answer the second for the first:
+/// "private" means no interaction is shared *and* the destination is not known
+/// or suspected to hold any ([`held`](Self::held)). A conversation can be held
+/// without being shared from here after an index rebuild or a re-ingest (Claude
+/// Code interaction ids are deterministic, so the next fetch finds the
+/// destination already holding them), and a pull records what it imports the
+/// same way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationSummary {
     pub id: String,
@@ -288,8 +304,136 @@ pub struct ConversationSummary {
     pub linked: i64,
     pub first_activity: i64,
     pub last_activity: i64,
+    /// Some interaction of the conversation is shared for the destination,
+    /// that is `shared_count > 0`.
     pub shared: bool,
+    /// How many of the conversation's interactions are currently shared for
+    /// the destination.
+    pub shared_count: i64,
+    /// How many of the shared interactions the destination is known to hold
+    /// (publication state `published`). It counts shared interactions only:
+    /// an imported interaction that a pull recorded as published at its source
+    /// is not counted until it is itself shared.
     pub published: i64,
+    /// How many of the shared interactions have an uncertain publication: a
+    /// push that began without concluding (`pending`) or failed ambiguously
+    /// (`unknown`). `cvc push --manual` and `cvc privacy reconcile` settle
+    /// them after a fresh fetch.
+    pub unconfirmed: i64,
+    /// What the destination holds for this conversation's future turns:
+    /// `Some(true)` shares them as they are captured, `Some(false)` keeps them
+    /// private (a share without `--future`, or an unshare), `None` when no
+    /// share decision was ever recorded for the destination.
+    pub share_future: Option<bool>,
+    /// The conversation has at least one interaction and every one of them was
+    /// imported from a remote (`capture_source = 'sync_import'`). A
+    /// conversation with a single locally captured interaction is not imported,
+    /// and neither is one with no interactions at all.
+    pub imported: bool,
+    /// How many of the conversation's interactions the destination holds or may
+    /// hold: their publication state for it is `published`, `pending` or
+    /// `unknown`, whether or not they are shared from here. Unlike
+    /// [`published`](Self::published) and [`unconfirmed`](Self::unconfirmed) it
+    /// does not stop at the shared ones, so it is what tells a conversation the
+    /// destination holds from one it has never seen.
+    pub held: i64,
+    /// Of the held interactions, how many the destination is known to hold
+    /// (state `published`), shared from here or not. Zero means that nothing is
+    /// held for certain: every held interaction is still unconfirmed.
+    pub held_published: i64,
+}
+
+/// Longest list of context paths [`CvcStore::conversation_details`] returns.
+pub const CONVERSATION_DETAIL_PATH_LIMIT: usize = 10;
+
+/// One context file path and how many of a conversation's interactions
+/// reference it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextPathUse {
+    /// The path exactly as stored. Locally captured paths are relative to the
+    /// capturing worktree; paths of an imported conversation are whatever the
+    /// remote's projection carried (secret-scrubbed, not otherwise validated),
+    /// so treat them as untrusted text.
+    pub path: String,
+    /// Distinct interactions of the conversation that reference the path.
+    pub interactions: i64,
+}
+
+/// Read-only detail view of one conversation for one destination, taken from a
+/// single consistent snapshot of the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationDetails {
+    /// The row [`CvcStore::list_conversation_summaries`] shows for the same
+    /// conversation and destination: id, title, activity range, thoughts,
+    /// linked, and the share, publication and import state.
+    pub summary: ConversationSummary,
+    /// The most used context paths, by number of interactions that reference
+    /// them (most first), then by path (byte order). At most
+    /// [`CONVERSATION_DETAIL_PATH_LIMIT`]. Empty and `NULL` paths are not
+    /// counted.
+    pub context_paths: Vec<ContextPathUse>,
+    /// How many distinct context paths the conversation has in total, so a view
+    /// can say "and N more".
+    pub context_path_total: usize,
+    /// How many interactions a share would cover now: exactly
+    /// `share_snapshot(id).len()`, the count the `I SHARE` challenge carries.
+    pub snapshot_count: usize,
+    /// Of those, how many are already shared for the destination.
+    pub snapshot_shared: usize,
+    /// Of those, how many a share would newly mark shared
+    /// (`snapshot_count - snapshot_shared`).
+    pub snapshot_new: usize,
+}
+
+/// How much of what is shared with one destination has reached it. It is local
+/// state: nothing was fetched, so it can lag the destination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DestinationPublicationCounts {
+    /// Interactions currently shared for the destination: an interaction share
+    /// for its fingerprint or for the `'*'` wildcard, each counted once. This is
+    /// the set `projection_interaction_ids` starts from, before it drops those
+    /// whose publication state is `unknown`. Interactions not shared are not
+    /// counted, whatever their publication state (a pull records what it
+    /// imports as published without sharing it).
+    pub shared: i64,
+    /// Of the shared ones, those whose publication state for the destination is
+    /// `published`.
+    pub published: i64,
+    /// Of the shared ones, those whose publication state is `pending` (a push
+    /// began and did not conclude) or `unknown` (a push failed ambiguously).
+    /// They are not published, but a push may still deliver them: it first
+    /// reconciles them against a fresh fetch.
+    pub unconfirmed: i64,
+}
+
+impl DestinationPublicationCounts {
+    /// Shared interactions the destination is not known to hold: never
+    /// attempted, `pending` or `unknown` (`shared - published`).
+    pub fn unpublished(&self) -> i64 {
+        self.shared - self.published
+    }
+}
+
+/// What stands in the way of unsharing one conversation for one destination.
+/// Each field counts the conversation's interactions with that publication
+/// state for the destination, whether or not they are still shared. Any of them
+/// non-zero makes [`CvcStore::unshare_conversation_for_remote`] refuse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnshareCheck {
+    pub published: i64,
+    pub pending: i64,
+    pub unknown: i64,
+}
+
+impl UnshareCheck {
+    pub fn blocked(&self) -> i64 {
+        self.published + self.pending + self.unknown
+    }
+
+    /// Whether unsharing would go ahead.
+    pub fn is_allowed(&self) -> bool {
+        self.blocked() == 0
+    }
 }
 
 /// Where an agent-harness transcript ingest resumes for one session. Purely a
@@ -315,6 +459,67 @@ pub struct HarnessBatchOutcome {
     /// Captures skipped because their id is locally tombstoned or was recorded
     /// concurrently.
     pub suppressed: usize,
+}
+
+/// "Shared for the destination `?1`": an interaction share for that
+/// fingerprint or for the `'*'` wildcard. This is the sharing test
+/// `projection_interaction_ids` applies, without its publication-state filter.
+/// No destination (`NULL`) shares nothing, wildcard included.
+const SHARED_FOR_DESTINATION: &str = "(?1 IS NOT NULL AND EXISTS (SELECT 1 FROM interaction_shares s WHERE s.interaction_id = i.id AND s.remote_fingerprint IN (?1, '*')))";
+
+/// The summary query up to its `tail` (`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`).
+/// `?1` is the destination fingerprint, or `NULL` for none. Every reader of
+/// summaries goes through this one statement, so no two of them can disagree
+/// about what "shared" or "published" means.
+fn conversation_summary_sql(tail: &str) -> String {
+    format!(
+        "SELECT c.id, c.title,
+                COUNT(i.id),
+                COALESCE(SUM(EXISTS(SELECT 1 FROM artifact_links a WHERE a.interaction_id = i.id)), 0),
+                COALESCE(MIN(i.timestamp), c.created_at),
+                COALESCE(MAX(i.timestamp), c.created_at),
+                COALESCE(SUM({SHARED_FOR_DESTINATION}), 0),
+                COALESCE(SUM({SHARED_FOR_DESTINATION} AND EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state = 'published')), 0),
+                COALESCE(SUM({SHARED_FOR_DESTINATION} AND EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state IN ('pending', 'unknown'))), 0),
+                (SELECT s.share_future FROM conversation_shares s WHERE s.conversation_id = c.id AND s.remote_fingerprint = ?1),
+                (COUNT(i.id) > 0 AND COUNT(i.id) = COALESCE(SUM(i.capture_source = 'sync_import'), 0)),
+                COALESCE(SUM(EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state IN ('published', 'pending', 'unknown'))), 0),
+                COALESCE(SUM(EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state = 'published')), 0)
+         FROM conversations c
+         LEFT JOIN interactions i ON i.conversation_id = c.id
+         {tail}"
+    )
+}
+
+/// The interactions a share of one conversation (`?1`) covers, in the order the
+/// `I SHARE` token hashes them. `share_snapshot` returns exactly these ids and
+/// `conversation_details` counts exactly these rows, so the number shown before
+/// a share is the number in its challenge.
+const SHARE_SNAPSHOT_SQL: &str = "SELECT id FROM interactions WHERE conversation_id=?1 ORDER BY id";
+
+/// The context paths of one conversation (`?1`), shared by the listing of the
+/// most used paths and the count of all of them.
+const CONVERSATION_CONTEXT_PATHS: &str = "FROM context_items x JOIN interactions i ON i.id = x.interaction_id WHERE i.conversation_id = ?1 AND x.file_path IS NOT NULL AND x.file_path <> ''";
+
+/// Maps a row of [`conversation_summary_sql`].
+fn map_summary_row(row: &Row) -> rusqlite::Result<ConversationSummary> {
+    let shared_count: i64 = row.get(6)?;
+    Ok(ConversationSummary {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        thoughts: row.get(2)?,
+        linked: row.get(3)?,
+        first_activity: row.get(4)?,
+        last_activity: row.get(5)?,
+        shared: shared_count > 0,
+        shared_count,
+        published: row.get(7)?,
+        unconfirmed: row.get(8)?,
+        share_future: row.get(9)?,
+        imported: row.get(10)?,
+        held: row.get(11)?,
+        held_published: row.get(12)?,
+    })
 }
 
 /// Maximum time a harness ingest waits for a busy shared database. Ingests are
@@ -807,7 +1012,9 @@ impl CvcStore {
         }
         if let Some(remote) = remote_fingerprint {
             for id in published_ids {
-                tx.execute("INSERT INTO publications(interaction_id,remote_fingerprint,state,updated_at) VALUES(?1,?2,'published',?3) ON CONFLICT(interaction_id,remote_fingerprint) DO UPDATE SET state='published',updated_at=excluded.updated_at", params![id.to_string(), remote, Utc::now().timestamp()])?;
+                // `updated_at` records when a row became published; observing a row that
+                // is already published at a later fetch must not re-stamp it.
+                tx.execute("INSERT INTO publications(interaction_id,remote_fingerprint,state,updated_at) VALUES(?1,?2,'published',?3) ON CONFLICT(interaction_id,remote_fingerprint) DO UPDATE SET state='published',updated_at=CASE WHEN publications.state='published' THEN publications.updated_at ELSE excluded.updated_at END", params![id.to_string(), remote, Utc::now().timestamp()])?;
             }
         }
         tx.commit()?;
@@ -2350,32 +2557,15 @@ impl CvcStore {
         destination_fingerprint: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ConversationSummary>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.title,
-                    COUNT(i.id),
-                    COALESCE(SUM(EXISTS(SELECT 1 FROM artifact_links a WHERE a.interaction_id = i.id)), 0),
-                    COALESCE(MIN(i.timestamp), c.created_at),
-                    COALESCE(MAX(i.timestamp), c.created_at),
-                    EXISTS(SELECT 1 FROM conversation_shares s WHERE s.conversation_id = c.id AND s.remote_fingerprint = ?1),
-                    COALESCE(SUM(EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state = 'published')), 0)
-             FROM conversations c
-             LEFT JOIN interactions i ON i.conversation_id = c.id
-             GROUP BY c.id, c.title
+        let mut stmt = self.conn.prepare(&conversation_summary_sql(
+            "GROUP BY c.id, c.title
              ORDER BY COALESCE(MAX(i.timestamp), c.created_at) DESC
              LIMIT ?2",
+        ))?;
+        let rows = stmt.query_map(
+            params![destination_fingerprint, limit as i64],
+            map_summary_row,
         )?;
-        let rows = stmt.query_map(params![destination_fingerprint, limit as i64], |row| {
-            Ok(ConversationSummary {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                thoughts: row.get(2)?,
-                linked: row.get(3)?,
-                first_activity: row.get(4)?,
-                last_activity: row.get(5)?,
-                shared: row.get(6)?,
-                published: row.get(7)?,
-            })
-        })?;
         let mut summaries = Vec::new();
         for summary in rows {
             summaries.push(summary?);
@@ -2421,9 +2611,7 @@ impl CvcStore {
         Ok(count)
     }
     pub fn share_snapshot(&self, conversation_id: &str) -> Result<Vec<InteractionId>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM interactions WHERE conversation_id=?1 ORDER BY id")?;
+        let mut stmt = self.conn.prepare(SHARE_SNAPSHOT_SQL)?;
         let result = stmt
             .query_map(params![conversation_id], |r| r.get::<_, String>(0))?
             .map(|r| {
@@ -2480,8 +2668,7 @@ impl CvcStore {
         remote: &str,
     ) -> Result<usize> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let blocked: i64 = tx.query_row("SELECT COUNT(*) FROM publications p JOIN interactions i ON i.id=p.interaction_id WHERE i.conversation_id=?1 AND p.remote_fingerprint=?2 AND p.state IN ('pending','published','unknown')", params![conversation_id, remote], |r| r.get(0))?;
-        if blocked != 0 {
+        if !Self::unshare_blockers(&tx, conversation_id, remote)?.is_allowed() {
             return Err(DbError::Migration(
                 "cannot unshare pending, published, or unknown content".into(),
             ));
@@ -2491,6 +2678,121 @@ impl CvcStore {
         tx.commit()?;
         Ok(count)
     }
+    /// Whether unsharing `conversation_id` for `remote` would be refused, and
+    /// why, without changing anything. It is the very rule
+    /// [`Self::unshare_conversation_for_remote`] enforces, so a view can say
+    /// that unsharing is impossible before asking anyone for a phrase.
+    pub fn can_unshare(&self, conversation_id: &str, remote: &str) -> Result<UnshareCheck> {
+        Self::unshare_blockers(&self.conn, conversation_id, remote)
+    }
+
+    /// The one definition of what blocks an unshare: any interaction of the
+    /// conversation with a `pending`, `published` or `unknown` publication for
+    /// the destination. Used by the refusal and by [`Self::can_unshare`].
+    fn unshare_blockers(
+        conn: &Connection,
+        conversation_id: &str,
+        remote: &str,
+    ) -> Result<UnshareCheck> {
+        let mut stmt = conn.prepare("SELECT p.state, COUNT(*) FROM publications p JOIN interactions i ON i.id=p.interaction_id WHERE i.conversation_id=?1 AND p.remote_fingerprint=?2 AND p.state IN ('pending','published','unknown') GROUP BY p.state")?;
+        let rows = stmt.query_map(params![conversation_id, remote], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut check = UnshareCheck::default();
+        for row in rows {
+            let (state, count) = row?;
+            match state.as_str() {
+                "published" => check.published = count,
+                "pending" => check.pending = count,
+                _ => check.unknown = count,
+            }
+        }
+        Ok(check)
+    }
+    /// How much of what is shared for `destination_fingerprint` is known to be
+    /// published. See [`DestinationPublicationCounts`] for what each number
+    /// means; "shared" is the same test the summaries use.
+    pub fn destination_publication_counts(
+        &self,
+        destination_fingerprint: &str,
+    ) -> Result<DestinationPublicationCounts> {
+        let sql = format!(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state = 'published')), 0),
+                    COALESCE(SUM(EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state IN ('pending', 'unknown'))), 0)
+             FROM interactions i
+             WHERE {SHARED_FOR_DESTINATION}"
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, params![destination_fingerprint], |row| {
+                Ok(DestinationPublicationCounts {
+                    shared: row.get(0)?,
+                    published: row.get(1)?,
+                    unconfirmed: row.get(2)?,
+                })
+            })?)
+    }
+
+    /// Everything a view shows about one conversation for one destination, or
+    /// `None` when there is no such conversation. All of it is read from one
+    /// consistent snapshot, so the counts agree with each other even while a
+    /// hook captures into the same store.
+    pub fn conversation_details(
+        &self,
+        conversation_id: &str,
+        destination_fingerprint: Option<&str>,
+    ) -> Result<Option<ConversationDetails>> {
+        // Dropped without committing: it only pins the snapshot for the reads.
+        let snapshot = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let Some(summary) = snapshot
+            .query_row(
+                &conversation_summary_sql("WHERE c.id = ?2 GROUP BY c.id, c.title"),
+                params![destination_fingerprint, conversation_id],
+                map_summary_row,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let context_paths = snapshot
+            .prepare(&format!(
+                "SELECT x.file_path, COUNT(DISTINCT x.interaction_id) AS uses {CONVERSATION_CONTEXT_PATHS} GROUP BY x.file_path ORDER BY uses DESC, x.file_path LIMIT ?2"
+            ))?
+            .query_map(
+                params![conversation_id, CONVERSATION_DETAIL_PATH_LIMIT as i64],
+                |row| {
+                    Ok(ContextPathUse {
+                        path: row.get(0)?,
+                        interactions: row.get(1)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let context_path_total: i64 = snapshot.query_row(
+            &format!("SELECT COUNT(DISTINCT x.file_path) {CONVERSATION_CONTEXT_PATHS}"),
+            params![conversation_id],
+            |row| row.get(0),
+        )?;
+        let snapshot_count: i64 = snapshot.query_row(
+            &format!("SELECT COUNT(*) FROM ({SHARE_SNAPSHOT_SQL})"),
+            params![conversation_id],
+            |row| row.get(0),
+        )?;
+        let snapshot_count = snapshot_count as usize;
+        // The shared interactions of a conversation are among the ones a share
+        // would cover, so the breakdown cannot go negative.
+        let snapshot_shared = (summary.shared_count as usize).min(snapshot_count);
+        Ok(Some(ConversationDetails {
+            summary,
+            context_paths,
+            context_path_total: context_path_total as usize,
+            snapshot_count,
+            snapshot_shared,
+            snapshot_new: snapshot_count - snapshot_shared,
+        }))
+    }
+
     pub fn projection_interaction_ids(&self, remote: &str) -> Result<Vec<InteractionId>> {
         let mut stmt = self.conn.prepare("SELECT i.id FROM interactions i LEFT JOIN publications p ON p.interaction_id=i.id AND p.remote_fingerprint=?1 WHERE EXISTS (SELECT 1 FROM interaction_shares s WHERE s.interaction_id=i.id AND s.remote_fingerprint IN (?1,'*')) AND (p.state IS NULL OR p.state IN ('pending','published'))")?;
         let result = stmt
@@ -2508,6 +2810,9 @@ impl CvcStore {
             .map_err(Into::into);
         result
     }
+    /// Records publication progress for `ids` at one destination. `Published` is
+    /// terminal here: a row already `published` is never moved back to `pending` or
+    /// `unknown` (its timestamp is also kept when `published` is re-asserted).
     pub fn mark_publication(
         &self,
         ids: &[InteractionId],
@@ -2519,9 +2824,17 @@ impl CvcStore {
             PublicationState::Published => "published",
             PublicationState::Unknown => "unknown",
         };
+        if ids.is_empty() {
+            return Ok(());
+        }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         for id in ids {
-            tx.execute("INSERT INTO publications(interaction_id,remote_fingerprint,state,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(interaction_id,remote_fingerprint) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at", params![id.to_string(), remote, value, Utc::now().timestamp()])?;
+            // A row that is `published` for this destination is never demoted: that fact
+            // is what blocks `unshare` and authorizes `redact` for content the
+            // destination holds, and a failed re-send of an id the remote lost must not
+            // make it look as if it was never published. Re-asserting `published` keeps
+            // the original timestamp; every genuine state change records a new one.
+            tx.execute("INSERT INTO publications(interaction_id,remote_fingerprint,state,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(interaction_id,remote_fingerprint) DO UPDATE SET state=excluded.state,updated_at=CASE WHEN publications.state='published' AND excluded.state='published' THEN publications.updated_at ELSE excluded.updated_at END WHERE publications.state <> 'published' OR excluded.state = 'published'", params![id.to_string(), remote, value, Utc::now().timestamp()])?;
         }
         tx.commit()?;
         Ok(())

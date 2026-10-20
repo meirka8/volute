@@ -66,8 +66,12 @@ function isLegacyNodePath(path: string): boolean {
 
 type GitTreeEntry = { path?: string; type?: string; url?: string; sha?: string; size?: number };
 
+// An interaction id as a tombstone path spells it: lowercase and hyphenated, with the RFC variant
+// (`[89ab]`) and any version RFC 9562 defines (1-8). Producers differ in the version: the Claude
+// Code harness writes version 8 (a deterministic id), every other producer version 4. Keep this in
+// step with the pattern in `validTombstone` (types/cvc.ts), which checks the payload.
 const CANONICAL_TOMBSTONE_UUID =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 /**
  * Validate the *entire* reserved tombstones namespace before reading a payload.
