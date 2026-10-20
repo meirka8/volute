@@ -274,10 +274,15 @@ fn an_empty_repository_says_so_with_one_hint_and_never_takes_over_the_screen() {
     // Capture is on, but this checkout does not record Claude Code sessions.
     cvc_core::privacy::acknowledge_capture(&fixture.open_repo()).unwrap();
     let output = empty(&fixture);
-    assert!(
-        output.contains("To record Claude Code sessions here: cvc harness install claude-code"),
-        "{output}"
-    );
+    // Both routes, each command on a line of its own so it can be pasted.
+    for line in [
+        "To record Claude Code sessions, run these in Claude Code:",
+        "  /plugin marketplace add meirka8/volute",
+        "  /plugin install cvc@volute",
+        "or, for this checkout only, run in a shell: cvc harness install claude-code",
+    ] {
+        assert!(output.contains(line), "{line:?} in {output}");
+    }
     assert!(!output.contains("Passive capture is off"), "{output}");
 
     // Both are done.
