@@ -204,8 +204,22 @@ pub fn validate_ref_name(ref_name: &str) -> bool {
 /// First two hex characters of an interaction ID, used as its `nodes/` shard.
 /// Mirrors `.git/objects`' own fan-out scheme so individual tree listings stay small
 /// as history grows, instead of one giant flat directory.
-fn shard_prefix(id: &str) -> &str {
-    &id[0..2]
+///
+/// Names that come out of a remote tree are validated before they get here, but
+/// this never panics whatever it is given: a name shorter than two bytes, or one
+/// whose second byte falls inside a multibyte character, is an error.
+fn shard_prefix(id: &str) -> Result<&str> {
+    id.get(0..2)
+        .ok_or_else(|| SyncError::Ref("identifier is too short to shard".into()))
+}
+
+/// `name` when it is an interaction id in canonical form: lowercase and hyphenated,
+/// as the rest of the sync paths require of the ids in a remote tree.
+fn canonical_interaction_id(name: &str) -> Option<&str> {
+    name.parse::<crate::models::InteractionId>()
+        .ok()
+        .filter(|id| id.as_str() == name)
+        .map(|_| name)
 }
 
 /// Resolves `name` as a child tree of `parent` (if `parent` is set and has such a
@@ -254,7 +268,7 @@ fn remove_tombstoned_projection_paths(
         let mut nb = repo.treebuilder(Some(&nodes))?;
         let mut changed = false;
         for id in ids {
-            let p = shard_prefix(id);
+            let p = shard_prefix(id)?;
             if let Some(sub) = child_tree(repo, Some(&nodes), p) {
                 let mut sb = repo.treebuilder(Some(&sub))?;
                 if sb.remove(format!("{id}.json")).is_ok() {
@@ -503,7 +517,7 @@ pub fn build_hard_redaction_plan<'repo>(
     }
     let id = target.as_str();
     let file = format!("{id}.json");
-    let shard = shard_prefix(&id);
+    let shard = shard_prefix(&id)?;
     let tombstones = child_tree(repo, Some(&tree), "tombstones");
     let tombstone_oid = child_tree(repo, tombstones.as_ref(), shard)
         .and_then(|s| s.get_name(&file).map(|e| e.id()))
@@ -705,7 +719,7 @@ pub fn apply_hard_redaction_locally(repo: &Repository, plan: &RedactionPlan) -> 
     let tree = commit.tree()?;
     let id = plan.target_id.as_str();
     let file = format!("{id}.json");
-    let shard = shard_prefix(&id);
+    let shard = shard_prefix(&id)?;
     if tree.get_name(&file).is_some()
         || child_tree(repo, Some(&tree), "nodes")
             .and_then(|nodes| child_tree(repo, Some(&nodes), shard))
@@ -779,7 +793,7 @@ fn validate_redaction_replacement(repo: &Repository, plan: &RedactionPlan) -> Re
     }
     let id = plan.target_id.as_str();
     let file = format!("{id}.json");
-    let shard = shard_prefix(&id);
+    let shard = shard_prefix(&id)?;
     let tombstone_oid = child_tree(
         repo,
         child_tree(repo, Some(&tree), "tombstones").as_ref(),
@@ -1015,7 +1029,7 @@ fn push_ids_to_ref(
         }
 
         let id_str = id.as_str();
-        let prefix = shard_prefix(&id_str);
+        let prefix = shard_prefix(&id_str)?;
         let already_sharded = child_tree(repo, existing_nodes_tree.as_ref(), prefix)
             .map(|sub| sub.get_name(&legacy_filename).is_some())
             .unwrap_or(false);
@@ -1074,7 +1088,7 @@ fn push_ids_to_ref(
         validate_tombstone(tombstone)?;
         let id = tombstone.interaction_id.to_string();
         let file = format!("{id}.json");
-        let prefix = shard_prefix(&id);
+        let prefix = shard_prefix(&id)?;
         let prior = child_tree(repo, existing_tombstones.as_ref(), prefix)
             .and_then(|x| x.get_name(&file).map(|e| e.id()));
         if let Some(oid) = prior {
@@ -1235,7 +1249,7 @@ fn push_ids_to_ref(
         {
             return Err(SyncError::Ref("invalid local derivation event".into()));
         }
-        let shard = &event.event_id[..2];
+        let shard = shard_prefix(&event.event_id)?;
         let file = format!("{}.json", event.event_id);
         let exists = child_tree(repo, existing_events_tree.as_ref(), shard)
             .and_then(|t| t.get_name(&file).map(|e| e.id()));
@@ -1271,7 +1285,7 @@ fn push_ids_to_ref(
         if !range.verify_id() {
             return Err(SyncError::Ref("invalid local range".into()));
         }
-        let shard = &range.range_id[..2];
+        let shard = shard_prefix(&range.range_id)?;
         let file = format!("{}.json", range.range_id);
         let bytes = serde_json::to_vec(&range)?;
         if let Some(oid) = child_tree(repo, existing_ranges_tree.as_ref(), shard)
@@ -2098,7 +2112,7 @@ fn collect_ranges(
                             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
                 })
                 .ok_or_else(|| SyncError::Ref("invalid range filename".into()))?;
-            if &id[..2] != name || entry.kind() != Some(ObjectType::Blob) {
+            if shard_prefix(id)? != name || entry.kind() != Some(ObjectType::Blob) {
                 return Err(SyncError::Ref("range path mismatch".into()));
             }
             let blob = repo.find_blob(entry.id())?;
@@ -2151,7 +2165,7 @@ fn collect_derivation_events(
                 .strip_suffix(".json")
                 .filter(|x| x.len() == 64 && x.bytes().all(|b| b.is_ascii_hexdigit()))
                 .ok_or_else(|| SyncError::Ref("invalid event filename".into()))?;
-            if &id[..2] != name || entry.kind() != Some(ObjectType::Blob) {
+            if shard_prefix(id)? != name || entry.kind() != Some(ObjectType::Blob) {
                 return Err(SyncError::Ref("event path mismatch".into()));
             }
             let blob = repo.find_blob(entry.id())?;
@@ -2259,10 +2273,13 @@ fn collect_tombstones(
             if entry.kind() != Some(ObjectType::Blob) {
                 return Err(SyncError::Ref("invalid tombstone entry type".into()));
             }
+            // The name comes from the remote tree: it must be a canonical
+            // interaction id before anything slices it.
             let id = name
                 .strip_suffix(".json")
+                .and_then(canonical_interaction_id)
                 .ok_or_else(|| SyncError::Ref("invalid tombstone filename".into()))?;
-            if shard_prefix(id) != shard_name {
+            if shard_prefix(id)? != shard_name {
                 return Err(SyncError::Ref("tombstone shard mismatch".into()));
             }
             let blob = repo.find_blob(entry.id())?;
@@ -2865,5 +2882,40 @@ mod derivation_graph_tests {
             &legacy,
         )
         .is_err());
+    }
+
+    #[test]
+    fn shard_prefix_is_an_error_and_never_a_panic_for_names_it_cannot_slice() {
+        assert_eq!(shard_prefix("ab").unwrap(), "ab");
+        assert_eq!(
+            shard_prefix("3c2b1a09-8f7e-8d6c-9b5a-4f3e2d1c0b9a").unwrap(),
+            "3c"
+        );
+        // Two bytes that are one whole character slice fine.
+        assert_eq!(shard_prefix("é").unwrap(), "é");
+        for name in ["", "a", "aé", "日本", "a日"] {
+            assert!(shard_prefix(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_canonical_interaction_id_is_accepted_as_a_name() {
+        let id = "3c2b1a09-8f7e-8d6c-9b5a-4f3e2d1c0b9a";
+        assert_eq!(canonical_interaction_id(id), Some(id));
+        for name in [
+            "",
+            "a",
+            "aé",
+            &id.to_uppercase(),
+            &id.replace('-', ""),
+            &format!("{{{id}}}"),
+            &format!("urn:uuid:{id}"),
+            &format!(" {id}"),
+            &format!("{id}\n"),
+            &"é".repeat(18),
+            &format!("{id}.json"),
+        ] {
+            assert_eq!(canonical_interaction_id(name), None, "{name:?}");
+        }
     }
 }

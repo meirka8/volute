@@ -2891,3 +2891,235 @@ fn a_clean_published_node_does_not_stop_a_push() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ---- hostile names in a remote tree --------------------------------------------------------
+
+const HOSTILE_REF: &str = "refs/cvc/hostile";
+
+/// A ref whose tree holds `<namespace>/<shard>/<file>`, as a hostile remote could
+/// publish it. The events and ranges namespaces come with FORMAT 5 and the empty
+/// sibling tree that format requires, so a name is all that is wrong with them.
+fn hostile_ref(
+    repo: &Repository,
+    namespace: &str,
+    shard: &str,
+    file: &str,
+    body: &[u8],
+) -> anyhow::Result<()> {
+    let mut shard_tree = repo.treebuilder(None)?;
+    shard_tree.insert(file, repo.blob(body)?, FileMode::Blob.into())?;
+    let mut outer = repo.treebuilder(None)?;
+    outer.insert(shard, shard_tree.write()?, FileMode::Tree.into())?;
+    let mut root = repo.treebuilder(None)?;
+    root.insert(namespace, outer.write()?, FileMode::Tree.into())?;
+    if namespace != "tombstones" {
+        let empty = repo.treebuilder(None)?.write()?;
+        let sibling = if namespace == "events" {
+            "ranges"
+        } else {
+            "events"
+        };
+        root.insert(sibling, empty, FileMode::Tree.into())?;
+        root.insert("FORMAT", repo.blob(b"5\n")?, FileMode::Blob.into())?;
+    }
+    let tree = repo.find_tree(root.write()?)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    repo.commit(
+        Some(HOSTILE_REF),
+        &signature,
+        &signature,
+        "hostile names",
+        &tree,
+        &[],
+    )?;
+    Ok(())
+}
+
+/// What pulling that ref does: an `Err` with its message, `Ok` for a tree that is
+/// accepted, and a failure of the test for a panic.
+fn pull_hostile(
+    namespace: &str,
+    shard: &str,
+    file: &str,
+    body: &[u8],
+) -> anyhow::Result<Result<(), String>> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("pulled.db"))?;
+    hostile_ref(&repo, namespace, shard, file, body)?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sync::pull_from_ref(&repo, &store, HOSTILE_REF)
+    }));
+    match outcome {
+        Ok(result) => Ok(result.map_err(|error| error.to_string())),
+        Err(_) => panic!("pulling {namespace}/{shard}/{file:?} panicked"),
+    }
+}
+
+#[test]
+fn a_remote_tombstone_name_that_is_not_a_canonical_id_is_an_error_never_a_panic(
+) -> anyhow::Result<()> {
+    let id = InteractionId::new().to_string();
+    let body = serde_json::to_vec(&Tombstone::new(
+        id.parse()?,
+        TombstoneReasonCode::Security,
+        None,
+    ))?;
+    let other_shard = if id.starts_with("00") { "01" } else { "00" };
+    let simple = id.replace('-', "");
+    let cases: Vec<(&str, String, String, &str)> = vec![
+        (
+            "a one-byte stem",
+            "ab".into(),
+            "a.json".into(),
+            "invalid tombstone filename",
+        ),
+        (
+            "an empty stem",
+            "ab".into(),
+            ".json".into(),
+            "invalid tombstone filename",
+        ),
+        (
+            "a multibyte character across byte 2",
+            "ab".into(),
+            "aé.json".into(),
+            "invalid tombstone filename",
+        ),
+        (
+            "a multibyte stem as long as an id",
+            "c3".into(),
+            format!("{}.json", "é".repeat(18)),
+            "invalid tombstone filename",
+        ),
+        (
+            "an uppercase id",
+            id[..2].to_uppercase(),
+            format!("{}.json", id.to_uppercase()),
+            "invalid tombstone filename",
+        ),
+        (
+            "an id without hyphens",
+            id[..2].into(),
+            format!("{simple}.json"),
+            "invalid tombstone filename",
+        ),
+        (
+            "a name that is not an id",
+            "ab".into(),
+            "ab-not-an-interaction-id.json".into(),
+            "invalid tombstone filename",
+        ),
+        (
+            "a name without .json",
+            id[..2].into(),
+            id.clone(),
+            "invalid tombstone filename",
+        ),
+        (
+            "an id in the wrong shard",
+            other_shard.into(),
+            format!("{id}.json"),
+            "tombstone shard mismatch",
+        ),
+    ];
+    for (case, shard, file, message) in cases {
+        let result = pull_hostile("tombstones", &shard, &file, &body)?;
+        let error = result.expect_err(case);
+        assert!(error.contains(message), "{case}: {error}");
+    }
+    // A valid tree is still accepted.
+    assert_eq!(
+        pull_hostile("tombstones", &id[..2], &format!("{id}.json"), &body)?,
+        Ok(())
+    );
+    Ok(())
+}
+
+#[test]
+fn a_remote_event_or_range_name_that_is_not_a_digest_is_an_error_never_a_panic(
+) -> anyhow::Result<()> {
+    for (namespace, lower_only, invalid, mismatch) in [
+        (
+            "events",
+            false,
+            "invalid event filename",
+            "event path mismatch",
+        ),
+        (
+            "ranges",
+            true,
+            "invalid range filename",
+            "range path mismatch",
+        ),
+    ] {
+        let digest = "a".repeat(64);
+        let mut cases: Vec<(&str, String, String, &str)> = vec![
+            ("a one-byte stem", "aa".into(), "a.json".into(), invalid),
+            ("an empty stem", "aa".into(), ".json".into(), invalid),
+            (
+                "a multibyte character across byte 2",
+                "aa".into(),
+                "aé.json".into(),
+                invalid,
+            ),
+            (
+                "a multibyte stem as long as a digest",
+                "c3".into(),
+                format!("{}.json", "é".repeat(32)),
+                invalid,
+            ),
+            (
+                "a stem of the right length that is not hex",
+                "aa".into(),
+                format!("{}.json", "g".repeat(64)),
+                invalid,
+            ),
+            (
+                "a digest in the wrong shard",
+                "bb".into(),
+                format!("{digest}.json"),
+                mismatch,
+            ),
+        ];
+        if lower_only {
+            cases.push((
+                "an uppercase stem",
+                "aa".into(),
+                format!("{}.json", "A".repeat(64)),
+                invalid,
+            ));
+            cases.push((
+                "an uppercase shard",
+                "AA".into(),
+                format!("{digest}.json"),
+                "invalid range shard",
+            ));
+        }
+        for (case, shard, file, message) in cases {
+            let result = pull_hostile(namespace, &shard, &file, b"{}")?;
+            let error = result.expect_err(case);
+            assert!(error.contains(message), "{namespace}, {case}: {error}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_local_event_with_a_malformed_id_is_an_error_at_projection() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let db_path = temp.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let item = published_item("an ordinary prompt");
+    store.create_interaction(&item)?;
+    let mut event = derivation(&item.id, 'a', Vec::new());
+    event.event_id = "a".into();
+    insert_event_fixture(&db_path, &event)?;
+    trust_and_authorize_event(&db_path, &event)?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION).is_err()
+    }));
+    assert_eq!(outcome.ok(), Some(true), "projecting a malformed event id");
+    Ok(())
+}
