@@ -110,6 +110,17 @@ impl RepositoryLayout {
     pub fn db_path(&self) -> PathBuf {
         self.cvc_dir().join("index.db")
     }
+    /// Whether the active worktree is a linked one (`git worktree add`) rather
+    /// than the main worktree: its administrative directory (`git_dir`) is not
+    /// the common directory. Both paths are the validated canonical ones, so
+    /// this rests on the `commondir` marker this module parses fail-closed,
+    /// not on a second opinion from libgit2. A bare repository, a clone, and a
+    /// main checkout whose Git directory lives elsewhere
+    /// (`--separate-git-dir`) all have `git_dir == common_git_dir` and so are
+    /// not linked.
+    pub fn is_linked_worktree(&self) -> bool {
+        self.git_dir != self.common_git_dir
+    }
     pub fn worktree_root(&self) -> Result<&Path, RepositoryLayoutError> {
         self.worktree_root
             .as_deref()

@@ -1,6 +1,8 @@
 //! `cvc harness`: lifecycle-hook capture for agent harnesses.
 use anyhow::{bail, Context, Result};
-use cvc_core::claude_code::settings::{self, ExcludeAction, InstallAction};
+use cvc_core::claude_code::harness_record;
+use cvc_core::claude_code::settings::{self, ExcludeAction, InstallAction, WorktreeState};
+use cvc_core::hooks::{self, HookAction};
 use cvc_core::privacy;
 use cvc_core::repository::RepositoryLayout;
 use std::cmp::Ordering;
@@ -387,6 +389,10 @@ pub async fn install_claude_code(binary: Option<PathBuf>) -> Result<()> {
         settings::HOOK_EVENTS.join(", "),
         outcome.command
     );
+    let cache_fallback = matches!(
+        choice,
+        Some(BinaryChoice::CacheCopyOnly { .. } | BinaryChoice::CacheCopyStableOlder { .. })
+    );
     match choice {
         Some(BinaryChoice::StableInsteadOfCache) => println!(
             "  using {} instead of the launcher's versioned cache, so upgrades reach the hooks without a reinstall",
@@ -432,7 +438,39 @@ pub async fn install_claude_code(binary: Option<PathBuf>) -> Result<()> {
         ),
         ExcludeAction::AlreadyIgnored => {}
     }
-    println!("This install is per checkout: run it again in each linked worktree you use.");
+    // The per-checkout install above is complete; what follows only makes new
+    // worktrees follow it. A failure there is reported, never fatal.
+    if cache_fallback {
+        // A versioned-cache path goes stale on the next upgrade, and every
+        // worktree created from the record would inherit the staleness, so
+        // this install is not recorded. What that means depends on whether an
+        // earlier install left a usable record.
+        let earlier = harness_record::read_record(&layout)
+            .ok()
+            .flatten()
+            .filter(|recorded| settings::binary_problem(recorded).is_none());
+        match earlier {
+            Some(recorded) => println!(
+                "New worktrees keep getting hooks that run {} (recorded earlier); this install was not recorded because it ran from the launcher's versioned cache.",
+                printable_path(&recorded)
+            ),
+            None => println!(
+                "New worktrees will not get these hooks until you run `cvc harness install claude-code` again with a current cvc in ~/.cvc/bin."
+            ),
+        }
+    } else if enable_worktree_propagation(&layout, &binary) {
+        println!(
+            "Claude Code sessions in worktrees created from now on (git worktree add, Claude Code's worktree option) are captured too: they get these hooks automatically while this repository's capture acknowledgement stands. `cvc harness uninstall claude-code` stops this."
+        );
+    } else {
+        println!("This install is per checkout: run it again in each linked worktree you use.");
+    }
+    report_other_worktrees(
+        &layout,
+        WorktreeWanted::WithoutHooks,
+        "Existing worktrees without these hooks (run `cvc harness install claude-code` there once):",
+        Some(WORKTREE_LIST_LIMIT),
+    );
     if matches!(
         outcome.action,
         InstallAction::Created | InstallAction::Updated
@@ -444,28 +482,173 @@ pub async fn install_claude_code(binary: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// How many worktrees the install listing names before summarizing the rest.
+const WORKTREE_LIST_LIMIT: usize = 10;
+
+/// Control characters (a newline, an escape sequence) in a path or a message
+/// that came from outside this process must not reach the terminal as such.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+fn printable_path(path: &Path) -> String {
+    printable(&path.to_string_lossy())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorktreeWanted {
+    /// Worktrees that carry no CVC hook entries (what `install` offers to fix).
+    WithoutHooks,
+    /// Worktrees that still carry them (what `uninstall` leaves behind).
+    WithHooks,
+}
+
+/// Lists the other worktrees `install` or `uninstall` left untouched, and says
+/// plainly what it could not find out: a worktree whose settings could not be
+/// read safely, a main worktree that could not be located, a failed
+/// enumeration. `limit` caps the listing (the rest is counted); `None` names
+/// every one, which `uninstall` does because each is still capturing.
+fn report_other_worktrees(
+    layout: &RepositoryLayout,
+    wanted: WorktreeWanted,
+    header: &str,
+    limit: Option<usize>,
+) {
+    let survey = match settings::other_worktrees(layout) {
+        Ok(survey) => survey,
+        Err(error) => {
+            eprintln!(
+                "warning: could not list other worktrees: {}; check `git worktree list`",
+                printable(&format!("{error:#}"))
+            );
+            return;
+        }
+    };
+    let listed: Vec<&Path> = survey
+        .worktrees
+        .iter()
+        .filter(|worktree| match wanted {
+            WorktreeWanted::WithoutHooks => worktree.state == WorktreeState::NotInstalled,
+            WorktreeWanted::WithHooks => worktree.installed(),
+        })
+        .map(|worktree| worktree.root.as_path())
+        .collect();
+    if !listed.is_empty() {
+        println!("{header}");
+        let shown = limit.unwrap_or(listed.len());
+        for root in listed.iter().take(shown) {
+            println!("  {}", printable_path(root));
+        }
+        if listed.len() > shown {
+            println!("  and {} more", listed.len() - shown);
+        }
+    }
+    for worktree in &survey.worktrees {
+        if let WorktreeState::Unreadable(reason) = &worktree.state {
+            eprintln!(
+                "warning: could not check: {} ({})",
+                printable_path(&worktree.root),
+                printable(reason)
+            );
+        }
+    }
+    if !survey.main_located {
+        eprintln!("warning: the main worktree could not be located; check it yourself");
+    }
+}
+
+/// Records that the harness is wanted for this repository and makes sure Git's
+/// `post-checkout` hook is there to act on the record in a new worktree. Only
+/// that hook: this never re-creates a post-commit or pre-push hook the user
+/// removed. Returns whether both are in place; otherwise a warning has been
+/// printed.
+fn enable_worktree_propagation(layout: &RepositoryLayout, binary: &Path) -> bool {
+    let mut complete = true;
+    if let Err(error) = harness_record::write_record(layout, binary) {
+        eprintln!("  warning: could not record this install for new worktrees: {error:#}");
+        complete = false;
+    }
+    match hooks::install_post_checkout(layout) {
+        Ok(outcome) => match outcome.action {
+            HookAction::Created => println!(
+                "  created the post-checkout Git hook at {} so new worktrees get these hooks",
+                outcome.hook_path.display()
+            ),
+            HookAction::Appended => println!(
+                "  added CVC to the existing post-checkout Git hook at {} so new worktrees get these hooks",
+                outcome.hook_path.display()
+            ),
+            HookAction::Updated => println!(
+                "  updated the post-checkout Git hook at {} so new worktrees get these hooks",
+                outcome.hook_path.display()
+            ),
+            HookAction::AlreadyPresent => {}
+            HookAction::SkippedNotShell => {
+                eprintln!("{}", super::hook::not_shell_warning(&outcome, Some(binary)));
+                complete = false;
+            }
+        },
+        Err(error) => {
+            eprintln!("  warning: could not install the post-checkout Git hook: {error:#}");
+            complete = false;
+        }
+    }
+    complete
+}
+
 pub async fn uninstall_claude_code() -> Result<()> {
     let layout = discover_initialized()?;
-    let outcome = settings::uninstall(&layout)?;
-    if outcome.removed == 0 {
-        println!(
+    // Two independent halves: this checkout's entries, and the repository-wide
+    // record that gives them to new worktrees. A failure in one must not stop
+    // the other, or "uninstall" could leave capture running in a way the user
+    // was told it no longer is.
+    let mut failures: Vec<anyhow::Error> = Vec::new();
+    match settings::uninstall(&layout) {
+        Ok(outcome) if outcome.removed == 0 => println!(
             "No CVC hook entries found in {}",
             outcome.settings_path.display()
-        );
-    } else if outcome.deleted_file {
-        println!(
+        ),
+        Ok(outcome) if outcome.deleted_file => println!(
             "Removed {} CVC hook entr{} and the now-empty {}",
             outcome.removed,
             if outcome.removed == 1 { "y" } else { "ies" },
             outcome.settings_path.display()
-        );
-    } else {
-        println!(
+        ),
+        Ok(outcome) => println!(
             "Removed {} CVC hook entr{} from {}",
             outcome.removed,
             if outcome.removed == 1 { "y" } else { "ies" },
             outcome.settings_path.display()
-        );
+        ),
+        Err(error) => failures.push(error.context("could not remove this checkout's hooks")),
+    }
+    // The record is repository-wide, so it goes whatever this checkout held:
+    // an uninstall means the harness is no longer wanted. It does not withdraw
+    // the capture acknowledgement.
+    match harness_record::clear_record(&layout) {
+        Ok(true) => println!("New worktrees will no longer get the Claude Code hooks."),
+        Ok(false) => {}
+        Err(error) => failures.push(error.context(format!(
+            "the repository-wide record that installs the hooks in new worktrees could not be cleared; remove {} by hand",
+            harness_record::record_path(&layout).display()
+        ))),
+    }
+    // Other worktrees' files are theirs to remove; every one that still
+    // carries entries is still capturing, so name them all.
+    report_other_worktrees(
+        &layout,
+        WorktreeWanted::WithHooks,
+        "Other worktrees still carry these hooks and keep capturing (run `cvc harness uninstall claude-code` there):",
+        None,
+    );
+    let mut failures = failures.into_iter();
+    if let Some(first) = failures.next() {
+        for other in failures {
+            eprintln!("{other:#}");
+        }
+        return Err(first);
     }
     Ok(())
 }
@@ -501,9 +684,16 @@ mod tests {
     /// The version of "this binary" in the resolver tests.
     const OWN: &str = "0.7.0";
 
+    /// A stand-in binary. Executable, since a hook entry (and a recorded path)
+    /// must name a file that can be run.
     fn touch(path: &Path) -> PathBuf {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         path.to_path_buf()
     }
 

@@ -160,7 +160,10 @@ fn harness_install_is_gated_idempotent_and_excluded_from_git() {
     fixture.acknowledge_capture();
     let stdout = fixture.cvc_ok(&["harness", "install", "claude-code"]);
     assert!(stdout.contains("installed"), "{stdout}");
-    assert!(stdout.contains("per checkout"), "{stdout}");
+    // Since public issue 113 new worktrees follow the install (see
+    // harness_worktree_cli.rs), so the old "per checkout" advice is gone.
+    assert!(stdout.contains("get these hooks automatically"), "{stdout}");
+    assert!(!stdout.contains("per checkout"), "{stdout}");
     let settings_path = fixture.repo.join(".claude/settings.local.json");
     let settings = fs::read_to_string(&settings_path).unwrap();
     assert!(settings.contains(env!("CARGO_BIN_EXE_cvc")), "{settings}");
