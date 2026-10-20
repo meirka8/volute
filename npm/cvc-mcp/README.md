@@ -2,10 +2,13 @@
 
 Launcher for [Volute CVC](https://github.com/meirka8/volute) (Cognitive Version Control). CVC records AI-assisted development context — prompts, responses, integration-exposed reasoning, and tool metadata — alongside Git history, private by default.
 
-This package downloads the released CVC binaries for your platform and runs them. It provides two commands:
+> **Using the `cvc` command line?** Install [`@volute_cvc/cvc`](https://www.npmjs.com/package/@volute_cvc/cvc) instead: `npm install --global @volute_cvc/cvc`. It is this same launcher published under a name for the CLI. This package, `@volute_cvc/cvc-mcp`, is still published with every release, so MCP client configurations that run `cvc-mcp` or `npx @volute_cvc/cvc-mcp` keep working unchanged.
+
+This package downloads the released CVC binaries for your platform and runs them. It provides three commands:
 
 - `cvc-mcp` — the MCP server, for coding agents that speak the Model Context Protocol.
 - `cvc` — the CVC command-line interface (init, capture, sharing, and the Claude Code harness).
+- `cvc-lsp` — the language server that editor integrations use.
 
 It checks `~/.cvc/bin` first. Unless that already holds this release or a newer one, it fetches the archive matching this package's version from the project's GitHub release, verifies it against the release `SHA256SUMS.txt`, and keeps the verified binaries in a versioned cache under `~/.cvc/mcp-cache/`. It then installs them into `~/.cvc/bin`, the directory the installer scripts use, and runs them from there. Binaries that are already in `~/.cvc/bin` are run as they are: the launcher verifies only what it downloads. The checksum is an integrity check from the same origin as the archive, not an independent signature.
 
@@ -17,11 +20,13 @@ Run the MCP server without installing:
 npx @volute_cvc/cvc-mcp
 ```
 
-Or install both commands on your `PATH`:
+Or install all three commands on your `PATH`:
 
 ```bash
 npm install --global @volute_cvc/cvc-mcp
 ```
+
+`@volute_cvc/cvc` provides the same three commands, so install one of the two globally, not both: npm stops the second install with an `EEXIST` error.
 
 Supported platforms: Linux x86-64, macOS x86-64, macOS ARM64, and Windows x86-64. Linux ARM64 is not published, and the launcher rejects an unsupported platform before downloading.
 
