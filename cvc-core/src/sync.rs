@@ -2543,28 +2543,28 @@ fn verify_existing_node(
     })
 }
 
-/// Why a published node fails: an unterminated private-key header, or else
-/// the check's own message.
+/// Why a published node fails: key material next to a private-key header or END
+/// line that has no partner, or else the check's own message.
 fn published_node_problem(bytes: &[u8], error: &SyncError) -> String {
-    fn holds_unterminated_header(value: &serde_json::Value) -> bool {
+    fn holds_unterminated_block(value: &serde_json::Value) -> bool {
         match value {
             serde_json::Value::String(text) => {
-                crate::privacy::has_unterminated_private_key_header(text)
+                crate::privacy::has_unterminated_private_key_block(text)
             }
-            serde_json::Value::Array(items) => items.iter().any(holds_unterminated_header),
+            serde_json::Value::Array(items) => items.iter().any(holds_unterminated_block),
             serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
-                crate::privacy::has_unterminated_private_key_header(key)
-                    || holds_unterminated_header(value)
+                crate::privacy::has_unterminated_private_key_block(key)
+                    || holds_unterminated_block(value)
             }),
             _ => false,
         }
     }
     let unterminated = serde_json::from_slice::<serde_json::Value>(bytes)
-        .is_ok_and(|value| holds_unterminated_header(&value));
+        .is_ok_and(|value| holds_unterminated_block(&value));
     if unterminated {
-        "its already-published text holds an unterminated private-key header (a \
-         \"-----BEGIN ... PRIVATE KEY-----\" line with no matching END line), which the privacy \
-         check now redacts"
+        "its already-published text holds an unterminated private-key block (key material next \
+         to a \"-----BEGIN ... PRIVATE KEY-----\" or \"-----END ... PRIVATE KEY-----\" line \
+         whose partner line is missing), which the privacy check now redacts"
             .to_owned()
     } else {
         format!("it no longer passes the privacy check ({error})")

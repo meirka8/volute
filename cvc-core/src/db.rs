@@ -309,13 +309,28 @@ pub struct HarnessCursorUpdate<'a> {
     pub byte_offset: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HarnessBatchOutcome {
+    /// Captures stored, stand-ins included.
     pub inserted: usize,
     /// Captures skipped because their id is locally tombstoned or was recorded
     /// concurrently.
     pub suppressed: usize,
+    /// Of `inserted`, the stand-ins: responses whose capture could not be
+    /// prepared (a field the scrubber cannot process, a collection over its
+    /// limit) and that are stored as a note instead, so that they do not keep
+    /// the responses after them from being recorded.
+    pub withheld: usize,
+    /// Captures that could not be prepared and whose stand-in could not be
+    /// either: skipped, so that the batch and its cursor can go on.
+    pub lost: usize,
+    /// Why captures were withheld or lost, each reason once, in the order met,
+    /// at most [`HARNESS_REASONS_SHOWN`] of them.
+    pub reasons: Vec<String>,
 }
+
+/// How many distinct reasons a [`HarnessBatchOutcome`] lists.
+pub const HARNESS_REASONS_SHOWN: usize = 8;
 
 /// Maximum time a harness ingest waits for a busy shared database. Ingests are
 /// not Git hooks: they may wait, but never indefinitely.
@@ -977,40 +992,82 @@ impl CvcStore {
     }
 
     /// Claude Code transcript ingest: every capture is prepared before SQLite
-    /// is touched, then the new captures and the advanced cursor commit in one
-    /// immediate transaction. Ids are deterministic per response, so a capture
-    /// that already exists or is locally tombstoned is skipped, never replaced:
-    /// replacing would drop the commit links an earlier ingest has earned.
+    /// is touched (one that cannot be is stored as a stand-in, see
+    /// [`HarnessBatchOutcome::withheld`]), then the new captures and the advanced
+    /// cursor commit in one immediate transaction. Ids are deterministic per
+    /// response, so a capture that already exists or is locally tombstoned is
+    /// skipped, never replaced: replacing would drop the commit links an earlier
+    /// ingest has earned.
     pub fn capture_claude_code_batch(
         &self,
         captures: Vec<crate::privacy::ClaudeCodeCapture>,
         cursor: HarnessCursorUpdate<'_>,
     ) -> Result<HarnessBatchOutcome> {
-        let prepared: Vec<Capture> = captures
-            .into_iter()
-            .map(|capture| privacy::prepare(capture.into_capture()))
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|e| DbError::Migration(e.to_string()))?;
+        // A capture that cannot be prepared is stored as a stand-in, or skipped
+        // when not even that works; it never fails the batch, because the
+        // cursor only moves when the batch is stored.
+        let mut prepared: Vec<(Capture, bool)> = Vec::with_capacity(captures.len());
+        let mut lost: Vec<(InteractionId, Option<InteractionId>)> = Vec::new();
+        let mut reasons: Vec<String> = Vec::new();
+        let mut note = |reason: String| {
+            if reasons.len() < HARNESS_REASONS_SHOWN && !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        };
+        for capture in captures {
+            match privacy::prepare_harness(capture.into_capture()) {
+                privacy::HarnessCapture::Prepared(capture) => prepared.push((capture, false)),
+                privacy::HarnessCapture::Withheld { stand_in, reason } => {
+                    note(reason);
+                    prepared.push((stand_in, true));
+                }
+                privacy::HarnessCapture::Lost {
+                    id,
+                    parent_id,
+                    reason,
+                } => {
+                    note(reason);
+                    lost.push((id, parent_id));
+                }
+            }
+        }
         let byte_offset = i64::try_from(cursor.byte_offset)
             .map_err(|_| DbError::Migration("harness cursor offset overflows".into()))?;
-        let outcome = self.with_immediate_write_retry(|tx| {
+        let mut outcome = self.with_immediate_write_retry(|tx| {
             let mut outcome = HarnessBatchOutcome::default();
-            for capture in &prepared {
+            // What this batch did not store, and what each of those was a child
+            // of: a capture whose parent is one of them is a child of that
+            // parent instead, so the chain skips over what is missing. A parent
+            // that is stored nowhere would fail the batch on the foreign key, so
+            // the chain breaks there instead.
+            let mut skipped: std::collections::HashMap<&InteractionId, Option<&InteractionId>> = lost
+                .iter()
+                .map(|(id, parent)| (id, parent.as_ref()))
+                .collect();
+            for (capture, withheld) in &prepared {
                 let id = &capture.interaction.id;
-                let exists = tx
-                    .query_row(
-                        "SELECT 1 FROM interactions WHERE id=?1",
-                        params![id.as_str()],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some();
+                let exists = Self::interaction_exists_tx(tx, id)?;
                 if exists || Self::is_tombstoned_tx(tx, id)? {
                     outcome.suppressed += 1;
+                    if !exists {
+                        skipped.insert(id, capture.interaction.parent_id.as_ref());
+                    }
                     continue;
                 }
-                Self::insert_capture(tx, capture)?;
+                let mut parent = capture.interaction.parent_id.as_ref();
+                for _ in 0..=skipped.len() {
+                    match parent.and_then(|parent| skipped.get(parent)) {
+                        Some(next) => parent = *next,
+                        None => break,
+                    }
+                }
+                let parent = match parent {
+                    Some(parent) if Self::interaction_exists_tx(tx, parent)? => Some(parent),
+                    _ => None,
+                };
+                Self::insert_capture_with_parent(tx, capture, parent)?;
                 outcome.inserted += 1;
+                outcome.withheld += usize::from(*withheld);
             }
             tx.execute(
                 "INSERT INTO harness_ingest_cursors(harness,session_id,transcript_path,byte_offset,updated_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(harness,session_id) DO UPDATE SET transcript_path=excluded.transcript_path, byte_offset=excluded.byte_offset, updated_at=excluded.updated_at",
@@ -1024,6 +1081,8 @@ impl CvcStore {
             )?;
             Ok(outcome)
         })?;
+        outcome.lost = lost.len();
+        outcome.reasons = reasons;
         self.ensure_wal_visible()?;
         Ok(outcome)
     }
@@ -1061,6 +1120,27 @@ impl CvcStore {
     }
 
     fn insert_capture(tx: &Transaction<'_>, capture: &Capture) -> Result<InteractionId> {
+        Self::insert_capture_with_parent(tx, capture, capture.interaction.parent_id.as_ref())
+    }
+
+    fn interaction_exists_tx(tx: &Transaction<'_>, id: &InteractionId) -> Result<bool> {
+        Ok(tx
+            .query_row(
+                "SELECT 1 FROM interactions WHERE id=?1",
+                params![id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Inserts `capture` as a child of `parent` rather than of the parent it
+    /// names, for a batch whose chain had to skip a capture it did not store.
+    fn insert_capture_with_parent(
+        tx: &Transaction<'_>,
+        capture: &Capture,
+        parent: Option<&InteractionId>,
+    ) -> Result<InteractionId> {
         if Self::is_tombstoned_tx(tx, &capture.interaction.id)? {
             return Err(DbError::Migration("interaction is tombstoned".into()));
         }
@@ -1073,7 +1153,7 @@ impl CvcStore {
             ],
         )?;
         let i = &capture.interaction;
-        let parent = i.parent_id.as_ref().map(InteractionId::as_str);
+        let parent = parent.map(InteractionId::as_str);
         let author = serde_json::to_string(&i.author)
             .unwrap_or_default()
             .replace('"', "");

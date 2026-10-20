@@ -399,3 +399,175 @@ fn post_commit_hook_names_the_commit_when_the_harness_is_installed() {
         format!("CVC: Linked 0 thought(s) to commit {}.", &head[..12])
     );
 }
+
+/// One transcript entry as Claude Code writes it, for the worktree placeholder
+/// `write_transcript` fills in.
+fn entry(
+    n: usize,
+    kind: &str,
+    parent: Option<usize>,
+    message: serde_json::Value,
+    request: Option<&str>,
+) -> String {
+    let mut line = serde_json::json!({
+        "parentUuid": parent.map(|p| format!("e{p}")),
+        "isSidechain": false,
+        "type": kind,
+        "message": message,
+        "uuid": format!("e{n}"),
+        "timestamp": format!("2026-10-01T10:00:{n:02}.000Z"),
+        "sessionId": SESSION,
+        "version": "2.1.300",
+        "cwd": "__WORKTREE__",
+    });
+    if let Some(request) = request {
+        line["requestId"] = request.into();
+    }
+    line.to_string()
+}
+
+fn reply(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": "claude-fixture-1", "id": "msg_x", "type": "message", "role": "assistant",
+        "content": [{"type": "text", "text": text}], "stop_reason": "end_turn",
+        "stop_sequence": null, "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+}
+
+/// A session whose first response reads a path the model chose: inside the
+/// worktree, 5.4 KB, and with 300 matches the scrubber refuses to count.
+fn hostile_read_session(extra_turn: bool) -> String {
+    let hostile = format!(
+        "__WORKTREE__/notes/{}",
+        (0..300)
+            .map(|n| format!("token=hunter2hunter{n} "))
+            .collect::<String>()
+    );
+    let mut lines = vec![
+        entry(
+            1,
+            "user",
+            None,
+            serde_json::json!({"role": "user", "content": "Summarise the notes"}),
+            None,
+        ),
+        entry(
+            2,
+            "assistant",
+            Some(1),
+            serde_json::json!({
+                "model": "claude-fixture-1", "id": "msg_a", "type": "message", "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": hostile}}],
+                "stop_reason": "tool_use", "stop_sequence": null,
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+            Some("req_A"),
+        ),
+        entry(
+            3,
+            "user",
+            Some(2),
+            serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "the notes", "is_error": false}
+            ]}),
+            None,
+        ),
+        entry(4, "assistant", Some(3), reply("Summary."), Some("req_B")),
+        entry(
+            5,
+            "user",
+            Some(4),
+            serde_json::json!({"role": "user", "content": "Thanks"}),
+            None,
+        ),
+        entry(
+            6,
+            "assistant",
+            Some(5),
+            reply("You are welcome."),
+            Some("req_C"),
+        ),
+    ];
+    if extra_turn {
+        lines.push(entry(
+            7,
+            "user",
+            Some(6),
+            serde_json::json!({"role": "user", "content": "One more thing"}),
+            None,
+        ));
+        lines.push(entry(
+            8,
+            "assistant",
+            Some(7),
+            reply("Done."),
+            Some("req_D"),
+        ));
+    }
+    lines.join("\n") + "\n"
+}
+
+/// A response whose path cannot be scrubbed used to fail every ingest of its
+/// session, because the cursor does not move when a batch fails. It is left out
+/// now, the operator is told so, and hook mode (which prints nothing) goes on.
+#[test]
+fn a_path_the_scrubber_cannot_take_does_not_stop_the_session_from_being_recorded() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let transcript = fixture.write_transcript(&hostile_read_session(false));
+
+    let stdout = fixture.cvc_ok(&[
+        "ingest",
+        "claude-code",
+        "--transcript",
+        transcript.to_str().unwrap(),
+    ]);
+    assert!(stdout.contains("3 new thought(s)"), "{stdout}");
+    assert!(
+        stdout.contains("left out of the responses recorded now: 0 tool call(s)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("1 context item(s)"), "{stdout}");
+    assert!(!stdout.contains("hunter2"), "{stdout}");
+    assert_eq!(fixture.interaction_count(), 3);
+
+    // The session grows; the next run records the new turn.
+    fixture.write_transcript(&hostile_read_session(true));
+    let stdout = fixture.cvc_ok(&[
+        "ingest",
+        "claude-code",
+        "--transcript",
+        transcript.to_str().unwrap(),
+    ]);
+    assert!(stdout.contains("1 new thought(s)"), "{stdout}");
+    assert_eq!(fixture.interaction_count(), 4);
+}
+
+#[test]
+fn hook_mode_goes_on_past_a_path_the_scrubber_cannot_take() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let transcript = fixture.write_transcript(&hostile_read_session(false));
+    let output = fixture.cvc_with_stdin(
+        &["ingest", "claude-code", "--hook"],
+        &fixture.hook_payload(&transcript, "Stop", ""),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert_eq!(fixture.interaction_count(), 3);
+
+    fixture.write_transcript(&hostile_read_session(true));
+    let output = fixture.cvc_with_stdin(
+        &["ingest", "claude-code", "--hook"],
+        &fixture.hook_payload(&transcript, "Stop", ""),
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(fixture.interaction_count(), 4);
+}

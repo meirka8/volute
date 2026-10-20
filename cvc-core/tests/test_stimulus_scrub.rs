@@ -148,15 +148,15 @@ fn a_key_block_spanning_two_parts_cannot_swallow_the_marker_between_them() {
     let read_back = contents(&text);
     assert_eq!(read_back.len(), 2);
     assert_eq!(read_back[1].0, PartKind::ToolResult);
-    // The part holding the header is redacted from the header to its own end,
-    // so none of that key's material is kept...
-    assert!(read_back[0].1.starts_with("output\n[CVC_REDACTED:v1:pem:"));
+    // The part holding the header is redacted from the header to the end of the
+    // key material after it, so none of that key's material is kept...
+    assert_eq!(masked(&read_back[0].1), "output\n[CVC_REDACTED:v1:pem:*]\n");
     assert!(!text.contains("MIIEfake"));
-    // ...and the second part is scrubbed on its own terms, markers and notes
-    // untouched. (A footer with no header before it is not a detector.)
-    assert!(read_back[1]
-        .1
-        .ends_with("-----END RSA PRIVATE KEY-----\ndone"));
+    // ...and the second part is scrubbed on its own terms, its marker untouched:
+    // the key text before its END line goes with the line, and what follows stays.
+    assert_eq!(masked(&read_back[1].1), "[CVC_REDACTED:v1:pem:*]\ndone");
+    assert!(!text.contains("KEYBODYLINE"));
+    assert!(text.contains("[tool_result Read "));
 }
 
 #[test]
@@ -196,8 +196,12 @@ fn a_token_at_the_cut_is_redacted_whole_not_kept_in_part() {
 
 #[test]
 fn an_unterminated_key_is_redacted_to_the_end_of_its_part() {
+    // The key material runs to the end of the part, so the redaction does too.
     let text = render(&[
-        tool("Bash", "log line\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\nmore key lines"),
+        tool(
+            "Bash",
+            "log line\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\nbm9uZQAAAAAAAAABAAAAMwAAAAtz",
+        ),
         StimulusPart::prompt("and a person after it"),
     ]);
     let read_back = contents(&text);
@@ -206,7 +210,32 @@ fn an_unterminated_key_is_redacted_to_the_end_of_its_part() {
         .starts_with("log line\n[CVC_REDACTED:v1:pem:"));
     assert!(read_back[0].1.ends_with(']'));
     assert!(!text.contains("b3BlbnNzaC1"));
+    assert!(!text.contains("bm9uZQAAAA"));
     assert_eq!(read_back[1].1, "and a person after it");
+}
+
+#[test]
+fn an_unterminated_key_redacts_its_key_text_and_keeps_the_prose_after_it() {
+    let text = render(&[
+        tool(
+            "Bash",
+            "log line\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\nthe key stops above, this is prose",
+        ),
+        tool(
+            "Read",
+            "the file must start with -----BEGIN RSA PRIVATE KEY----- and a body",
+        ),
+    ]);
+    let read_back = contents(&text);
+    assert_eq!(
+        masked(&read_back[0].1),
+        "log line\n[CVC_REDACTED:v1:pem:*]\nthe key stops above, this is prose"
+    );
+    // A header that is only mentioned costs the part nothing.
+    assert_eq!(
+        read_back[1].1,
+        "the file must start with -----BEGIN RSA PRIVATE KEY----- and a body"
+    );
 }
 
 #[test]
@@ -262,9 +291,28 @@ fn a_part_too_large_to_scrub_is_withheld_and_so_is_one_past_the_scrub_budget() {
     assert_eq!(contents(&text)[0].1, format!("[cvc: withheld {b}]"));
     assert_eq!(contents(&text)[1].1, "small");
 
-    // One stimulus asks the scrubber to read at most 8 MiB. Five parts of
-    // 1.5 MiB (each withheld above) use 7.5 MiB of it, so a part that would
-    // scrub fine on its own is withheld without being read.
+    // One stimulus asks the scrubber to scan at most 8 MiB, and only bytes that
+    // are scanned count. Eight parts of 1,000,000 bytes scan 8,000,000 of them,
+    // so the ninth, which would take the stimulus past its budget, is withheld
+    // without being read; a small part after it still fits and is scrubbed.
+    let mut parts: Vec<StimulusPart> = (0..9)
+        .map(|_| tool("Bash", &"x".repeat(1_000_000)))
+        .collect();
+    parts.push(tool("Read", "tiny"));
+    let text = render(&parts);
+    let b = token(&text);
+    let read_back = contents(&text);
+    assert_eq!(read_back[8].1, format!("[cvc: withheld {b}]"));
+    assert_eq!(read_back[9].1, "tiny");
+    assert!(read_back[7].1.starts_with("xxxx"), "a scanned part is kept");
+    assert!(text.len() <= MAX_STIMULUS_BYTES);
+}
+
+#[test]
+fn parts_the_scrubber_rejects_unread_are_not_charged_to_the_scrub_budget() {
+    // Five parts of 1.5 MiB are each over the one-value limit: rejected without
+    // being scanned, so they take nothing from the 8 MiB the stimulus may scan,
+    // and the part after them is scrubbed.
     let mut parts: Vec<StimulusPart> = (0..5)
         .map(|_| tool("Bash", &"x".repeat(1_536 * 1024)))
         .collect();
@@ -273,9 +321,45 @@ fn a_part_too_large_to_scrub_is_withheld_and_so_is_one_past_the_scrub_budget() {
     let text = render(&parts);
     let b = token(&text);
     let read_back = contents(&text);
-    assert_eq!(read_back[5].1, format!("[cvc: withheld {b}]"));
+    for withheld in &read_back[..5] {
+        assert_eq!(withheld.1, format!("[cvc: withheld {b}]"));
+    }
+    assert!(read_back[5].1.starts_with("yyyy"), "the next part was read");
     assert_eq!(read_back[6].1, "tiny");
-    assert!(text.len() <= MAX_STIMULUS_BYTES);
+}
+
+#[test]
+fn a_persons_words_are_scrubbed_first_so_tool_output_cannot_starve_them() {
+    // One tool result of 8 MiB, rejected for its size. It used to be charged to
+    // the budget anyway, which withheld everything after it.
+    let huge = tool("Bash", &"x".repeat(8 * 1024 * 1024));
+    let text = render(&[
+        huge,
+        StimulusPart::prompt("STOP. Do not push to main."),
+        tool("Read", "after"),
+    ]);
+    let read_back = contents(&text);
+    assert_eq!(read_back[1].0, PartKind::Prompt);
+    assert_eq!(read_back[1].1, "STOP. Do not push to main.");
+    assert_eq!(read_back[2].1, "after");
+
+    // Tool results that are all scanned and use the whole budget: the person's
+    // words, which come last in the stimulus, are scrubbed before any of them.
+    let mut parts: Vec<StimulusPart> = (0..9)
+        .map(|_| tool("Bash", &"x".repeat(1_000_000)))
+        .collect();
+    parts.push(StimulusPart::prompt("STOP. Do not push to main."));
+    parts.push(StimulusPart::task("A task for the subagent"));
+    let text = render(&parts);
+    let b = token(&text);
+    let read_back = contents(&text);
+    assert_eq!(read_back[9].1, "STOP. Do not push to main.");
+    assert_eq!(read_back[10].1, "A task for the subagent");
+    // The budget did run out on tool output: the ninth was withheld unread.
+    assert_eq!(read_back[8].1, format!("[cvc: withheld {b}]"));
+    // And the order of the parts in the stimulus is the order they came in.
+    assert_eq!(read_back[9].0, PartKind::Prompt);
+    assert_eq!(read_back[10].0, PartKind::Task);
 }
 
 // ---- scrubbed again around the markers ---------------------------------------
@@ -455,4 +539,96 @@ fn projection_and_import_keep_a_verified_stimulus_verified() {
         .user_prompt;
     assert_eq!(pulled, text);
     assert_eq!(contents(&pulled).len(), 3);
+}
+
+// ---- the name a marker carries is text too -------------------------------------
+
+const SECRET_NAME: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// A stimulus as a writer that scrubbed nothing, or a crafted node, would hold
+/// it: secrets in the names its markers carry.
+fn stimulus_with_secret_names() -> String {
+    stimulus::render(
+        &id(),
+        &[
+            StimulusPart::tool_result(Some(SECRET_NAME), false, "output"),
+            StimulusPart::tool_result(Some("Bash"), true, "boom"),
+            StimulusPart::tool_result(Some(SECRET_NAME), true, "failed"),
+            StimulusPart::prompt("then a person"),
+        ],
+        &unscrubbed,
+    )
+}
+
+#[test]
+fn a_secret_in_a_marker_name_is_rewritten_when_a_stimulus_is_scrubbed_again() {
+    let text = stimulus_with_secret_names();
+    assert!(text.contains(&format!("[tool_result {SECRET_NAME} ")));
+    // As it stands it verifies: names are not part of what the boundary covers.
+    let before = contents(&text);
+    assert_eq!(before.len(), 4);
+
+    let scrubbed = stimulus::scrub_stimulus(&id(), &text, &built_in).unwrap();
+    let b = token(&text);
+    assert!(!scrubbed.contains("ghp_"), "{scrubbed}");
+    assert!(scrubbed.starts_with(&format!("[tool_result redacted-tool {b}] output")));
+    assert!(scrubbed.contains(&format!("[tool_result Bash error {b}] boom")));
+    assert!(scrubbed.contains(&format!("[tool_result redacted-tool error {b}] failed")));
+    // Still the same verified stimulus, part for part.
+    assert_eq!(contents(&scrubbed), before);
+    assert_eq!(token(&scrubbed), b);
+    // And scrubbing it again changes nothing.
+    assert_eq!(
+        stimulus::scrub_stimulus(&id(), &scrubbed, &built_in).unwrap(),
+        scrubbed
+    );
+}
+
+#[test]
+fn a_clean_marker_name_is_kept_byte_for_byte() {
+    let text = render(&[
+        tool("Bash", "one"),
+        tool("mcp__github__create_issue", "two"),
+        StimulusPart::tool_result(Some("Read"), true, "three"),
+    ]);
+    assert_eq!(
+        stimulus::scrub_stimulus(&id(), &text, &built_in).unwrap(),
+        text
+    );
+}
+
+#[test]
+fn a_policy_literal_in_a_marker_name_is_rewritten_too() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join(".thoughtignore"), "literal:acme-internal\n").unwrap();
+    let policy = PreparedPolicy::load(dir.path()).unwrap();
+    // The name was valid and unredacted when it was written, before the rule.
+    let text = stimulus::render(
+        &id(),
+        &[
+            tool("mcp__acme-internal__lookup", "found it"),
+            tool("Read", "plain"),
+        ],
+        &unscrubbed,
+    );
+    let scrubbed = stimulus::scrub_stimulus(&id(), &text, &|text| policy.scrub(text)).unwrap();
+    assert!(
+        scrubbed.starts_with("[tool_result redacted-tool "),
+        "{scrubbed}"
+    );
+    assert!(scrubbed.contains("[tool_result Read "));
+    assert!(!scrubbed.contains("acme-internal"));
+    assert_eq!(contents(&scrubbed), contents(&text));
+}
+
+#[test]
+fn final_scrub_for_sync_rewrites_a_secret_marker_name() {
+    let text = stimulus_with_secret_names();
+    let mut node = interaction(&id(), text.clone());
+    final_scrub_for_sync(&mut node, &mut [], &mut []).unwrap();
+    assert!(!node.user_prompt.contains("ghp_"));
+    assert!(node
+        .user_prompt
+        .contains(&format!("[tool_result redacted-tool {}]", token(&text))));
+    assert_eq!(contents(&node.user_prompt), contents(&text));
 }

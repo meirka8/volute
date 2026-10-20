@@ -2759,22 +2759,30 @@ fn push_error(repo: &Repository, store: &CvcStore) -> String {
 #[test]
 fn a_published_node_with_an_unterminated_key_header_stops_the_push_and_says_how_to_go_on(
 ) -> anyhow::Result<()> {
-    for place in ["prompt", "response", "tool arguments"] {
+    let header = "output\n-----BEGIN RSA PRIVATE KEY-----\nMIIEfakeFAKEfake0123456789";
+    // The key text before a lone END line is the same case from the other side.
+    let footer =
+        "MIIEfakeFAKEfake0123456789\nQ2VudCB0aGUgZW5k==\n-----END RSA PRIVATE KEY-----\nok";
+    for (place, text) in [
+        ("prompt", header),
+        ("response", header),
+        ("tool arguments", header),
+        ("end line", footer),
+    ] {
         let temp = TempDir::new()?;
         let repo = Repository::init(temp.path())?;
         let store = CvcStore::open(temp.path().join("source.db"))?;
         let item = published_item("an ordinary prompt");
         store.create_interaction(&item)?;
         let id = item.id.to_string();
-        let header = "output\n-----BEGIN RSA PRIVATE KEY-----\nMIIEfakeFAKEfake0123456789";
         fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| match place {
-            "prompt" => node["interaction"]["user_prompt"] = header.into(),
-            "response" => node["interaction"]["model_response"] = header.into(),
+            "prompt" => node["interaction"]["user_prompt"] = text.into(),
+            "response" | "end line" => node["interaction"]["model_response"] = text.into(),
             _ => {
                 node["tool_executions"] = serde_json::json!([{
                     "id": 1, "interaction_id": id, "tool_protocol": "native",
                     "tool_name": "Write", "status": "success",
-                    "arguments": serde_json::json!({"content": header}).to_string(),
+                    "arguments": serde_json::json!({"content": text}).to_string(),
                 }]);
             }
         })?;
@@ -2782,7 +2790,7 @@ fn a_published_node_with_an_unterminated_key_header_stops_the_push_and_says_how_
         let message = push_error(&repo, &store);
         assert!(message.contains(&id), "{place}: {message}");
         assert!(
-            message.contains("already-published text holds an unterminated private-key header"),
+            message.contains("already-published text holds an unterminated private-key block"),
             "{place}: {message}"
         );
         assert!(
@@ -2818,7 +2826,8 @@ fn suppressing_the_node_for_the_destination_is_what_lets_the_push_go_on() -> any
     store.create_interaction(&other)?;
     let id = item.id.to_string();
     fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
-        node["interaction"]["user_prompt"] = "-----BEGIN PRIVATE KEY-----\nMIIEfake".into();
+        node["interaction"]["user_prompt"] =
+            "-----BEGIN PRIVATE KEY-----\nMIIEfakeFAKEfake0123456789".into();
     })?;
     assert!(push_error(&repo, &store).contains(&id));
 
@@ -2867,7 +2876,7 @@ fn any_published_node_that_fails_the_check_is_named_with_its_own_reason() -> any
         "{message}"
     );
     assert!(
-        !message.contains("unterminated private-key header"),
+        !message.contains("unterminated private-key block"),
         "{message}"
     );
     assert!(message.contains("cvc redact"), "{message}");
@@ -2889,6 +2898,95 @@ fn a_clean_published_node_does_not_stop_a_push() -> anyhow::Result<()> {
     assert!(
         sync::push_projection_to_ref(&repo, &store, FETCHED_BASELINE, TEST_DESTINATION).is_ok()
     );
+    Ok(())
+}
+
+#[test]
+fn a_published_node_that_only_mentions_a_key_header_does_not_stop_a_push() -> anyhow::Result<()> {
+    for (place, text) in [
+        (
+            "prompt",
+            "A key file must start with -----BEGIN RSA PRIVATE KEY----- and end with its END line.",
+        ),
+        (
+            "response",
+            "Header:\n-----BEGIN PRIVATE KEY-----\nThe next line is ordinary text, not a key.",
+        ),
+        ("tool arguments", "-----END PRIVATE KEY-----"),
+    ] {
+        let temp = TempDir::new()?;
+        let repo = Repository::init(temp.path())?;
+        let store = CvcStore::open(temp.path().join("source.db"))?;
+        let item = published_item("an ordinary prompt");
+        store.create_interaction(&item)?;
+        let id = item.id.to_string();
+        fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| match place {
+            "prompt" => node["interaction"]["user_prompt"] = text.into(),
+            "response" => node["interaction"]["model_response"] = text.into(),
+            _ => {
+                node["tool_executions"] = serde_json::json!([{
+                    "id": 1, "interaction_id": id, "tool_protocol": "native",
+                    "tool_name": "Write", "status": "success",
+                    "arguments": serde_json::json!({"content": text}).to_string(),
+                }]);
+            }
+        })?;
+        assert!(
+            sync::push_projection_to_ref(&repo, &store, FETCHED_BASELINE, TEST_DESTINATION).is_ok(),
+            "{place}: prose that mentions a header must not stop the push"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_secret_in_a_marker_name_of_a_remote_node_is_refused_on_push_and_rewritten_on_import(
+) -> anyhow::Result<()> {
+    use cvc_core::stimulus::{self, Reading, StimulusPart};
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("an ordinary prompt");
+    store.create_interaction(&item)?;
+    let id = item.id.to_string();
+    // A node as a hostile remote could write it: a stimulus that verifies, with
+    // a token where a tool's name goes. Names are not covered by the boundary.
+    let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    let crafted = stimulus::render(
+        &item.id,
+        &[
+            StimulusPart::tool_result(Some(secret), false, "output"),
+            StimulusPart::prompt("then a person"),
+        ],
+        &|text| Ok(text.to_owned()),
+    );
+    assert!(crafted.contains(&format!("[tool_result {secret} ")));
+    fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
+        node["interaction"]["user_prompt"] = crafted.clone().into();
+    })?;
+
+    // Pushing on top of it stops: the node no longer passes the privacy check.
+    let message = push_error(&repo, &store);
+    assert!(message.contains(&id), "{message}");
+    assert!(
+        message.contains("no longer passes the privacy check"),
+        "{message}"
+    );
+
+    // Pulling it rewrites the name before the first write, and what is stored
+    // is still the verified stimulus.
+    let imported = CvcStore::open(temp.path().join("imported.db"))?;
+    sync::pull_from_ref(&repo, &imported, FETCHED_BASELINE)?;
+    let stored = imported
+        .get_interaction(&item.id)?
+        .expect("the node was imported")
+        .user_prompt;
+    assert!(!stored.contains("ghp_"), "{stored}");
+    assert!(stored.contains("[tool_result redacted-tool "), "{stored}");
+    assert!(matches!(
+        stimulus::read(&item.id, &stored),
+        Reading::Verified(_)
+    ));
     Ok(())
 }
 

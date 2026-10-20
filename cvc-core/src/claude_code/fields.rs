@@ -38,7 +38,22 @@
 //! `N` is the number of bytes the field held. The arguments forms are valid JSON
 //! with their keys in alphabetical order, and both they and the text note are
 //! left unchanged by the scrubber, so they are stable through every later pass.
-use crate::privacy::{PreparedPolicy, MAX_TEXT};
+//!
+//! # Collections
+//!
+//! A capture holds at most 256 tool executions and 256 context items, and the
+//! capture boundary refuses one that holds more. A response with more calls than
+//! that (a model can make thousands) would then keep the session from being
+//! recorded, for the same reason. A response is therefore captured with its first
+//! 255 tool calls and, when any call or context item was left out, one last
+//! record that says how many: a tool execution named `cvc-omitted` whose
+//! arguments are `{"context_items":M,"cvc_omitted":true,"tool_calls":N}`. A
+//! context item is one path inside the worktree that a call read or edited. It is
+//! recorded scrubbed, and one whose path cannot be scrubbed (more than 256
+//! matches, or more than 1 MiB) is left out and counted, rather than failing the
+//! capture. A path the policy ignores is not recorded and not counted.
+use crate::models::{ContextItem, InteractionId, ToolExecution, ToolStatus};
+use crate::privacy::{PreparedPolicy, MAX_CONTEXT, MAX_TEXT, MAX_TOOLS};
 use crate::stimulus;
 use serde_json::Value;
 
@@ -47,6 +62,13 @@ pub(crate) const MAX_ARGUMENT_STRING_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_ARGUMENTS_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_ARGUMENTS_TOTAL_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_TITLE_BYTES: usize = 120;
+/// What one response records of its tool calls and of its context items.
+pub(crate) const MAX_TOOL_EXECUTIONS: usize = MAX_TOOLS;
+pub(crate) const MAX_CONTEXT_ITEMS: usize = MAX_CONTEXT;
+/// The protocol and name of the record that says calls or context items were
+/// left out.
+pub(crate) const OMITTED_PROTOCOL: &str = "cvc";
+pub(crate) const OMITTED_TOOL_NAME: &str = "cvc-omitted";
 
 /// What stands in for a text field of `bytes` bytes that could not be scrubbed.
 pub(crate) fn withheld_text(bytes: usize) -> String {
@@ -137,6 +159,79 @@ pub(crate) fn captured_arguments(
     }
     *budget -= bounded.len();
     bounded
+}
+
+/// The arguments of the record that says what a response left out.
+pub(crate) fn omitted_arguments(tool_calls: usize, context_items: usize) -> String {
+    format!(
+        "{{\"context_items\":{context_items},\"cvc_omitted\":true,\"tool_calls\":{tool_calls}}}"
+    )
+}
+
+/// The tool calls of one response as they are captured: each one's arguments
+/// scrubbed and bounded (see [`captured_arguments`]), all of them drawing on one
+/// budget, and at most [`MAX_TOOL_EXECUTIONS`] records. When a call was left out,
+/// or `left_out_context_items` says an item was, the last record is the
+/// `cvc-omitted` note. Returns the records and how many calls were left out.
+pub(crate) fn captured_tool_executions(
+    tools: Vec<ToolExecution>,
+    left_out_context_items: usize,
+    interaction_id: &InteractionId,
+    policy: &PreparedPolicy,
+) -> (Vec<ToolExecution>, usize) {
+    let note = tools.len() > MAX_TOOL_EXECUTIONS || left_out_context_items > 0;
+    let room = MAX_TOOL_EXECUTIONS - usize::from(note);
+    let left_out = tools.len().saturating_sub(room);
+    let mut budget = MAX_ARGUMENTS_TOTAL_BYTES;
+    let mut captured: Vec<ToolExecution> = tools
+        .into_iter()
+        .take(room)
+        .map(|mut tool| {
+            tool.arguments = captured_arguments(tool.arguments, &mut budget, policy);
+            tool
+        })
+        .collect();
+    if note {
+        captured.push(ToolExecution {
+            id: None,
+            interaction_id: interaction_id.clone(),
+            tool_protocol: OMITTED_PROTOCOL.to_owned(),
+            tool_name: OMITTED_TOOL_NAME.to_owned(),
+            arguments: omitted_arguments(left_out, left_out_context_items),
+            status: ToolStatus::Success,
+        });
+    }
+    (captured, left_out)
+}
+
+/// The context items of one response as they are captured: the path of each
+/// scrubbed with the capture's policy, at most [`MAX_CONTEXT_ITEMS`] of them. An
+/// item whose path the policy ignores is not recorded and not counted. One whose
+/// path cannot be scrubbed is left out, and so is each one past the limit.
+/// Returns the items and how many were left out.
+pub(crate) fn captured_context_items(
+    items: Vec<ContextItem>,
+    policy: &PreparedPolicy,
+) -> (Vec<ContextItem>, usize) {
+    let mut kept = Vec::new();
+    let mut left_out = 0usize;
+    for mut item in items {
+        if policy.ignores_path(&item.file_path) {
+            continue;
+        }
+        if kept.len() == MAX_CONTEXT_ITEMS {
+            left_out += 1;
+            continue;
+        }
+        match policy.scrub(&item.file_path) {
+            Ok(path) => {
+                item.file_path = path;
+                kept.push(item);
+            }
+            Err(_) => left_out += 1,
+        }
+    }
+    (kept, left_out)
 }
 
 fn withhold_oversized_strings(value: &mut Value) {
@@ -369,6 +464,149 @@ mod tests {
             withheld_arguments(noisy_input.len())
         );
         assert_eq!(budget, MAX_ARGUMENTS_TOTAL_BYTES);
+    }
+
+    fn call(n: usize, id: &InteractionId) -> ToolExecution {
+        ToolExecution {
+            id: None,
+            interaction_id: id.clone(),
+            tool_protocol: "native".into(),
+            tool_name: "Bash".into(),
+            arguments: format!(r#"{{"command":"echo {n}"}}"#),
+            status: ToolStatus::Success,
+        }
+    }
+
+    fn item(path: &str, id: &InteractionId) -> ContextItem {
+        ContextItem {
+            id: None,
+            interaction_id: id.clone(),
+            file_path: path.into(),
+            git_blob_sha: None,
+            dirty_patch: None,
+            start_line: None,
+            end_line: None,
+        }
+    }
+
+    #[test]
+    fn up_to_the_limit_of_calls_is_recorded_whole_and_one_more_is_cut_with_a_note() {
+        let policy = PreparedPolicy::built_ins_only();
+        let id = InteractionId::new();
+        let calls = |count: usize| (0..count).map(|n| call(n, &id)).collect::<Vec<_>>();
+
+        let (kept, left_out) = captured_tool_executions(calls(256), 0, &id, &policy);
+        assert_eq!((kept.len(), left_out), (256, 0));
+        assert!(kept.iter().all(|tool| tool.tool_name == "Bash"));
+
+        let (kept, left_out) = captured_tool_executions(calls(257), 0, &id, &policy);
+        assert_eq!((kept.len(), left_out), (256, 2), "255 calls and the note");
+        assert_eq!(kept[254].arguments, r#"{"command":"echo 254"}"#);
+        let note = &kept[255];
+        assert_eq!(
+            (note.tool_protocol.as_str(), note.tool_name.as_str()),
+            ("cvc", "cvc-omitted")
+        );
+        assert_eq!(
+            note.arguments,
+            r#"{"context_items":0,"cvc_omitted":true,"tool_calls":2}"#
+        );
+        assert_eq!(note.status, ToolStatus::Success);
+        assert_eq!(note.interaction_id, id);
+
+        let (kept, left_out) = captured_tool_executions(calls(10_000), 0, &id, &policy);
+        assert_eq!((kept.len(), left_out), (256, 9_745));
+    }
+
+    #[test]
+    fn left_out_context_items_are_noted_even_when_every_call_fits() {
+        let policy = PreparedPolicy::built_ins_only();
+        let id = InteractionId::new();
+        let (kept, left_out) = captured_tool_executions(vec![call(0, &id)], 3, &id, &policy);
+        assert_eq!((kept.len(), left_out), (2, 0));
+        assert_eq!(
+            kept[1].arguments,
+            r#"{"context_items":3,"cvc_omitted":true,"tool_calls":0}"#
+        );
+        // With nothing left out there is no note.
+        let (kept, _) = captured_tool_executions(vec![call(0, &id)], 0, &id, &policy);
+        assert_eq!(kept.len(), 1);
+        let (kept, _) = captured_tool_executions(Vec::new(), 0, &id, &policy);
+        assert!(kept.is_empty());
+        // A response with 256 calls that also left a context item out gives up
+        // one call for the note.
+        let calls: Vec<_> = (0..256).map(|n| call(n, &id)).collect();
+        let (kept, left_out) = captured_tool_executions(calls, 1, &id, &policy);
+        assert_eq!((kept.len(), left_out), (256, 1));
+    }
+
+    #[test]
+    fn the_omitted_note_survives_every_later_scrub_unchanged() {
+        let arguments = omitted_arguments(45, 44);
+        assert_eq!(
+            arguments,
+            r#"{"context_items":44,"cvc_omitted":true,"tool_calls":45}"#
+        );
+        assert_eq!(scrub_json(&arguments).unwrap(), arguments);
+        assert!(validate_sanitized_json(&arguments).is_ok());
+        let policy = PreparedPolicy::built_ins_only();
+        assert_eq!(policy.scrub_json(&arguments).unwrap(), arguments);
+        for name in [OMITTED_PROTOCOL, OMITTED_TOOL_NAME] {
+            assert_eq!(scrub(name).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn a_context_path_is_scrubbed_a_policy_ignored_one_is_dropped_and_an_unscrubbable_one_is_counted(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".thoughtignore"),
+            "path:secrets
+",
+        )
+        .unwrap();
+        let policy = PreparedPolicy::load(dir.path()).unwrap();
+        let id = InteractionId::new();
+        let hostile = (0..300)
+            .map(|n| format!("token=hunter2hunter{n} "))
+            .collect::<String>();
+        let (kept, left_out) = captured_context_items(
+            vec![
+                item("src/lib.rs", &id),
+                item("secrets/key.pem", &id),
+                item(&hostile, &id),
+                item("src/token=abcdefgh1234.txt", &id),
+                item("a/b.rs", &id),
+            ],
+            &policy,
+        );
+        let paths: Vec<&str> = kept.iter().map(|item| item.file_path.as_str()).collect();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert_eq!(paths[0], "src/lib.rs");
+        assert!(paths[1].starts_with("src/[CVC_REDACTED:v1:secret_assignment:"));
+        assert_eq!(paths[2], "a/b.rs");
+        // The ignored path is not counted; the hostile one is.
+        assert_eq!(left_out, 1);
+    }
+
+    #[test]
+    fn context_items_past_the_limit_are_counted_and_not_scrubbed() {
+        let policy = PreparedPolicy::built_ins_only();
+        let id = InteractionId::new();
+        let items: Vec<_> = (0..300)
+            .map(|n| item(&format!("src/f{n}.rs"), &id))
+            .collect();
+        let (kept, left_out) = captured_context_items(items, &policy);
+        assert_eq!((kept.len(), left_out), (256, 44));
+        assert_eq!(kept[255].file_path, "src/f255.rs");
+        // A path that cannot be scrubbed past the limit is counted, not read.
+        let mut items: Vec<_> = (0..256)
+            .map(|n| item(&format!("src/f{n}.rs"), &id))
+            .collect();
+        items.push(item(&"z".repeat(MAX_TEXT + 1), &id));
+        let (kept, left_out) = captured_context_items(items, &policy);
+        assert_eq!((kept.len(), left_out), (256, 1));
     }
 
     #[test]

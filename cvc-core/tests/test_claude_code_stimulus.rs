@@ -923,3 +923,723 @@ fn the_size_bounds_of_the_captured_fields_are_unchanged_for_ordinary_text() {
         )
     );
 }
+
+// ---- a response that could keep the session from being recorded ---------------------
+//
+// The cursor only moves when a whole batch is stored, and a capture the boundary
+// refuses used to fail the batch. Each of these responses did that, on every later
+// run too. Each test ingests twice, the second time after another turn was added:
+// the cursor must move past the first, and the second must record the new turn.
+
+/// Whether the cursor of `report` is at or past the end of the last line of
+/// `path` that holds `marker`.
+fn cursor_is_past(
+    report: &cvc_core::claude_code::IngestReport,
+    path: &std::path::Path,
+    marker: &str,
+) -> bool {
+    let text = fs::read_to_string(path).unwrap();
+    let at = text.rfind(marker).unwrap();
+    let line_end = at + text[at..].find('\n').unwrap() + 1;
+    report.cursor as usize >= line_end
+}
+
+/// Appends a turn, ingests again, and checks that it was recorded and the cursor
+/// moved on.
+fn a_later_turn_is_recorded(
+    fixture: &Fixture,
+    t: &mut Transcript,
+    path: &std::path::Path,
+    first: &cvc_core::claude_code::IngestReport,
+) {
+    t.say("One more thing").answer("req_Z", "Done.");
+    fs::write(path, t.text()).unwrap();
+    let again = fixture.ingest(path, IngestMode::Final);
+    assert_eq!(again.inserted, 1, "{again:?}");
+    assert!(again.cursor > first.cursor, "{first:?} then {again:?}");
+    assert_eq!(
+        parts(&stored(&fixture.store(), SESSION, "req_Z")).1[0].content,
+        "One more thing"
+    );
+}
+
+fn policy_markers(text: &str) -> usize {
+    text.matches("[CVC_REDACTED:v1:policy_regex:").count()
+}
+
+#[test]
+fn a_read_path_with_too_many_secret_matches_is_left_out_and_the_session_keeps_capturing() {
+    let fixture = Fixture::new();
+    // A path the model chose, inside the worktree, 5.4 KB with 300 matches.
+    let hostile = format!(
+        "{}/notes/{}",
+        fixture.root.display(),
+        (0..300)
+            .map(|n| format!("token=hunter2hunter{n} "))
+            .collect::<String>()
+    );
+    assert!(hostile.len() > 5_000);
+    assert!(scrub(&hostile).is_err());
+    let mut t = fixture.transcript();
+    t.say("Summarise the notes")
+        .call("req_A", "toolu_1", "Read", json!({"file_path": hostile}))
+        .results(&[("toolu_1", "the notes", false)])
+        .answer("req_B", "Summary.")
+        .say("Thanks")
+        .answer("req_C", "You are welcome.");
+    let path = fixture.write(&t);
+
+    let report = fixture.ingest(&path, IngestMode::Final);
+    assert_eq!(report.inserted, 3, "{report:?}");
+    assert_eq!((report.withheld, report.lost), (0, 0), "{report:?}");
+    assert_eq!(report.omitted_context_items, 1, "{report:?}");
+    assert_eq!(report.omitted_tool_calls, 0, "{report:?}");
+    let store = fixture.store();
+    let first = stored(&store, SESSION, "req_A");
+    // The path was not recorded, the call was, and the response says what it left out.
+    assert!(store.get_context_items(&first.id).unwrap().is_empty());
+    let tools = store.get_tool_executions(&first.id).unwrap();
+    assert_eq!(tools.len(), 2, "{tools:?}");
+    assert_eq!(tools[0].tool_name, "Read");
+    assert!(tools[0].arguments.contains("cvc_withheld"));
+    assert_eq!(tools[1].tool_name, "cvc-omitted");
+    assert_eq!(tools[1].tool_protocol, "cvc");
+    assert_eq!(
+        tools[1].arguments,
+        r#"{"context_items":1,"cvc_omitted":true,"tool_calls":0}"#
+    );
+    // The cursor moved past it.
+    let cursor = store
+        .harness_ingest_cursor(HARNESS, SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.byte_offset, report.cursor);
+    assert!(
+        cursor_is_past(&report, &path, "hunter2hunter299"),
+        "{report:?}"
+    );
+    for bytes in database_bytes(&fixture) {
+        assert!(
+            !contains(&bytes, b"hunter2"),
+            "a secret reached the database"
+        );
+    }
+    a_later_turn_is_recorded(&fixture, &mut t, &path, &report);
+}
+
+#[test]
+fn a_response_with_more_tool_calls_than_a_capture_holds_is_capped_with_a_note() {
+    let fixture = Fixture::new();
+    let calls: Vec<Value> = (0..257)
+        .map(|n| {
+            json!({"type": "tool_use", "id": format!("toolu_{n}"), "name": "Bash",
+                   "input": {"command": format!("echo {n}")}})
+        })
+        .collect();
+    let ids: Vec<String> = (0..257).map(|n| format!("toolu_{n}")).collect();
+    let results: Vec<(&str, &str, bool)> =
+        ids.iter().map(|id| (id.as_str(), "ok", false)).collect();
+    let mut t = fixture.transcript();
+    t.say("Run all of them")
+        .respond("req_A", calls, "tool_use")
+        .results(&results)
+        .answer("req_B", "Ran them.")
+        .say("Thanks")
+        .answer("req_C", "You are welcome.");
+    let path = fixture.write(&t);
+
+    let report = fixture.ingest(&path, IngestMode::Final);
+    assert_eq!(report.inserted, 3, "{report:?}");
+    assert_eq!((report.withheld, report.lost), (0, 0), "{report:?}");
+    assert_eq!(report.omitted_tool_calls, 2, "{report:?}");
+    assert_eq!(report.omitted_context_items, 0, "{report:?}");
+    let store = fixture.store();
+    let first = stored(&store, SESSION, "req_A");
+    let tools = store.get_tool_executions(&first.id).unwrap();
+    assert_eq!(tools.len(), 256, "255 calls and the note");
+    assert_eq!(tools[0].arguments, r#"{"command":"echo 0"}"#);
+    assert_eq!(tools[254].arguments, r#"{"command":"echo 254"}"#);
+    assert_eq!(tools[255].tool_name, "cvc-omitted");
+    assert_eq!(
+        tools[255].arguments,
+        r#"{"context_items":0,"cvc_omitted":true,"tool_calls":2}"#
+    );
+    // The responses around it are recorded, and the cursor moved.
+    assert_eq!(
+        parts(&stored(&store, SESSION, "req_C")).1[0].content,
+        "Thanks"
+    );
+    assert!(cursor_is_past(&report, &path, "toolu_256"), "{report:?}");
+    a_later_turn_is_recorded(&fixture, &mut t, &path, &report);
+}
+
+#[test]
+fn exactly_the_most_tool_calls_and_context_items_are_recorded_without_a_note() {
+    let fixture = Fixture::new();
+    let calls: Vec<Value> = (0..256)
+        .map(|n| {
+            json!({"type": "tool_use", "id": format!("toolu_{n}"), "name": "Read",
+                   "input": {"file_path": format!("{}/src/f{n}.rs", fixture.root.display())}})
+        })
+        .collect();
+    let ids: Vec<String> = (0..256).map(|n| format!("toolu_{n}")).collect();
+    let results: Vec<(&str, &str, bool)> =
+        ids.iter().map(|id| (id.as_str(), "ok", false)).collect();
+    let mut t = fixture.transcript();
+    t.say("Read them all")
+        .respond("req_A", calls, "tool_use")
+        .results(&results)
+        .answer("req_B", "Read them.");
+    let path = fixture.write(&t);
+    let report = fixture.ingest(&path, IngestMode::Final);
+    assert_eq!(report.inserted, 2, "{report:?}");
+    assert_eq!(
+        (report.omitted_tool_calls, report.omitted_context_items),
+        (0, 0)
+    );
+    let store = fixture.store();
+    let first = stored(&store, SESSION, "req_A");
+    let tools = store.get_tool_executions(&first.id).unwrap();
+    assert_eq!(tools.len(), 256);
+    assert!(tools.iter().all(|tool| tool.tool_name == "Read"));
+    assert_eq!(store.get_context_items(&first.id).unwrap().len(), 256);
+}
+
+#[test]
+fn more_context_items_than_a_capture_holds_are_capped_and_counted() {
+    let fixture = Fixture::new();
+    let calls: Vec<Value> = (0..300)
+        .map(|n| {
+            json!({"type": "tool_use", "id": format!("toolu_{n}"), "name": "Read",
+                   "input": {"file_path": format!("{}/src/f{n}.rs", fixture.root.display())}})
+        })
+        .collect();
+    let ids: Vec<String> = (0..300).map(|n| format!("toolu_{n}")).collect();
+    let results: Vec<(&str, &str, bool)> =
+        ids.iter().map(|id| (id.as_str(), "ok", false)).collect();
+    let mut t = fixture.transcript();
+    t.say("Read them all")
+        .respond("req_A", calls, "tool_use")
+        .results(&results)
+        .answer("req_B", "Read them.");
+    let path = fixture.write(&t);
+
+    let report = fixture.ingest(&path, IngestMode::Final);
+    assert_eq!(report.inserted, 2, "{report:?}");
+    assert_eq!(report.omitted_context_items, 44, "{report:?}");
+    assert_eq!(report.omitted_tool_calls, 45, "{report:?}");
+    let store = fixture.store();
+    let first = stored(&store, SESSION, "req_A");
+    let items = store.get_context_items(&first.id).unwrap();
+    assert_eq!(items.len(), 256);
+    assert_eq!(items[0].file_path, "src/f0.rs");
+    assert_eq!(items[255].file_path, "src/f255.rs");
+    let tools = store.get_tool_executions(&first.id).unwrap();
+    assert_eq!(tools.len(), 256, "255 calls and the note");
+    assert_eq!(
+        tools[255].arguments,
+        r#"{"context_items":44,"cvc_omitted":true,"tool_calls":45}"#
+    );
+    assert!(cursor_is_past(&report, &path, "toolu_299"), "{report:?}");
+    a_later_turn_is_recorded(&fixture, &mut t, &path, &report);
+}
+
+#[test]
+fn a_policy_rule_that_matches_inside_markers_no_longer_fails_the_capture() {
+    // `regex:[0-9a-f]{8}` matches inside the id of every redaction marker it
+    // inserts. With 150 ids in a response, the capture made 150 replacements and
+    // the capture boundary, scrubbing the result again, counted 300.
+    let fixture = Fixture::with_policy(Some("regex:[0-9a-f]{8}\n"));
+    let ids: String = (0..150).map(|n| format!("deadbe{n:02x} ")).collect();
+    let mut t = fixture.transcript();
+    t.say("List the ids")
+        .respond(
+            "req_A",
+            vec![
+                json!({"type": "thinking", "thinking": ids, "signature": "s"}),
+                json!({"type": "text", "text": ids}),
+                json!({"type": "tool_use", "id": "toolu_1", "name": "Bash",
+                       "input": {"command": format!("echo {ids}")}}),
+            ],
+            "tool_use",
+        )
+        .results(&[("toolu_1", &ids, false)])
+        .answer("req_B", "Listed.")
+        .say("Thanks")
+        .answer("req_C", "You are welcome.");
+    let path = fixture.write(&t);
+
+    let report = fixture.ingest(&path, IngestMode::Final);
+    assert_eq!(report.inserted, 3, "{report:?}");
+    assert_eq!((report.withheld, report.lost), (0, 0), "{report:?}");
+    let store = fixture.store();
+    let first = stored(&store, SESSION, "req_A");
+    for (field, text) in [
+        ("model_response", first.model_response.clone().unwrap()),
+        ("model_cot", first.model_cot.clone().unwrap()),
+        (
+            "arguments",
+            store.get_tool_executions(&first.id).unwrap()[0]
+                .arguments
+                .clone(),
+        ),
+    ] {
+        assert_eq!(policy_markers(&text), 150, "{field}: {text}");
+        assert!(!text.contains("deadbe"), "{field}");
+    }
+    // The ids in the tool result were redacted in its part, before it was cut
+    // to the head and tail it keeps.
+    let (_, after_tool) = parts(&stored(&store, SESSION, "req_B"));
+    assert!(policy_markers(&after_tool[0].content) > 100);
+    assert!(!after_tool[0].content.contains("deadbe"));
+    assert!(cursor_is_past(&report, &path, "deadbe95"), "{report:?}");
+    for bytes in database_bytes(&fixture) {
+        assert!(
+            !contains(&bytes, b"deadbe"),
+            "a matched id reached the database"
+        );
+    }
+    a_later_turn_is_recorded(&fixture, &mut t, &path, &report);
+}
+
+// ---- a capture the boundary still refuses ---------------------------------------------
+//
+// The ingest closes the ways a transcript can produce one, but the boundary is the
+// last word: a capture it refuses is stored as a stand-in (same id, its place in the
+// conversation, a note in place of the response, no tool calls or context items)
+// instead of failing the batch.
+
+const WITHHELD_RESPONSE: &str =
+    "[cvc: withheld this response: it could not be scrubbed within the limits]";
+
+fn hand_built_capture(
+    conversation: &str,
+    request: &str,
+    user_prompt: String,
+    response: &str,
+    tools: usize,
+) -> cvc_core::privacy::ClaudeCodeCapture {
+    hand_built_capture_in(
+        conversation,
+        conversation,
+        request,
+        None,
+        user_prompt,
+        response,
+        tools,
+        PreparedPolicy::built_ins_only(),
+    )
+}
+
+/// A capture whose interaction names `interaction_conversation`, which the
+/// boundary refuses when it is not the conversation's own id, and a `parent`.
+#[allow(clippy::too_many_arguments)]
+fn hand_built_capture_in(
+    conversation: &str,
+    interaction_conversation: &str,
+    request: &str,
+    parent: Option<&str>,
+    user_prompt: String,
+    response: &str,
+    tools: usize,
+    policy: PreparedPolicy,
+) -> cvc_core::privacy::ClaudeCodeCapture {
+    use chrono::Utc;
+    use cvc_core::models::{ContextItem, Conversation, ToolExecution, ToolStatus};
+    let id = derived_interaction_id(conversation, request);
+    cvc_core::privacy::ClaudeCodeCapture::new(
+        Conversation {
+            id: conversation.to_owned(),
+            title: "Hand built".into(),
+            created_at: Utc::now(),
+        },
+        Interaction {
+            id: id.clone(),
+            conversation_id: interaction_conversation.to_owned(),
+            parent_id: parent.map(|request| derived_interaction_id(conversation, request)),
+            timestamp: Utc::now(),
+            author: Author::Human,
+            user_prompt,
+            model_name: Some("claude-fixture-1".into()),
+            model_cot: Some("thinking about it".into()),
+            model_response: Some(response.to_owned()),
+            source_request_id: Some(request.to_owned()),
+        },
+        vec![ContextItem {
+            id: None,
+            interaction_id: id.clone(),
+            file_path: "src/a.rs".into(),
+            git_blob_sha: None,
+            dirty_patch: None,
+            start_line: None,
+            end_line: None,
+        }],
+        (0..tools)
+            .map(|n| ToolExecution {
+                id: None,
+                interaction_id: id.clone(),
+                tool_protocol: "native".into(),
+                tool_name: "Bash".into(),
+                arguments: json!({"command": format!("echo {n}")}).to_string(),
+                status: ToolStatus::Success,
+            })
+            .collect(),
+        policy,
+        "0".repeat(64),
+    )
+}
+
+fn cursor_update(offset: u64) -> cvc_core::db::HarnessCursorUpdate<'static> {
+    cvc_core::db::HarnessCursorUpdate {
+        harness: HARNESS,
+        session_id: SESSION,
+        transcript_path: "/transcripts/session.jsonl",
+        byte_offset: offset,
+    }
+}
+
+fn prompt_for(request: &str, text: &str) -> String {
+    stimulus::render(
+        &derived_interaction_id(SESSION, request),
+        &[stimulus::StimulusPart::prompt(text)],
+        &scrub,
+    )
+}
+
+#[test]
+fn a_capture_over_the_collection_limit_is_a_stand_in_and_the_batch_goes_on() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let outcome = store
+        .capture_claude_code_batch(
+            vec![
+                hand_built_capture(
+                    SESSION,
+                    "req_A",
+                    prompt_for("req_A", "Run them all"),
+                    "text",
+                    300,
+                ),
+                hand_built_capture(
+                    SESSION,
+                    "req_B",
+                    prompt_for("req_B", "Then this"),
+                    "fine",
+                    2,
+                ),
+            ],
+            cursor_update(4242),
+        )
+        .unwrap();
+    assert_eq!(outcome.inserted, 2, "{outcome:?}");
+    assert_eq!((outcome.withheld, outcome.lost), (1, 0), "{outcome:?}");
+    assert_eq!(
+        outcome.reasons,
+        vec!["capture collection exceeds limit".to_owned()]
+    );
+
+    // The stand-in keeps what the person said and where it sits, says its
+    // response was withheld, and holds no calls or context.
+    let stand_in = stored(&store, SESSION, "req_A");
+    assert_eq!(parts(&stand_in).1[0].content, "Run them all");
+    assert_eq!(stand_in.model_response.as_deref(), Some(WITHHELD_RESPONSE));
+    assert_eq!(stand_in.model_cot, None);
+    assert_eq!(stand_in.model_name, None);
+    assert_eq!(stand_in.author, Author::Human);
+    assert_eq!(stand_in.source_request_id.as_deref(), Some("req_A"));
+    assert!(store.get_tool_executions(&stand_in.id).unwrap().is_empty());
+    assert!(store.get_context_items(&stand_in.id).unwrap().is_empty());
+    // The one after it is stored as it was, and the cursor moved.
+    let next = stored(&store, SESSION, "req_B");
+    assert_eq!(next.model_response.as_deref(), Some("fine"));
+    assert_eq!(store.get_tool_executions(&next.id).unwrap().len(), 2);
+    assert_eq!(
+        store
+            .harness_ingest_cursor(HARNESS, SESSION)
+            .unwrap()
+            .unwrap()
+            .byte_offset,
+        4242
+    );
+    // A second batch with the same id skips it, as it does any recorded id.
+    let again = store
+        .capture_claude_code_batch(
+            vec![hand_built_capture(
+                SESSION,
+                "req_A",
+                prompt_for("req_A", "Run them all"),
+                "x",
+                300,
+            )],
+            cursor_update(4300),
+        )
+        .unwrap();
+    assert_eq!(
+        (again.inserted, again.suppressed, again.withheld),
+        (0, 1, 0)
+    );
+}
+
+#[test]
+fn a_stimulus_the_boundary_refuses_is_replaced_by_a_withheld_one() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    // Not a stimulus that verifies, and too many matches to scrub as one string.
+    let refused = noisy_lines(300);
+    assert_eq!(
+        stimulus::read(&derived_interaction_id(SESSION, "req_A"), &refused),
+        Reading::Legacy
+    );
+    let outcome = store
+        .capture_claude_code_batch(
+            vec![hand_built_capture(SESSION, "req_A", refused, "text", 1)],
+            cursor_update(10),
+        )
+        .unwrap();
+    assert_eq!(
+        (outcome.inserted, outcome.withheld, outcome.lost),
+        (1, 1, 0)
+    );
+    let stand_in = stored(&store, SESSION, "req_A");
+    let (boundary, read_back) = parts(&stand_in);
+    assert_eq!(read_back.len(), 1);
+    assert_eq!(read_back[0].content, format!("[cvc: withheld {boundary}]"));
+    assert_eq!(stand_in.model_response.as_deref(), Some(WITHHELD_RESPONSE));
+    for bytes in database_bytes(&fixture) {
+        assert!(!contains(&bytes, b"hunter2"));
+    }
+}
+
+#[test]
+fn a_capture_that_cannot_be_stored_even_as_a_stand_in_is_lost_and_the_batch_goes_on() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    // A conversation id that is not a safe identifier is refused for the
+    // capture and for any stand-in with it.
+    let outcome = store
+        .capture_claude_code_batch(
+            vec![
+                hand_built_capture(
+                    "not a safe id",
+                    "req_A",
+                    prompt_for("req_A", "lost"),
+                    "text",
+                    1,
+                ),
+                hand_built_capture(SESSION, "req_B", prompt_for("req_B", "kept"), "fine", 1),
+            ],
+            cursor_update(77),
+        )
+        .unwrap();
+    assert_eq!(outcome.inserted, 1, "{outcome:?}");
+    assert_eq!((outcome.withheld, outcome.lost), (0, 1), "{outcome:?}");
+    assert_eq!(
+        outcome.reasons,
+        vec!["unsafe or inconsistent conversation id".to_owned()]
+    );
+    assert!(!store
+        .interaction_exists(&derived_interaction_id("not a safe id", "req_A"))
+        .unwrap());
+    assert_eq!(
+        stored(&store, SESSION, "req_B").model_response.as_deref(),
+        Some("fine")
+    );
+    assert_eq!(
+        store
+            .harness_ingest_cursor(HARNESS, SESSION)
+            .unwrap()
+            .unwrap()
+            .byte_offset,
+        77
+    );
+}
+
+#[test]
+fn the_chain_skips_a_capture_that_was_lost_and_never_names_one_that_is_not_stored() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let outcome = store
+        .capture_claude_code_batch(
+            vec![
+                hand_built_capture_in(
+                    SESSION,
+                    SESSION,
+                    "req_A",
+                    None,
+                    prompt_for("req_A", "a"),
+                    "A",
+                    0,
+                    PreparedPolicy::built_ins_only(),
+                ),
+                // Refused, and so is any stand-in for it: the interaction names
+                // another conversation than the one it is stored under.
+                hand_built_capture_in(
+                    SESSION,
+                    "other",
+                    "req_B",
+                    Some("req_A"),
+                    prompt_for("req_B", "b"),
+                    "B",
+                    0,
+                    PreparedPolicy::built_ins_only(),
+                ),
+                // The child of the one that was lost, and of one stored nowhere.
+                hand_built_capture_in(
+                    SESSION,
+                    SESSION,
+                    "req_C",
+                    Some("req_B"),
+                    prompt_for("req_C", "c"),
+                    "C",
+                    0,
+                    PreparedPolicy::built_ins_only(),
+                ),
+                hand_built_capture_in(
+                    SESSION,
+                    SESSION,
+                    "req_D",
+                    Some("req_never"),
+                    prompt_for("req_D", "d"),
+                    "D",
+                    0,
+                    PreparedPolicy::built_ins_only(),
+                ),
+            ],
+            cursor_update(9),
+        )
+        .unwrap();
+    assert_eq!((outcome.inserted, outcome.lost), (3, 1), "{outcome:?}");
+    let a = derived_interaction_id(SESSION, "req_A");
+    assert!(!store
+        .interaction_exists(&derived_interaction_id(SESSION, "req_B"))
+        .unwrap());
+    // C points at A, the parent of the one that was lost: the chain stays whole.
+    assert_eq!(stored(&store, SESSION, "req_C").parent_id, Some(a));
+    // D's parent is stored nowhere: the chain breaks there, the batch does not fail.
+    assert_eq!(stored(&store, SESSION, "req_D").parent_id, None);
+    assert_eq!(
+        store
+            .harness_ingest_cursor(HARNESS, SESSION)
+            .unwrap()
+            .unwrap()
+            .byte_offset,
+        9
+    );
+}
+
+#[test]
+fn a_policy_that_refuses_a_capture_cannot_refuse_its_stand_in() {
+    // A rule that matches every character: the capture's fields cannot be
+    // scrubbed within the limit, and the note that stands in for the response
+    // has more than 256 characters' worth of matches too, were the rule applied to it.
+    let fixture = Fixture::with_policy(Some("regex:.\n"));
+    let store = fixture.store();
+    let capture = hand_built_capture_in(
+        SESSION,
+        SESSION,
+        "req_A",
+        None,
+        prompt_for("req_A", "Run them all"),
+        &"long text ".repeat(100),
+        300,
+        fixture.policy(),
+    );
+    let outcome = store
+        .capture_claude_code_batch(vec![capture], cursor_update(5))
+        .unwrap();
+    assert_eq!(
+        (outcome.inserted, outcome.withheld, outcome.lost),
+        (1, 1, 0),
+        "{outcome:?}"
+    );
+    let stand_in = stored(&store, SESSION, "req_A");
+    // The note is exactly ours, whatever the policy would have made of it.
+    assert_eq!(stand_in.model_response.as_deref(), Some(WITHHELD_RESPONSE));
+    assert!(store.get_tool_executions(&stand_in.id).unwrap().is_empty());
+    // What was carried over went through the policy: nothing of the prompt's
+    // text is left in the stored stimulus.
+    assert!(!stand_in.user_prompt.contains("Run them all"));
+    assert_eq!(
+        store
+            .harness_ingest_cursor(HARNESS, SESSION)
+            .unwrap()
+            .unwrap()
+            .byte_offset,
+        5
+    );
+}
+
+#[test]
+fn a_stand_in_is_published_and_imported_like_any_node() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    store
+        .capture_claude_code_batch(
+            vec![hand_built_capture(
+                SESSION,
+                "req_A",
+                prompt_for("req_A", "Run them all"),
+                "text",
+                300,
+            )],
+            cursor_update(1),
+        )
+        .unwrap();
+    store
+        .share_conversation_for_remote(SESSION, DESTINATION, FutureSharePolicy::Private)
+        .unwrap();
+    let repo = fixture.layout.repository();
+    let sync::ProjectionResult::Candidate { oid, candidate, .. } =
+        sync::push_projection_to_ref(repo, &store, "", DESTINATION).unwrap()
+    else {
+        panic!("expected a projection")
+    };
+    repo.reference("refs/cvc/stand-in-source", oid, true, "test")
+        .unwrap();
+    drop(candidate);
+    let imported = CvcStore::open(fixture.root.join("imported.db")).unwrap();
+    sync::pull_from_ref(repo, &imported, "refs/cvc/stand-in-source").unwrap();
+    let id = derived_interaction_id(SESSION, "req_A");
+    let pulled = imported.get_interaction(&id).unwrap().unwrap();
+    assert_eq!(pulled.model_response.as_deref(), Some(WITHHELD_RESPONSE));
+    assert_eq!(
+        pulled.user_prompt,
+        stored(&store, SESSION, "req_A").user_prompt
+    );
+    assert!(imported.get_tool_executions(&id).unwrap().is_empty());
+}
+
+#[test]
+fn deleting_the_latest_thought_locally_does_not_stop_the_next_ingest() {
+    // The cursor rests on the start of the last response recorded, so the next
+    // ingest reads it again. A response the person deleted is tombstoned and
+    // skipped, and the response after it names it as its parent.
+    let fixture = Fixture::new();
+    let mut t = fixture.transcript();
+    t.say("First")
+        .answer("req_A", "One.")
+        .say("Second")
+        .answer("req_B", "Two.");
+    let path = fixture.write(&t);
+    let report = fixture.ingest(&path, IngestMode::Final);
+    assert_eq!(report.inserted, 2, "{report:?}");
+    let store = fixture.store();
+    let latest = derived_interaction_id(SESSION, "req_B");
+    store
+        .tombstone_local(
+            &latest,
+            cvc_core::models::TombstoneReasonCode::UserRequested,
+            None,
+        )
+        .unwrap();
+    assert!(!store.interaction_exists(&latest).unwrap());
+
+    t.say("Third").answer("req_C", "Three.");
+    fs::write(&path, t.text()).unwrap();
+    let again = fixture.ingest(&path, IngestMode::Final);
+    assert_eq!(again.inserted, 1, "{again:?}");
+    // The deleted response stays deleted, and the new one does not point at it.
+    assert!(!store.interaction_exists(&latest).unwrap());
+    let newest = stored(&store, SESSION, "req_C");
+    assert_eq!(newest.parent_id, None);
+}

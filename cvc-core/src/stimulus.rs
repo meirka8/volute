@@ -152,8 +152,9 @@ const PLACEHOLDER_TOKEN: &str = "~cvc-0000000000000000";
 const NOTE_RESERVE: usize = 64;
 /// Bytes the closing `omitted` note may take, with its separator.
 const OMITTED_RESERVE: usize = 64;
-/// The most unscrubbed bytes one stimulus asks the scrubber to read; parts
-/// after that are withheld without being read.
+/// The most bytes one stimulus asks the scrubber to scan; a part that would
+/// take it past that is withheld without being read. A part the scrubber rejects
+/// unread (over its size limit) scans nothing and is not charged.
 const MAX_SCRUBBED_BYTES: usize = 8 * 1024 * 1024;
 /// Opens a stimulus none of whose parts could be marked.
 const UNDIVIDED_NOTE: &str = "[cvc: stimulus parts not marked]";
@@ -628,7 +629,8 @@ fn scrub_verified(text: &str, verified: &Verified<'_>, scrub: Scrub<'_>) -> Stri
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     for part in &verified.parts {
-        out.push_str(&text[copied..part.content.start]);
+        out.push_str(&text[copied..part.marker.start]);
+        out.push_str(&scrub_marker(text, part, verified.boundary, scrub));
         out.push_str(&scrub_content(
             part.content_of(text),
             verified.boundary,
@@ -638,6 +640,23 @@ fn scrub_verified(text: &str, verified: &Verified<'_>, scrub: Scrub<'_>) -> Stri
     }
     out.push_str(&text[copied..]);
     out
+}
+
+/// A part's marker, with its tool name scrubbed on its own: the name a marker
+/// carries is text too, and one the scrubber would change becomes `redacted-tool`
+/// as it does when a stimulus is written. Names are not part of what the boundary
+/// is computed from, so the stimulus still verifies.
+fn scrub_marker(text: &str, part: &ReadPart<'_>, boundary: &str, scrub: Scrub<'_>) -> String {
+    let marker = &text[part.marker.clone()];
+    let Some(name) = part.name else {
+        return marker.to_owned();
+    };
+    let safe = safe_name(Some(name), scrub);
+    if safe == name {
+        marker.to_owned()
+    } else {
+        render_marker(part.kind, Some(&safe), part.is_error, boundary)
+    }
 }
 
 /// Scrubs one part's content around its notes.
@@ -687,6 +706,15 @@ pub fn render(id: &InteractionId, parts: &[StimulusPart], scrub: Scrub<'_>) -> S
     render_detailed(id, parts, scrub).text
 }
 
+/// A stimulus whose one part is withheld, for a capture that could not be
+/// scrubbed: it verifies like any other, and a reader shows it as a withheld
+/// part.
+pub(crate) fn withheld_stimulus(id: &InteractionId) -> String {
+    render(id, &[StimulusPart::meta("")], &|_| {
+        Err(PrivacyError::TooLarge)
+    })
+}
+
 /// [`render`], with what the writer decided.
 pub fn render_detailed(id: &InteractionId, parts: &[StimulusPart], scrub: Scrub<'_>) -> Rendered {
     if parts.is_empty() {
@@ -699,11 +727,18 @@ pub fn render_detailed(id: &InteractionId, parts: &[StimulusPart], scrub: Scrub<
     }
     let total = parts.len();
     let mut unscrubbed = MAX_SCRUBBED_BYTES;
-    let prepared: Vec<Prepared> = parts
-        .iter()
-        .take(MAX_PARTS)
-        .map(|part| prepare(part, scrub, &mut unscrubbed))
-        .collect();
+    // A person's words (and a subagent's task) are scrubbed first, so that tool
+    // output, which can be as large as it likes, never uses up what they need.
+    let shown = total.min(MAX_PARTS);
+    let is_person = |index: &usize| matches!(parts[*index].kind, PartKind::Prompt | PartKind::Task);
+    let mut prepared: Vec<Option<Prepared>> = (0..shown).map(|_| None).collect();
+    for index in (0..shown)
+        .filter(is_person)
+        .chain((0..shown).filter(|index| !is_person(index)))
+    {
+        prepared[index] = Some(prepare(&parts[index], scrub, &mut unscrubbed));
+    }
+    let prepared: Vec<Prepared> = prepared.into_iter().flatten().collect();
     let slots: Vec<Slot> = prepared.iter().map(slot).collect();
     let (kept, allowances) = allocate(&slots, total, MAX_STIMULUS_BYTES);
     let shown = &prepared[..kept];
@@ -765,15 +800,29 @@ struct Prepared {
 }
 
 /// Scrubs one part, and its tool name on its own. A part that cannot be
-/// scrubbed is withheld; nothing here can fail the stimulus.
+/// scrubbed is withheld; nothing here can fail the stimulus. `unscrubbed` is
+/// what is left of the budget of bytes to scan, and only bytes that were scanned
+/// are taken from it.
 fn prepare(part: &StimulusPart, scrub: Scrub<'_>, unscrubbed: &mut usize) -> Prepared {
     let is_tool = part.kind == PartKind::ToolResult;
     let name = is_tool.then(|| safe_name(part.name.as_deref(), scrub));
-    let body = if part.text.len() <= *unscrubbed {
-        *unscrubbed -= part.text.len();
-        scrub(&part.text).ok()
-    } else {
+    let body = if part.text.len() > *unscrubbed {
+        // Not read: it would take the stimulus past its budget.
         None
+    } else {
+        match scrub(&part.text) {
+            Ok(scrubbed) => {
+                *unscrubbed -= part.text.len();
+                Some(scrubbed)
+            }
+            // Rejected unread, for its size alone: nothing was scanned.
+            Err(PrivacyError::TooLarge) => None,
+            // Scanned, then refused: the work was done.
+            Err(_) => {
+                *unscrubbed -= part.text.len();
+                None
+            }
+        }
     };
     Prepared {
         kind: part.kind,

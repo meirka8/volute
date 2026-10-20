@@ -7,8 +7,8 @@
 use super::fields;
 use super::links;
 use super::transcript::{self, ParsedLine, PlanInput, TranscriptError, HARNESS};
-use crate::db::{CvcStore, DbError, HarnessCursorUpdate};
-use crate::models::{Conversation, Interaction, InteractionId, ToolExecution};
+use crate::db::{CvcStore, DbError, HarnessCursorUpdate, HARNESS_REASONS_SHOWN};
+use crate::models::{Conversation, Interaction, InteractionId};
 use crate::privacy::{self, ClaudeCodeCapture, PreparedPolicy};
 use crate::repository::{RepositoryLayout, RepositoryLayoutError};
 use crate::stimulus;
@@ -76,6 +76,25 @@ pub struct IngestReport {
     pub unrecorded_blocks: usize,
     /// The distinct block types behind `unrecorded_blocks`, sorted.
     pub unrecorded_block_types: Vec<String>,
+    /// Of `inserted`, the responses recorded as a stand-in because their capture
+    /// could not be scrubbed within the limits: the stand-in keeps the stimulus,
+    /// says its response was withheld, and holds no tool calls or context items.
+    /// Without it, one such response would keep the cursor from moving past it.
+    pub withheld: usize,
+    /// Responses that could not be recorded at all, not even as a stand-in
+    /// (a conversation id or a title the capture boundary refuses). They are
+    /// skipped so that the responses after them are recorded.
+    pub lost: usize,
+    /// Why responses were withheld or lost: the limit that was hit, each once,
+    /// never any of the text.
+    pub withheld_reasons: Vec<String>,
+    /// Tool calls a response made beyond the 255 it records, in the responses
+    /// this run newly saw. A response that left calls or context items out ends
+    /// with a `cvc-omitted` record that says how many.
+    pub omitted_tool_calls: usize,
+    /// Context items (worktree paths a call read or edited) a response left out:
+    /// past the 256 it records, or a path that could not be scrubbed.
+    pub omitted_context_items: usize,
 }
 
 /// One transcript file to ingest: the file, the session id every entry must
@@ -163,6 +182,17 @@ pub fn ingest(
             }
         }
         report.unrecorded_block_types.sort();
+        report.withheld += target_report.withheld;
+        report.lost += target_report.lost;
+        for reason in target_report.withheld_reasons {
+            if report.withheld_reasons.len() < HARNESS_REASONS_SHOWN
+                && !report.withheld_reasons.contains(&reason)
+            {
+                report.withheld_reasons.push(reason);
+            }
+        }
+        report.omitted_tool_calls += target_report.omitted_tool_calls;
+        report.omitted_context_items += target_report.omitted_context_items;
     }
 
     Ok(report)
@@ -261,6 +291,8 @@ fn ingest_target(
     let mut already_present = 0usize;
     let mut unrecorded_blocks = 0usize;
     let mut unrecorded_block_types: BTreeSet<String> = BTreeSet::new();
+    let mut omitted_tool_calls = 0usize;
+    let mut omitted_context_items = 0usize;
     let mut commit_bearing: Vec<links::CommitBearingResponse> = Vec::new();
     for planned in plan.interactions {
         if !planned.commit_candidates.is_empty() {
@@ -297,16 +329,19 @@ fn ingest_target(
         let model_response = planned
             .model_response
             .map(|text| fields::captured_text(text, policy));
-        let mut arguments_budget = fields::MAX_ARGUMENTS_TOTAL_BYTES;
-        let tool_executions: Vec<ToolExecution> = planned
-            .tool_executions
-            .into_iter()
-            .map(|mut tool| {
-                tool.arguments =
-                    fields::captured_arguments(tool.arguments, &mut arguments_budget, policy);
-                tool
-            })
-            .collect();
+        // The same for the paths and the calls, which are also capped at what the
+        // capture boundary takes (a response with more would otherwise keep the
+        // cursor from moving): see `fields`.
+        let (context_items, left_out_context_items) =
+            fields::captured_context_items(planned.context_items, policy);
+        let (tool_executions, left_out_tool_calls) = fields::captured_tool_executions(
+            planned.tool_executions,
+            left_out_context_items,
+            &planned.id,
+            policy,
+        );
+        omitted_tool_calls += left_out_tool_calls;
+        omitted_context_items += left_out_context_items;
         let interaction = Interaction {
             id: planned.id.clone(),
             conversation_id: target.conversation_id.to_owned(),
@@ -323,7 +358,7 @@ fn ingest_target(
         captures.push(ClaudeCodeCapture::new(
             conversation.clone(),
             interaction,
-            planned.context_items,
+            context_items,
             tool_executions,
             policy.clone(),
             capture_worktree.clone(),
@@ -370,6 +405,11 @@ fn ingest_target(
         subagent_linked: 0,
         unrecorded_blocks,
         unrecorded_block_types: unrecorded_block_types.into_iter().collect(),
+        withheld: outcome.withheld,
+        lost: outcome.lost,
+        withheld_reasons: outcome.reasons,
+        omitted_tool_calls,
+        omitted_context_items,
     })
 }
 
