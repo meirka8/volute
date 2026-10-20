@@ -131,6 +131,12 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+      # Keep this pin in lockstep with the "Install npm 12.0.2 for trusted
+      # publishing" step of the publish-npm job in release.yml. The manifest
+      # guards below only mean anything on the npm that really publishes, and
+      # the two files cannot share a variable, so bump both together.
+      - name: Install the npm version used to publish
+        run: npm install --global npm@12.0.2
       - name: Check wrapper syntax
         working-directory: npm/cvc-mcp
         run: |
@@ -139,9 +145,37 @@ jobs:
       - name: Run wrapper tests
         working-directory: npm/cvc-mcp
         run: npm test
-      - name: Verify package contents without publishing
+      # Guard 1, independent of how npm words its warnings: if `npm pkg fix`
+      # changes the manifest, npm would also rewrite it while publishing. This
+      # must run before anything below modifies package.json.
+      - name: Verify npm would not rewrite the manifest
         working-directory: npm/cvc-mcp
-        run: npm pack --dry-run
+        run: |
+          npm pkg fix
+          if ! git diff --exit-code -- package.json; then
+            echo "::error file=npm/cvc-mcp/package.json::npm would rewrite this manifest on publish. Run 'npm pkg fix' in npm/cvc-mcp and commit the result."
+            exit 1
+          fi
+      # Guard 2 replays the release publish without publishing, so a manifest
+      # npm auto-corrects fails the build before a tag exists. It also lists
+      # the tarball contents (running the prepack/postpack lifecycle scripts),
+      # which makes a separate `npm pack --dry-run` redundant. Needs no
+      # credentials: a dry run only reads the public registry.
+      - name: Dry-run the npm publish and fail on manifest corrections
+        working-directory: npm/cvc-mcp
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/npm-publish-dry-run.log"
+          # The committed version is always the last one published, and even a
+          # dry run refuses to publish over it. Use a throwaway prerelease that
+          # never exists on the registry; npm requires an explicit tag other
+          # than latest to publish a prerelease.
+          npm version "0.0.0-ci.${GITHUB_RUN_ID}" --no-git-tag-version
+          npm publish --dry-run --access public --tag ci-dry-run --registry=https://registry.npmjs.org/ 2>&1 | tee "$log"
+          if grep -qi 'auto-corrected' "$log"; then
+            echo "::error file=npm/cvc-mcp/package.json::npm auto-corrected the manifest while publishing. Run 'npm pkg fix' in npm/cvc-mcp and commit the result."
+            exit 1
+          fi
 
   installer-windows:
     name: PowerShell installer (Windows)
