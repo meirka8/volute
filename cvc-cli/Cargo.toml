@@ -27,7 +27,24 @@ zip = "0.6"
 sha2 = "0.10"
 hex = "0.4"
 libc = "0.2"
+# Terminal UI for `cvc conversations`. Only the crossterm backend is enabled:
+# the default features add widgets (calendar), macros and a layout cache the
+# view does not use. Terminal control and key events come from the crossterm
+# that ratatui re-exports (`ratatui::crossterm`), so the two cannot disagree on
+# a version.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+# Display width of the text the view lays out; already part of ratatui's tree.
+unicode-width = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+# Puts the terminal back when the process is told to stop (SIGTERM, SIGHUP,
+# SIGINT) while the full-screen view is up. crossterm already depends on it on
+# Unix, so it adds no crate to the build.
+signal-hook = "0.3"
 
 [dev-dependencies]
 tempfile = "3.24"
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Checks the terminal-text sanitizer against the Unicode general categories it
+# claims to cover. Already part of the build through cvc-core.
+regex = "1.11"

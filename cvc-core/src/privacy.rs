@@ -7,6 +7,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::path::{Component, Path};
+use std::sync::OnceLock;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -54,12 +55,26 @@ pub struct PrivacyStatus {
 /// An immutable description of the destination selected for one operation.  Do not
 /// re-read the git config after this is created: `pushurl` is deliberately allowed
 /// to differ from the fetch URL.
-#[derive(Debug, Clone)]
+///
+/// `effective_url` may embed credentials. `Debug` therefore leaves it out, and
+/// anything shown to a person uses [`display_location`] instead.
+#[derive(Clone)]
 pub struct RemoteDestination {
     pub name: String,
     pub effective_url: String,
     pub fingerprint: String,
     pub ref_name: String,
+}
+
+impl std::fmt::Debug for RemoteDestination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteDestination")
+            .field("name", &self.name)
+            .field("effective_url", &"<redacted>")
+            .field("fingerprint", &self.fingerprint)
+            .field("ref_name", &self.ref_name)
+            .finish()
+    }
 }
 
 pub fn remote_destination(repo: &git2::Repository, remote_name: &str) -> Result<RemoteDestination> {
@@ -114,6 +129,225 @@ pub fn common_git_dir(repo: &git2::Repository) -> PathBuf {
 pub fn remote_fingerprint(repo: &git2::Repository, remote_name: &str) -> Result<String> {
     Ok(remote_destination(repo, remote_name)?.fingerprint)
 }
+
+/// Longest remote URL [`display_location`] will look at.
+const MAX_LOCATION_INPUT: usize = 2048;
+
+/// A form of a remote's effective push URL that is safe to put on a screen, or
+/// `None` when no such form can be established. It is display-only: nothing may
+/// be resolved, fetched or compared through it.
+///
+/// - `scheme://[userinfo@]host[:port]/path?query#fragment` becomes
+///   `host[:port]/path`. The user and the password or token, the query and the
+///   fragment are all dropped. It is shown only when the host shown is the host
+///   git contacts (see below).
+/// - scp-like `[user@]host:path` becomes `host:path`.
+/// - a local path, or a `file://` URL, becomes the path.
+/// - anything else yields `None`. That includes a string that does not parse; a
+///   host that is not plain (a percent-encoded or non-ASCII one among them); a
+///   `?` or `#` in a form that is not a URL; a transport-helper address
+///   (`<transport>::<address>`, whose address is a command line, not a
+///   location); any `@` left in what would be shown, which is where a credential
+///   hides when the URL is mistyped (`https:/user:pw@host/r`, `user:pw/x@host:r`);
+///   any control, format, line-separator or paragraph-separator character
+///   (Unicode categories Cc, Cf, Zl and Zp), whether the string holds it or only
+///   the part of it that is not shown; or a form in which the built-in secret
+///   scrubber still finds a secret.
+///
+/// The host shown is checked against the one libgit2 contacts. The `url` crate
+/// ends a URL's authority at `?`, `#` and `\`, but libgit2 ends it only at the
+/// first `/` and takes the host after the *last* `@`, so
+/// `https://github.com?@evil.example/o/r.git` parses as host `github.com` and is
+/// contacted as host `evil.example`. A `\`, `?` or `#` in the authority, or a
+/// host that does not read the same both ways, is therefore not shown.
+///
+/// The raw string is never returned as a fallback, and no error carries it.
+/// This is leak prevention for what a terminal shows; it is not a promise that a
+/// path component holds no sensitive text.
+pub fn display_location(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty()
+        || url.len() > MAX_LOCATION_INPUT
+        || has_unsafe_display_char(url)
+        || is_transport_helper(url)
+    {
+        return None;
+    }
+    let location = if url.contains("://") {
+        url_location(url)?
+    } else if is_windows_drive_path(url) {
+        url.to_owned()
+    } else if let Some((authority, path)) = split_scp_like(url) {
+        scp_location(authority, path)?
+    } else {
+        url.to_owned()
+    };
+    // A parsed URL's query and fragment are already gone and its path is
+    // percent-encoded, so a raw `?` or `#` can only come from a form that has
+    // no query to strip (`host:path`, a local path). There it may well be one,
+    // so nothing is shown.
+    //
+    // No `@` is shown either, whatever form it came out of. Every form in which
+    // user information could survive to this point is one that is not
+    // recognized as having any (a single slash after the scheme, a `/` inside
+    // the user information of an scp-like remote, a drive-letter lookalike),
+    // and git reads those as something else: `user:secret@host:path` is host
+    // `user` and path `secret@host:path`.
+    if location.is_empty()
+        || location.contains(['?', '#', '@'])
+        || has_unsafe_display_char(&location)
+    {
+        return None;
+    }
+    // Defense in depth: whatever the scrubber would redact is not shown at all.
+    match scrub(&location) {
+        Ok(scrubbed) if scrubbed == location => Some(location),
+        _ => None,
+    }
+}
+
+fn url_location(url: &str) -> Option<String> {
+    // libgit2 reads a URL as `<scheme>://<authority>` where the scheme is the
+    // unbroken run of scheme characters before the first `://` and the
+    // authority ends at the first `/`. Whatever else the `url` crate would make
+    // of the string is not what is contacted.
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.is_empty() || !scheme.bytes().all(is_scheme_byte) {
+        return None;
+    }
+    // `\` is a path separator to the `url` crate in a URL with a special
+    // scheme, and a character like any other to libgit2, so the path shown
+    // would not be the path used. In the authority it also moves the end of the
+    // host, as do `?` and `#`.
+    let authority = rest.split('/').next().unwrap_or("");
+    if url.contains('\\') || authority.contains(['?', '#']) {
+        return None;
+    }
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() == "file" {
+        // A local file has no host to contact; `localhost` means the same.
+        if !(authority.is_empty() || authority.eq_ignore_ascii_case("localhost")) {
+            return None;
+        }
+        return parsed.to_file_path().ok()?.to_str().map(str::to_owned);
+    }
+    // The host as libgit2 takes it: after the last `@`, before the port.
+    let host_port = authority.rsplit('@').next()?;
+    let raw_host = match host_port.strip_prefix('[') {
+        Some(_) => {
+            let end = host_port.find(']')? + 1;
+            let (host, rest) = host_port.split_at(end);
+            if !(rest.is_empty() || rest.starts_with(':')) {
+                return None;
+            }
+            host
+        }
+        None => host_port.split(':').next()?,
+    };
+    // Only a plain host can be told apart from its normalized form: a
+    // percent-encoded, non-ASCII or numeric-looking one is not shown even when
+    // it would turn out the same.
+    let host = parsed.host_str().filter(|host| !host.is_empty())?;
+    if !is_plain_host(raw_host) || !raw_host.eq_ignore_ascii_case(host) {
+        return None;
+    }
+    let mut location = host.to_owned();
+    if let Some(port) = parsed.port() {
+        location.push(':');
+        location.push_str(&port.to_string());
+    }
+    let path = parsed.path();
+    if path != "/" {
+        location.push_str(path);
+    }
+    Some(location)
+}
+
+/// Splits `[user@]host:path` the way git recognizes it: the first `:` outside a
+/// bracketed IPv6 host, with no `/` before it.
+fn split_scp_like(value: &str) -> Option<(&str, &str)> {
+    let mut in_brackets = false;
+    for (index, character) in value.char_indices() {
+        match character {
+            '[' => in_brackets = true,
+            ']' => in_brackets = false,
+            '/' | '\\' if !in_brackets => return None,
+            ':' if !in_brackets => return Some((&value[..index], &value[index + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn scp_location(authority: &str, path: &str) -> Option<String> {
+    // Only the host survives: everything up to the last `@` is user information.
+    let host = authority.rsplit('@').next()?;
+    if path.is_empty() || !is_plain_host(host) {
+        return None;
+    }
+    Some(format!("{host}:{path}"))
+}
+
+fn is_plain_host(host: &str) -> bool {
+    match host.strip_prefix('[') {
+        Some(rest) => rest.strip_suffix(']').is_some_and(|inner| {
+            !inner.is_empty()
+                && inner
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.'))
+        }),
+        None => {
+            !host.is_empty()
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        }
+    }
+}
+
+fn is_windows_drive_path(value: &str) -> bool {
+    let mut characters = value.chars();
+    matches!(
+        (characters.next(), characters.next(), characters.next()),
+        (Some(drive), Some(':'), Some('/' | '\\')) if drive.is_ascii_alphabetic()
+    )
+}
+
+/// A character libgit2 and git accept in a URL scheme.
+fn is_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+}
+
+/// Whether git would hand the address to a remote helper program: a run of
+/// scheme characters (the first of them a letter or a digit), then `::`. The
+/// address after the `::` is the helper's own business (`ext::` runs it as a
+/// command line), so nothing in it is a location.
+fn is_transport_helper(url: &str) -> bool {
+    let scheme_length = url
+        .bytes()
+        .enumerate()
+        .take_while(|&(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'+' | b'-' | b'.'))
+        })
+        .count();
+    url[scheme_length..].starts_with("::")
+}
+
+/// Whether `text` holds a character that can make a terminal show something
+/// other than what the text is, or nothing at all: any character of the Unicode
+/// general categories `Cc` (controls, ESC among them), `Cf` (format characters:
+/// the bidirectional controls and isolates, the Arabic letter mark, the soft
+/// hyphen, zero-width characters, joiners, the byte order mark, the interlinear
+/// annotation anchors, the tag characters, and more), `Zl` and `Zp` (the line
+/// and paragraph separators). The categories come from the `regex` crate's
+/// Unicode tables, not from a list of ranges that could fall behind them.
+fn has_unsafe_display_char(text: &str) -> bool {
+    static UNSAFE: OnceLock<Regex> = OnceLock::new();
+    UNSAFE
+        .get_or_init(|| re(r"[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]"))
+        .is_match(text)
+}
+
 fn read_privacy(repo: &git2::Repository) -> Result<PrivacyFile> {
     let path = privacy_path(repo)?;
     let meta = match std::fs::symlink_metadata(&path) {
@@ -980,7 +1214,24 @@ pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
     Ok(capture)
 }
 
-pub(crate) fn is_safe_identifier(value: &str) -> bool {
+/// Whether `value` is an identifier the capture policy accepts: 1 to 256 bytes,
+/// every one an ASCII letter, a digit, or one of `.`, `_`, `-` and `:`.
+///
+/// Conversation ids and source request ids are relational keys, so they are
+/// never rewritten: a randomized redaction marker cannot stand in for one
+/// without breaking what points at it. They are refused when they are not safe
+/// instead. `prepare` does that at the one capture boundary every source goes
+/// through (the MCP server, `cvc run`, the editor, a Claude Code transcript, and
+/// a pull, before it namespaces an imported id with `remote:<fingerprint>:`), so
+/// a stored id is always one of these. It also means an id cannot carry anything
+/// that acts on a terminal: no control, format or separator character, and no
+/// space.
+///
+/// Public so that a front that lets a client choose an id (the MCP server, for
+/// `conversation_id`) refuses with this very function, before anything is
+/// recorded, and not with a rule of its own that could disagree with the
+/// capture's.
+pub fn is_safe_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
         && value

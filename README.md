@@ -49,7 +49,7 @@ CVC records each Claude Code session from the transcript Claude Code writes, thr
 2. `cvc privacy acknowledge-capture` — the one-time local capture acknowledgement. It is an interactive typed challenge, and passive capture stays off until it is granted.
 3. `cvc harness install claude-code` — write the capture hooks into this checkout's `.claude/settings.local.json`, using the absolute path of the `cvc` you just ran.
 4. Start a *new* Claude Code session. A session already running does not pick up the new hooks.
-5. Work as usual, then `cvc conversations` to see the captured sessions and `cvc log` for detail.
+5. Work as usual, then `cvc conversations` to see the captured sessions (in a terminal it opens an interactive view: `q` quits, and `--plain` prints the plain listing; see [Browse and share interactively](cvc-cli/README.md#browse-and-share-interactively)) and `cvc log` for detail.
 
 Step 3 is per checkout: run it again in each linked worktree. See [`cvc-cli/README.md`](cvc-cli/README.md) for sharing, consent, linking, and redaction, and [`cvc-mcp/README.md`](cvc-mcp/README.md) for MCP configuration.
 
