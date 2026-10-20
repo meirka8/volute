@@ -8,13 +8,17 @@
 //! every completed assistant response becomes one private interaction in the
 //! shared local database, attributed to the worktree the hook ran in.
 //!
-//! The three pieces are independent and individually testable:
+//! The pieces are independent and individually testable:
 //!
 //! * [`transcript`] parses transcript lines and plans captures without touching
 //!   the filesystem or the database;
 //! * [`ingest`] applies a plan to a store idempotently;
 //! * [`settings`] installs and removes the hook entries in the checkout-local
-//!   Claude Code settings file.
+//!   Claude Code settings file;
+//! * [`harness_record`] is the repository-wide record that the harness is
+//!   wanted, which Git's `post-checkout` hook reads to install the entries into
+//!   a new linked worktree.
+pub mod harness_record;
 pub mod ingest;
 pub mod links;
 pub mod settings;

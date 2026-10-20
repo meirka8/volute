@@ -127,9 +127,17 @@ for binary in cvc cvc-mcp cvc-lsp; do
   cp "$STAGE/$binary" "$PUBLISH_STAGE/$binary"
   chmod 0755 "$PUBLISH_STAGE/$binary"
 done
-for binary in cvc cvc-mcp cvc-lsp; do
+# cvc moves into place LAST: the npm launcher probes `cvc --version` without
+# the lock, so a new cvc must imply its siblings are already new.
+for binary in cvc-lsp cvc-mcp cvc; do
   mv -f "$PUBLISH_STAGE/$binary" "$INSTALL_DIR/$binary"
 done
+# Release the shared lock now so the interactive PATH prompt below does not
+# block the npm launcher from publishing. The trap still covers failure paths.
+rmdir "$PUBLISH_STAGE" 2>/dev/null || rm -rf "$PUBLISH_STAGE"
+PUBLISH_STAGE=
+rmdir "$LOCK_DIR" 2>/dev/null || true
+LOCK_DIR=
 
 echo ""
 echo "Success! CVC installed to $INSTALL_DIR"
@@ -141,9 +149,13 @@ echo "Please manually add $INSTALL_DIR to your PATH:"
 echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
 echo ""
 
-if [ -t 0 ] || [ -c /dev/tty ]; then
+# Prompt only when /dev/tty can actually be opened. A process without a
+# controlling terminal (CI, cron, `setsid`, a container without a tty) can have
+# /dev/tty present as a device node that fails with ENXIO on open, and under
+# `set -e` a failing `read` would otherwise exit 1 after a successful install.
+if (: </dev/tty) 2>/dev/null; then
   printf 'Would you like to automatically add CVC to your PATH? [Y/n] '
-  read -r ADD_PATH < /dev/tty
+  read -r ADD_PATH </dev/tty || ADD_PATH="n"
 else ADD_PATH="n"; fi
 case "$ADD_PATH" in
   [Nn]*) echo "Skipping PATH configuration." ;;

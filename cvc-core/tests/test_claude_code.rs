@@ -982,11 +982,21 @@ fn legacy_capture_source_constraint_is_widened_once() {
     assert_eq!(store.conversation_interaction_count("conv").unwrap(), 2);
 }
 
+/// A stand-in for the `cvc` binary: a hook needs an existing, executable file.
+fn write_fake_binary(path: &Path) {
+    fs::write(path, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 #[test]
 fn hook_settings_install_is_idempotent_and_preserves_foreign_entries() {
     let fixture = Fixture::new();
     let binary = fixture.root.join("fake-cvc");
-    fs::write(&binary, "#!/bin/sh\n").unwrap();
+    write_fake_binary(&binary);
     let settings_path = settings::settings_path(&fixture.layout).unwrap();
     fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
     fs::write(
@@ -1028,7 +1038,7 @@ fn hook_settings_install_is_idempotent_and_preserves_foreign_entries() {
     assert_eq!(again.exclude, ExcludeAction::AlreadyIgnored);
 
     let moved = fixture.root.join("moved-cvc");
-    fs::write(&moved, "#!/bin/sh\n").unwrap();
+    write_fake_binary(&moved);
     let updated = settings::install(&fixture.layout, &moved).unwrap();
     assert_eq!(updated.action, InstallAction::Updated);
     let rendered = fs::read_to_string(&settings_path).unwrap();

@@ -107,7 +107,7 @@ enum Commands {
         #[command(subcommand)]
         command: RelinkCommands,
     },
-    /// Manage agent-harness capture hooks in this checkout
+    /// Manage agent-harness capture hooks: in this checkout, and in new worktrees while capture is acknowledged
     Harness {
         #[command(subcommand)]
         command: HarnessCommands,
@@ -139,14 +139,23 @@ enum HarnessKind {
 
 #[derive(Subcommand)]
 enum HarnessCommands {
-    /// Install lifecycle hooks in this checkout's local harness settings
+    /// Install Claude Code capture hooks here and in new worktrees
+    ///
+    /// Writes the lifecycle hook entries into this checkout's local harness
+    /// settings. Worktrees created afterwards (git worktree add) get them too,
+    /// while this repository's capture acknowledgement stands; existing
+    /// worktrees do not. Refuses, and changes nothing, in a checkout whose
+    /// .claude/settings.local.json Git tracks or whose .claude is a symlink.
     Install {
         harness: HarnessKind,
-        /// Absolute path of the cvc binary the hooks run (default: this executable)
+        /// Absolute path of the cvc binary the hooks run (default: this executable, or ~/.cvc/bin/cvc when this is the npm launcher's versioned cache copy and that file is at least as new)
         #[arg(long)]
         binary: Option<PathBuf>,
     },
-    /// Remove the hook entries installed by `cvc harness install`
+    /// Remove this checkout's hooks and stop new worktrees from getting them
+    ///
+    /// Other worktrees keep theirs and keep capturing (they are listed; run
+    /// this in each), and the capture acknowledgement is not withdrawn.
     Uninstall { harness: HarnessKind },
 }
 
@@ -179,6 +188,18 @@ enum HookCommands {
     },
     PostRewrite {
         mode: String,
+    },
+    /// Run by Git's post-checkout hook as `<previous HEAD> <new HEAD> <branch flag>`.
+    /// Acts only for a checkout from the null ref with flag 1 inside a linked
+    /// worktree, which is what `git worktree add` does (so does a switch away
+    /// from an unborn orphan branch inside a linked worktree): it then installs
+    /// the Claude Code capture hooks recorded by `harness install` into that
+    /// worktree. Never acts in the main worktree. Does nothing for other
+    /// `git checkout` or `git switch` runs, or file checkouts.
+    PostCheckout {
+        prev: String,
+        new: String,
+        flag: String,
     },
 }
 
@@ -280,6 +301,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 commands::hook::post_merge(squash.as_deref()).await?
             }
             HookCommands::PostRewrite { mode } => commands::hook::post_rewrite(&mode).await?,
+            HookCommands::PostCheckout { prev, new, flag } => {
+                commands::hook::post_checkout(&prev, &new, &flag).await?
+            }
         },
         Commands::Privacy { command } => match command {
             PrivacyCommands::Status { remote } => {
@@ -385,6 +409,14 @@ mod hook_cli_tests {
             vec!["cvc", "hook", "pre-push", "origin", "file:///remote"],
             vec!["cvc", "hook", "post-merge", "1"],
             vec!["cvc", "hook", "post-rewrite", "rebase"],
+            vec![
+                "cvc",
+                "hook",
+                "post-checkout",
+                "0000000000000000000000000000000000000000",
+                "1111111111111111111111111111111111111111",
+                "1",
+            ],
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
         }
