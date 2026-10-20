@@ -1643,3 +1643,101 @@ fn deleting_the_latest_thought_locally_does_not_stop_the_next_ingest() {
     let newest = stored(&store, SESSION, "req_C");
     assert_eq!(newest.parent_id, None);
 }
+
+// ---- a Read range the model chose: nothing it writes may stall the session ---------
+
+#[test]
+fn a_read_with_extreme_offset_and_limit_is_recorded_and_its_node_is_pushed() {
+    let fixture = Fixture::new();
+    let path = format!("{}/src/a.rs", fixture.root.display());
+    let extremes: Vec<(Value, Value)> = vec![
+        (json!(i64::MAX), json!(i64::MAX)),
+        (json!(1), json!(i64::MAX)),
+        (json!(i64::MAX), json!(1)),
+        (json!(i64::MIN), json!(i64::MIN)),
+        (json!(0), json!(0)),
+        (json!(-7), json!(3)),
+        (json!(3_000_000_000i64), json!(3_000_000_000i64)),
+        (json!(10), json!(20)),
+        (json!(u64::MAX), json!(u64::MAX)),
+        (json!(1.5), json!(1e300)),
+        (json!("ten"), json!(null)),
+    ];
+    let calls: Vec<Value> = extremes
+        .iter()
+        .enumerate()
+        .map(|(n, (offset, limit))| {
+            json!({"type": "tool_use", "id": format!("toolu_{n}"), "name": "Read",
+                   "input": {"file_path": path, "offset": offset, "limit": limit}})
+        })
+        .collect();
+    let ids: Vec<String> = (0..extremes.len()).map(|n| format!("toolu_{n}")).collect();
+    let results: Vec<(&str, &str, bool)> =
+        ids.iter().map(|id| (id.as_str(), "ok", false)).collect();
+    let mut t = fixture.transcript();
+    t.say("Read it all")
+        .respond("req_A", calls, "tool_use")
+        .results(&results)
+        .answer("req_B", "Read it.")
+        .say("Thanks")
+        .answer("req_C", "You are welcome.");
+    let transcript = fixture.write(&t);
+
+    // Neither a panic in a debug build nor a wrapped number in a release build.
+    let report = fixture.ingest(&transcript, IngestMode::Final);
+    assert_eq!(report.inserted, 3, "{report:?}");
+    let store = fixture.store();
+    let first = stored(&store, SESSION, "req_A");
+    let items = store.get_context_items(&first.id).unwrap();
+    assert!(!items.is_empty());
+    for item in &items {
+        assert!(item.start_line.is_none_or(|line| line >= 1), "{item:?}");
+        assert!(item.end_line.is_none_or(|line| line >= 1), "{item:?}");
+        if let (Some(start), Some(end)) = (item.start_line, item.end_line) {
+            assert!(end >= start, "{item:?}");
+        }
+    }
+    // The ranges that were asked for are held at the largest line, not wrapped.
+    let largest = i32::MAX;
+    assert!(items
+        .iter()
+        .any(|item| item.start_line == Some(1) && item.end_line == Some(largest)));
+    assert!(items
+        .iter()
+        .any(|item| item.start_line == Some(largest) && item.end_line == Some(largest)));
+    assert!(items
+        .iter()
+        .any(|item| item.start_line == Some(10) && item.end_line == Some(29)));
+
+    // And the conversation can be shared and pushed: no item is refused.
+    store
+        .share_conversation_for_remote(SESSION, DESTINATION, FutureSharePolicy::Private)
+        .unwrap();
+    let repo = fixture.layout.repository();
+    let sync::ProjectionResult::Candidate { oid, candidate, .. } =
+        sync::push_projection_to_ref(repo, &store, "", DESTINATION).unwrap()
+    else {
+        panic!("expected a projection")
+    };
+    drop(candidate);
+    let id = first.id.to_string();
+    let tree = repo.find_commit(oid).unwrap().tree().unwrap();
+    let entry = tree
+        .get_path(std::path::Path::new(&format!(
+            "nodes/{}/{id}.json",
+            &id[..2]
+        )))
+        .unwrap();
+    let node: Value =
+        serde_json::from_slice(repo.find_blob(entry.id()).unwrap().content()).unwrap();
+    for item in node["context_items"].as_array().unwrap() {
+        for key in ["start_line", "end_line"] {
+            assert!(
+                item[key].is_null() || item[key].as_i64().unwrap() >= 1,
+                "{item}"
+            );
+        }
+    }
+    // A later turn is recorded too.
+    a_later_turn_is_recorded(&fixture, &mut t, &transcript, &report);
+}

@@ -1253,22 +1253,7 @@ fn context_item_for(
     let raw = input.get(path_key)?.as_str()?;
     let file_path = worktree_relative(raw, plan_input.worktree_root, plan_input.path_aliases)?;
     let (start_line, end_line) = if tool_name == "Read" {
-        let offset = input
-            .get("offset")
-            .and_then(Value::as_i64)
-            .filter(|value| *value >= 1);
-        let limit = input
-            .get("limit")
-            .and_then(Value::as_i64)
-            .filter(|value| *value >= 1);
-        match (offset, limit) {
-            (Some(offset), Some(limit)) => (
-                Some(offset.min(i32::MAX as i64) as i32),
-                Some((offset + limit - 1).min(i32::MAX as i64) as i32),
-            ),
-            (Some(offset), None) => (Some(offset.min(i32::MAX as i64) as i32), None),
-            _ => (None, None),
-        }
+        read_range(input)
     } else {
         (None, None)
     };
@@ -1281,6 +1266,31 @@ fn context_item_for(
         start_line,
         end_line,
     })
+}
+
+/// The first and last line a Read call asked for, as a context item records
+/// them. `offset` is the line to start at and `limit` how many lines to read; the
+/// model chooses both, and `i64::MAX` is a valid JSON integer it can write. Lines
+/// are numbered from 1 and held in 32 bits, so a value outside `1..=i32::MAX` is
+/// clamped to it (a value below 1 is no line at all and gives no range), and the
+/// last line is worked out without overflowing.
+fn read_range(input: &Value) -> (Option<i32>, Option<i32>) {
+    let line = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 1)
+    };
+    let held = |value: i64| value.clamp(1, i64::from(i32::MAX)) as i32;
+    match (line("offset"), line("limit")) {
+        (Some(offset), Some(limit)) => {
+            // offset + limit - 1, which is at least `offset` because `limit` is at least 1.
+            let last = offset.saturating_add(limit - 1);
+            (Some(held(offset)), Some(held(last)))
+        }
+        (Some(offset), None) => (Some(held(offset)), None),
+        _ => (None, None),
+    }
 }
 
 fn worktree_relative(
@@ -1320,6 +1330,161 @@ fn worktree_relative(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the line range of a Read call: the model chooses the numbers -------------
+
+    #[test]
+    fn a_read_range_is_clamped_and_never_overflows() {
+        let max = i64::MAX;
+        let big = i32::MAX;
+        let wide = i64::from(i32::MAX);
+        let cases = [
+            // Ordinary ranges are as they were.
+            (
+                serde_json::json!({"offset": 10, "limit": 5}),
+                (Some(10), Some(14)),
+            ),
+            (
+                serde_json::json!({"offset": 1, "limit": 1}),
+                (Some(1), Some(1)),
+            ),
+            (serde_json::json!({"offset": 7}), (Some(7), None)),
+            (serde_json::json!({"limit": 5}), (None, None)),
+            (serde_json::json!({}), (None, None)),
+            // Below 1 is no line.
+            (serde_json::json!({"offset": 0, "limit": 5}), (None, None)),
+            (serde_json::json!({"offset": -5, "limit": 5}), (None, None)),
+            (
+                serde_json::json!({"offset": i64::MIN, "limit": i64::MIN}),
+                (None, None),
+            ),
+            (
+                serde_json::json!({"offset": 5, "limit": 0}),
+                (Some(5), None),
+            ),
+            (
+                serde_json::json!({"offset": 5, "limit": -1}),
+                (Some(5), None),
+            ),
+            (
+                serde_json::json!({"offset": 5, "limit": i64::MIN}),
+                (Some(5), None),
+            ),
+            // Huge numbers are held at the largest line.
+            (
+                serde_json::json!({"offset": max, "limit": max}),
+                (Some(big), Some(big)),
+            ),
+            (
+                serde_json::json!({"offset": 1, "limit": max}),
+                (Some(1), Some(big)),
+            ),
+            (
+                serde_json::json!({"offset": max, "limit": 1}),
+                (Some(big), Some(big)),
+            ),
+            (serde_json::json!({"offset": max}), (Some(big), None)),
+            (
+                serde_json::json!({"offset": 5, "limit": max}),
+                (Some(5), Some(big)),
+            ),
+            (
+                serde_json::json!({"offset": wide, "limit": 1}),
+                (Some(big), Some(big)),
+            ),
+            (
+                serde_json::json!({"offset": wide + 1, "limit": 1}),
+                (Some(big), Some(big)),
+            ),
+            (
+                serde_json::json!({"offset": 3_000_000_000i64, "limit": 3_000_000_000i64}),
+                (Some(big), Some(big)),
+            ),
+            (
+                serde_json::json!({"offset": 100, "limit": 10_000_000_000i64}),
+                (Some(100), Some(big)),
+            ),
+            // Not integers a line number can be.
+            (serde_json::json!({"offset": 1.5, "limit": 2}), (None, None)),
+            (
+                serde_json::json!({"offset": "10", "limit": "5"}),
+                (None, None),
+            ),
+            (
+                serde_json::json!({"offset": u64::MAX, "limit": 5}),
+                (None, None),
+            ),
+            (
+                serde_json::json!({"offset": null, "limit": null}),
+                (None, None),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(read_range(&input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn every_pair_of_extreme_numbers_gives_a_range_that_can_be_stored_and_published() {
+        let numbers = [
+            i64::MIN,
+            i64::MIN + 1,
+            -1,
+            0,
+            1,
+            2,
+            i64::from(i32::MAX) - 1,
+            i64::from(i32::MAX),
+            i64::from(i32::MAX) + 1,
+            i64::MAX / 2,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        for offset in numbers {
+            for limit in numbers {
+                let (start, end) =
+                    read_range(&serde_json::json!({"offset": offset, "limit": limit}));
+                if let Some(start) = start {
+                    assert!(start >= 1, "{offset} {limit}");
+                }
+                if let Some(end) = end {
+                    assert!(
+                        end >= start.expect("an end has a start") && end >= 1,
+                        "{offset} {limit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_with_extreme_numbers_is_planned_with_a_valid_range() {
+        let calls: Vec<serde_json::Value> = [
+            (i64::MAX, i64::MAX),
+            (1, i64::MAX),
+            (i64::MAX, 1),
+            (i64::MIN, i64::MIN),
+            (0, 0),
+            (-7, 3),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(n, (offset, limit))| {
+            serde_json::json!({"type": "tool_use", "id": format!("toolu_{n}"), "name": "Read",
+                               "input": {"file_path": "/work/repo/src/lib.rs",
+                                         "offset": offset, "limit": limit}})
+        })
+        .collect();
+        let planned = respond(serde_json::Value::Array(calls));
+        assert!(!planned.context_items.is_empty());
+        for item in &planned.context_items {
+            assert!(item.start_line.is_none_or(|line| line >= 1), "{item:?}");
+            assert!(item.end_line.is_none_or(|line| line >= 1), "{item:?}");
+            if let (Some(start), Some(end)) = (item.start_line, item.end_line) {
+                assert!(end >= start, "{item:?}");
+            }
+        }
+    }
 
     #[test]
     fn derived_ids_are_stable_and_session_scoped() {

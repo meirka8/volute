@@ -2990,6 +2990,87 @@ fn a_secret_in_a_marker_name_of_a_remote_node_is_refused_on_push_and_rewritten_o
     Ok(())
 }
 
+#[test]
+fn a_context_range_an_earlier_version_stored_with_a_negative_line_is_published_without_it(
+) -> anyhow::Result<()> {
+    // A Read with huge numbers wrapped around in a release build and stored a negative
+    // end line; a remote refuses such an item, so a push of its conversation failed
+    // every time. The item is published, without a range.
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("a thought that read three ranges");
+    let range = |path: &str, start: Option<i32>, end: Option<i32>| ContextItem {
+        id: None,
+        interaction_id: item.id.clone(),
+        file_path: path.into(),
+        git_blob_sha: None,
+        dirty_patch: None,
+        start_line: start,
+        end_line: end,
+    };
+    store.capture_mcp(McpCapture::new(
+        Conversation {
+            id: item.conversation_id.clone(),
+            title: "fixture".into(),
+            created_at: item.timestamp,
+        },
+        item.clone(),
+        vec![
+            range("src/wrapped.rs", Some(5), Some(-3)),
+            range("src/negative_start.rs", Some(-1), Some(9)),
+            range("src/fine.rs", Some(3), Some(8)),
+        ],
+        Vec::new(),
+        PreparedPolicy::built_ins_only(),
+        "0".repeat(64),
+    ))?;
+    store.share_conversation_for_remote(
+        &item.conversation_id,
+        TEST_DESTINATION,
+        FutureSharePolicy::Private,
+    )?;
+    let sync::ProjectionResult::Candidate { oid, candidate, .. } =
+        sync::push_projection_to_ref(&repo, &store, "", TEST_DESTINATION)?
+    else {
+        panic!("the thought is something to publish")
+    };
+    drop(candidate);
+    let id = item.id.to_string();
+    let tree = repo.find_commit(oid)?.tree()?;
+    let entry = tree.get_path(std::path::Path::new(&format!(
+        "nodes/{}/{id}.json",
+        &id[..2]
+    )))?;
+    let node: serde_json::Value = serde_json::from_slice(repo.find_blob(entry.id())?.content())?;
+    let ranges: std::collections::BTreeMap<String, (serde_json::Value, serde_json::Value)> = node
+        ["context_items"]
+        .as_array()
+        .expect("context items")
+        .iter()
+        .map(|item| {
+            (
+                item["file_path"].as_str().unwrap().to_owned(),
+                (item["start_line"].clone(), item["end_line"].clone()),
+            )
+        })
+        .collect();
+    assert_eq!(ranges.len(), 3);
+    assert_eq!(
+        ranges["src/wrapped.rs"],
+        (serde_json::Value::Null, serde_json::Value::Null)
+    );
+    assert_eq!(
+        ranges["src/negative_start.rs"],
+        (serde_json::Value::Null, serde_json::Value::Null)
+    );
+    assert_eq!(ranges["src/fine.rs"], (3.into(), 8.into()));
+    // The stored rows are not touched: the repair is made on what is published.
+    let stored = store.get_context_items(&item.id)?;
+    assert!(stored.iter().any(|row| row.end_line == Some(-3)));
+    Ok(())
+}
+
 // ---- hostile names in a remote tree --------------------------------------------------------
 
 const HOSTILE_REF: &str = "refs/cvc/hostile";

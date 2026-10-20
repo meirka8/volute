@@ -393,19 +393,47 @@ pub fn set_auto_push_destination(
     write_privacy(repo, &s)
 }
 
+/// The kinds of redaction marker the repository policy writes. The built-in
+/// detectors each write one named as they are.
+const POLICY_MARKER_KINDS: [&str; 2] = ["policy_literal", "policy_regex"];
+
 fn marker(kind: &str) -> String {
+    debug_assert!(
+        builtin_detectors().iter().any(|(known, _)| *known == kind)
+            || POLICY_MARKER_KINDS.contains(&kind),
+        "no redaction marker of kind {kind} is recognised"
+    );
     format!("[CVC_REDACTED:v1:{kind}:{}]", Uuid::new_v4())
 }
 fn re(p: &str) -> Regex {
     Regex::new(p).expect("built-in privacy regex is valid")
 }
 
-/// An existing CVC redaction marker.
-const REDACTION_MARKER: &str = r"\[CVC_REDACTED:v1:[a-z_]+:[0-9a-fA-F-]{16,}\]";
+/// What a redaction marker is: exactly what [`marker`] writes, which is
+/// `[CVC_REDACTED:v1:<kind>:<uuid>]` with a kind cvc writes and an id that is a
+/// lowercase hyphenated UUID (36 characters). Nothing else is one. Text that only
+/// looks like a marker (another kind, an id of another shape, capital letters,
+/// brackets inside) is ordinary text, and every detector and rule reads it as any
+/// other: a marker is atomic to them, so what can pass for one must not be able
+/// to carry anything but what a marker carries.
+fn redaction_marker_pattern() -> &'static str {
+    static PATTERN: OnceLock<String> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        let kinds: Vec<&str> = builtin_detectors()
+            .iter()
+            .map(|(kind, _)| *kind)
+            .chain(POLICY_MARKER_KINDS)
+            .collect();
+        format!(
+            r"\[CVC_REDACTED:v1:(?:{}):[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}\]",
+            kinds.join("|")
+        )
+    })
+}
 
 fn redaction_marker_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| re(REDACTION_MARKER))
+    REGEX.get_or_init(|| re(redaction_marker_pattern()))
 }
 
 /// The byte ranges of the redaction markers in `text`, in order. Bounding code
@@ -495,19 +523,60 @@ const KEY_LINE_MIN: usize = 16;
 const KEY_PREAMBLE_LINES: usize = 12;
 const KEY_PREAMBLE_LINE_BYTES: usize = 256;
 
-/// The length of the line break that starts at `at`: `\n` or `\r\n`, or the same
-/// written out as the characters backslash and `n`, as it is in text that was
-/// itself escaped (a log line, a JSON string shown raw). 0 when there is none.
+/// The length of the line break that starts at `at`; 0 when there is none. A line
+/// break is `\n` or `\r\n`; the same written out as characters, as it is in text
+/// that was itself escaped (a log line, a JSON string shown raw: a backslash and
+/// `n`, or two backslashes and `n` when that was escaped again); or an HTML break
+/// (`<br>`, `<br/>`, `<br />`) with the newline that may follow it.
 fn break_at(bytes: &[u8], at: usize) -> usize {
     let rest = &bytes[at..];
-    if rest.starts_with(b"\r\n") {
-        2
-    } else if rest.starts_with(b"\n") {
-        1
-    } else if rest.starts_with(b"\\r\\n") {
-        4
-    } else if rest.starts_with(b"\\n") {
-        2
+    match plain_break_at(rest) {
+        0 => match html_break_at(rest) {
+            0 => 0,
+            html => html + plain_break_at(&rest[html..]),
+        },
+        plain => plain,
+    }
+}
+
+/// A break that is a newline, written or spelled out.
+fn plain_break_at(rest: &[u8]) -> usize {
+    match rest.first() {
+        Some(b'\r') if rest.starts_with(b"\r\n") => 2,
+        Some(b'\n') => 1,
+        Some(b'\\') => {
+            if rest.starts_with(b"\\r\\n") {
+                4
+            } else if rest.starts_with(b"\\\\n") {
+                3
+            } else if rest.starts_with(b"\\n") {
+                2
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// An HTML break at the start of `rest`: `<br>`, `<br/>` or `<br />`, in either case.
+fn html_break_at(rest: &[u8]) -> usize {
+    if rest.len() < 4
+        || rest[0] != b'<'
+        || !rest[1].eq_ignore_ascii_case(&b'b')
+        || !rest[2].eq_ignore_ascii_case(&b'r')
+    {
+        return 0;
+    }
+    let mut at = 3;
+    while at < 6 && rest.get(at) == Some(&b' ') {
+        at += 1;
+    }
+    if rest.get(at) == Some(&b'/') {
+        at += 1;
+    }
+    if rest.get(at) == Some(&b'>') {
+        at + 1
     } else {
         0
     }
@@ -516,14 +585,56 @@ fn break_at(bytes: &[u8], at: usize) -> usize {
 /// The length of the line break that ends exactly at `at`; 0 when there is none.
 fn break_before(bytes: &[u8], at: usize) -> usize {
     let head = &bytes[..at];
-    if head.ends_with(b"\r\n") {
-        2
-    } else if head.ends_with(b"\n") {
-        1
-    } else if head.ends_with(b"\\r\\n") {
-        4
-    } else if head.ends_with(b"\\n") {
-        2
+    match plain_break_before(head) {
+        0 => html_break_before(head),
+        plain => plain + html_break_before(&head[..head.len() - plain]),
+    }
+}
+
+fn plain_break_before(head: &[u8]) -> usize {
+    match head.last() {
+        Some(b'\n') => {
+            if head.ends_with(b"\r\n") {
+                2
+            } else {
+                1
+            }
+        }
+        Some(b'n') => {
+            if head.ends_with(b"\\r\\n") {
+                4
+            } else if head.ends_with(b"\\\\n") {
+                3
+            } else if head.ends_with(b"\\n") {
+                2
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// An HTML break that ends `head`, as [`html_break_at`] reads one.
+fn html_break_before(head: &[u8]) -> usize {
+    if head.last() != Some(&b'>') {
+        return 0;
+    }
+    let mut end = head.len() - 1;
+    if end > 0 && head[end - 1] == b'/' {
+        end -= 1;
+    }
+    let mut spaces = 0;
+    while spaces < 3 && end > 0 && head[end - 1] == b' ' {
+        end -= 1;
+        spaces += 1;
+    }
+    if end >= 3
+        && head[end - 3] == b'<'
+        && head[end - 2].eq_ignore_ascii_case(&b'b')
+        && head[end - 1].eq_ignore_ascii_case(&b'r')
+    {
+        head.len() - (end - 3)
     } else {
         0
     }
@@ -539,38 +650,93 @@ fn is_key_line(line: &[u8]) -> bool {
 
 /// The longest line number a tool prints in front of a line.
 const LINE_NUMBER_DIGITS: usize = 10;
-/// How far before an END line its own line may start (a line number and a
-/// marker with the spaces around them).
-const LINE_PREFIX_MAX: usize = 32;
+/// The longest file name `grep` or `rg` prints in front of a line's number.
+const LINE_PREFIX_NAME_MAX: usize = 256;
+/// How far before an END line its own line may start: a file name, a line number
+/// or a marker, and the spaces around them.
+const LINE_PREFIX_MAX: usize = LINE_PREFIX_NAME_MAX + 48;
+
+/// A line number and the separator after it at the start of `bytes`: digits, then a
+/// tab, an arrow, a bar, a colon or a hyphen (`59\t`, `59→`, `59|`, `59:`, `59-`),
+/// or, after a file name, a colon or a hyphen only. 0 when there is none.
+fn number_and_separator(bytes: &[u8], after_name: bool) -> usize {
+    let digits = bytes
+        .iter()
+        .take(LINE_NUMBER_DIGITS + 1)
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if !(1..=LINE_NUMBER_DIGITS).contains(&digits) {
+        return 0;
+    }
+    let rest = &bytes[digits..];
+    let separator = match rest.first() {
+        Some(b':' | b'-') => 1,
+        Some(b'\t' | b'|') if !after_name => 1,
+        _ if !after_name && rest.starts_with("→".as_bytes()) => "→".len(),
+        _ => 0,
+    };
+    if separator == 0 {
+        0
+    } else {
+        digits + separator
+    }
+}
+
+/// A line number, with the column that follows it in `rg --column` output
+/// (`12:5:`), at the start of `bytes`. 0 when there is none.
+fn numbers(bytes: &[u8], after_name: bool) -> usize {
+    let line = number_and_separator(bytes, after_name);
+    if line == 0 {
+        return 0;
+    }
+    let column = if matches!(bytes[line - 1], b':' | b'-') {
+        number_and_separator(&bytes[line..], true)
+    } else {
+        0
+    };
+    line + column
+}
 
 /// How much of the start of `line` (which has no leading spaces) is what a tool
-/// puts in front of the lines it prints, with the spaces after it: a line number
-/// (`59\t`, `59→`, `59|`, `59:`, as the Read tool, `cat -n` and `grep -n` print
-/// them) or the one marker a diff or a quotation uses (`-`, `+`, `>`). 0 when
-/// there is none.
+/// puts in front of the lines it prints, with the spaces after it:
+/// - a line number, as the Read tool, `cat -n` and `grep -n` print one (`59\t`,
+///   `59→`, `59|`, `59:`, `59-`);
+/// - a file name and a line number, as `grep` and `rg` print them for a matching
+///   line (`path:59:`) and for a line of context (`path-59-`);
+/// - the one marker a diff or a quotation uses (`-`, `+`, `>`).
+///
+/// 0 when there is none.
 fn line_prefix_len(line: &[u8]) -> usize {
-    let spaces_after = |from: usize| {
+    let blanks = |from: usize| {
         from + line[from..]
             .iter()
             .take_while(|byte| matches!(**byte, b' ' | b'\t'))
             .count()
     };
-    let digits = line.iter().take_while(|byte| byte.is_ascii_digit()).count();
-    if (1..=LINE_NUMBER_DIGITS).contains(&digits) {
-        let rest = &line[digits..];
-        let separator = if rest.starts_with("→".as_bytes()) {
-            "→".len()
-        } else if rest.starts_with(b"\t") || rest.starts_with(b"|") || rest.starts_with(b":") {
-            1
-        } else {
-            0
-        };
-        if separator > 0 {
-            return spaces_after(digits + separator);
+    let bare = numbers(line, false);
+    if bare > 0 {
+        return blanks(bare);
+    }
+    // A file name has no blanks and may hold digits and hyphens of its own, so the
+    // number is the last one that is followed by a separator before the first blank
+    // or the end of the line (`line` runs on into the lines after it).
+    let mut named = 0;
+    for at in 1..line.len().min(LINE_PREFIX_NAME_MAX) {
+        if matches!(line[at], b' ' | b'\t') || break_at(line, at) > 0 {
+            break;
+        }
+        if matches!(line[at], b':' | b'-') {
+            let len = numbers(&line[at + 1..], true);
+            if len > 0 {
+                named = at + 1 + len;
+            }
         }
     }
+    if named > 0 {
+        return blanks(named);
+    }
     match line.first() {
-        Some(b'-' | b'+' | b'>') => spaces_after(1),
+        Some(b'-' | b'+' | b'>') => blanks(1),
         _ => 0,
     }
 }
@@ -804,18 +970,97 @@ fn key_run_start(text: &str, footer: usize) -> Option<usize> {
     start
 }
 
+// ---- a key in a layout the lines above do not know -----------------------------------
+//
+// A key can be printed in a layout that is not lines of base64: a list of strings, a
+// string inside a string, lines run together with spaces. When no run of key lines is
+// found next to a lone header or END line, the key is looked for as long base64
+// tokens instead, and everything from the line through the last of them (or, for an
+// END line, from the first of them) is redacted. Prose rarely has a token that long.
+// What tools print all the time is not taken for one: a commit or blob id, a checksum
+// or a digest is a run of hex digits and nothing else, and the base64 of a key never is.
+
+/// How far from a lone header or END line its key's long tokens are looked for. It
+/// holds the PEM of a 4096-bit RSA key, which is about 3.2 KB.
+const FALLBACK_WINDOW: usize = 4 * 1024;
+/// A token of base64 characters at least this long is taken for key material, unless
+/// it is hex digits alone (see [`long_tokens`]).
+const FALLBACK_TOKEN_MIN: usize = 40;
+
+/// The runs of base64 characters in `bytes` that are at least [`FALLBACK_TOKEN_MIN`]
+/// long and mostly letters and digits (a rule of `=` or `/` signs is not key text),
+/// in order, except a run of hex digits alone, which is exactly `[0-9a-fA-F]+`. That
+/// is what a commit or blob id, a SHA-256 or SHA-512 digest and a checksum look like,
+/// and what `git` and the hooks print in every session; the base64 of a key is never
+/// only that (each of 40 characters or more would have to be one of 22 out of 64). One
+/// character outside those digits, any other letter or a `+`, `/` or `=`, makes the
+/// run count again, as in `sha256=<digest>` or `0x<digest>`, where it is one run.
+fn long_tokens(bytes: &[u8]) -> Vec<Range<usize>> {
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if !is_key_byte(bytes[at]) {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        let mut alphanumeric = 0usize;
+        let mut hex_only = true;
+        while at < bytes.len() && is_key_byte(bytes[at]) {
+            alphanumeric += usize::from(bytes[at].is_ascii_alphanumeric());
+            hex_only &= bytes[at].is_ascii_hexdigit();
+            at += 1;
+        }
+        let length = at - start;
+        if length >= FALLBACK_TOKEN_MIN && alphanumeric * 4 >= length * 3 && !hex_only {
+            tokens.push(start..at);
+        }
+    }
+    tokens
+}
+
+/// Where the last long token that starts after `from` and ends within
+/// [`FALLBACK_WINDOW`] of it ends.
+fn last_token_end_after(tokens: &[Range<usize>], from: usize) -> Option<usize> {
+    let limit = from.saturating_add(FALLBACK_WINDOW);
+    let first = tokens.partition_point(|token| token.start < from);
+    let after = tokens.partition_point(|token| token.end <= limit);
+    (after > first).then(|| tokens[after - 1].end)
+}
+
+/// Where the first long token that ends before `at` and starts within
+/// [`FALLBACK_WINDOW`] of it starts.
+fn first_token_start_before(tokens: &[Range<usize>], at: usize) -> Option<usize> {
+    let floor = at.saturating_sub(FALLBACK_WINDOW);
+    let first = tokens.partition_point(|token| token.start < floor);
+    let before = tokens.partition_point(|token| token.end <= at);
+    (before > first).then(|| tokens[first].start)
+}
+
 /// The regions of `text` that hold key material next to a lone header or END line.
 fn orphan_pem_regions(text: &str) -> Vec<Range<usize>> {
     let mut regions: Vec<Range<usize>> = Vec::new();
+    // Found when a lone line has no run of key lines next to it, once for all of them.
+    let mut tokens: Option<Vec<Range<usize>>> = None;
     for header in pem_header_regex().find_iter(text) {
         let end = key_run_end(text, header.end());
         if end > header.end() {
             regions.push(header.start()..end);
+        } else {
+            let tokens = tokens.get_or_insert_with(|| long_tokens(text.as_bytes()));
+            if let Some(end) = last_token_end_after(tokens, header.end()) {
+                regions.push(header.start()..end);
+            }
         }
     }
     for footer in pem_footer_regex().find_iter(text) {
         if let Some(start) = key_run_start(text, footer.start()) {
             regions.push(start..footer.end());
+        } else {
+            let tokens = tokens.get_or_insert_with(|| long_tokens(text.as_bytes()));
+            if let Some(start) = first_token_start_before(tokens, footer.start()) {
+                regions.push(start..footer.end());
+            }
         }
     }
     regions.sort_by_key(|region| region.start);
@@ -837,19 +1082,25 @@ pub fn has_unterminated_private_key_block(text: &str) -> bool {
         .iter()
         .find(|(kind, _)| *kind == "pem")
         .map(|(_, regex)| regex);
-    match complete_blocks {
-        Some(regex) => !orphan_pem_regions(&regex.replace_all(text, "")).is_empty(),
-        None => !orphan_pem_regions(text).is_empty(),
-    }
+    let without_complete_blocks = match complete_blocks {
+        Some(regex) => regex.replace_all(text, "").into_owned(),
+        None => text.to_owned(),
+    };
+    let (staged, _) = stage_markers(&without_complete_blocks);
+    !orphan_pem_regions(&staged).is_empty()
 }
 
-/// Redacts the key material next to a lone header or END line, with the line.
-/// Complete blocks were replaced before this runs. Like every detector, it takes
-/// at most [`MAX_MATCHES`] of them.
-fn redact_orphan_pem(text: String) -> Result<String> {
-    let regions = orphan_pem_regions(&text);
+/// `text` with the key material next to each lone header or END line redacted
+/// with the line, or `None` when there is none. Like every detector, it takes at
+/// most [`MAX_MATCHES`] of them.
+fn orphan_pem_replace(text: &str) -> Result<Option<String>> {
+    // Every header and END line holds these words.
+    if !text.contains("PRIVATE KEY") {
+        return Ok(None);
+    }
+    let regions = orphan_pem_regions(text);
     if regions.is_empty() {
-        return Ok(text);
+        return Ok(None);
     }
     if regions.len() > MAX_MATCHES {
         return Err(PrivacyError::Policy("too many secret matches".into()));
@@ -862,7 +1113,66 @@ fn redact_orphan_pem(text: String) -> Result<String> {
         at = region.end;
     }
     out.push_str(&text[at..]);
-    Ok(out)
+    Ok(Some(out))
+}
+
+/// Redacts the key material next to a lone header or END line, with the line.
+/// Complete blocks were replaced before this runs.
+fn redact_orphan_pem(text: String) -> Result<String> {
+    Ok(orphan_pem_replace(&text)?.unwrap_or(text))
+}
+
+/// How many times lone key blocks are looked for again once they were redacted.
+const SETTLE_ROUNDS: usize = 8;
+
+/// `text` with every lone key block redacted, looked for again until none is left.
+/// What is looked for next to a lone line depends on how far away text is (a long
+/// token within a window of it), and redacting a block shortens the text, so a block
+/// can come into reach once another is gone. This is done on the text as a later
+/// scrub sees it, with its markers set aside the same way, so that a scrub of the
+/// result finds nothing and changes nothing. A text that never settles (each round
+/// bringing another block into reach, more of them than any real one has) is an
+/// error, as a text with too many matches is.
+fn settle_orphan_blocks(mut text: String) -> Result<String> {
+    for _ in 0..SETTLE_ROUNDS {
+        if !text.contains("PRIVATE KEY") {
+            return Ok(text);
+        }
+        let (staged, protected) = stage_markers(&text);
+        match orphan_pem_replace(&staged)? {
+            None => return Ok(text),
+            Some(redacted) => text = restore_markers(&redacted, &protected),
+        }
+    }
+    Err(PrivacyError::Policy("too many secret matches".into()))
+}
+
+/// `input` with each redaction marker replaced by a placeholder, and the markers
+/// in the order of their placeholders: the detectors read the text between them,
+/// never inside one.
+fn stage_markers(input: &str) -> (String, Vec<String>) {
+    let mut protected = Vec::new();
+    let staged = redaction_marker_regex()
+        .replace_all(input, |found: &regex::Captures<'_>| {
+            protected.push(found[0].to_owned());
+            format!("\u{0}CVC{}\u{0}", protected.len() - 1)
+        })
+        .into_owned();
+    (staged, protected)
+}
+
+/// Every placeholder of `staged` back to its marker in one pass: a text can hold
+/// as many markers as fit in it, and one pass for each would be quadratic.
+fn restore_markers(staged: &str, protected: &[String]) -> String {
+    placeholder_regex()
+        .replace_all(staged, |found: &regex::Captures<'_>| {
+            found[1]
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| protected.get(index))
+                .map_or_else(|| found[0].to_owned(), Clone::clone)
+        })
+        .into_owned()
 }
 
 /// Bounded high-confidence replacement. Existing markers are deliberately preserved.
@@ -870,14 +1180,7 @@ pub fn scrub(input: &str) -> Result<String> {
     if input.len() > MAX_TEXT {
         return Err(PrivacyError::TooLarge);
     }
-    let mut protected = Vec::new();
-    let staged = redaction_marker_regex()
-        .replace_all(input, |m: &regex::Captures<'_>| {
-            protected.push(m[0].to_owned());
-            format!("\u{0}CVC{}\u{0}", protected.len() - 1)
-        })
-        .into_owned();
-    let mut out = staged;
+    let (mut out, protected) = stage_markers(input);
     for (kind, regex) in builtin_detectors() {
         let count = regex.find_iter(&out).count();
         if count > MAX_MATCHES {
@@ -890,17 +1193,7 @@ pub fn scrub(input: &str) -> Result<String> {
             out = redact_orphan_pem(out)?;
         }
     }
-    // Every placeholder back to its marker in one pass: a text can hold as many
-    // markers as fit in it, and one pass for each would be quadratic.
-    Ok(placeholder_regex()
-        .replace_all(&out, |found: &regex::Captures<'_>| {
-            found[1]
-                .parse::<usize>()
-                .ok()
-                .and_then(|index| protected.get(index))
-                .map_or_else(|| found[0].to_owned(), Clone::clone)
-        })
-        .into_owned())
+    settle_orphan_blocks(restore_markers(&out, &protected))
 }
 
 /// A placeholder [`scrub`] puts where a redaction marker was while it runs.
@@ -999,7 +1292,7 @@ fn redact_json_leaves(value: &mut Value) {
 fn is_redaction_marker(value: &str) -> bool {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX
-        .get_or_init(|| re(&format!("^{REDACTION_MARKER}$")))
+        .get_or_init(|| re(&format!("^{}$", redaction_marker_pattern())))
         .is_match(value)
 }
 
@@ -1750,6 +2043,15 @@ pub fn final_scrub_for_sync(
     for item in context {
         item.file_path = scrub(&item.file_path)?;
         item.dirty_patch = item.dirty_patch.take().map(|v| scrub(&v)).transpose()?;
+        // A range with a negative line cannot be published (a remote refuses it), and
+        // an earlier version could store one: a Read with huge numbers wrapped around.
+        // It is no range at all, so the item is published without one.
+        if item.start_line.is_some_and(|line| line < 0)
+            || item.end_line.is_some_and(|line| line < 0)
+        {
+            item.start_line = None;
+            item.end_line = None;
+        }
     }
     for tool in tools {
         tool.tool_protocol = scrub(&tool.tool_protocol)?;

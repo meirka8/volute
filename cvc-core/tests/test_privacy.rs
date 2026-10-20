@@ -287,6 +287,491 @@ fn key_lines_in_a_diff_or_a_quotation_are_key_lines() {
     }
 }
 
+// ---- the layouts a cut key arrives in -------------------------------------------------
+//
+// Lines of base64 are the common case and are read as lines. A key printed another
+// way (with a file name in front of each line, in a list of strings, inside a string
+// inside a string, between HTML breaks, run together with spaces) is read as lines
+// too where its layout is one the scanner knows, and otherwise as long base64
+// tokens, so that none of it is left behind.
+
+const BODY_B: &str = "N7ITxKLUkX0vyOYx6tzS+nWQ36xgB0Oz5eGSQw4zzZ/VZtQb1wMhDp9kY2uRS66M";
+const BODY_C: &str = "DMqZmJeOHNKXceA9P5Nd+RbOmmgsmCV6ZKuaY7NvBK/YoJcXJUPt25nNlHHHlXQd";
+/// The short last line of a body, with its padding.
+const TAIL: &str = "Q2VudCB0aGUgZW5k==";
+
+/// Whether any of the three body lines, or twenty characters of one, is in `text`.
+fn holds_body(text: &str) -> bool {
+    [LINE_64, BODY_B, BODY_C].iter().any(|line| {
+        text.contains(&line[..20]) || text.contains(&line[20..40]) || text.contains(line)
+    })
+}
+
+#[test]
+fn grep_and_rg_output_with_file_names_is_key_text_behind_its_prefixes() {
+    let cases = [
+        // `grep -n -A`: the matching line has colons, the lines of context hyphens.
+        (
+            format!("src/keys/server.pem:1:-----BEGIN PRIVATE KEY-----\nsrc/keys/server.pem-2-{LINE_64}\nsrc/keys/server.pem-3-{BODY_B}\nsrc/keys/server.pem-4-{TAIL}\nsrc/keys/server.pem-5-and some prose after it"),
+            "src/keys/server.pem:1:[CVC_REDACTED:v1:pem:*]\nsrc/keys/server.pem-5-and some prose after it",
+        ),
+        // `rg` with a heading: the file once, then bare numbers.
+        (
+            format!("server.pem\n1:-----BEGIN PRIVATE KEY-----\n2-{LINE_64}\n3-{BODY_B}\n4-{TAIL}\n--\n9-other"),
+            "server.pem\n1:[CVC_REDACTED:v1:pem:*]\n--\n9-other",
+        ),
+        // `rg --column`: a column after the line number.
+        (
+            format!("key.pem:1:1:-----BEGIN PRIVATE KEY-----\nkey.pem:2:1:{LINE_64}\nkey.pem:3:1:{BODY_B}\nkey.pem:4:1:and more"),
+            "key.pem:1:1:[CVC_REDACTED:v1:pem:*]\nkey.pem:4:1:and more",
+        ),
+        // `grep -n -B` before an END line.
+        (
+            format!("src/keys/server.pem-57-{LINE_64}\nsrc/keys/server.pem-58-{BODY_B}\nsrc/keys/server.pem-59-{TAIL}\nsrc/keys/server.pem:60:-----END PRIVATE KEY-----\nsrc/keys/server.pem-61-after"),
+            "[CVC_REDACTED:v1:pem:*]\nsrc/keys/server.pem-61-after",
+        ),
+        // A file name that holds numbers and hyphens of its own.
+        (
+            format!("logs/key-2024-01-01.pem-1-{LINE_64}\nlogs/key-2024-01-01.pem-2-{BODY_B}\nlogs/key-2024-01-01.pem:3:-----END PRIVATE KEY-----"),
+            "[CVC_REDACTED:v1:pem:*]",
+        ),
+        // The END line itself as a line of context, behind a hyphen of its own.
+        (
+            format!("a.pem-1-{LINE_64}\na.pem-2-{BODY_B}\na.pem-3------END PRIVATE KEY-----\na.pem-4-after"),
+            "[CVC_REDACTED:v1:pem:*]\na.pem-4-after",
+        ),
+    ];
+    for (text, expected) in cases {
+        let scrubbed = scrub(&text).unwrap();
+        assert!(!holds_body(&scrubbed), "{text} -> {scrubbed}");
+        assert_eq!(masked(&scrubbed), expected, "{text}");
+        assert!(has_unterminated_private_key_block(&text), "{text}");
+        assert_eq!(scrub(&scrubbed).unwrap(), scrubbed, "{text}");
+    }
+}
+
+#[test]
+fn a_prefix_that_is_not_a_line_number_does_not_make_prose_key_text() {
+    for text in [
+        // Words behind what looks like a file name and a number.
+        "notes.txt-2-and then the header -----BEGIN PRIVATE KEY----- appears in a sentence",
+        "notes.txt:2:-----BEGIN PRIVATE KEY-----\nnotes.txt-3-the next line is a sentence, not a key",
+        "readme.md-10-the end is shown as\nreadme.md:11:-----END PRIVATE KEY-----\nreadme.md-12-then more prose",
+        // A date is a number and a hyphen, and what follows it is words.
+        "2026-10-20 the header -----BEGIN PRIVATE KEY----- was mentioned",
+    ] {
+        assert_eq!(scrub(text).unwrap(), text, "{text}");
+    }
+}
+
+#[test]
+fn a_list_of_the_lines_of_a_key_is_redacted_through_its_last_long_token() {
+    for (text, expected) in [
+        // A Python list of lines, cut inside it.
+        (
+            format!(
+                r"lines = ['-----BEGIN PRIVATE KEY-----\n', '{LINE_64}\n', '{BODY_B}\n', '{BODY_C}\n']"
+            ),
+            r"lines = ['[CVC_REDACTED:v1:pem:*]\n']",
+        ),
+        // The same as JSON, with double quotes.
+        (
+            format!(
+                r#"["-----BEGIN RSA PRIVATE KEY-----\n","{LINE_64}\n","{BODY_B}\n","{BODY_C}\n"]"#
+            ),
+            r#"["[CVC_REDACTED:v1:pem:*]\n"]"#,
+        ),
+        // A list that ends with the END line.
+        (
+            format!(r"['{LINE_64}\n', '{BODY_B}\n', '{BODY_C}\n', '-----END PRIVATE KEY-----\n']"),
+            r"['[CVC_REDACTED:v1:pem:*]\n']",
+        ),
+        (
+            format!(r#"["{LINE_64}\n", "{BODY_B}\n", "-----END EC PRIVATE KEY-----\n"]"#),
+            r#"["[CVC_REDACTED:v1:pem:*]\n"]"#,
+        ),
+    ] {
+        let scrubbed = scrub(&text).unwrap();
+        assert!(!holds_body(&scrubbed), "{text} -> {scrubbed}");
+        assert_eq!(masked(&scrubbed), expected, "{text}");
+        assert!(has_unterminated_private_key_block(&text), "{text}");
+        assert_eq!(scrub(&scrubbed).unwrap(), scrubbed, "{text}");
+    }
+}
+
+#[test]
+fn a_key_inside_json_inside_json_is_redacted() {
+    // A JSON document in a string of another one: the line breaks are escaped twice.
+    for (text, expected) in [
+        (
+            format!(
+                r#"{{"stdout":"{{\"key\":\"-----BEGIN PRIVATE KEY-----\\n{LINE_64}\\n{BODY_B}\\n{TAIL}\\n\"}}"}}"#
+            ),
+            r#"{"stdout":"{\"key\":\"[CVC_REDACTED:v1:pem:*]\\n\"}"}"#,
+        ),
+        (
+            format!(
+                r#"{{"stdout":"{{\"key\":\"{LINE_64}\\n{BODY_B}\\n{TAIL}\\n-----END PRIVATE KEY-----\\n\"}}"}}"#
+            ),
+            r#"{"stdout":"{\"key\":\"[CVC_REDACTED:v1:pem:*]\\n\"}"}"#,
+        ),
+    ] {
+        let scrubbed = scrub(&text).unwrap();
+        assert!(
+            !holds_body(&scrubbed) && !scrubbed.contains(TAIL),
+            "{text} -> {scrubbed}"
+        );
+        assert_eq!(masked(&scrubbed), expected, "{text}");
+        assert_eq!(scrub(&scrubbed).unwrap(), scrubbed, "{text}");
+    }
+    // Three levels deep is no layout the lines are read in; the long tokens are redacted.
+    let deeper = format!(
+        r#"{{"a":"{{\"b\":\"{{\\\"c\\\":\\\"-----BEGIN PRIVATE KEY-----\\\\n{LINE_64}\\\\n{BODY_B}\\\\n{BODY_C}\\\\n\\\"}}\"}}"}}"#
+    );
+    let scrubbed = scrub(&deeper).unwrap();
+    assert!(!holds_body(&scrubbed), "{scrubbed}");
+    assert_eq!(scrub(&scrubbed).unwrap(), scrubbed);
+}
+
+#[test]
+fn a_key_between_html_breaks_is_read_as_lines() {
+    for (text, expected) in [
+        (
+            format!("-----BEGIN PRIVATE KEY-----<br>{LINE_64}<br>{BODY_B}<br>{TAIL}<br>after the key"),
+            "[CVC_REDACTED:v1:pem:*]<br>after the key",
+        ),
+        (
+            format!("<p>-----BEGIN PRIVATE KEY-----<br/>{LINE_64}<br/>{BODY_B}<br/>{TAIL}<br/>after the key</p>"),
+            "<p>[CVC_REDACTED:v1:pem:*]<br/>after the key</p>",
+        ),
+        (
+            format!("-----BEGIN PRIVATE KEY-----<BR />{LINE_64}<BR />{BODY_B}<BR />{TAIL}<BR />after it"),
+            "[CVC_REDACTED:v1:pem:*]<BR />after it",
+        ),
+        // Each break followed by a newline.
+        (
+            format!("-----BEGIN PRIVATE KEY-----<br>\n{LINE_64}<br>\n{BODY_B}<br>\n{TAIL}<br>\nafter the key"),
+            "[CVC_REDACTED:v1:pem:*]<br>\nafter the key",
+        ),
+        // Cut before the END line.
+        (
+            format!("{LINE_64}<br>{BODY_B}<br>{TAIL}<br>-----END PRIVATE KEY-----<br>after"),
+            "[CVC_REDACTED:v1:pem:*]<br>after",
+        ),
+    ] {
+        let scrubbed = scrub(&text).unwrap();
+        assert!(!holds_body(&scrubbed) && !scrubbed.contains(TAIL), "{text} -> {scrubbed}");
+        assert_eq!(masked(&scrubbed), expected, "{text}");
+        assert_eq!(scrub(&scrubbed).unwrap(), scrubbed, "{text}");
+    }
+    // A tag that is not a break is no break.
+    let text = format!("-----BEGIN PRIVATE KEY-----<break>and <b>bold</b> words {LINE_64}");
+    assert!(
+        !scrub(&text).unwrap().contains(LINE_64),
+        "the long token is still found"
+    );
+}
+
+#[test]
+fn a_key_run_together_with_spaces_is_redacted_through_its_last_long_token() {
+    for (text, expected) in [
+        // As `echo $KEY` or an environment dump prints it.
+        (
+            format!("KEY=-----BEGIN PRIVATE KEY----- {LINE_64} {BODY_B} {BODY_C} next=1"),
+            "KEY=[CVC_REDACTED:v1:pem:*] next=1",
+        ),
+        (
+            format!("-----BEGIN OPENSSH PRIVATE KEY-----  {LINE_64}   {BODY_B}"),
+            "[CVC_REDACTED:v1:pem:*]",
+        ),
+        // Cut before the END line, which is in the middle of the line.
+        (
+            format!("export KEY=\"{LINE_64} {BODY_B} {BODY_C} -----END PRIVATE KEY-----\""),
+            "export KEY=\"[CVC_REDACTED:v1:pem:*]\"",
+        ),
+    ] {
+        let scrubbed = scrub(&text).unwrap();
+        assert!(!holds_body(&scrubbed), "{text} -> {scrubbed}");
+        assert_eq!(masked(&scrubbed), expected, "{text}");
+        assert!(has_unterminated_private_key_block(&text), "{text}");
+        assert_eq!(scrub(&scrubbed).unwrap(), scrubbed, "{text}");
+    }
+}
+
+#[test]
+fn a_lone_header_or_end_line_in_prose_with_no_long_token_keeps_its_text() {
+    // 39 characters is not a token; 40 is.
+    let token = |length: usize| "Ab1+".repeat(length / 4 + 1)[..length].to_owned();
+    assert_eq!(token(39).len(), 39);
+    let below = format!(
+        "The header -----BEGIN PRIVATE KEY----- is followed by {} and more words.",
+        token(39)
+    );
+    assert_eq!(scrub(&below).unwrap(), below);
+    let at_the_limit = format!(
+        "The header -----BEGIN PRIVATE KEY----- is followed by {} and more words.",
+        token(40)
+    );
+    let scrubbed = scrub(&at_the_limit).unwrap();
+    assert!(!scrubbed.contains(&token(40)), "{scrubbed}");
+    assert_eq!(
+        masked(&scrubbed),
+        "The header [CVC_REDACTED:v1:pem:*] and more words."
+    );
+    for text in [
+        // Prose, code and rules.
+        "A key file must start with -----BEGIN RSA PRIVATE KEY----- and then holds the body.".to_owned(),
+        "The body is followed by -----END RSA PRIVATE KEY-----, which closes the file.".to_owned(),
+        "if line.starts_with(\"-----BEGIN PRIVATE KEY-----\") { skip(); } // then read the body".to_owned(),
+        "Header: -----BEGIN PRIVATE KEY-----\n==================================================================\nThen the rest of the document, with ordinary words only.".to_owned(),
+        format!("-----END PRIVATE KEY----- closes it\n{}\nand that was all", "/".repeat(80)),
+        format!("Section ----------------------------------------\n-----BEGIN PRIVATE KEY-----\n{}", "+".repeat(70)),
+        // Words and numbers and paths whose pieces are short.
+        "See cvc-core/src/claude_code/transcript.rs and cvc-core/src/privacy.rs for -----BEGIN PRIVATE KEY----- handling in 2026-10-20 builds.".to_owned(),
+    ] {
+        assert_eq!(scrub(&text).unwrap(), text, "{text}");
+        assert!(!has_unterminated_private_key_block(&text), "{text}");
+    }
+}
+
+#[test]
+fn the_long_tokens_are_looked_for_only_within_a_window_of_the_line() {
+    let prose = |bytes: usize| "word ".repeat(bytes / 5);
+    // The token ends within 4 KiB of the header: found, and the prose between goes with it.
+    let near = format!("-----BEGIN PRIVATE KEY----- {}{LINE_64}", prose(3_000));
+    let scrubbed = scrub(&near).unwrap();
+    assert_eq!(masked(&scrubbed), "[CVC_REDACTED:v1:pem:*]");
+    // Beyond it: the header is left alone with the rest of the text.
+    let far = format!("-----BEGIN PRIVATE KEY----- {}{LINE_64}", prose(4_200));
+    assert_eq!(scrub(&far).unwrap(), far);
+    // The same before an END line.
+    let near_end = format!("{LINE_64}{} -----END PRIVATE KEY-----", prose(3_000));
+    assert_eq!(
+        masked(&scrub(&near_end).unwrap()),
+        "[CVC_REDACTED:v1:pem:*]"
+    );
+    let far_end = format!("{LINE_64}{} -----END PRIVATE KEY-----", prose(4_200));
+    assert_eq!(scrub(&far_end).unwrap(), far_end);
+    // A key of 4096 bits (about 3.2 KB of base64) run together is reached from either end.
+    let long_body: Vec<String> = (0..50)
+        .map(|n| format!("{}{n:02}", &LINE_64[..62]))
+        .collect();
+    let joined = long_body.join(" ");
+    for text in [
+        format!("-----BEGIN PRIVATE KEY----- {joined}"),
+        format!("{joined} -----END PRIVATE KEY-----"),
+    ] {
+        let scrubbed = scrub(&text).unwrap();
+        assert!(!scrubbed.contains(&LINE_64[..40]), "{scrubbed}");
+        assert_eq!(masked(&scrubbed), "[CVC_REDACTED:v1:pem:*]");
+    }
+}
+
+// ---- commit ids and digests are not key material -------------------------------------
+//
+// `git` and the hooks print a commit or blob id (40 hex digits) or a SHA-256 digest (64)
+// in every session, and either is a run of base64 characters long enough to be looked
+// for as a key. The base64 of a key is never only hex digits, so a run of those, exactly
+// `[0-9a-fA-F]+`, is not taken for one. A run with a single character outside them is.
+
+/// A commit or blob id, as `git` prints one.
+const SHA_1: &str = "0123456789abcdef0123456789abcdef01234567";
+/// A SHA-256 digest.
+const SHA_256: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+#[test]
+fn a_lone_header_or_end_line_near_a_commit_id_or_a_digest_keeps_its_text() {
+    assert_eq!((SHA_1.len(), SHA_256.len()), (40, 64));
+    let sha_512 = format!("{SHA_256}{SHA_256}");
+    let upper = SHA_256.to_uppercase();
+    let mixed = "0123456789aBcDeF".repeat(4);
+    let prose = |bytes: usize| "word ".repeat(bytes / 5);
+    for id in [
+        SHA_1,
+        SHA_256,
+        sha_512.as_str(),
+        upper.as_str(),
+        mixed.as_str(),
+    ] {
+        for text in [
+            // A header named in prose, and an id after it, as a commit is named.
+            format!("A key file starts with -----BEGIN RSA PRIVATE KEY----- and came in with commit {id}, which touched the docs."),
+            format!("-----BEGIN PRIVATE KEY----- is what it looks for. Linked 2 interactions to commit {id}"),
+            // An id and a 64-hex digest up to 3 KB after the header, inside the window:
+            // the prose between them stays.
+            format!("-----BEGIN PRIVATE KEY----- {}{id} and {SHA_256} after", prose(3_000)),
+            // The same around an END line.
+            format!("The tree {id} holds a file that ends with -----END RSA PRIVATE KEY-----, which closes it."),
+            format!("{SHA_1} {id} {} -----END PRIVATE KEY-----", prose(3_000)),
+            // `git log` and `git ls-tree` output.
+            format!("commit {SHA_1}\nAuthor: A <a@example.com>\n\n    Document -----BEGIN PRIVATE KEY----- handling\n\ncommit {id}\n100644 blob {id}\tkeys/server.pem\n"),
+        ] {
+            assert_eq!(scrub(&text).unwrap(), text, "{text}");
+            assert!(!has_unterminated_private_key_block(&text), "{text}");
+        }
+    }
+}
+
+#[test]
+fn a_base64_run_still_starts_the_fallback_beside_commit_ids_and_digests() {
+    for (text, expected) in [
+        // A key after an id: through the last base64 token. The id after it stays.
+        (
+            format!(
+                "-----BEGIN PRIVATE KEY----- {SHA_1} {LINE_64} {BODY_B} then {SHA_256} follows"
+            ),
+            format!("[CVC_REDACTED:v1:pem:*] then {SHA_256} follows"),
+        ),
+        // An id between two pieces of the key goes with them.
+        (
+            format!("-----BEGIN PRIVATE KEY----- {LINE_64} {SHA_256} {BODY_B}"),
+            "[CVC_REDACTED:v1:pem:*]".to_owned(),
+        ),
+        // Prose, and the ids in it, between a header and its key go with them.
+        (
+            format!("-----BEGIN PRIVATE KEY----- see commit {SHA_1} and {SHA_256}: {LINE_64}"),
+            "[CVC_REDACTED:v1:pem:*]".to_owned(),
+        ),
+        // Before an END line: from the first base64 token. The ids around stay.
+        (
+            format!(
+                "{SHA_256} before {LINE_64} {BODY_B} -----END PRIVATE KEY----- and {SHA_1} after"
+            ),
+            format!("{SHA_256} before [CVC_REDACTED:v1:pem:*] and {SHA_1} after"),
+        ),
+        // Without an id, as before.
+        (
+            format!("-----BEGIN PRIVATE KEY----- {LINE_64} {BODY_B}"),
+            "[CVC_REDACTED:v1:pem:*]".to_owned(),
+        ),
+    ] {
+        let scrubbed = scrub(&text).unwrap();
+        assert!(!holds_body(&scrubbed), "{text} -> {scrubbed}");
+        assert_eq!(masked(&scrubbed), expected, "{text}");
+        assert!(has_unterminated_private_key_block(&text), "{text}");
+        assert_eq!(scrub(&scrubbed).unwrap(), scrubbed, "{text}");
+    }
+}
+
+#[test]
+fn a_run_is_not_key_material_only_when_every_character_of_it_is_a_hex_digit() {
+    // Hex digits alone, `[0-9a-fA-F]+`, of any length from 40 up: not key material.
+    let hex_only = [
+        SHA_1.to_owned(),
+        SHA_256.to_owned(),
+        SHA_256.to_uppercase(),
+        "0123456789aBcDeF".repeat(4),
+        format!("{SHA_256}{SHA_256}"),
+        // Each end of each range of digits.
+        "0".repeat(40),
+        "9".repeat(40),
+        "a".repeat(40),
+        "f".repeat(40),
+        "A".repeat(40),
+        "F".repeat(40),
+        "9".repeat(2_000),
+    ];
+    // One character that is not one makes the run count, wherever it is in it: the
+    // letter after `f`, the one after `F`, any other letter, `+`, `/` and `=`.
+    let counts = [
+        format!("g{}", &SHA_256[1..]),
+        format!("{}g", &SHA_256[..63]),
+        format!("{}g{}", &SHA_256[..30], &SHA_256[31..]),
+        format!("G{}", &SHA_256[1..]),
+        format!("{}Z", &SHA_256[..63]),
+        format!("{}z{}", &SHA_1[..20], &SHA_1[21..]),
+        format!("{}+{}", &SHA_1[..20], &SHA_1[21..]),
+        format!("{}/{}", &SHA_1[..20], &SHA_1[21..]),
+        format!("{SHA_1}="),
+        format!("{SHA_256}=="),
+        // The run is whatever base64 characters stand together, so a digest joined to a
+        // word or a prefix by one is a single run with it.
+        format!("0x{SHA_256}"),
+        format!("sha256={SHA_256}"),
+        format!("commit={SHA_1}"),
+        // The shortest run that counts: 40 characters, one of them not a digit.
+        format!("g{}", &SHA_1[1..]),
+    ];
+    // Still too short, with or without such a character: 39.
+    let too_short = [SHA_1[1..].to_owned(), format!("g{}", &SHA_1[2..])];
+    for token in &hex_only {
+        assert!(token.len() >= 40 && token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        for text in [
+            format!(
+                "The header -----BEGIN PRIVATE KEY----- is followed by {token} and more words."
+            ),
+            format!("Words {token} then -----END PRIVATE KEY-----."),
+        ] {
+            assert_eq!(scrub(&text).unwrap(), text, "{text}");
+            assert!(!has_unterminated_private_key_block(&text), "{text}");
+        }
+    }
+    for token in &counts {
+        assert!(token.len() >= 40 && !token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let after_header = format!(
+            "The header -----BEGIN PRIVATE KEY----- is followed by {token} and more words."
+        );
+        let before_end = format!("Words {token} then -----END PRIVATE KEY-----.");
+        for (text, expected) in [
+            (
+                after_header,
+                "The header [CVC_REDACTED:v1:pem:*] and more words.",
+            ),
+            (before_end, "Words [CVC_REDACTED:v1:pem:*]."),
+        ] {
+            let scrubbed = scrub(&text).unwrap();
+            assert!(!scrubbed.contains(token.as_str()), "{text} -> {scrubbed}");
+            assert_eq!(masked(&scrubbed), expected, "{text}");
+            assert!(has_unterminated_private_key_block(&text), "{text}");
+            assert_eq!(scrub(&scrubbed).unwrap(), scrubbed, "{text}");
+        }
+    }
+    for token in &too_short {
+        assert_eq!(token.len(), 39);
+        let text = format!(
+            "The header -----BEGIN PRIVATE KEY----- is followed by {token} and more words."
+        );
+        assert_eq!(scrub(&text).unwrap(), text, "{text}");
+    }
+    // What stands next to an id and is not a base64 character is not part of its run, so
+    // a word, a path or a quote in front of an id leaves it hex only: `sha256:<digest>`,
+    // `commit-<id>`, `"<id>"`, `(<id>)`, `repo#<id>`, `a@<id>`. (These are the characters
+    // on either side of the ranges of hex digits among them: `:` after `9`, `@` before
+    // `A`, and a backtick before `a`.)
+    for separator in [
+        " ", "\t", ":", "-", "_", ".", ",", ";", "\"", "'", "(", ")", "[", "]", "{", "}", "<", ">",
+        "#", "@", "`", "\\", "|", "~", "&", "?", "!", "$", "%", "*",
+    ] {
+        for id in [SHA_1, SHA_256] {
+            let text = format!(
+                "The header -----BEGIN PRIVATE KEY----- is followed by commit{separator}{id}{separator}and more words."
+            );
+            assert_eq!(scrub(&text).unwrap(), text, "{text:?}");
+        }
+    }
+}
+
+#[test]
+fn a_redaction_that_brings_a_key_within_reach_is_made_before_scrub_returns() {
+    // The header has no key within 4 KiB of it, until the assignment between them is
+    // replaced by a marker. Scrubbing the result must then change nothing, as a push
+    // checks, so the key is redacted the first time.
+    let text = format!(
+        "-----BEGIN PRIVATE KEY----- token={} {LINE_64}",
+        "#".repeat(4_100)
+    );
+    let once = scrub(&text).unwrap();
+    assert!(!once.contains(LINE_64), "{once}");
+    assert_eq!(masked(&once), "[CVC_REDACTED:v1:pem:*]");
+    assert_eq!(scrub(&once).unwrap(), once);
+    // And several such steps in a row.
+    let step = format!(" token={} {LINE_64}", "#".repeat(4_100));
+    let chain = format!("-----BEGIN PRIVATE KEY-----{}", step.repeat(3));
+    let settled = scrub(&chain).unwrap();
+    assert!(!settled.contains(LINE_64), "{settled}");
+    assert_eq!(scrub(&settled).unwrap(), settled);
+}
+
 /// A small deterministic generator, so that a failing case can be rerun.
 struct Lcg(u64);
 impl Lcg {
@@ -341,10 +826,47 @@ fn scrubbing_key_like_text_never_panics_and_scrubbing_again_changes_nothing() {
         "=====================",
         "prose with words",
         "\u{E000}",
+        // The layouts a cut key arrives in, and the pieces of them.
+        BODY_B,
+        BODY_C,
+        TAIL,
+        "src/k.pem-2-",
+        "src/k.pem:3:",
+        "a-2024-01.pem-12-",
+        "1:",
+        "2-",
+        "<br>",
+        "<br/>",
+        "<BR />",
+        "<b>",
+        "\\\\n",
+        "', '",
+        "\", \"",
+        "['",
+        "']",
+        "token=###############",
+        "export KEY=",
+        // Commit ids and digests, and runs that are one character off being one.
+        SHA_1,
+        SHA_256,
+        "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+        "0123456789abcdef0123456789abcdef0123456g",
+        "sha256=",
+        " commit ",
+        // Prose to put distance between the pieces.
+        "word word word word word word word word word word word word ",
+        // Text that is not a marker and looks like one, and one that is.
+        "[CVC_REDACTED:v1:x:0123456789abcdef0123456789abcdef]",
+        "[CVC_REDACTED:v1:pem:3F2A9C1E-0B7D-4A5E-9C3D-2E1F0A9B8C7D]",
     ]
     .iter()
     .map(|fragment| (*fragment).to_owned())
-    .chain([marker])
+    .chain([
+        marker,
+        // Long runs, so that a window of a few KB is crossed by a few pieces.
+        "word ".repeat(300),
+        format!("token={}", "#".repeat(2_500)),
+    ])
     .collect();
     let mut random = Lcg(0x5eed);
     for case in 0..6_000 {
@@ -366,6 +888,64 @@ fn scrubbing_key_like_text_never_panics_and_scrubbing_again_changes_nothing() {
         }
         // The text kept around redactions is valid UTF-8 cut on boundaries.
         assert!(once.is_char_boundary(0) && once.is_char_boundary(once.len()));
+    }
+}
+
+#[test]
+fn policy_scrubbing_of_marker_like_text_settles_and_what_a_push_checks_never_changes() {
+    // Rules that match inside any marker, and text of every shape a marker can have
+    // or be taken for: real ones, fakes, pieces of them, and what the rules are for.
+    let policy = policy("literal:projectx\nliteral:v1\nregex:[0-9a-f]{8}\nregex:[A-Z_]{4,}\n");
+    let real = scrub("AKIAABCDEFGHIJKLMNOP").unwrap();
+    let pem = scrub(&format!(
+        "-----BEGIN PRIVATE KEY-----\n{LINE_64}\n-----END PRIVATE KEY-----"
+    ))
+    .unwrap();
+    let fragments: Vec<String> = vec![
+        real,
+        pem,
+        format!("[CVC_REDACTED:v1:projectx:{SOME_UUID}]"),
+        format!("[CVC_REDACTED:v1:pem:{}]", "0123456789abcdef".repeat(4)),
+        format!("[CVC_REDACTED:v1:pem:{}]", SOME_UUID.to_uppercase()),
+        format!("[CVC_REDACTED:v1:aws_access_key:{SOME_UUID}]"),
+        format!("[CVC_REDACTED:v1:policy_regex:{SOME_UUID}]"),
+        "[CVC_REDACTED:v1:".to_owned(),
+        "]".to_owned(),
+        "[".to_owned(),
+        ":".to_owned(),
+        "projectx".to_owned(),
+        "deadbeef".to_owned(),
+        "password=hunter2hunter2".to_owned(),
+        " ".to_owned(),
+        "\n".to_owned(),
+        "-----BEGIN PRIVATE KEY-----".to_owned(),
+        LINE_64.to_owned(),
+    ];
+    let mut random = Lcg(0xfeed);
+    for case in 0..3_000 {
+        let mut text = String::new();
+        for _ in 0..random.below(10) + 1 {
+            text.push_str(&fragments[random.below(fragments.len())]);
+        }
+        let Ok(once) = policy.scrub(&text) else {
+            continue;
+        };
+        // The terms the rules are for are gone, wherever they were.
+        assert!(
+            !once.contains("projectx"),
+            "case {case}: {text:?} -> {once:?}"
+        );
+        // A policy marker can end a word, and the built-in detectors then read what
+        // follows it as they would after any other non-word character, so scrubbing
+        // with the policy once more can redact more. It settles by the next scrub.
+        let twice = policy
+            .scrub(&once)
+            .unwrap_or_else(|error| panic!("case {case}: {error}: {text:?}"));
+        let thrice = policy.scrub(&twice).unwrap();
+        assert_eq!(thrice, twice, "case {case}: {text:?}");
+        // What a push checks, which has no policy, is stable for what was stored.
+        let pushed = scrub(&once).unwrap();
+        assert_eq!(scrub(&pushed).unwrap(), pushed, "case {case}: {text:?}");
     }
 }
 
@@ -419,6 +999,56 @@ fn text_made_of_many_headers_or_end_lines_is_scrubbed_in_linear_time() {
         (
             "key lines, each before an END line",
             format!("{key_lines}-----END PRIVATE KEY-----\n").repeat(mib / 91),
+        ),
+        // The layouts that are read as long tokens, and the prefixes and breaks.
+        (
+            "a header and a commit id, many times, on one line",
+            format!("-----BEGIN PRIVATE KEY----- {SHA_256} ").repeat(mib / 94),
+        ),
+        (
+            "a commit id and an END line, many times, on one line",
+            format!("{SHA_256} -----END PRIVATE KEY----- ").repeat(mib / 92),
+        ),
+        (
+            "a header and a long token, many times, on one line",
+            format!("-----BEGIN PRIVATE KEY----- {LINE_64} ").repeat(mib / 93),
+        ),
+        (
+            "a long token and an END line, many times, on one line",
+            format!("{LINE_64} -----END PRIVATE KEY----- ").repeat(mib / 91),
+        ),
+        (
+            "a header, then 3 KB of words and a long token, many times",
+            format!(
+                "-----BEGIN PRIVATE KEY----- {}{LINE_64}\n",
+                "word ".repeat(600)
+            )
+            .repeat(mib / 3_100),
+        ),
+        (
+            "key lines behind file names",
+            format!(
+                "-----BEGIN PRIVATE KEY-----\n{}",
+                format!("src/keys/server.pem-2-{LINE_64}\n").repeat(mib / 90)
+            ),
+        ),
+        (
+            "key lines between HTML breaks",
+            format!(
+                "-----BEGIN PRIVATE KEY-----<br>{}",
+                format!("{LINE_64}<br>").repeat(mib / 70)
+            ),
+        ),
+        (
+            "key lines with escaped line breaks, twice over",
+            format!(
+                "-----BEGIN PRIVATE KEY-----\\\\n{}",
+                format!("{LINE_64}\\\\n").repeat(mib / 70)
+            ),
+        ),
+        (
+            "one line of colons and hyphens with headers in it",
+            format!("-----BEGIN PRIVATE KEY----- {}", "a-1-:2:".repeat(mib / 8)),
         ),
     ];
     for (name, text) in cases {
@@ -607,7 +1237,24 @@ fn an_unterminated_private_key_block_is_told_from_a_complete_one_and_from_prose(
             format!("{block}\nlater\n-----BEGIN EC PRIVATE KEY-----\n{LINE_64}"),
             true,
         ),
+        // A key in a layout that is read as long tokens is the lone case too.
+        (
+            format!(r"['-----BEGIN PRIVATE KEY-----\n', '{LINE_64}\n']"),
+            true,
+        ),
+        (
+            format!("KEY=-----BEGIN PRIVATE KEY----- {LINE_64} {BODY_B}"),
+            true,
+        ),
+        (
+            format!("src/k.pem-2-{LINE_64}\nsrc/k.pem:3:-----END PRIVATE KEY-----"),
+            true,
+        ),
         // A header or END line with no key text beside it is only text.
+        (
+            "A header, -----BEGIN PRIVATE KEY-----, then words only".into(),
+            false,
+        ),
         ("-----BEGIN PRIVATE KEY-----".into(), false),
         ("-----END PRIVATE KEY-----".into(), false),
         (
@@ -777,6 +1424,203 @@ fn policy_rules_still_redact_plain_text_and_still_have_a_match_limit() {
     let many = "ACME-INTERNAL ".repeat(257);
     assert!(policy.scrub(&many).is_err());
     assert!(policy.scrub(&"ACME-INTERNAL ".repeat(256)).is_ok());
+}
+
+// ---- what a redaction marker is ---------------------------------------------------
+//
+// A marker is atomic to every detector and rule, so only what cvc writes may count
+// as one: `[CVC_REDACTED:v1:<kind>:<uuid>]`, with a kind cvc writes and a lowercase
+// hyphenated UUID. Anything that merely looks like one is ordinary text.
+
+/// A policy snapshot holding these `.thoughtignore` lines.
+fn policy(rules: &str) -> PreparedPolicy {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join(".thoughtignore"), rules).unwrap();
+    PreparedPolicy::load(dir.path()).unwrap()
+}
+
+const SOME_UUID: &str = "3f2a9c1e-0b7d-4a5e-9c3d-2e1f0a9b8c7d";
+
+#[test]
+fn text_that_only_looks_like_a_marker_is_open_to_every_policy_rule() {
+    let policy = policy(
+        "literal:projectx\nliteral:PROJECTX\nregex:[0-9a-f]{32,}\nregex:[0-9A-F]{8}\nregex:[0-9a-f]{13}\n",
+    );
+    let long_hex = "0123456789abcdef".repeat(4);
+    let no_hyphens = SOME_UUID.replace('-', "");
+    let capitals = SOME_UUID.to_uppercase();
+    // (text, what a rule is for in it)
+    let cases: Vec<(String, String)> = vec![
+        // A kind cvc does not write, carrying a term a rule is for.
+        (
+            format!("[CVC_REDACTED:v1:projectx:{SOME_UUID}]"),
+            "projectx".into(),
+        ),
+        (format!("[CVC_REDACTED:v1:x:{long_hex}]"), long_hex.clone()),
+        (
+            format!("[CVC_REDACTED:v1:projectx_secret:{SOME_UUID}]"),
+            "projectx".into(),
+        ),
+        // A known kind, but a long hex id instead of a UUID, or a UUID of another shape.
+        (
+            format!("[CVC_REDACTED:v1:pem:{long_hex}]"),
+            long_hex.clone(),
+        ),
+        (
+            format!("[CVC_REDACTED:v1:pem:{no_hyphens}]"),
+            no_hyphens.clone(),
+        ),
+        (
+            format!("[CVC_REDACTED:v1:pem:{SOME_UUID}0]"),
+            "e1f0a9b8c7d0".into(),
+        ),
+        // Capital letters: in the id, in the kind, in the term.
+        (
+            format!("[CVC_REDACTED:v1:pem:{capitals}]"),
+            "3F2A9C1E".into(),
+        ),
+        (
+            format!("[CVC_REDACTED:v1:PROJECTX:{SOME_UUID}]"),
+            "PROJECTX".into(),
+        ),
+        (
+            format!("[CVC_REDACTED:v1:Pem:{capitals}]"),
+            "3F2A9C1E".into(),
+        ),
+        // Brackets inside, or around: the inside is not a marker's, and the
+        // outside is not part of one.
+        (
+            format!("[CVC_REDACTED:v1:pem:[projectx]{SOME_UUID}]"),
+            "projectx".into(),
+        ),
+        (
+            format!("[CVC_REDACTED:v1:[projectx]:{SOME_UUID}]"),
+            "projectx".into(),
+        ),
+        (
+            format!("[[CVC_REDACTED:v1:projectx:{SOME_UUID}]]"),
+            "projectx".into(),
+        ),
+        // The wrong version, a space, a missing colon.
+        (
+            format!("[CVC_REDACTED:v2:pem:{long_hex}]"),
+            long_hex.clone(),
+        ),
+        (
+            format!("[CVC_REDACTED:v1: pem:{long_hex}]"),
+            long_hex.clone(),
+        ),
+        (
+            format!("[CVC_REDACTED:v1:pem {long_hex}]"),
+            long_hex.clone(),
+        ),
+    ];
+    for (text, needle) in cases {
+        let scrubbed = policy.scrub(&text).unwrap();
+        assert!(
+            !scrubbed.contains(&needle),
+            "{needle} survived in {text}: {scrubbed}"
+        );
+        // What was scrubbed is left as it is by another scrub, the way a push re-checks it.
+        assert_eq!(policy.scrub(&scrubbed).unwrap(), scrubbed, "{text}");
+        assert_eq!(scrub(&scrubbed).unwrap(), scrubbed, "{text}");
+    }
+}
+
+#[test]
+fn a_real_marker_inside_text_that_looks_like_one_stays_whole_and_the_rest_is_scrubbed() {
+    let policy = policy("literal:projectx\n");
+    let real = scrub("AKIAABCDEFGHIJKLMNOP").unwrap();
+    // A fake marker whose kind slot holds a real one: the real one is atomic, and the
+    // term around it is not shielded by the fake brackets.
+    let text = format!("[CVC_REDACTED:v1:projectx:{real}] and projectx");
+    let scrubbed = policy.scrub(&text).unwrap();
+    assert!(scrubbed.contains(&real), "{scrubbed}");
+    assert!(!scrubbed.contains("projectx"), "{scrubbed}");
+    assert_eq!(policy.scrub(&scrubbed).unwrap(), scrubbed);
+}
+
+#[test]
+fn a_marker_cvc_wrote_is_atomic_to_every_rule_whatever_kind_wrote_it() {
+    // One marker of each kind the built-in detectors write.
+    let samples = [
+        "AKIAABCDEFGHIJKLMNOP".to_owned(),
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+            .to_owned(),
+        "ghp_abcdefghijklmnopqrstuvwxyz0123456789".to_owned(),
+        "sk-abcdefghijklmnopqrstuvwxyz123456".to_owned(),
+        "xoxb-1234567890-abcdefghij".to_owned(),
+        "ya29.abcdefghijklmnopqrstuvwxyz0123".to_owned(),
+        "Authorization: Bearer abcdefghijklmnop1234".to_owned(),
+        "https://user:pass@example.invalid/x".to_owned(),
+        "password=supersecretvalue".to_owned(),
+        format!("-----BEGIN PRIVATE KEY-----\n{LINE_64}\n-----END PRIVATE KEY-----"),
+        format!("-----BEGIN PRIVATE KEY-----\n{LINE_64}\nand a sentence"),
+    ];
+    // Rules that match inside any marker: its id, its prefix, its kind.
+    let policy = policy(
+        "regex:[0-9a-f]{8}\nregex:[0-9a-f]{4}\nliteral:CVC\nliteral:REDACTED\nliteral:v1\nliteral:pem\nliteral:jwt\nliteral:aws_access_key\nliteral:github_token\nliteral:openai_token\nliteral:slack_token\nliteral:google_token\nliteral:authorization\nliteral:url_credentials\nliteral:secret_assignment\nliteral:policy_literal\nliteral:policy_regex\n",
+    );
+    for text in samples {
+        let once = scrub(&text).unwrap();
+        assert!(once.contains("[CVC_REDACTED:v1:"), "{text}");
+        let again = policy.scrub(&once).unwrap();
+        assert_eq!(again, once, "a rule rewrote a marker: {text}");
+    }
+    // The markers the policy writes are atomic to its own rules too.
+    let made = policy.scrub("the pem and the jwt are words").unwrap();
+    assert!(made.contains("[CVC_REDACTED:v1:policy_literal:"), "{made}");
+    assert_eq!(policy.scrub(&made).unwrap(), made);
+}
+
+#[test]
+fn the_built_in_detectors_read_inside_text_that_only_looks_like_a_marker() {
+    // A kind that is a keyword a detector looks for, and a key where an id goes.
+    for text in [
+        format!(
+            "[CVC_REDACTED:v1:password:{}]",
+            "0123456789abcdef".repeat(2)
+        ),
+        "[CVC_REDACTED:v1:pem:AKIAABCDEFGHIJKLMNOP]".to_owned(),
+        format!("[CVC_REDACTED:v1:token:{SOME_UUID}]"),
+    ] {
+        let scrubbed = scrub(&text).unwrap();
+        assert_ne!(scrubbed, text, "{text}");
+        assert!(!scrubbed.contains("AKIAABCD"), "{scrubbed}");
+        assert!(!scrubbed.contains("0123456789abcdef"), "{scrubbed}");
+        assert!(!scrubbed.contains(SOME_UUID), "{scrubbed}");
+        assert_eq!(scrub(&scrubbed).unwrap(), scrubbed, "{text}");
+    }
+    // A shape that no detector reads inside is left alone.
+    let inert = format!("[CVC_REDACTED:v1:x:{SOME_UUID}]");
+    assert_eq!(scrub(&inert).unwrap(), inert);
+}
+
+#[test]
+fn only_a_real_marker_stands_as_the_value_under_a_credential_key() {
+    let real = scrub("AKIAABCDEFGHIJKLMNOP").unwrap();
+    let kept = format!(r#"{{"password":"{real}"}}"#);
+    assert_eq!(scrub_json(&kept).unwrap(), kept);
+    assert!(validate_sanitized_json(&kept).is_ok());
+    for fake in [
+        format!("[CVC_REDACTED:v1:projectx:{SOME_UUID}]"),
+        format!(
+            "[CVC_REDACTED:v1:aws_access_key:{}]",
+            SOME_UUID.to_uppercase()
+        ),
+        "[CVC_REDACTED:v1:pem:0123456789abcdef0123456789abcdef]".to_owned(),
+    ] {
+        let input = format!(r#"{{"token":"{fake}"}}"#);
+        let scrubbed = scrub_json(&input).unwrap();
+        assert_ne!(scrubbed, input);
+        assert!(!scrubbed.contains(&fake), "{scrubbed}");
+        assert!(
+            scrubbed.contains("[CVC_REDACTED:v1:secret_assignment:"),
+            "{scrubbed}"
+        );
+        assert!(validate_sanitized_json(&scrubbed).is_ok());
+        assert!(validate_sanitized_json(&input).is_err());
+    }
 }
 
 #[test]
