@@ -38,6 +38,22 @@ pub enum SyncError {
     Serde(#[from] serde_json::Error),
     #[error("Reference error: {0}")]
     Ref(String),
+    /// A node already in the destination's published history no longer passes
+    /// the privacy check. Published bytes are immutable, so the destination
+    /// can only be extended once the node is suppressed for it.
+    #[error(
+        "published node {id} cannot be re-verified: {reason}. If it held a real credential, \
+         rotate it first. To continue, suppress the node for this destination with \
+         `cvc redact {id} --remote {remote} --rewrite-plan redaction-plan.json` (this also \
+         removes the node from this machine's database), then run \
+         `cvc push --manual --remote {remote}`. The old bytes stay in the destination's Git \
+         history."
+    )]
+    PublishedNode {
+        id: String,
+        remote: String,
+        reason: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
@@ -942,6 +958,7 @@ fn push_ids_to_ref(
         // ref absent. Never seed outbound bytes from a mutable local shadow ref.
     }
 
+    let remote_name = remote_name_of_baseline(baseline_ref);
     let mut emitted_bytes = 0usize;
 
     // Tombstones dominate every historical projection. Remove all target paths
@@ -993,7 +1010,7 @@ fn push_ids_to_ref(
         }
         let legacy_filename = format!("{}.json", id.as_str());
         if let Some(entry) = root_builder.get(&legacy_filename)? {
-            verify_existing_node(repo, entry.id(), &id.as_str())?;
+            verify_existing_node(repo, entry.id(), &id.as_str(), remote_name)?;
             continue; // already synced under the pre-v2 flat layout; leave it alone
         }
 
@@ -1006,7 +1023,7 @@ fn push_ids_to_ref(
             let entry = child_tree(repo, existing_nodes_tree.as_ref(), prefix)
                 .and_then(|tree| tree.get_name(&legacy_filename).map(|entry| entry.id()))
                 .ok_or_else(|| SyncError::Ref("missing immutable node".into()))?;
-            verify_existing_node(repo, entry, &id.as_str())?;
+            verify_existing_node(repo, entry, &id.as_str(), remote_name)?;
             continue;
         }
 
@@ -2478,13 +2495,63 @@ fn add_sync_bytes(total: &mut usize, amount: usize, max_total_bytes: usize) -> R
     Ok(())
 }
 
-fn verify_existing_node(repo: &Repository, oid: git2::Oid, expected_id: &str) -> Result<()> {
+/// The remote named by a tracking ref of the form `refs/remotes/<name>/cvc/main`,
+/// which is what an error message can tell a person to type.
+fn remote_name_of_baseline(baseline_ref: Option<&str>) -> &str {
+    baseline_ref
+        .and_then(|name| name.strip_prefix("refs/remotes/"))
+        .and_then(|name| name.strip_suffix("/cvc/main"))
+        .filter(|name| !name.is_empty())
+        .unwrap_or("<remote>")
+}
+
+/// Re-checks a node already published to the destination against the current
+/// privacy check. The bytes cannot be changed, so a node that fails stops the
+/// push; the error says which node, why, and how to go on.
+fn verify_existing_node(
+    repo: &Repository,
+    oid: git2::Oid,
+    expected_id: &str,
+    remote: &str,
+) -> Result<()> {
     let blob = repo.find_blob(oid)?;
     let node: SyncNode = serde_json::from_slice(blob.content())?;
     if node.interaction.id.to_string() != expected_id {
         return Err(SyncError::Ref("immutable node filename/id mismatch".into()));
     }
-    validate_final_node_bytes(blob.content())
+    validate_final_node_bytes(blob.content()).map_err(|error| SyncError::PublishedNode {
+        id: expected_id.to_owned(),
+        remote: remote.to_owned(),
+        reason: published_node_problem(blob.content(), &error),
+    })
+}
+
+/// Why a published node fails: an unterminated private-key header, or else
+/// the check's own message.
+fn published_node_problem(bytes: &[u8], error: &SyncError) -> String {
+    fn holds_unterminated_header(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(text) => {
+                crate::privacy::has_unterminated_private_key_header(text)
+            }
+            serde_json::Value::Array(items) => items.iter().any(holds_unterminated_header),
+            serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+                crate::privacy::has_unterminated_private_key_header(key)
+                    || holds_unterminated_header(value)
+            }),
+            _ => false,
+        }
+    }
+    let unterminated = serde_json::from_slice::<serde_json::Value>(bytes)
+        .is_ok_and(|value| holds_unterminated_header(&value));
+    if unterminated {
+        "its already-published text holds an unterminated private-key header (a \
+         \"-----BEGIN ... PRIVATE KEY-----\" line with no matching END line), which the privacy \
+         check now redacts"
+            .to_owned()
+    } else {
+        format!("it no longer passes the privacy check ({error})")
+    }
 }
 
 /// This is intentionally after serialization: it verifies the precise bytes

@@ -461,6 +461,20 @@ fn pem_header_regex() -> &'static Regex {
     REGEX.get_or_init(|| re(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"))
 }
 
+/// Whether `text` holds a private-key header with no END line after it, the
+/// case [`scrub`] redacts from the header to the end of the text. A complete
+/// block does not count.
+pub fn has_unterminated_private_key_header(text: &str) -> bool {
+    let complete_blocks = builtin_detectors()
+        .iter()
+        .find(|(kind, _)| *kind == "pem")
+        .map(|(_, regex)| regex);
+    match complete_blocks {
+        Some(regex) => pem_header_regex().is_match(&regex.replace_all(text, "")),
+        None => pem_header_regex().is_match(text),
+    }
+}
+
 /// A private-key header whose END line never comes (the text ended or was cut
 /// first): the key material is whatever follows it, so everything from the
 /// header to the end of the text is redacted. Complete blocks were replaced
@@ -742,6 +756,11 @@ impl PreparedPolicy {
     /// the way every capture field is scrubbed.
     pub fn scrub(&self, input: &str) -> Result<String> {
         self.0.scrub(input)
+    }
+    /// The same for a JSON document such as tool arguments: every string and
+    /// key is scrubbed, and the values under a credential key are replaced.
+    pub fn scrub_json(&self, input: &str) -> Result<String> {
+        scrub_json_with_policy(input, &self.0)
     }
 }
 

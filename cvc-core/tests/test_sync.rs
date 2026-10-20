@@ -2676,3 +2676,218 @@ fn test_sync_cycle_detection() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ---- a node already published that the privacy check now refuses ------------------------
+
+const FETCHED_BASELINE: &str = "refs/remotes/fixture/cvc/main";
+
+fn published_item(text: &str) -> Interaction {
+    Interaction {
+        id: InteractionId::new(),
+        conversation_id: "published".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: text.into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    }
+}
+
+/// Publishes the item, then rewrites its node in the published tree the way an
+/// earlier version could have written it, and makes the result the fetched
+/// baseline of the remote called `fixture`.
+fn fetch_baseline_with_edited_node(
+    repo: &Repository,
+    store: &CvcStore,
+    id: &InteractionId,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> anyhow::Result<()> {
+    project_fixture_to_ref(repo, store, "refs/cvc/published")?;
+    let commit = repo
+        .find_reference("refs/cvc/published")?
+        .peel_to_commit()?;
+    let tree = commit.tree()?;
+    let id_text = id.to_string();
+    let shard = &id_text[..2];
+    let file = format!("{id_text}.json");
+    let blob = repo.find_blob(
+        tree.get_path(std::path::Path::new(&format!("nodes/{shard}/{file}")))?
+            .id(),
+    )?;
+    let mut value: serde_json::Value = serde_json::from_slice(blob.content())?;
+    edit(&mut value);
+    let edited = repo.blob(&serde_json::to_vec_pretty(&value)?)?;
+    let nodes = tree
+        .get_name("nodes")
+        .expect("nodes")
+        .to_object(repo)?
+        .peel_to_tree()?;
+    let shard_tree = nodes
+        .get_name(shard)
+        .expect("shard")
+        .to_object(repo)?
+        .peel_to_tree()?;
+    let mut shard_builder = repo.treebuilder(Some(&shard_tree))?;
+    shard_builder.insert(&file, edited, FileMode::Blob.into())?;
+    let mut nodes_builder = repo.treebuilder(Some(&nodes))?;
+    nodes_builder.insert(shard, shard_builder.write()?, FileMode::Tree.into())?;
+    let mut root = repo.treebuilder(Some(&tree))?;
+    root.insert("nodes", nodes_builder.write()?, FileMode::Tree.into())?;
+    let rewritten = repo.find_tree(root.write()?)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    repo.commit(
+        Some(FETCHED_BASELINE),
+        &signature,
+        &signature,
+        "a node as an earlier version wrote it",
+        &rewritten,
+        &[&commit],
+    )?;
+    Ok(())
+}
+
+fn push_error(repo: &Repository, store: &CvcStore) -> String {
+    match sync::push_projection_to_ref(repo, store, FETCHED_BASELINE, TEST_DESTINATION) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("the push was expected to stop at the published node"),
+    }
+}
+
+#[test]
+fn a_published_node_with_an_unterminated_key_header_stops_the_push_and_says_how_to_go_on(
+) -> anyhow::Result<()> {
+    for place in ["prompt", "response", "tool arguments"] {
+        let temp = TempDir::new()?;
+        let repo = Repository::init(temp.path())?;
+        let store = CvcStore::open(temp.path().join("source.db"))?;
+        let item = published_item("an ordinary prompt");
+        store.create_interaction(&item)?;
+        let id = item.id.to_string();
+        let header = "output\n-----BEGIN RSA PRIVATE KEY-----\nMIIEfakeFAKEfake0123456789";
+        fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| match place {
+            "prompt" => node["interaction"]["user_prompt"] = header.into(),
+            "response" => node["interaction"]["model_response"] = header.into(),
+            _ => {
+                node["tool_executions"] = serde_json::json!([{
+                    "id": 1, "interaction_id": id, "tool_protocol": "native",
+                    "tool_name": "Write", "status": "success",
+                    "arguments": serde_json::json!({"content": header}).to_string(),
+                }]);
+            }
+        })?;
+
+        let message = push_error(&repo, &store);
+        assert!(message.contains(&id), "{place}: {message}");
+        assert!(
+            message.contains("already-published text holds an unterminated private-key header"),
+            "{place}: {message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "`cvc redact {id} --remote fixture --rewrite-plan redaction-plan.json`"
+            )),
+            "{place}: {message}"
+        );
+        assert!(
+            message.contains("`cvc push --manual --remote fixture`"),
+            "{place}: {message}"
+        );
+        assert!(message.contains("rotate it first"), "{place}: {message}");
+        assert!(
+            message.contains("also removes the node from this machine's database"),
+            "{place}: {message}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn suppressing_the_node_for_the_destination_is_what_lets_the_push_go_on() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("an ordinary prompt");
+    let other = Interaction {
+        user_prompt: "another turn, also published".into(),
+        ..published_item("unused")
+    };
+    store.create_interaction(&item)?;
+    store.create_interaction(&other)?;
+    let id = item.id.to_string();
+    fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
+        node["interaction"]["user_prompt"] = "-----BEGIN PRIVATE KEY-----\nMIIEfake".into();
+    })?;
+    assert!(push_error(&repo, &store).contains(&id));
+
+    // What `cvc redact <id> --remote fixture` records, then the next push.
+    store.authorize_and_tombstone_remote(
+        &item.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::UserRequested,
+    )?;
+    let sync::ProjectionResult::Candidate { oid, .. } =
+        sync::push_projection_to_ref(&repo, &store, FETCHED_BASELINE, TEST_DESTINATION)?
+    else {
+        panic!("the tombstone is something to publish")
+    };
+    let tree = repo.find_commit(oid)?.tree()?;
+    let at = |dir: &str, who: &str| {
+        tree.get_path(std::path::Path::new(&format!(
+            "{dir}/{}/{who}.json",
+            &who[..2]
+        )))
+        .is_ok()
+    };
+    assert!(!at("nodes", &id), "the suppressed node left the tree");
+    assert!(at("tombstones", &id), "its tombstone is published");
+    assert!(
+        at("nodes", &other.id.to_string()),
+        "the other node is still there"
+    );
+    Ok(())
+}
+
+#[test]
+fn any_published_node_that_fails_the_check_is_named_with_its_own_reason() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("an ordinary prompt");
+    store.create_interaction(&item)?;
+    fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
+        node["interaction"]["model_response"] = "key AKIAABCDEFGHIJKLMNOP here".into();
+    })?;
+    let message = push_error(&repo, &store);
+    assert!(message.contains(&item.id.to_string()), "{message}");
+    assert!(
+        message.contains("no longer passes the privacy check"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("unterminated private-key header"),
+        "{message}"
+    );
+    assert!(message.contains("cvc redact"), "{message}");
+    Ok(())
+}
+
+#[test]
+fn a_clean_published_node_does_not_stop_a_push() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("an ordinary prompt");
+    store.create_interaction(&item)?;
+    // A key block that has its END line is redacted whole, not unterminated, and
+    // text that only mentions the words is not a header.
+    fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
+        node["interaction"]["user_prompt"] = "see the PRIVATE KEY section of the BEGIN docs".into();
+    })?;
+    assert!(
+        sync::push_projection_to_ref(&repo, &store, FETCHED_BASELINE, TEST_DESTINATION).is_ok()
+    );
+    Ok(())
+}

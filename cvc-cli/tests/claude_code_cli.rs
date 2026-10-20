@@ -314,6 +314,65 @@ fn hook_mode_is_quiet_incremental_and_never_blocking() {
     assert!(output.stdout.is_empty());
 }
 
+/// `cvc log` shows what a person said, or a label of what the stimulus held,
+/// never the boundary markers a harness capture is written with.
+#[test]
+fn log_shows_the_persons_first_line_or_a_label_not_the_stimulus_markers() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let transcript = fixture.write_transcript(BASIC);
+    fixture.cvc_ok(&[
+        "ingest",
+        "claude-code",
+        "--transcript",
+        transcript.to_str().unwrap(),
+    ]);
+
+    let log = fixture.cvc_ok(&["log"]);
+    assert!(log.contains("CVC Log (7 interactions)"), "{log}");
+    assert!(!log.contains("~cvc-"), "{log}");
+    let shown: Vec<&str> = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("Prom: "))
+        .collect();
+    assert_eq!(shown.len(), 7, "{log}");
+    // The person's prompt (its meta text is not shown), the two results of one
+    // response, the compaction summary, and results alone.
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|line| **line == "Add a greeting to lib.rs...")
+            .count(),
+        1,
+        "{shown:?}"
+    );
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|line| **line == "tool results (2)")
+            .count(),
+        1,
+        "{shown:?}"
+    );
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|line| **line == "compaction summary")
+            .count(),
+        1,
+        "{shown:?}"
+    );
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|line| **line == "tool results (1)")
+            .count(),
+        4,
+        "{shown:?}"
+    );
+}
+
 /// Public issue 102: the post-commit hook names the commit it ran for, so an
 /// agent's quiet commit still leaves exact evidence in its tool output. With
 /// nothing linked and no harness installed it stays silent, as before.

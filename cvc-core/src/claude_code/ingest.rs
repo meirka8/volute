@@ -4,10 +4,11 @@
 //! closed responses in that window, skips the ones already recorded (by their
 //! deterministic ids), and commits the new captures together with the advanced
 //! cursor in one transaction. A run that fails changes nothing.
+use super::fields;
 use super::links;
 use super::transcript::{self, ParsedLine, PlanInput, TranscriptError, HARNESS};
 use crate::db::{CvcStore, DbError, HarnessCursorUpdate};
-use crate::models::{Conversation, Interaction, InteractionId};
+use crate::models::{Conversation, Interaction, InteractionId, ToolExecution};
 use crate::privacy::{self, ClaudeCodeCapture, PreparedPolicy};
 use crate::repository::{RepositoryLayout, RepositoryLayoutError};
 use crate::stimulus;
@@ -282,6 +283,24 @@ fn ingest_target(
             }
             _ => None,
         };
+        // The model's text, its reasoning and the tool arguments are scrubbed
+        // here, with the capture's policy, so that one of them the scrubber
+        // cannot process is recorded as a note instead of failing the batch
+        // and holding the cursor back: see `fields`.
+        let model_cot = planned
+            .model_cot
+            .map(|text| fields::scrubbed_text(text, policy));
+        let model_response = planned
+            .model_response
+            .map(|text| fields::scrubbed_text(text, policy));
+        let tool_executions: Vec<ToolExecution> = planned
+            .tool_executions
+            .into_iter()
+            .map(|mut tool| {
+                tool.arguments = fields::scrubbed_arguments(tool.arguments, policy);
+                tool
+            })
+            .collect();
         let interaction = Interaction {
             id: planned.id.clone(),
             conversation_id: target.conversation_id.to_owned(),
@@ -290,8 +309,8 @@ fn ingest_target(
             author: planned.author,
             user_prompt,
             model_name: planned.model_name,
-            model_cot: planned.model_cot,
-            model_response: planned.model_response,
+            model_cot,
+            model_response,
             source_request_id: Some(planned.response_key),
         };
         batch_ids.insert(planned.id);
@@ -299,7 +318,7 @@ fn ingest_target(
             conversation.clone(),
             interaction,
             planned.context_items,
-            planned.tool_executions,
+            tool_executions,
             policy.clone(),
             capture_worktree.clone(),
         ));

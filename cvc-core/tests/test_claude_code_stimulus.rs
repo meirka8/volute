@@ -1,14 +1,17 @@
-//! The stimulus of a Claude Code response, end to end: transcript to planner to
-//! the database. Each part is scrubbed in full before anything is cut, a part
-//! that cannot be scrubbed is withheld without stopping the session, and a
-//! reader can tell a person's words from tool output.
+//! What the Claude Code adapter captures, end to end: transcript to planner to
+//! the database. The stimulus has each part scrubbed in full before anything is
+//! cut, a part that cannot be scrubbed is withheld without stopping the
+//! session, and a reader can tell a person's words from tool output; the
+//! model's text, its reasoning and the tool arguments are withheld the same
+//! way; and a title is scrubbed before it is cut.
 use cvc_core::claude_code::transcript::{derived_interaction_id, HARNESS};
 use cvc_core::claude_code::{ingest, IngestMode};
 use cvc_core::db::CvcStore;
-use cvc_core::models::{Author, Interaction};
+use cvc_core::models::{Author, FutureSharePolicy, Interaction};
 use cvc_core::privacy::{scrub, PreparedPolicy};
 use cvc_core::repository::RepositoryLayout;
 use cvc_core::stimulus::{self, notes_in, NoteKind, PartKind, Reading};
+use cvc_core::sync;
 use git2::Repository;
 use serde_json::{json, Value};
 use std::fs;
@@ -17,6 +20,7 @@ use tempfile::TempDir;
 
 const SESSION: &str = "5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a";
 const AGENT: &str = "agent-a0bd78e0693c35eed";
+const DESTINATION: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 struct Fixture {
     _temp: TempDir,
@@ -593,4 +597,210 @@ fn a_title_line_that_cannot_be_scrubbed_gives_the_default_title_and_does_not_sto
     let (boundary, read_back) = parts(&stored(&fixture.store(), SESSION, "req_A"));
     assert_eq!(read_back[0].kind, PartKind::Prompt);
     assert_eq!(read_back[0].content, format!("[cvc: withheld {boundary}]"));
+}
+
+// ---- the model's text, its reasoning and the tool arguments ------------------------
+
+fn noisy_lines(count: usize) -> String {
+    (0..count)
+        .map(|n| format!("password=hunter2hunter{n}\n"))
+        .collect()
+}
+
+fn withheld_text(bytes: usize) -> String {
+    format!("[cvc: withheld {bytes} bytes that could not be scrubbed]")
+}
+
+#[test]
+fn a_response_its_reasoning_or_a_tool_call_the_scrubber_cannot_process_are_withheld_and_capture_continues(
+) {
+    let fixture = Fixture::new();
+    let noisy = noisy_lines(300);
+    // Scrubbed whole, each of these is an error (too many matches).
+    assert!(scrub(&noisy).is_err());
+    let write_input = json!({"file_path": "/opt/x.env", "content": noisy});
+    let read_input = json!({"file_path": "/opt/notes.txt"});
+
+    let mut t = fixture.transcript();
+    t.say("Run the audit")
+        .respond(
+            "req_A",
+            vec![
+                json!({"type": "thinking", "thinking": noisy, "signature": "s"}),
+                json!({"type": "text", "text": noisy}),
+                json!({"type": "tool_use", "id": "toolu_1", "name": "Write", "input": write_input}),
+                json!({"type": "tool_use", "id": "toolu_2", "name": "Read", "input": read_input}),
+            ],
+            "tool_use",
+        )
+        .results(&[("toolu_1", "ok", false), ("toolu_2", "notes", false)])
+        .answer("req_B", "All done.")
+        .say("Thanks, keep going")
+        .answer("req_C", "Continuing.");
+    let path = fixture.write(&t);
+
+    let report = fixture.ingest(&path, IngestMode::Final);
+    assert_eq!(report.inserted, 3, "{report:?}");
+    let store = fixture.store();
+    let first = stored(&store, SESSION, "req_A");
+    assert_eq!(first.model_cot, Some(withheld_text(noisy.len())));
+    assert_eq!(first.model_response, Some(withheld_text(noisy.len())));
+    let tools = store.get_tool_executions(&first.id).unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].tool_name, "Write");
+    assert_eq!(
+        tools[0].arguments,
+        format!(
+            r#"{{"bytes":{},"cvc_withheld":true}}"#,
+            write_input.to_string().len()
+        )
+    );
+    // A neighbour that scrubbed is recorded as it was, and statuses are kept.
+    assert_eq!(tools[1].arguments, read_input.to_string());
+    assert!(tools
+        .iter()
+        .all(|tool| tool.status == cvc_core::models::ToolStatus::Success));
+    // The responses around it are recorded and the cursor moved past it.
+    assert_eq!(
+        parts(&stored(&store, SESSION, "req_C")).1[0].content,
+        "Thanks, keep going"
+    );
+    let cursor = store
+        .harness_ingest_cursor(HARNESS, SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.byte_offset, report.cursor);
+    let text = fs::read_to_string(&path).unwrap();
+    let offender_end = text.rfind("hunter2hunter299").unwrap();
+    assert!(report.cursor as usize > offender_end, "{report:?}");
+    for bytes in database_bytes(&fixture) {
+        assert!(
+            !contains(&bytes, b"hunter2"),
+            "a secret reached the database"
+        );
+    }
+
+    // A later turn is captured as usual.
+    t.say("One more thing").answer("req_D", "Done.");
+    fs::write(&path, t.text()).unwrap();
+    let again = fixture.ingest(&path, IngestMode::Final);
+    assert_eq!(again.inserted, 1, "{again:?}");
+    assert_eq!(
+        parts(&stored(&fixture.store(), SESSION, "req_D")).1[0].content,
+        "One more thing"
+    );
+}
+
+#[test]
+fn repository_policy_still_redacts_the_fields_it_can_scrub() {
+    let fixture = Fixture::with_policy(Some("literal:acme-internal\n"));
+    let mut t = fixture.transcript();
+    t.say("Look it up")
+        .respond(
+            "req_A",
+            vec![
+                json!({"type": "thinking", "thinking": "reason about acme-internal", "signature": "s"}),
+                json!({"type": "text", "text": "Found it on acme-internal.example"}),
+                json!({"type": "tool_use", "id": "toolu_1", "name": "Bash",
+                       "input": {"command": "ping acme-internal.example"}}),
+            ],
+            "tool_use",
+        )
+        .results(&[("toolu_1", "pong", false)])
+        .answer("req_B", "ok");
+    let path = fixture.write(&t);
+    fixture.ingest(&path, IngestMode::Final);
+    let store = fixture.store();
+    let row = stored(&store, SESSION, "req_A");
+    let cot = row.model_cot.unwrap();
+    let response = row.model_response.unwrap();
+    assert!(
+        cot.starts_with("reason about [CVC_REDACTED:v1:policy_literal:"),
+        "{cot}"
+    );
+    assert!(
+        response.starts_with("Found it on [CVC_REDACTED:v1:policy_literal:"),
+        "{response}"
+    );
+    let arguments = store.get_tool_executions(&row.id).unwrap()[0]
+        .arguments
+        .clone();
+    assert!(
+        arguments.contains("[CVC_REDACTED:v1:policy_literal:"),
+        "{arguments}"
+    );
+    for bytes in database_bytes(&fixture) {
+        assert!(!contains(&bytes, b"acme-internal"));
+    }
+}
+
+#[test]
+fn a_node_with_withheld_fields_is_published_and_imported_as_it_is() {
+    let fixture = Fixture::new();
+    let noisy = noisy_lines(300);
+    let input = json!({"file_path": "/opt/x.env", "content": noisy});
+    let mut t = fixture.transcript();
+    t.say("Run the audit")
+        .respond(
+            "req_A",
+            vec![
+                json!({"type": "text", "text": noisy}),
+                json!({"type": "tool_use", "id": "toolu_1", "name": "Write", "input": input}),
+            ],
+            "tool_use",
+        )
+        .results(&[("toolu_1", "ok", false)])
+        .answer("req_B", "done");
+    let path = fixture.write(&t);
+    fixture.ingest(&path, IngestMode::Final);
+    let store = fixture.store();
+    store
+        .share_conversation_for_remote(SESSION, DESTINATION, FutureSharePolicy::Private)
+        .unwrap();
+
+    // The published bytes pass the same checks any node does, and say the same.
+    let repo = fixture.layout.repository();
+    let sync::ProjectionResult::Candidate { oid, candidate, .. } =
+        sync::push_projection_to_ref(repo, &store, "", DESTINATION).unwrap()
+    else {
+        panic!("expected a projection")
+    };
+    repo.reference("refs/cvc/withheld-source", oid, true, "test")
+        .unwrap();
+    drop(candidate);
+    let id = derived_interaction_id(SESSION, "req_A").to_string();
+    let tree = repo.find_commit(oid).unwrap().tree().unwrap();
+    let entry = tree
+        .get_path(std::path::Path::new(&format!(
+            "nodes/{}/{id}.json",
+            &id[..2]
+        )))
+        .unwrap();
+    let node: Value =
+        serde_json::from_slice(repo.find_blob(entry.id()).unwrap().content()).unwrap();
+    assert_eq!(
+        node["interaction"]["model_response"],
+        withheld_text(noisy.len())
+    );
+    assert_eq!(
+        node["tool_executions"][0]["arguments"],
+        format!(
+            r#"{{"bytes":{},"cvc_withheld":true}}"#,
+            input.to_string().len()
+        )
+    );
+
+    // And another machine imports exactly that.
+    let imported = CvcStore::open(fixture.root.join("imported.db")).unwrap();
+    sync::pull_from_ref(repo, &imported, "refs/cvc/withheld-source").unwrap();
+    let id = derived_interaction_id(SESSION, "req_A");
+    let pulled = imported.get_interaction(&id).unwrap().unwrap();
+    assert_eq!(
+        pulled.model_response,
+        stored(&store, SESSION, "req_A").model_response
+    );
+    assert_eq!(
+        imported.get_tool_executions(&id).unwrap()[0].arguments,
+        store.get_tool_executions(&id).unwrap()[0].arguments
+    );
 }

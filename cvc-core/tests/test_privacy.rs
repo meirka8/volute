@@ -5,8 +5,8 @@ use cvc_core::models::{
     Author, ContextItem, Conversation, Interaction, InteractionId, ToolExecution, ToolStatus,
 };
 use cvc_core::privacy::{
-    acknowledge_sharing, privacy_status, scrub, scrub_json, validate_sanitized_json, CliRunCapture,
-    McpCapture, PreparedPolicy,
+    acknowledge_sharing, has_unterminated_private_key_header, privacy_status, scrub, scrub_json,
+    validate_sanitized_json, CliRunCapture, McpCapture, PreparedPolicy,
 };
 use cvc_core::sync;
 use git2::Repository;
@@ -181,6 +181,37 @@ fn json_strings_and_policies_get_the_unterminated_header_rule_too() {
         ),
         "a\n[CVC_REDACTED:v1:pem:*]"
     );
+}
+
+#[test]
+fn an_unterminated_private_key_header_is_told_from_a_complete_block_and_from_prose() {
+    let block = format!("-----BEGIN PRIVATE KEY-----\n{KEY_BODY}-----END PRIVATE KEY-----");
+    for (text, expected) in [
+        ("-----BEGIN PRIVATE KEY-----", true),
+        ("out\n-----BEGIN RSA PRIVATE KEY-----\nMIIEvQ", true),
+        ("-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbn\nmore", true),
+        // A complete block is redacted whole, so it is not the lone-header case...
+        (block.as_str(), false),
+        // ...unless another header follows it with no END of its own.
+        (
+            format!("{block}\nlater\n-----BEGIN EC PRIVATE KEY-----\nMHcC").as_str(),
+            true,
+        ),
+        ("-----BEGIN PUBLIC KEY-----\nMIIBIj", false),
+        ("-----BEGIN CERTIFICATE-----\nMIIDdz", false),
+        ("the PRIVATE KEY block starts with a BEGIN line", false),
+        ("", false),
+    ] {
+        assert_eq!(
+            has_unterminated_private_key_header(text),
+            expected,
+            "{text}"
+        );
+        // It is exactly the case the scrubber redacts to the end of the text.
+        if expected {
+            assert_ne!(scrub(text).unwrap(), text);
+        }
+    }
 }
 
 #[test]
