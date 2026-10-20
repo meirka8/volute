@@ -6,13 +6,14 @@
 //! repository's canonical root at test time.
 use cvc_core::claude_code::settings::{self, ExcludeAction, InstallAction};
 use cvc_core::claude_code::transcript::{
-    self, derived_interaction_id, ParsedLine, PlanInput, TranscriptError,
+    self, derived_interaction_id, ParsedLine, PlanInput, PlannedInteraction, TranscriptError,
 };
 use cvc_core::claude_code::{ingest, IngestError, IngestMode};
 use cvc_core::db::CvcStore;
 use cvc_core::models::{Author, ToolStatus};
 use cvc_core::privacy::PreparedPolicy;
 use cvc_core::repository::RepositoryLayout;
+use cvc_core::stimulus::{self, PartKind, Reading};
 use git2::Repository;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -82,12 +83,39 @@ impl Fixture {
             worktree_root: &self.root,
             path_aliases: &[],
             final_mode,
+            subagent: false,
         }
     }
 }
 
 fn parse(content: &str, session: &str) -> Result<transcript::Window, TranscriptError> {
     transcript::parse_window(content.as_bytes(), 0, session, false)
+}
+
+/// The stimulus of `planned` as it is stored under the built-in scrubber.
+fn prompt(planned: &PlannedInteraction) -> String {
+    planned.user_prompt(&PreparedPolicy::built_ins_only())
+}
+
+/// A rendered stimulus read back, as `(kind, tool name, is_error, content)`
+/// per part. The stimulus must verify.
+fn parts(planned: &PlannedInteraction) -> Vec<(PartKind, Option<String>, bool, String)> {
+    let text = prompt(planned);
+    match stimulus::read(&planned.id, &text) {
+        Reading::Verified(verified) => verified
+            .parts
+            .iter()
+            .map(|part| {
+                (
+                    part.kind,
+                    part.name.map(str::to_owned),
+                    part.is_error,
+                    part.content_of(&text).to_owned(),
+                )
+            })
+            .collect(),
+        other => panic!("stimulus did not verify: {other:?}\n{text}"),
+    }
 }
 
 #[test]
@@ -114,8 +142,19 @@ fn plans_one_interaction_per_response_with_threaded_stimuli() {
 
     let a = &plan.interactions[0];
     assert_eq!(a.author, Author::Human);
-    assert!(a.user_prompt.starts_with("Add a greeting to lib.rs"));
-    assert!(a.user_prompt.contains("[meta] <system-reminder>"));
+    let a_parts = parts(a);
+    assert_eq!(a_parts.len(), 2, "{a_parts:?}");
+    assert_eq!(
+        a_parts[0],
+        (
+            PartKind::Prompt,
+            None,
+            false,
+            "Add a greeting to lib.rs".to_owned()
+        )
+    );
+    assert_eq!(a_parts[1].0, PartKind::Meta);
+    assert!(a_parts[1].3.starts_with("<system-reminder>"));
     assert_eq!(a.model_cot.as_deref(), Some("I should read lib.rs first."));
     assert_eq!(
         a.model_response.as_deref(),
@@ -135,12 +174,15 @@ fn plans_one_interaction_per_response_with_threaded_stimuli() {
 
     let b = &plan.interactions[1];
     assert_eq!(b.author, Author::System);
-    assert!(
-        b.user_prompt.starts_with("[tool_result Read] "),
-        "{}",
-        b.user_prompt
+    assert_eq!(
+        parts(b),
+        vec![(
+            PartKind::ToolResult,
+            Some("Read".to_owned()),
+            false,
+            "     1\tfn main() {}".to_owned()
+        )]
     );
-    assert!(b.user_prompt.contains("fn main() {}"));
     assert_eq!(b.model_response, None);
     assert_eq!(b.parent_id.as_ref(), Some(&a.id));
     assert_eq!(b.tool_executions[0].tool_name, "Edit");
@@ -149,9 +191,15 @@ fn plans_one_interaction_per_response_with_threaded_stimuli() {
     assert_eq!(b.context_items[0].start_line, None);
 
     let c = &plan.interactions[2];
-    assert!(c
-        .user_prompt
-        .starts_with("[tool_result Edit error] String to replace"));
+    assert_eq!(
+        parts(c),
+        vec![(
+            PartKind::ToolResult,
+            Some("Edit".to_owned()),
+            true,
+            "String to replace not found in file.".to_owned()
+        )]
+    );
     assert_eq!(c.tool_executions[0].tool_name, "Write");
     assert_eq!(c.tool_executions[0].status, ToolStatus::Success);
     assert_eq!(c.parent_id.as_ref(), Some(&b.id));
@@ -168,16 +216,21 @@ fn plans_one_interaction_per_response_with_threaded_stimuli() {
     // The stimulus walk passes through the stop-hook system entry and
     // collects both tool results in chronological order.
     let e = &plan.interactions[4];
-    let bash_at = e.user_prompt.find("[tool_result Bash]").unwrap();
-    let read_at = e.user_prompt.find("[tool_result Read]").unwrap();
-    assert!(bash_at < read_at, "{}", e.user_prompt);
+    let e_parts = parts(e);
+    let names: Vec<_> = e_parts.iter().map(|part| part.1.as_deref()).collect();
+    assert_eq!(names, [Some("Bash"), Some("Read")], "{e_parts:?}");
+    assert!(e_parts[0].3.starts_with("[main 1234abc] greet\n"));
+    assert_eq!(e_parts[1].3, "127.0.0.1 localhost");
     assert_eq!(e.model_response.as_deref(), Some("Done."));
     assert_eq!(e.parent_id.as_ref(), Some(&d.id));
 
     // Compaction: the boundary's logical parent keeps the chain continuous
     // and the summary is the recorded stimulus.
     let f = &plan.interactions[5];
-    assert!(f.user_prompt.starts_with("[compaction summary]\n"));
+    let f_parts = parts(f);
+    assert_eq!(f_parts.len(), 1, "{f_parts:?}");
+    assert_eq!(f_parts[0].0, PartKind::CompactionSummary);
+    assert!(f_parts[0].3.starts_with("This session is being continued"));
     assert_eq!(f.author, Author::System);
     assert_eq!(f.parent_id.as_ref(), Some(&e.id));
     assert_eq!(f.context_items[0].file_path, "secret/key.txt");
@@ -185,6 +238,51 @@ fn plans_one_interaction_per_response_with_threaded_stimuli() {
     let g = &plan.interactions[6];
     assert_eq!(g.parent_id.as_ref(), Some(&f.id));
     assert_eq!(plan.cursor_offset, g.first_offset);
+}
+
+#[test]
+fn a_subagent_transcript_records_its_user_text_as_tasks_and_nothing_else_changes() {
+    let fixture = Fixture::new();
+    let content = fixture.render(BASIC);
+    let lines = transcript::parse_window(content.as_bytes(), 0, BASIC_SESSION, true)
+        .unwrap()
+        .lines;
+    let person = transcript::plan(&lines, 0, &fixture.plan_input(true));
+    let agent = transcript::plan(
+        &lines,
+        0,
+        &PlanInput {
+            subagent: true,
+            ..fixture.plan_input(true)
+        },
+    );
+    assert_eq!(agent.interactions.len(), person.interactions.len());
+
+    // Only the kind of the typed text differs: a delegated task, not a person.
+    let task = parts(&agent.interactions[0]);
+    assert_eq!(
+        task[0],
+        (
+            PartKind::Task,
+            None,
+            false,
+            "Add a greeting to lib.rs".to_owned()
+        )
+    );
+    assert_eq!(task[1].0, PartKind::Meta);
+    assert_eq!(agent.interactions[0].author, Author::Human);
+    assert_eq!(parts(&person.interactions[0])[0].0, PartKind::Prompt);
+    for index in 1..person.interactions.len() {
+        assert_eq!(
+            parts(&agent.interactions[index]),
+            parts(&person.interactions[index]),
+            "response {index}"
+        );
+    }
+    assert_eq!(
+        parts(&agent.interactions[5])[0].0,
+        PartKind::CompactionSummary
+    );
 }
 
 #[test]
@@ -327,11 +425,15 @@ fn earlier_minor_version_fixture_parses() {
             worktree_root: &fixture.root,
             path_aliases: &[],
             final_mode: true,
+            subagent: false,
         },
     );
     assert_eq!(plan.interactions.len(), 1);
     assert_eq!(plan.interactions[0].author, Author::Human);
-    assert_eq!(plan.interactions[0].user_prompt, "Say hello");
+    assert_eq!(
+        parts(&plan.interactions[0]),
+        vec![(PartKind::Prompt, None, false, "Say hello".to_owned())]
+    );
     assert_eq!(plan.title.as_deref(), Some("Hello exchange"));
 }
 
@@ -399,7 +501,7 @@ fn chainless_cache_entries_of_2_1_300_are_skipped_and_never_captured() {
         .map(|planned| {
             format!(
                 "{} {} {}",
-                planned.user_prompt,
+                prompt(planned),
                 planned.model_response.clone().unwrap_or_default(),
                 planned.model_cot.clone().unwrap_or_default()
             )
@@ -474,6 +576,7 @@ fn server_side_calls_take_their_status_from_the_result_block_of_their_response()
             worktree_root: &fixture.root,
             path_aliases: &[],
             final_mode: true,
+            subagent: false,
         },
     );
     assert_eq!(plan.title.as_deref(), Some("Server tool outcomes"));
@@ -501,7 +604,15 @@ fn server_side_calls_take_their_status_from_the_result_block_of_their_response()
     assert_eq!(a.context_items[0].file_path, "src/lib.rs");
 
     let b = &plan.interactions[1];
-    assert_eq!(b.user_prompt, "[tool_result Read]      1\tfn main() {}");
+    assert_eq!(
+        parts(b),
+        vec![(
+            PartKind::ToolResult,
+            Some("Read".to_owned()),
+            false,
+            "     1\tfn main() {}".to_owned()
+        )]
+    );
     assert_eq!(
         call_summary(&b.tool_executions),
         vec![("server:web_search", "server", ToolStatus::Success)]
@@ -1097,6 +1208,7 @@ fn real_transcript_dry_run() {
             worktree_root: &worktree,
             path_aliases: &[],
             final_mode: true,
+            subagent: false,
         },
     );
     let humans = plan
@@ -1133,7 +1245,7 @@ fn real_transcript_dry_run() {
     let largest_prompt = plan
         .interactions
         .iter()
-        .map(|planned| planned.user_prompt.len())
+        .map(|planned| prompt(planned).len())
         .max()
         .unwrap_or(0);
     println!(

@@ -2,11 +2,14 @@
 use crate::models::{
     ArtifactLink, CaptureSource, ContextItem, Conversation, Interaction, ToolExecution,
 };
+use crate::stimulus;
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::path::{Component, Path};
+use std::sync::OnceLock;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -394,52 +397,97 @@ fn re(p: &str) -> Regex {
     Regex::new(p).expect("built-in privacy regex is valid")
 }
 
+/// An existing CVC redaction marker.
+const REDACTION_MARKER: &str = r"\[CVC_REDACTED:v1:[a-z_]+:[0-9a-fA-F-]{16,}\]";
+
+fn redaction_marker_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| re(REDACTION_MARKER))
+}
+
+/// The byte ranges of the redaction markers in `text`, in order. Bounding code
+/// keeps these whole: a cut inside one would leave a fragment that is neither
+/// text nor marker.
+pub(crate) fn redaction_marker_spans(text: &str) -> Vec<Range<usize>> {
+    redaction_marker_regex()
+        .find_iter(text)
+        .map(|found| found.range())
+        .collect()
+}
+
+/// The built-in detectors in application order, compiled once.
+fn builtin_detectors() -> &'static [(&'static str, Regex)] {
+    static DETECTORS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    DETECTORS.get_or_init(|| {
+        [
+            (
+                "pem",
+                r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+            ),
+            ("aws_access_key", r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+            (
+                "jwt",
+                r"\beyJ[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\b",
+            ),
+            (
+                "github_token",
+                r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
+            ),
+            ("openai_token", r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b"),
+            ("slack_token", r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+            ("google_token", r"\bya29\.[A-Za-z0-9_-]{20,}\b"),
+            (
+                "authorization",
+                r"(?i)\b(?:authorization\s*:\s*|bearer\s+)[A-Za-z0-9._~+/=-]{12,}",
+            ),
+            (
+                "url_credentials",
+                r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s@]+@",
+            ),
+            (
+                "secret_assignment",
+                r#"(?i)\b(?:aws_secret_access_key|api[_-]?key|secret|password|token)\s*[:=]\s*[^\s'"`]{8,}"#,
+            ),
+        ]
+        .into_iter()
+        .map(|(kind, pattern)| (kind, re(pattern)))
+        .collect()
+    })
+}
+
+/// A private-key header line alone, whether or not its END line follows.
+fn pem_header_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| re(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"))
+}
+
+/// A private-key header whose END line never comes (the text ended or was cut
+/// first): the key material is whatever follows it, so everything from the
+/// header to the end of the text is redacted. Complete blocks were replaced
+/// before this runs, so any header still present has no END after it.
+fn redact_unterminated_pem(mut text: String) -> String {
+    if let Some(header) = pem_header_regex().find(&text) {
+        let start = header.start();
+        text.truncate(start);
+        text.push_str(&marker("pem"));
+    }
+    text
+}
+
 /// Bounded high-confidence replacement. Existing markers are deliberately preserved.
 pub fn scrub(input: &str) -> Result<String> {
     if input.len() > MAX_TEXT {
         return Err(PrivacyError::TooLarge);
     }
-    let marker_re = re(r"\[CVC_REDACTED:v1:[a-z_]+:[0-9a-fA-F-]{16,}\]");
     let mut protected = Vec::new();
-    let staged = marker_re
+    let staged = redaction_marker_regex()
         .replace_all(input, |m: &regex::Captures<'_>| {
             protected.push(m[0].to_owned());
             format!("\u{0}CVC{}\u{0}", protected.len() - 1)
         })
         .into_owned();
-    let patterns = [
-        (
-            "pem",
-            r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
-        ),
-        ("aws_access_key", r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
-        (
-            "jwt",
-            r"\beyJ[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\b",
-        ),
-        (
-            "github_token",
-            r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
-        ),
-        ("openai_token", r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b"),
-        ("slack_token", r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
-        ("google_token", r"\bya29\.[A-Za-z0-9_-]{20,}\b"),
-        (
-            "authorization",
-            r"(?i)\b(?:authorization\s*:\s*|bearer\s+)[A-Za-z0-9._~+/=-]{12,}",
-        ),
-        (
-            "url_credentials",
-            r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s@]+@",
-        ),
-        (
-            "secret_assignment",
-            r#"(?i)\b(?:aws_secret_access_key|api[_-]?key|secret|password|token)\s*[:=]\s*[^\s'"`]{8,}"#,
-        ),
-    ];
     let mut out = staged;
-    for (kind, pattern) in patterns {
-        let regex = re(pattern);
+    for (kind, regex) in builtin_detectors() {
         let count = regex.find_iter(&out).count();
         if count > MAX_MATCHES {
             return Err(PrivacyError::Policy("too many secret matches".into()));
@@ -447,6 +495,9 @@ pub fn scrub(input: &str) -> Result<String> {
         out = regex
             .replace_all(&out, |_: &regex::Captures<'_>| marker(kind))
             .into_owned();
+        if *kind == "pem" {
+            out = redact_unterminated_pem(out);
+        }
     }
     for (i, value) in protected.iter().enumerate() {
         out = out.replace(&format!("\u{0}CVC{i}\u{0}"), value);
@@ -542,7 +593,10 @@ fn redact_json_leaves(value: &mut Value) {
 }
 
 fn is_redaction_marker(value: &str) -> bool {
-    re(r"^\[CVC_REDACTED:v1:[a-z_]+:[0-9a-fA-F-]{16,}\]$").is_match(value)
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX
+        .get_or_init(|| re(&format!("^{REDACTION_MARKER}$")))
+        .is_match(value)
 }
 
 /// Verifies the precise JSON tool-arguments representation is already
@@ -683,6 +737,11 @@ impl PreparedPolicy {
     }
     pub fn ignores_path(&self, path: &str) -> bool {
         self.0.ignores_path(path)
+    }
+    /// Scrubs `input` with the built-in detectors and this snapshot's rules,
+    /// the way every capture field is scrubbed.
+    pub fn scrub(&self, input: &str) -> Result<String> {
+        self.0.scrub(input)
     }
 }
 
@@ -942,7 +1001,13 @@ pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
             scrub(&s)
         })
         .transpose()?;
-    capture.interaction.user_prompt = policy.scrub(&capture.interaction.user_prompt)?;
+    // A harness stimulus is scrubbed part by part (see `stimulus`); any other
+    // text, including a stimulus whose boundary does not verify, as one string.
+    capture.interaction.user_prompt = stimulus::scrub_stimulus(
+        &capture.interaction.id,
+        &capture.interaction.user_prompt,
+        &|text| policy.scrub(text),
+    )?;
     capture.interaction.model_name = capture
         .interaction
         .model_name
@@ -1005,7 +1070,8 @@ pub fn final_scrub_for_sync(
         .take()
         .map(|v| scrub(&v))
         .transpose()?;
-    interaction.user_prompt = scrub(&interaction.user_prompt)?;
+    interaction.user_prompt =
+        stimulus::scrub_stimulus(&interaction.id, &interaction.user_prompt, &scrub)?;
     interaction.model_name = interaction
         .model_name
         .take()

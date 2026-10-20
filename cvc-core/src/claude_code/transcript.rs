@@ -41,6 +41,12 @@
 //! ingestion place reasoning into the database before a mid-session commit's
 //! post-commit hook runs.
 //!
+//! The planner does not render the stimulus. It hands over its *parts*, typed
+//! (a person's text, a subagent's task, harness meta text, a compaction
+//! summary, a tool result with its tool's name), and ingestion renders them
+//! with the capture's policy: scrubbed part by part, then bounded, then marked
+//! (see `crate::stimulus`).
+//!
 //! # Provider-side (server) tools
 //!
 //! A tool the model provider runs (web search, web fetch, code execution, ...)
@@ -53,6 +59,8 @@
 //! interrupted call. Only a `[<block type>]` placeholder reaches the response
 //! text, never the result's content, which is third-party text.
 use crate::models::{Author, ContextItem, InteractionId, ToolExecution, ToolStatus};
+use crate::privacy::PreparedPolicy;
+use crate::stimulus::{self, PartKind, StimulusPart};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
@@ -70,10 +78,6 @@ pub const SUPPORTED_MAJOR_VERSION: u64 = 2;
 /// A single transcript line larger than this is treated as corruption rather
 /// than buffered; Claude Code writes oversized tool output out of line.
 const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
-/// Tool output rendered into the next node's prompt keeps its head and tail.
-const TOOL_RESULT_HEAD_BYTES: usize = 6 * 1024;
-const TOOL_RESULT_TAIL_BYTES: usize = 2 * 1024;
-const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 /// Tool arguments stay valid JSON: long string values are truncated in place.
 const MAX_ARGUMENT_STRING_BYTES: usize = 16 * 1024;
@@ -740,6 +744,10 @@ pub struct PlanInput<'a> {
     /// Stop/SessionEnd semantics: every response is complete, missing tool
     /// results are failures, nothing stays pending.
     pub final_mode: bool,
+    /// The transcript is a subagent's. No person types into one, so the text
+    /// its user entries carry (the delegating agent's task, and any follow-up
+    /// it sends) is recorded as a `task`, never as a person's `prompt`.
+    pub subagent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -749,7 +757,9 @@ pub struct PlannedInteraction {
     pub parent_id: Option<InteractionId>,
     pub timestamp: DateTime<Utc>,
     pub author: Author,
-    pub user_prompt: String,
+    /// What the model was reacting to, as typed parts, raw. Render it with
+    /// [`PlannedInteraction::user_prompt`].
+    pub stimulus: Vec<StimulusPart>,
     pub model_name: Option<String>,
     pub model_cot: Option<String>,
     pub model_response: Option<String>,
@@ -766,6 +776,14 @@ pub struct PlannedInteraction {
     pub unrecorded_blocks: Vec<String>,
     /// Byte offset of the response's first entry.
     pub first_offset: u64,
+}
+
+impl PlannedInteraction {
+    /// The stimulus as it is stored under `policy`: each part scrubbed in full,
+    /// then bounded, then marked (see [`crate::stimulus`]).
+    pub fn user_prompt(&self, policy: &PreparedPolicy) -> String {
+        stimulus::render(&self.id, &self.stimulus, &|text| policy.scrub(text))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -794,12 +812,6 @@ struct ToolCall<'a> {
     input: &'a Value,
     /// Provider-side: answered by a result block inside the response itself.
     server: bool,
-}
-
-enum Stimulus<'a> {
-    Human { text: &'a str, meta: bool },
-    CompactSummary(&'a str),
-    ToolResult(&'a ToolResultBlock),
 }
 
 /// Plans captures for one window of parsed lines starting at `window_start`.
@@ -973,7 +985,7 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
             cursor = entries[position].parent_uuid.as_deref();
         }
         stimulus_positions.reverse();
-        let mut stimuli = Vec::new();
+        let mut stimulus: Vec<StimulusPart> = Vec::new();
         // Block types this parser does not record are visible in the text as
         // placeholders and reported by name, so an omission is never silent.
         let mut unrecorded_blocks: Vec<String> = Vec::new();
@@ -981,21 +993,41 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
             if let Payload::User(message) = &entries[position].payload {
                 unrecorded_blocks.extend(message.unrecorded.iter().cloned());
                 for text in &message.texts {
-                    if message.compact_summary {
-                        stimuli.push(Stimulus::CompactSummary(text));
+                    let kind = if message.compact_summary {
+                        PartKind::CompactionSummary
+                    } else if message.meta {
+                        PartKind::Meta
+                    } else if input.subagent {
+                        PartKind::Task
                     } else {
-                        stimuli.push(Stimulus::Human {
-                            text,
-                            meta: message.meta,
-                        });
-                    }
+                        PartKind::Prompt
+                    };
+                    stimulus.push(StimulusPart {
+                        kind,
+                        name: None,
+                        is_error: false,
+                        text: text.clone(),
+                    });
                 }
                 for result in &message.tool_results {
-                    stimuli.push(Stimulus::ToolResult(result));
+                    stimulus.push(StimulusPart::tool_result(
+                        tool_names.get(result.tool_use_id.as_str()).copied(),
+                        result.is_error,
+                        result.content.clone(),
+                    ));
                 }
             }
         }
-        let (user_prompt, author) = render_stimuli(&stimuli, &tool_names);
+        // A person (or, in a subagent, the agent that delegated to it) wrote
+        // some of it, or none did.
+        let author = if stimulus
+            .iter()
+            .any(|part| matches!(part.kind, PartKind::Prompt | PartKind::Task))
+        {
+            Author::Human
+        } else {
+            Author::System
+        };
 
         let id = derived_interaction_id(input.session_id, &group.key);
         let parent_id =
@@ -1102,7 +1134,7 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
             parent_id,
             timestamp,
             author,
-            user_prompt,
+            stimulus,
             model_name,
             model_cot,
             model_response,
@@ -1193,48 +1225,6 @@ fn creates_commit(command: &str) -> bool {
 
 fn is_hex_token(token: &str) -> bool {
     (7..=40).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn render_stimuli(stimuli: &[Stimulus<'_>], tool_names: &HashMap<&str, &str>) -> (String, Author) {
-    let mut author = Author::System;
-    let mut parts = Vec::with_capacity(stimuli.len());
-    for stimulus in stimuli {
-        match stimulus {
-            Stimulus::Human { text, meta } => {
-                if !*meta {
-                    author = Author::Human;
-                    parts.push(bounded_text(text, MAX_PROMPT_BYTES));
-                } else {
-                    parts.push(format!("[meta] {}", bounded_text(text, MAX_PROMPT_BYTES)));
-                }
-            }
-            Stimulus::CompactSummary(text) => parts.push(format!(
-                "[compaction summary]\n{}",
-                bounded_text(text, MAX_PROMPT_BYTES)
-            )),
-            Stimulus::ToolResult(result) => {
-                let name = tool_names
-                    .get(result.tool_use_id.as_str())
-                    .copied()
-                    .unwrap_or("unknown-tool");
-                let outcome = if result.is_error { " error" } else { "" };
-                parts.push(format!(
-                    "[tool_result {name}{outcome}] {}",
-                    bounded_head_tail(
-                        &result.content,
-                        TOOL_RESULT_HEAD_BYTES,
-                        TOOL_RESULT_TAIL_BYTES
-                    )
-                ));
-            }
-        }
-    }
-    let prompt = if parts.is_empty() {
-        "[no stimulus recorded]".to_owned()
-    } else {
-        bounded_text(&parts.join("\n\n"), MAX_PROMPT_BYTES)
-    };
-    (prompt, author)
 }
 
 fn join_bounded(parts: &[&str], max: usize) -> Option<String> {
@@ -1385,22 +1375,6 @@ fn bounded_text(text: &str, max: usize) -> String {
     )
 }
 
-fn bounded_head_tail(text: &str, head: usize, tail: usize) -> String {
-    if text.len() <= head + tail {
-        return text.to_owned();
-    }
-    let kept_head = truncate_to_boundary(text, head);
-    let mut start = text.len() - tail;
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    let omitted = start - kept_head.len();
-    format!(
-        "{kept_head}\n…[cvc: truncated {omitted} bytes]…\n{}",
-        &text[start..]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1411,10 +1385,9 @@ mod tests {
         assert_eq!(truncate_to_boundary(text, 2), "h");
         assert!(bounded_text(text, 3).starts_with("hé"));
         let long = "a".repeat(100) + "é" + &"b".repeat(100);
-        let rendered = bounded_head_tail(&long, 10, 10);
+        let rendered = bounded_text(&long, 10);
         assert!(rendered.starts_with(&"a".repeat(10)));
-        assert!(rendered.ends_with(&"b".repeat(10)));
-        assert!(rendered.contains("truncated"));
+        assert!(rendered.contains("truncated 192 bytes"));
     }
 
     #[test]
@@ -1604,6 +1577,7 @@ mod tests {
                 worktree_root: Path::new("/work/repo"),
                 path_aliases: &[],
                 final_mode,
+                subagent: false,
             },
         )
     }

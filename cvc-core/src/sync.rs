@@ -2501,7 +2501,26 @@ fn validate_final_node_bytes(bytes: &[u8]) -> Result<()> {
         crate::privacy::validate_sanitized_json(&tool.arguments)
             .map_err(|e| SyncError::Ref(format!("unsafe final tool arguments: {e}")))?;
     }
-    inspect_final_strings(bytes)
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+    // A harness stimulus was scrubbed part by part, so it is checked that way:
+    // scrubbing it as one string could touch the markers between its parts.
+    // Every other string, and an unverified stimulus, is checked whole.
+    if let Some(prompt) = value.pointer_mut("/interaction/user_prompt") {
+        if let serde_json::Value::String(text) = prompt.take() {
+            let scrubbed = crate::stimulus::scrub_stimulus(
+                &node.interaction.id,
+                &text,
+                &crate::privacy::scrub,
+            )
+            .map_err(|e| SyncError::Ref(format!("final string invalid: {e}")))?;
+            if scrubbed != text {
+                return Err(SyncError::Ref(
+                    "unredacted secret in final Git bytes".into(),
+                ));
+            }
+        }
+    }
+    inspect_value(&value)
 }
 
 fn validate_final_link_bytes(bytes: &[u8]) -> Result<()> {
@@ -2528,36 +2547,38 @@ fn validate_final_link_bytes(bytes: &[u8]) -> Result<()> {
 }
 
 fn inspect_final_strings(bytes: &[u8]) -> Result<()> {
-    fn visit(value: &serde_json::Value) -> Result<()> {
-        match value {
-            serde_json::Value::String(text) => {
-                // scrub is marker-aware.  Thus an unchanged value is either
-                // clean or a valid CVC marker, while a changed one is a leak.
-                if crate::privacy::scrub(text)
-                    .map_err(|e| SyncError::Ref(format!("final string invalid: {e}")))?
-                    != *text
-                {
-                    return Err(SyncError::Ref(
-                        "unredacted secret in final Git bytes".into(),
-                    ));
-                }
+    inspect_value(&serde_json::from_slice(bytes)?)
+}
+
+/// Every string in `value`, keys included, must already be clean.
+fn inspect_value(value: &serde_json::Value) -> Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            // scrub is marker-aware.  Thus an unchanged value is either
+            // clean or a valid CVC marker, while a changed one is a leak.
+            if crate::privacy::scrub(text)
+                .map_err(|e| SyncError::Ref(format!("final string invalid: {e}")))?
+                != *text
+            {
+                return Err(SyncError::Ref(
+                    "unredacted secret in final Git bytes".into(),
+                ));
             }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    visit(value)?;
-                }
-            }
-            serde_json::Value::Object(values) => {
-                for (key, value) in values {
-                    visit(&serde_json::Value::String(key.clone()))?;
-                    visit(value)?;
-                }
-            }
-            _ => {}
         }
-        Ok(())
+        serde_json::Value::Array(values) => {
+            for value in values {
+                inspect_value(value)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                inspect_value(&serde_json::Value::String(key.clone()))?;
+                inspect_value(value)?;
+            }
+        }
+        _ => {}
     }
-    visit(&serde_json::from_slice(bytes)?)
+    Ok(())
 }
 
 /// Fetch using the already snapshotted effective destination.  The named remote is

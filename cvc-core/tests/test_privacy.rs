@@ -48,6 +48,141 @@ fn scrub_covers_sensitive_forms() {
     );
 }
 
+/// The text with each redaction marker's random id replaced, so that scrubs of
+/// the same input can be compared.
+fn masked(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("[CVC_REDACTED:v1:") {
+        out.push_str(&rest[..at]);
+        let marker = &rest[at..];
+        let end = marker.find(']').map_or(marker.len(), |end| end + 1);
+        let colon = marker[..end].rfind(':').unwrap_or(0);
+        out.push_str(&marker[..=colon]);
+        out.push_str("*]");
+        rest = &marker[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+const KEY_BODY: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\nVJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dVMvDuictGeurT\n";
+
+#[test]
+fn an_unterminated_private_key_header_redacts_to_the_end_of_the_text() {
+    for kind in [
+        "PRIVATE KEY",
+        "RSA PRIVATE KEY",
+        "EC PRIVATE KEY",
+        "DSA PRIVATE KEY",
+        "OPENSSH PRIVATE KEY",
+        "ENCRYPTED PRIVATE KEY",
+    ] {
+        let text =
+            format!("before\n-----BEGIN {kind}-----\n{KEY_BODY}and a sentence after the key lines");
+        let scrubbed = scrub(&text).unwrap();
+        assert_eq!(
+            masked(&scrubbed),
+            "before\n[CVC_REDACTED:v1:pem:*]",
+            "{kind}"
+        );
+        assert!(
+            !scrubbed.contains("MIIEvQ") && !scrubbed.contains("BEGIN"),
+            "{kind}"
+        );
+    }
+    // The header alone, and as the whole text.
+    assert_eq!(
+        masked(&scrub("-----BEGIN PRIVATE KEY-----").unwrap()),
+        "[CVC_REDACTED:v1:pem:*]"
+    );
+}
+
+#[test]
+fn a_complete_block_is_redacted_alone_and_the_text_around_it_is_kept() {
+    let text =
+        format!("a\n-----BEGIN PRIVATE KEY-----\n{KEY_BODY}-----END PRIVATE KEY-----\nafter");
+    assert_eq!(
+        masked(&scrub(&text).unwrap()),
+        "a\n[CVC_REDACTED:v1:pem:*]\nafter"
+    );
+}
+
+#[test]
+fn a_complete_block_then_an_unterminated_header_each_redacts_what_it_holds() {
+    let text = format!(
+        "one\n-----BEGIN PRIVATE KEY-----\n{KEY_BODY}-----END PRIVATE KEY-----\nbetween\n-----BEGIN RSA PRIVATE KEY-----\n{KEY_BODY}tail"
+    );
+    assert_eq!(
+        masked(&scrub(&text).unwrap()),
+        "one\n[CVC_REDACTED:v1:pem:*]\nbetween\n[CVC_REDACTED:v1:pem:*]"
+    );
+}
+
+#[test]
+fn text_that_only_resembles_a_private_key_header_is_left_alone() {
+    for text in [
+        "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A\n",
+        "-----BEGIN CERTIFICATE-----\nMIIDdzCCAl+gAwIBAgIEAgAAuTANBgkqhkiG9w0BAQUFADBaMQswCQYDVQQGEwJJ\n",
+        "-----BEGIN PRIVATE KEY",
+        "BEGIN PRIVATE KEY-----",
+        "---BEGIN PRIVATE KEY---",
+        "the PRIVATE KEY block begins with a dashed BEGIN line",
+    ] {
+        assert_eq!(scrub(text).unwrap(), text);
+    }
+}
+
+#[test]
+fn an_unterminated_header_keeps_markers_before_it_and_scrubbing_is_stable() {
+    let first = scrub("key AKIAABCDEFGHIJKLMNOP here").unwrap();
+    let text = format!("{first}\n-----BEGIN PRIVATE KEY-----\n{KEY_BODY}");
+    let scrubbed = scrub(&text).unwrap();
+    assert!(scrubbed.starts_with("key [CVC_REDACTED:v1:aws_access_key:"));
+    assert_eq!(scrubbed.matches("[CVC_REDACTED:").count(), 2);
+    assert!(!scrubbed.contains("MIIEvQ"));
+    // A scrubbed text scrubs to itself, which is what the push checks rely on.
+    assert_eq!(scrub(&scrubbed).unwrap(), scrubbed);
+}
+
+#[test]
+fn an_existing_marker_inside_the_redacted_tail_goes_with_it() {
+    let marker = scrub("AKIAABCDEFGHIJKLMNOP").unwrap();
+    let text = format!("x\n-----BEGIN PRIVATE KEY-----\n{KEY_BODY}{marker}\nend");
+    assert_eq!(masked(&scrub(&text).unwrap()), "x\n[CVC_REDACTED:v1:pem:*]");
+}
+
+#[test]
+fn json_strings_and_policies_get_the_unterminated_header_rule_too() {
+    let scrubbed = scrub_json(
+        r#"{"command":"cat key","output":"head\n-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg","after":"kept"}"#,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&scrubbed).unwrap();
+    assert!(!scrubbed.contains("MIIEvQ"));
+    assert!(value["output"]
+        .as_str()
+        .unwrap()
+        .starts_with("head\n[CVC_REDACTED:v1:pem:"));
+    assert_eq!(value["after"], "kept");
+    assert!(validate_sanitized_json(&scrubbed).is_ok());
+    assert!(
+        validate_sanitized_json(r#"{"output":"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg"}"#)
+            .is_err()
+    );
+
+    let dir = tempdir().unwrap();
+    let policy = PreparedPolicy::load(dir.path()).unwrap();
+    assert_eq!(
+        masked(
+            &policy
+                .scrub("a\n-----BEGIN PRIVATE KEY-----\nMIIEvQ")
+                .unwrap()
+        ),
+        "a\n[CVC_REDACTED:v1:pem:*]"
+    );
+}
+
 #[test]
 fn credential_subtrees_keep_shape_but_not_raw_leaves() {
     let scrubbed = scrub_json(

@@ -10,6 +10,7 @@ use crate::db::{CvcStore, DbError, HarnessCursorUpdate};
 use crate::models::{Conversation, Interaction, InteractionId};
 use crate::privacy::{self, ClaudeCodeCapture, PreparedPolicy};
 use crate::repository::{RepositoryLayout, RepositoryLayoutError};
+use crate::stimulus;
 use chrono::Utc;
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
@@ -133,7 +134,7 @@ pub fn ingest(
     // each in `<session>/subagents/agent-<id>.jsonl` beside the main file. Each
     // becomes its own conversation, keyed off the parent session so it never
     // collides with the parent or another agent.
-    for subagent in discover_subagents(transcript_path)? {
+    for subagent in discover_subagents(transcript_path, policy)? {
         let conversation_id = format!("{session}:{}", subagent.agent_stem);
         if !privacy::is_safe_identifier(&conversation_id) {
             continue;
@@ -218,6 +219,7 @@ fn ingest_target(
             worktree_root: &worktree_root,
             path_aliases: &path_aliases,
             final_mode: mode == IngestMode::Final,
+            subagent: target.include_sidechain,
         },
     );
 
@@ -232,7 +234,11 @@ fn ingest_target(
                 .map(|conversation| conversation.title.clone())
                 .filter(|title| !title.trim().is_empty())
         })
-        .or_else(|| plan.first_human_prompt.as_deref().and_then(derive_title))
+        .or_else(|| {
+            plan.first_human_prompt
+                .as_deref()
+                .and_then(|prompt| derive_title(prompt, policy))
+        })
         .unwrap_or_else(|| DEFAULT_TITLE.to_owned());
     let created_at = existing
         .as_ref()
@@ -265,6 +271,9 @@ fn ingest_target(
         }
         unrecorded_blocks += planned.unrecorded_blocks.len();
         unrecorded_block_types.extend(planned.unrecorded_blocks.iter().cloned());
+        // Scrubbed part by part with this capture's policy, then bounded and
+        // marked: see `crate::stimulus`.
+        let user_prompt = planned.user_prompt(policy);
         // A parent outside this batch and outside the store (suppressed, or
         // never recorded) breaks the chain rather than failing the batch.
         let parent_id = match planned.parent_id {
@@ -279,7 +288,7 @@ fn ingest_target(
             parent_id,
             timestamp: planned.timestamp,
             author: planned.author,
-            user_prompt: planned.user_prompt,
+            user_prompt,
             model_name: planned.model_name,
             model_cot: planned.model_cot,
             model_response: planned.model_response,
@@ -350,7 +359,10 @@ struct Subagent {
 
 /// Finds `<session>/subagents/agent-*.jsonl` beside `<session>.jsonl`. A missing
 /// directory yields nothing; symlinks and non-files are ignored.
-fn discover_subagents(transcript_path: &Path) -> Result<Vec<Subagent>, IngestError> {
+fn discover_subagents(
+    transcript_path: &Path,
+    policy: &PreparedPolicy,
+) -> Result<Vec<Subagent>, IngestError> {
     let directory = transcript_path.with_extension("").join("subagents");
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -375,7 +387,7 @@ fn discover_subagents(transcript_path: &Path) -> Result<Vec<Subagent>, IngestErr
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             continue;
         }
-        let title = subagent_title(&path.with_extension("meta.json"));
+        let title = subagent_title(&path.with_extension("meta.json"), policy);
         subagents.push(Subagent {
             path: path.clone(),
             agent_stem: stem.to_owned(),
@@ -388,7 +400,7 @@ fn discover_subagents(transcript_path: &Path) -> Result<Vec<Subagent>, IngestErr
 }
 
 /// A short title from a subagent's `.meta.json` (`agentType`: `description`).
-fn subagent_title(meta_path: &Path) -> Option<String> {
+fn subagent_title(meta_path: &Path, policy: &PreparedPolicy) -> Option<String> {
     let text = fs::read_to_string(meta_path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let agent_type = value.get("agentType").and_then(|v| v.as_str());
@@ -399,7 +411,7 @@ fn subagent_title(meta_path: &Path) -> Option<String> {
         (None, Some(desc)) if !desc.trim().is_empty() => desc.to_owned(),
         _ => return None,
     };
-    Some(derive_title(&combined).unwrap_or(combined))
+    derive_title(&combined, policy)
 }
 
 /// The stored cursor is trusted only when it still lands on a line boundary
@@ -445,14 +457,15 @@ fn path_aliases(lines: &[ParsedLine], worktree_root: &Path) -> Vec<(PathBuf, Pat
     aliases
 }
 
-fn derive_title(prompt: &str) -> Option<String> {
+/// A title from the first non-blank line of `prompt`. The line is scrubbed in
+/// full before it is cut, so a secret is redacted whole rather than cut in
+/// half; a line that cannot be scrubbed yields no title.
+fn derive_title(prompt: &str, policy: &PreparedPolicy) -> Option<String> {
     let line = prompt.lines().find(|line| !line.trim().is_empty())?.trim();
+    let line = policy.scrub(line).ok()?;
     if line.len() <= MAX_DERIVED_TITLE_BYTES {
-        return Some(line.to_owned());
+        return Some(line);
     }
-    let mut end = MAX_DERIVED_TITLE_BYTES;
-    while end > 0 && !line.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = stimulus::head_len(&line, MAX_DERIVED_TITLE_BYTES);
     Some(format!("{}…", &line[..end]))
 }
