@@ -215,6 +215,26 @@ jobs:
           done
           exit "$failed"
 
+  installer-windows:
+    name: PowerShell installer (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # install.ps1 itself downloads a release, so it is not run here. The script
+      # lifts its publish and PATH-prompt functions out of the syntax tree and
+      # tests them offline: replacing a running .exe, restoring on failure,
+      # sweeping retired images, and skipping the prompt without input. It runs
+      # under both shells because `irm | iex` uses Windows PowerShell 5.1 by default.
+      - name: Test install.ps1 on Windows PowerShell 5.1
+        shell: powershell
+        run: ./.github/scripts/test-install-ps1.ps1
+      - name: Test install.ps1 on PowerShell 7
+        shell: pwsh
+        run: ./.github/scripts/test-install-ps1.ps1
+
   third-party-notices:
     name: Verify third-party notices
     runs-on: ubuntu-latest

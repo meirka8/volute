@@ -1,11 +1,159 @@
 use anyhow::{Context, Result};
+use cvc_core::claude_code::{harness_record, settings};
 use cvc_core::db::CvcStore;
 use cvc_core::linker;
-use cvc_core::repository::RepositoryLayout;
+use cvc_core::privacy;
+use cvc_core::repository::{RepositoryLayout, RepositoryLayoutError};
 use git2::Repository;
 use std::env;
 use std::fs;
 use std::io::Read;
+use std::path::Path;
+
+/// What the `post-checkout` hook did for a new worktree.
+#[derive(Debug, PartialEq, Eq)]
+enum Propagation {
+    /// Nothing to do: not a new worktree, not CVC-initialized, or the harness
+    /// is not wanted for this repository.
+    Nothing,
+    /// The hook entries were written (or refreshed) in this worktree.
+    Installed,
+    /// The harness is wanted but cannot be installed here, with the reason.
+    Declined(String),
+}
+
+/// The warning for a managed hook that was left alone because the file already
+/// there is not a shell script: appending shell text to it would break it, and
+/// Git returns a hook's status from `git checkout` and `git worktree add`.
+///
+/// `binary` is the absolute path of the `cvc` the caller is installing for, when
+/// there is one (`harness install`). The `post-checkout` advice then names that
+/// binary, quoted, instead of a bare `cvc` that depends on `PATH` and may be a
+/// stale release; without one (`cvc init`) it keeps the generic line and
+/// points at the README for how to call it.
+pub(crate) fn not_shell_warning(
+    outcome: &cvc_core::hooks::HookInstallOutcome,
+    binary: Option<&Path>,
+) -> String {
+    let (line, purpose) = cvc_core::hooks::manual_invocation(outcome.hook_name)
+        .unwrap_or(("cvc hook <name>", "CVC's hook"));
+    let path = outcome.hook_path.display();
+    if outcome.hook_name == "post-checkout" {
+        return match binary.and_then(Path::to_str) {
+            Some(binary) => format!(
+                "warning: {path} is not a shell script; CVC did not modify it. Call `{} hook post-checkout \"$@\"` from it yourself (ignore its exit status) to enable {purpose}.",
+                settings::shell_quote(binary)
+            ),
+            None => format!(
+                "warning: {path} is not a shell script; CVC did not modify it. Call `{line}` from it yourself to enable {purpose} (see \"Hooks in new worktrees\" in cvc-cli/README.md for how to call it)."
+            ),
+        };
+    }
+    format!(
+        "warning: {path} is not a shell script; CVC did not modify it. Call `{line}` from it yourself to enable {purpose}."
+    )
+}
+
+/// Git's null object id: all zeros, 40 digits (SHA-1) or 64 (SHA-256).
+fn is_null_oid(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte == b'0')
+}
+
+/// Git runs `post-checkout` as `<previous HEAD> <new HEAD> <flag>`. A new
+/// worktree (`git worktree add`, Claude Code's worktree option) or a clone
+/// starts from the null ref with the flag set to 1; every other checkout is
+/// none of this hook's business. The installed Git hook already filters on this
+/// so ordinary checkouts never start `cvc`; the check is repeated here so a
+/// hand-written call behaves the same. Only a linked worktree is ever acted
+/// on (see [`propagate_claude_code_harness`]): a clone, and the main worktree
+/// leaving an unborn orphan branch, send the same arguments but are not new.
+///
+/// Advisory like every hook: this always succeeds, whatever happens.
+pub async fn post_checkout(previous: &str, _new: &str, flag: &str) -> Result<()> {
+    if flag != "1" || !is_null_oid(previous) {
+        return Ok(());
+    }
+    let outcome = env::current_dir()
+        .context("Failed to get current directory")
+        .and_then(|cwd| propagate_claude_code_harness(&cwd));
+    match outcome {
+        Ok(Propagation::Nothing) => {}
+        Ok(Propagation::Installed) => println!(
+            "CVC: installed the Claude Code capture hooks in this worktree ({})",
+            settings::SETTINGS_RELATIVE_PATH
+        ),
+        Ok(Propagation::Declined(reason)) => {
+            eprintln!("CVC: Claude Code hooks not installed in this worktree: {reason}")
+        }
+        Err(error) => eprintln!("CVC: post-checkout: {error:#}"),
+    }
+    Ok(())
+}
+
+/// Installs the Claude Code hook entries into the worktree at `cwd` when the
+/// repository's harness record asks for them. Reads one small file and the
+/// repository's consent state; it opens no database and touches no network,
+/// because it runs inside `git worktree add`.
+fn propagate_claude_code_harness(cwd: &Path) -> Result<Propagation> {
+    let layout = match RepositoryLayout::discover(cwd) {
+        Ok(layout) => layout,
+        Err(RepositoryLayoutError::NotRepository) => return Ok(Propagation::Nothing),
+        Err(error) => return Err(error.into()),
+    };
+    // A bare repository has no worktree to install into.
+    if matches!(
+        layout.worktree_root(),
+        Err(RepositoryLayoutError::BareRepository)
+    ) || !layout.cvc_dir().is_dir()
+    {
+        return Ok(Propagation::Nothing);
+    }
+    // Only a linked worktree can be new. The main worktree is where the user
+    // runs `harness install`, and a fresh clone has no CVC state; a null
+    // previous ref there (leaving an unborn orphan branch, say) is not a new
+    // worktree, so it is never acted on and never reported.
+    if !layout.is_linked_worktree() {
+        return Ok(Propagation::Nothing);
+    }
+    // The Git hook script has read the same file and run the binary it names;
+    // read it again here with the full checks (ownership, permissions, shape),
+    // since this is what decides what gets written.
+    let binary = match harness_record::read_record(&layout) {
+        Ok(Some(binary)) => binary,
+        Ok(None) => return Ok(Propagation::Nothing),
+        Err(error) => return Ok(Propagation::Declined(format!("{error:#}"))),
+    };
+    if let Some(problem) = settings::binary_problem(&binary) {
+        return Ok(Propagation::Declined(format!(
+            "{problem}; run `cvc harness install claude-code` here"
+        )));
+    }
+    // Hook-driven ingestion needs the repository-local acknowledgement, and
+    // installing hooks that would only report `consent-required` is no use.
+    if !privacy::capture_acknowledged(layout.repository())? {
+        return Ok(Propagation::Declined(
+            "local capture is not acknowledged for this repository".into(),
+        ));
+    }
+    // Create-only: this runs unattended inside Git, so it never merges into a
+    // settings file that is already there.
+    match settings::create(&layout, &binary) {
+        Ok(outcome) => Ok(match outcome.action {
+            settings::InstallAction::Created | settings::InstallAction::Updated => {
+                Propagation::Installed
+            }
+            settings::InstallAction::AlreadyPresent => Propagation::Nothing,
+        }),
+        // A settings file the checkout itself carries, tracked or not, is the
+        // user's (or the branch's), not ours.
+        Err(error)
+            if error.is::<settings::TrackedSettings>() || error.is::<settings::SettingsExist>() =>
+        {
+            Ok(Propagation::Declined(error.to_string()))
+        }
+        Err(error) => Err(error),
+    }
+}
 
 pub async fn post_commit() -> Result<()> {
     let result = (|| -> Result<()> {
@@ -246,7 +394,7 @@ fn head_short_sha(repo: &Repository) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::observe_pre_push;
+    use super::{is_null_oid, observe_pre_push};
     use git2::{Repository, Signature};
     use tempfile::TempDir;
     fn commit(
@@ -313,5 +461,23 @@ mod tests {
             assert_eq!(trusted, configured as i64);
         }
         Ok(())
+    }
+
+    #[test]
+    fn only_the_all_zero_object_id_is_the_null_ref() {
+        assert!(is_null_oid(&"0".repeat(40)));
+        assert!(is_null_oid(&"0".repeat(64)));
+        for other in [
+            String::new(),
+            "0".repeat(39),
+            "0".repeat(41),
+            "0".repeat(63),
+            "0".repeat(65),
+            format!("{}1", "0".repeat(39)),
+            format!("{}x", "0".repeat(39)),
+            "1".repeat(40),
+        ] {
+            assert!(!is_null_oid(&other), "{other:?}");
+        }
     }
 }

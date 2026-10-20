@@ -88,6 +88,86 @@ function Expand-SafeBinary([string]$Archive, [string]$Member, [string]$Destinati
     } finally { $Zip.Dispose() }
 }
 
+# 'absent', 'file' (a regular file), or 'other' (a directory or any reparse
+# point, which are never replaced or deleted).
+function Get-CvcPathKind([string]$Path) {
+    $Item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $Item) { return 'absent' }
+    if ($Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return 'other' }
+    return 'file'
+}
+
+# `.cvc-old-<file>-<16 lowercase hex>`, the name the npm launcher
+# (npm/cvc-mcp/bin/release.js) gives a replaced binary, so that either
+# publisher sweeps up the other's leftovers.
+function New-CvcRetiredPath([string]$InstallDir, [string]$Binary) {
+    $Bytes = New-Object byte[] 8
+    $Generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $Generator.GetBytes($Bytes) } finally { $Generator.Dispose() }
+    return Join-Path $InstallDir ('.cvc-old-' + $Binary + '-' + [BitConverter]::ToString($Bytes).Replace('-', '').ToLowerInvariant())
+}
+
+# Deletes leftovers of earlier publishes, best effort: one that is still running
+# cannot be deleted and is retried by the next publish. Only regular files with
+# exactly the retired-image name are touched, never directories or reparse points.
+function Remove-CvcRetiredImages([string]$InstallDir) {
+    foreach ($Entry in @(Get-ChildItem -LiteralPath $InstallDir -Force -Filter '.cvc-old-*' -ErrorAction SilentlyContinue)) {
+        if ($Entry.Name -cnotmatch '^\.cvc-old-(cvc|cvc-mcp|cvc-lsp)(\.exe)?-[0-9a-f]{16}$') { continue }
+        if ($Entry.PSIsContainer -or ($Entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }
+        try { [IO.File]::Delete($Entry.FullName) } catch { }
+    }
+}
+
+# Moves the prepared files (a hashtable of file name to a staged file in
+# $InstallDir, so the move stays on one volume) over the installed binaries, in
+# $MoveOrder. Windows refuses to overwrite or delete a running .exe but allows
+# renaming it, and the printed MCP config and the npm launcher both run
+# cvc-mcp.exe from this directory. So an existing target is renamed aside, the
+# new file is moved in, the old one is renamed back if that fails, and the retired
+# file is deleted best effort (it stays while its process runs). Throws on
+# failure; nothing is replaced when a target or a prepared file is unusable.
+function Publish-CvcBinaries([string]$InstallDir, [string[]]$MoveOrder, [hashtable]$Prepared) {
+    Remove-CvcRetiredImages $InstallDir
+    foreach ($Binary in $MoveOrder) {
+        $Target = Join-Path $InstallDir $Binary
+        if ((Get-CvcPathKind $Target) -eq 'other') { throw "Refusing unsafe existing target: $Target" }
+        if (-not $Prepared.ContainsKey($Binary) -or (Get-CvcPathKind $Prepared[$Binary]) -ne 'file') { throw "The prepared file for $Binary is missing or unsafe." }
+    }
+    foreach ($Binary in $MoveOrder) {
+        $Target = Join-Path $InstallDir $Binary
+        $Retired = $null
+        $Kind = Get-CvcPathKind $Target
+        if ($Kind -eq 'other') { throw "Refusing unsafe existing target: $Target" }
+        if ($Kind -eq 'file') {
+            $Retired = New-CvcRetiredPath $InstallDir $Binary
+            [IO.File]::Move($Target, $Retired)
+        }
+        try { [IO.File]::Move($Prepared[$Binary], $Target) }
+        catch {
+            $Failure = $_
+            if ($null -ne $Retired) {
+                try { [IO.File]::Move($Retired, $Target) }
+                catch { Write-Warning "Could not restore $Target; the previous file is $Retired" }
+            }
+            throw $Failure
+        }
+        if ($null -ne $Retired) { try { [IO.File]::Delete($Retired) } catch { } }
+    }
+}
+
+# Returns 'add' or 'skip'. Read-Host throws in a -NonInteractive host and
+# misbehaves when stdin is redirected (CI, automation), so an unattended session
+# skips PATH configuration instead of failing a successful install. Answering
+# anything that starts with n or N also skips, as install.sh does.
+function Read-CvcPathConsent([string]$Prompt) {
+    $Interactive = $false
+    try { $Interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected } catch { }
+    if (-not $Interactive) { return 'skip' }
+    try { $Answer = Read-Host $Prompt } catch { return 'skip' }
+    if ($Answer -match '^\s*[nN]') { return 'skip' }
+    return 'add'
+}
+
 Write-Host "Installing CVC..."
 $Arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 if ($Arch -notin @("AMD64", "x86_64")) { throw "Unsupported architecture: $Arch. Windows releases are published for x64 only." }
@@ -105,6 +185,9 @@ $ArchivePath = Join-Path $TempDir $AssetName
 $ChecksumPath = Join-Path $TempDir "SHA256SUMS"
 $StageDir = Join-Path $TempDir "stage"
 $Binaries = @("cvc.exe", "cvc-mcp.exe", "cvc-lsp.exe")
+# cvc.exe moves into place LAST: the npm launcher probes `cvc --version`
+# without the lock, so a new cvc must imply its siblings are already new.
+$MoveOrder = @("cvc-lsp.exe", "cvc-mcp.exe", "cvc.exe")
 $Prepared = @{}
 $InstallLock = $null
 $InstallLockPath = $null
@@ -132,19 +215,13 @@ try {
     catch { throw "Another installation is active (or a stale lock exists): $InstallLockPath" }
 
     foreach ($Binary in $Binaries) {
-        $Target = Join-Path $InstallDir $Binary
-        if (Test-Path -LiteralPath $Target) {
-            $TargetItem = Get-Item -LiteralPath $Target -Force
-            if ($TargetItem.PSIsContainer -or ($TargetItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Refusing unsafe existing target: $Target" }
-        }
         $Temporary = Join-Path $InstallDir (".cvc-" + $Binary + "." + [Guid]::NewGuid())
         [IO.File]::Copy((Join-Path $StageDir $Binary), $Temporary, $false)
         $Prepared[$Binary] = $Temporary
     }
-    # cvc.exe moves into place LAST: the npm launcher probes `cvc --version`
-    # without the lock, so a new cvc must imply its siblings are already new.
-    $MoveOrder = @("cvc-lsp.exe", "cvc-mcp.exe", "cvc.exe")
-    foreach ($Binary in $MoveOrder) { Move-Item -LiteralPath $Prepared[$Binary] -Destination (Join-Path $InstallDir $Binary) -Force }
+    # Refuses unsafe targets before replacing anything, then renames running
+    # images aside instead of overwriting them.
+    Publish-CvcBinaries -InstallDir $InstallDir -MoveOrder $MoveOrder -Prepared $Prepared
 }
 finally {
     if ($null -ne $InstallLock) { $InstallLock.Dispose() }
@@ -157,8 +234,7 @@ Write-Host "`nSuccess! CVC installed to $InstallDir"
 Write-Host "  cvc.exe       - CLI interface"
 Write-Host "  cvc-mcp.exe   - MCP server for coding agents"
 Write-Host "  cvc-lsp.exe   - Language server for the VSCode extension`n"
-$AddPath = Read-Host "Would you like to add CVC to your User PATH? [Y/n]"
-if ($AddPath -notin @('n', 'N')) {
+if ((Read-CvcPathConsent "Would you like to add CVC to your User PATH? [Y/n]") -eq 'add') {
     $UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
     if ($null -eq $UserPath) { $UserPath = '' }
     $PathEntries = @($UserPath -split ';' | Where-Object { $_ })

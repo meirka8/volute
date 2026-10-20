@@ -149,9 +149,13 @@ echo "Please manually add $INSTALL_DIR to your PATH:"
 echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
 echo ""
 
-if [ -t 0 ] || [ -c /dev/tty ]; then
+# Prompt only when /dev/tty can actually be opened. A process without a
+# controlling terminal (CI, cron, `setsid`, a container without a tty) can have
+# /dev/tty present as a device node that fails with ENXIO on open, and under
+# `set -e` a failing `read` would otherwise exit 1 after a successful install.
+if (: </dev/tty) 2>/dev/null; then
   printf 'Would you like to automatically add CVC to your PATH? [Y/n] '
-  read -r ADD_PATH < /dev/tty
+  read -r ADD_PATH </dev/tty || ADD_PATH="n"
 else ADD_PATH="n"; fi
 case "$ADD_PATH" in
   [Nn]*) echo "Skipping PATH configuration." ;;
