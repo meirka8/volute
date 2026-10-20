@@ -1592,28 +1592,55 @@ fn validate_closed_derivation_graph(
             }
         }
     }
+    // A depth-first walk down the sources of each event, with a stack of its own:
+    // the length of a chain of derivations is whatever a remote published, up to
+    // the limit on events, and a call for each would overflow the stack.
     fn visit<'a>(
-        id: &'a str,
+        start: &'a str,
         by_id: &HashMap<&'a str, &'a DerivationEvent>,
         visiting: &mut HashSet<&'a str>,
         visited: &mut HashSet<&'a str>,
     ) -> Result<()> {
-        if visited.contains(id) {
+        if visited.contains(start) {
             return Ok(());
         }
-        if !visiting.insert(id) {
+        // Each frame is an event being walked and the next of its sources to look at.
+        let mut stack: Vec<(&'a str, usize)> = Vec::new();
+        if !visiting.insert(start) {
             return Err(SyncError::Ref("cyclic derivation graph".into()));
         }
-        let event = by_id
-            .get(id)
-            .ok_or_else(|| SyncError::Ref("missing derivation event".into()))?;
-        for source in &event.source_event_ids {
-            if is_event_source(source) {
-                visit(source, by_id, visiting, visited)?;
+        stack.push((start, 0));
+        while let Some((id, next)) = stack.last().copied() {
+            let event = by_id
+                .get(id)
+                .ok_or_else(|| SyncError::Ref("missing derivation event".into()))?;
+            let mut descend = None;
+            let mut at = next;
+            while at < event.source_event_ids.len() {
+                let source = event.source_event_ids[at].as_str();
+                at += 1;
+                if is_event_source(source) && !visited.contains(source) {
+                    descend = Some(source);
+                    break;
+                }
+            }
+            if let Some(frame) = stack.last_mut() {
+                frame.1 = at;
+            }
+            match descend {
+                Some(source) => {
+                    if !visiting.insert(source) {
+                        return Err(SyncError::Ref("cyclic derivation graph".into()));
+                    }
+                    stack.push((source, 0));
+                }
+                None => {
+                    visiting.remove(id);
+                    visited.insert(id);
+                    stack.pop();
+                }
             }
         }
-        visiting.remove(id);
-        visited.insert(id);
         Ok(())
     }
     let mut visiting = HashSet::new();
@@ -2777,6 +2804,15 @@ pub fn cleanup_projection_ref(repo: &Repository, temporary_ref: &str) -> Result<
     Ok(())
 }
 
+/// Puts the node `id` into `sorted_nodes` after the chain of its ancestors that
+/// are in this batch, nearest to the root first.
+///
+/// The ancestors are collected by walking up the parent links, and put in order
+/// afterwards, rather than by a call for each: the depth is the length of a
+/// session, which a remote chooses, and a call for each of thousands of
+/// responses overflows the stack of the thread this runs on (a runtime worker
+/// has 2 MiB, a Windows main thread 1 MiB). The order of the output, and the
+/// error for a cycle, are the ones the recursive walk gave.
 fn topo_visit(
     id: &str,
     node_map: &mut std::collections::HashMap<String, SyncNode>,
@@ -2787,40 +2823,41 @@ fn topo_visit(
     if visited.contains(id) {
         return Ok(());
     }
-    if visiting.contains(id) {
-        return Err(SyncError::Ref(format!(
-            "Cycle detected in interaction dependencies: {}",
-            id
-        )));
-    }
-
-    visiting.insert(id.to_string());
-
-    // Process dependencies (parent)
-    if let Some(node) = node_map.get(id) {
-        if let Some(parent_id) = &node.interaction.parent_id {
-            // parent_id is InteractionId. We need string string.
-            let p_id = parent_id.to_string();
-            // If parent is in our batch, visit it first.
-            // If it's not in the batch, we assume it's in DB or missing (which will fail FK).
-            if node_map.contains_key(&p_id) {
-                topo_visit(&p_id, node_map, sorted_nodes, visited, visiting)?;
-            }
+    // `id`, then its parent if that is in the batch and not sorted yet, then its
+    // parent's parent, and so on: the node that is to come last is first.
+    let mut chain: Vec<String> = Vec::new();
+    let mut current = id.to_owned();
+    loop {
+        if visiting.contains(&current) {
+            return Err(SyncError::Ref(format!(
+                "Cycle detected in interaction dependencies: {}",
+                current
+            )));
+        }
+        visiting.insert(current.clone());
+        // If the parent is not in our batch, we assume it is in the DB or
+        // missing (which will fail the foreign key).
+        let parent = node_map
+            .get(&current)
+            .and_then(|node| node.interaction.parent_id.as_ref())
+            .map(|parent| parent.to_string())
+            .filter(|parent| !visited.contains(parent) && node_map.contains_key(parent));
+        chain.push(current);
+        match parent {
+            Some(parent) => current = parent,
+            None => break,
         }
     }
-
-    visiting.remove(id);
-    visited.insert(id.to_string());
-
-    // Move from map to sorted list
-    // Note: This removes from map, so if multiple nodes depend on A,
-    // the second time we check A it won't be in map.
-    // BUT we check `visited` first. If A is visited, we return Ok.
-    // So we don't need A in map anymore.
-    if let Some(node) = node_map.remove(id) {
-        sorted_nodes.push(node);
+    // The root-most ancestor first, `id` last.
+    while let Some(next) = chain.pop() {
+        visiting.remove(&next);
+        visited.insert(next.clone());
+        // Moving the node out of the map is what the later nodes that name it
+        // as their parent find: they check `visited` first.
+        if let Some(node) = node_map.remove(&next) {
+            sorted_nodes.push(node);
+        }
     }
-
     Ok(())
 }
 
@@ -2882,6 +2919,301 @@ mod derivation_graph_tests {
             &legacy,
         )
         .is_err());
+    }
+
+    // ---- walks over chains a remote chooses ------------------------------------------
+    //
+    // The depth of a walk over parents or over derivation sources is the length of a
+    // session or of a chain of events, which a remote publishes. These run on a
+    // thread with a one-mebibyte stack (a Windows main thread has that much, a
+    // runtime worker twice it): a recursive walk overflows it, which aborts the
+    // process, so a test that finishes is the proof that the walk does not recurse.
+
+    fn on_a_small_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .name("one-mebibyte-stack".into())
+            .stack_size(1024 * 1024)
+            .spawn(work)
+            .expect("a thread with a small stack")
+            .join()
+            .expect("the walk finished")
+    }
+
+    fn sync_node(id: &InteractionId, parent: Option<&InteractionId>) -> SyncNode {
+        SyncNode {
+            interaction: crate::models::Interaction {
+                id: id.clone(),
+                conversation_id: "conversation".into(),
+                parent_id: parent.cloned(),
+                timestamp: chrono::Utc::now(),
+                author: crate::models::Author::Human,
+                user_prompt: String::new(),
+                model_name: None,
+                model_cot: None,
+                model_response: None,
+                source_request_id: None,
+            },
+            context_items: Vec::new(),
+            tool_executions: Vec::new(),
+            artifact_links: Vec::new(),
+        }
+    }
+
+    /// What `topo_visit` was before it stopped recursing, for comparison.
+    fn recursive_topo_visit(
+        id: &str,
+        node_map: &mut HashMap<String, SyncNode>,
+        sorted_nodes: &mut Vec<SyncNode>,
+        visited: &mut HashSet<String>,
+        visiting: &mut HashSet<String>,
+    ) -> Result<()> {
+        if visited.contains(id) {
+            return Ok(());
+        }
+        if visiting.contains(id) {
+            return Err(SyncError::Ref(format!(
+                "Cycle detected in interaction dependencies: {}",
+                id
+            )));
+        }
+        visiting.insert(id.to_string());
+        if let Some(node) = node_map.get(id) {
+            if let Some(parent_id) = &node.interaction.parent_id {
+                let p_id = parent_id.to_string();
+                if node_map.contains_key(&p_id) {
+                    recursive_topo_visit(&p_id, node_map, sorted_nodes, visited, visiting)?;
+                }
+            }
+        }
+        visiting.remove(id);
+        visited.insert(id.to_string());
+        if let Some(node) = node_map.remove(id) {
+            sorted_nodes.push(node);
+        }
+        Ok(())
+    }
+
+    /// A walk over the parents of a batch.
+    type Walk = fn(
+        &str,
+        &mut HashMap<String, SyncNode>,
+        &mut Vec<SyncNode>,
+        &mut HashSet<String>,
+        &mut HashSet<String>,
+    ) -> Result<()>;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) % bound as u64) as usize
+        }
+    }
+
+    #[test]
+    fn a_chain_of_ten_thousand_responses_is_ordered_parents_first_on_a_one_mebibyte_stack() {
+        let (ordered, ids) = on_a_small_stack(|| {
+            let ids: Vec<InteractionId> = (0..10_000).map(|_| InteractionId::new()).collect();
+            let mut node_map: HashMap<String, SyncNode> = HashMap::new();
+            for (at, id) in ids.iter().enumerate() {
+                let parent = at.checked_sub(1).map(|before| &ids[before]);
+                node_map.insert(id.to_string(), sync_node(id, parent));
+            }
+            let mut sorted = Vec::new();
+            let (mut visited, mut visiting) = (HashSet::new(), HashSet::new());
+            // From the newest response, so that the whole chain is one walk.
+            topo_visit(
+                &ids[9_999].to_string(),
+                &mut node_map,
+                &mut sorted,
+                &mut visited,
+                &mut visiting,
+            )
+            .expect("a chain is not a cycle");
+            assert!(node_map.is_empty() && visiting.is_empty());
+            (
+                sorted
+                    .iter()
+                    .map(|node| node.interaction.id.clone())
+                    .collect::<Vec<_>>(),
+                ids,
+            )
+        });
+        assert_eq!(ordered, ids);
+    }
+
+    #[test]
+    fn the_order_and_the_error_of_the_walk_are_those_of_the_recursive_one() {
+        let mut random = Lcg(0x70b0);
+        for case in 0..3_000 {
+            let count = random.below(40) + 1;
+            let ids: Vec<InteractionId> = (0..count).map(|_| InteractionId::new()).collect();
+            let outsider = InteractionId::new();
+            // Parents anywhere in the batch (so cycles and self-parents happen),
+            // outside it, or none.
+            let parents: Vec<Option<usize>> = (0..count)
+                .map(|_| match random.below(4) {
+                    0 => None,
+                    1 => Some(count),
+                    _ => Some(random.below(count)),
+                })
+                .collect();
+            let build = || {
+                let mut node_map: HashMap<String, SyncNode> = HashMap::new();
+                for (at, id) in ids.iter().enumerate() {
+                    let parent = parents[at].map(|p| if p == count { &outsider } else { &ids[p] });
+                    node_map.insert(id.to_string(), sync_node(id, parent));
+                }
+                node_map
+            };
+            let mut starts: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+            for at in (1..starts.len()).rev() {
+                starts.swap(at, random.below(at + 1));
+            }
+            let run = |walk: Walk| {
+                let mut node_map = build();
+                let mut sorted = Vec::new();
+                let (mut visited, mut visiting) = (HashSet::new(), HashSet::new());
+                for start in &starts {
+                    if let Err(error) = walk(
+                        start,
+                        &mut node_map,
+                        &mut sorted,
+                        &mut visited,
+                        &mut visiting,
+                    ) {
+                        return Err(error.to_string());
+                    }
+                }
+                Ok(sorted
+                    .iter()
+                    .map(|node| node.interaction.id.to_string())
+                    .collect::<Vec<_>>())
+            };
+            assert_eq!(run(topo_visit), run(recursive_topo_visit), "case {case}");
+        }
+    }
+
+    #[test]
+    fn a_cycle_of_parents_is_an_error_that_names_the_node_the_walk_came_back_to() {
+        let (a, b, c) = (
+            InteractionId::new(),
+            InteractionId::new(),
+            InteractionId::new(),
+        );
+        let mut node_map: HashMap<String, SyncNode> = HashMap::new();
+        node_map.insert(a.to_string(), sync_node(&a, Some(&c)));
+        node_map.insert(b.to_string(), sync_node(&b, Some(&a)));
+        node_map.insert(c.to_string(), sync_node(&c, Some(&b)));
+        let mut sorted = Vec::new();
+        let (mut visited, mut visiting) = (HashSet::new(), HashSet::new());
+        let error = topo_visit(
+            &a.to_string(),
+            &mut node_map,
+            &mut sorted,
+            &mut visited,
+            &mut visiting,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                SyncError::Ref(message)
+                    if *message == format!("Cycle detected in interaction dependencies: {a}")
+            ),
+            "{error}"
+        );
+        assert!(sorted.is_empty());
+        // A node that is its own parent is a cycle of one.
+        let mut node_map: HashMap<String, SyncNode> = HashMap::new();
+        node_map.insert(a.to_string(), sync_node(&a, Some(&a)));
+        assert!(topo_visit(
+            &a.to_string(),
+            &mut node_map,
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            &mut HashSet::new()
+        )
+        .is_err());
+    }
+
+    fn event_chain_id(n: usize) -> String {
+        format!("{n:064x}")
+    }
+
+    #[test]
+    fn a_chain_of_twenty_thousand_derivation_events_is_checked_on_a_one_mebibyte_stack() {
+        let first = "11111111-1111-4111-8111-111111111111";
+        let verdict = on_a_small_stack(move || {
+            // The most events a pull takes, each derived from the one before it.
+            let mut events = vec![event(
+                &event_chain_id(1),
+                first,
+                vec![format!("legacy:{first}:{}", "d".repeat(40))],
+            )];
+            for n in 2..=MAX_SYNC_DERIVATION_EVENTS {
+                events.push(event(
+                    &event_chain_id(n),
+                    first,
+                    vec![event_chain_id(n - 1)],
+                ));
+            }
+            let legacy = HashSet::from([(first.to_owned(), "d".repeat(40))]);
+            let ok = validate_closed_derivation_graph(&events, &legacy).is_ok();
+            // The same chain closed into a ring is a cycle.
+            events[0].source_event_ids = vec![event_chain_id(MAX_SYNC_DERIVATION_EVENTS)];
+            let ring = validate_closed_derivation_graph(&events, &legacy).is_err();
+            (ok, ring)
+        });
+        assert_eq!(verdict, (true, true));
+    }
+
+    #[test]
+    fn derivation_graphs_are_accepted_exactly_when_they_have_no_cycle() {
+        let first = "11111111-1111-4111-8111-111111111111";
+        let legacy_source = format!("legacy:{first}:{}", "d".repeat(40));
+        let legacy = HashSet::from([(first.to_owned(), "d".repeat(40))]);
+        let mut random = Lcg(0xde71);
+        for case in 0..3_000 {
+            let count = random.below(12) + 1;
+            // Each event derives from some events and, when it has none, from the legacy one.
+            let sources: Vec<Vec<usize>> = (0..count)
+                .map(|_| (0..random.below(3)).map(|_| random.below(count)).collect())
+                .collect();
+            let events: Vec<DerivationEvent> = (0..count)
+                .map(|at| {
+                    let mut list: Vec<String> =
+                        sources[at].iter().map(|s| event_chain_id(s + 1)).collect();
+                    list.sort();
+                    list.dedup();
+                    if list.is_empty() || random.below(2) == 0 {
+                        list.push(legacy_source.clone());
+                    }
+                    event(&event_chain_id(at + 1), first, list)
+                })
+                .collect();
+            // An independent check: repeatedly remove an event nothing waits on.
+            let mut remaining: Vec<bool> = vec![true; count];
+            let mut progress = true;
+            while progress {
+                progress = false;
+                for at in 0..count {
+                    if remaining[at] && sources[at].iter().all(|s| !remaining[*s]) {
+                        remaining[at] = false;
+                        progress = true;
+                    }
+                }
+            }
+            let acyclic = remaining.iter().all(|left| !left);
+            assert_eq!(
+                validate_closed_derivation_graph(&events, &legacy).is_ok(),
+                acyclic,
+                "case {case}: {sources:?}"
+            );
+        }
     }
 
     #[test]
