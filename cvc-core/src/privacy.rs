@@ -13,7 +13,8 @@ use std::sync::OnceLock;
 use thiserror::Error;
 use uuid::Uuid;
 
-const MAX_TEXT: usize = 1024 * 1024;
+/// The longest single value the scrubber takes.
+pub(crate) const MAX_TEXT: usize = 1024 * 1024;
 const MAX_POLICY: usize = 64 * 1024;
 const MAX_DIRECTIVE: usize = 4096;
 const MAX_REGEXES: usize = 64;

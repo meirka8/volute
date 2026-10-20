@@ -228,7 +228,11 @@ fn ingest_target(
     let title = target
         .title_override
         .clone()
-        .or_else(|| plan.title.clone())
+        .or_else(|| {
+            plan.title
+                .as_deref()
+                .and_then(|title| fields::captured_title(title, policy))
+        })
         .or_else(|| {
             existing
                 .as_ref()
@@ -284,20 +288,22 @@ fn ingest_target(
             _ => None,
         };
         // The model's text, its reasoning and the tool arguments are scrubbed
-        // here, with the capture's policy, so that one of them the scrubber
-        // cannot process is recorded as a note instead of failing the batch
-        // and holding the cursor back: see `fields`.
+        // in full here, with the capture's policy, and only then bounded; one
+        // the scrubber cannot process is recorded as a note instead of failing
+        // the batch and holding the cursor back: see `fields`.
         let model_cot = planned
             .model_cot
-            .map(|text| fields::scrubbed_text(text, policy));
+            .map(|text| fields::captured_text(text, policy));
         let model_response = planned
             .model_response
-            .map(|text| fields::scrubbed_text(text, policy));
+            .map(|text| fields::captured_text(text, policy));
+        let mut arguments_budget = fields::MAX_ARGUMENTS_TOTAL_BYTES;
         let tool_executions: Vec<ToolExecution> = planned
             .tool_executions
             .into_iter()
             .map(|mut tool| {
-                tool.arguments = fields::scrubbed_arguments(tool.arguments, policy);
+                tool.arguments =
+                    fields::captured_arguments(tool.arguments, &mut arguments_budget, policy);
                 tool
             })
             .collect();

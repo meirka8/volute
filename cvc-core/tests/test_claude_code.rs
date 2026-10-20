@@ -286,6 +286,36 @@ fn a_subagent_transcript_records_its_user_text_as_tasks_and_nothing_else_changes
 }
 
 #[test]
+fn the_planner_hands_over_the_model_text_arguments_and_title_raw() {
+    // Scrubbing and bounding belong to the ingest step, which has the policy:
+    // the planner cuts nothing, so nothing is cut before it is scrubbed.
+    let fixture = Fixture::new();
+    let long = "r".repeat(300 * 1024);
+    let content = "w".repeat(40_000);
+    let title = "t".repeat(500);
+    let lines = [
+        format!(
+            r#"{{"parentUuid":null,"isSidechain":false,"type":"user","message":{{"role":"user","content":"Go"}},"uuid":"u1","timestamp":"2026-09-10T10:00:00.000Z","sessionId":"{BASIC_SESSION}","version":"2.1.260","cwd":"x"}}"#
+        ),
+        format!(
+            r#"{{"parentUuid":"u1","isSidechain":false,"requestId":"req_A","type":"assistant","message":{{"model":"m","id":"a","type":"message","role":"assistant","content":[{{"type":"thinking","thinking":"{long}","signature":"s"}},{{"type":"text","text":"{long}"}},{{"type":"tool_use","id":"toolu_1","name":"Write","input":{{"file_path":"/opt/x","content":"{content}"}}}}],"stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":1,"output_tokens":1}}}},"uuid":"s1","timestamp":"2026-09-10T10:00:01.000Z","sessionId":"{BASIC_SESSION}","version":"2.1.260","cwd":"x"}}"#
+        ),
+        format!(r#"{{"type":"ai-title","aiTitle":"{title}","sessionId":"{BASIC_SESSION}"}}"#),
+    ]
+    .join("\n")
+        + "\n";
+    let window = parse(&lines, BASIC_SESSION).unwrap();
+    let plan = transcript::plan(&window.lines, 0, &fixture.plan_input(true));
+    let planned = &plan.interactions[0];
+    assert_eq!(planned.model_response.as_deref(), Some(long.as_str()));
+    assert_eq!(planned.model_cot.as_deref(), Some(long.as_str()));
+    let arguments: serde_json::Value =
+        serde_json::from_str(&planned.tool_executions[0].arguments).unwrap();
+    assert_eq!(arguments["content"], content.as_str());
+    assert_eq!(plan.title.as_deref(), Some(title.as_str()));
+}
+
+#[test]
 fn incremental_mode_keeps_the_last_response_pending_until_closed() {
     let fixture = Fixture::new();
     let content = fixture.render(BASIC);

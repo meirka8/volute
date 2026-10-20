@@ -3,7 +3,7 @@
 //! cut, a part that cannot be scrubbed is withheld without stopping the
 //! session, and a reader can tell a person's words from tool output; the
 //! model's text, its reasoning and the tool arguments are withheld the same
-//! way; and a title is scrubbed before it is cut.
+//! way; and these, with a title, are scrubbed before they are cut.
 use cvc_core::claude_code::transcript::{derived_interaction_id, HARNESS};
 use cvc_core::claude_code::{ingest, IngestMode};
 use cvc_core::db::CvcStore;
@@ -146,6 +146,12 @@ impl Transcript {
         }
         self.lines.push(line.to_string());
         self.last = Some(uuid);
+    }
+
+    /// A bookkeeping entry that is not part of the chain (a title, say).
+    fn bookkeeping(&mut self, line: Value) -> &mut Self {
+        self.lines.push(line.to_string());
+        self
     }
 
     /// Text a person typed (or, in a subagent, the task it was given).
@@ -802,5 +808,118 @@ fn a_node_with_withheld_fields_is_published_and_imported_as_it_is() {
     assert_eq!(
         imported.get_tool_executions(&id).unwrap()[0].arguments,
         store.get_tool_executions(&id).unwrap()[0].arguments
+    );
+}
+
+/// A text whose key id starts `before` bytes in (after a space, which the
+/// detector needs).
+fn text_with_key_at(before: usize) -> String {
+    format!(
+        "{} AKIAIOSFODNN7EXAMPLE and some words after it",
+        "x".repeat(before - 1)
+    )
+}
+
+#[test]
+fn a_key_cut_by_a_size_bound_is_redacted_whole_in_every_captured_field() {
+    let fixture = Fixture::new();
+    // Each key starts ten bytes before the bound of its field: 256 KiB for the
+    // model's text and reasoning, 16 KiB for a string in tool arguments, 120
+    // bytes for a title Claude Code recorded.
+    let mut t = fixture.transcript();
+    t.say("Go")
+        .respond(
+            "req_A",
+            vec![
+                json!({"type": "thinking", "thinking": text_with_key_at(256 * 1024 - 10), "signature": "s"}),
+                json!({"type": "text", "text": text_with_key_at(256 * 1024 - 10)}),
+                json!({"type": "tool_use", "id": "toolu_1", "name": "Write",
+                       "input": {"file_path": "/opt/x.txt", "content": text_with_key_at(16 * 1024 - 10)}}),
+            ],
+            "tool_use",
+        )
+        .results(&[("toolu_1", "ok", false)])
+        .answer("req_B", "done")
+        .bookkeeping(json!({"type": "ai-title", "aiTitle": text_with_key_at(110), "sessionId": SESSION}));
+    let path = fixture.write(&t);
+    fixture.ingest(&path, IngestMode::Final);
+
+    let store = fixture.store();
+    let row = stored(&store, SESSION, "req_A");
+    let cot = row.model_cot.unwrap();
+    let response = row.model_response.unwrap();
+    let arguments = store.get_tool_executions(&row.id).unwrap()[0]
+        .arguments
+        .clone();
+    let title = store.get_conversation(SESSION).unwrap().unwrap().title;
+    for (field, text) in [
+        ("model_cot", &cot),
+        ("model_response", &response),
+        ("arguments", &arguments),
+        ("title", &title),
+    ] {
+        assert!(!text.contains("AKIAIOSFO"), "{field} kept a key prefix");
+        assert!(text.contains("…[cvc: truncated "), "{field} was not cut");
+    }
+    for bytes in database_bytes(&fixture) {
+        assert!(
+            !contains(&bytes, b"AKIAIOSFO"),
+            "a key prefix reached the database"
+        );
+    }
+}
+
+#[test]
+fn the_size_bounds_of_the_captured_fields_are_unchanged_for_ordinary_text() {
+    let fixture = Fixture::new();
+    let long_response = "r".repeat(300 * 1024);
+    let write_input = json!({"file_path": "/opt/x.txt", "content": "w".repeat(40_000)});
+    let bulk_input =
+        json!({"items": (0..10).map(|n| format!("{n}{}", "b".repeat(10_000))).collect::<Vec<_>>()});
+    let mut t = fixture.transcript();
+    t.say("Go")
+        .respond(
+            "req_A",
+            vec![
+                json!({"type": "text", "text": long_response}),
+                json!({"type": "tool_use", "id": "toolu_1", "name": "Write", "input": write_input}),
+                json!({"type": "tool_use", "id": "toolu_2", "name": "mcp__fixture__bulk", "input": bulk_input}),
+            ],
+            "tool_use",
+        )
+        .results(&[("toolu_1", "ok", false), ("toolu_2", "ok", false)])
+        .answer("req_B", "done");
+    let path = fixture.write(&t);
+    fixture.ingest(&path, IngestMode::Final);
+
+    let store = fixture.store();
+    let row = stored(&store, SESSION, "req_A");
+    let response = row.model_response.unwrap();
+    assert_eq!(
+        response,
+        format!(
+            "{}\n…[cvc: truncated {} bytes]",
+            "r".repeat(256 * 1024),
+            300 * 1024 - 256 * 1024
+        )
+    );
+    let tools = store.get_tool_executions(&row.id).unwrap();
+    let written: Value = serde_json::from_str(&tools[0].arguments).unwrap();
+    assert_eq!(written["file_path"], "/opt/x.txt");
+    assert_eq!(
+        written["content"],
+        format!(
+            "{}\n…[cvc: truncated {} bytes]",
+            "w".repeat(16 * 1024),
+            40_000 - 16 * 1024
+        )
+    );
+    // Over one call's limit: the truncated form, with the size of the original.
+    assert_eq!(
+        tools[1].arguments,
+        format!(
+            r#"{{"bytes":{},"cvc_truncated":true}}"#,
+            bulk_input.to_string().len()
+        )
     );
 }

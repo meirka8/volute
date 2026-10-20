@@ -78,12 +78,6 @@ pub const SUPPORTED_MAJOR_VERSION: u64 = 2;
 /// A single transcript line larger than this is treated as corruption rather
 /// than buffered; Claude Code writes oversized tool output out of line.
 const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
-const MAX_TEXT_BYTES: usize = 256 * 1024;
-/// Tool arguments stay valid JSON: long string values are truncated in place.
-const MAX_ARGUMENT_STRING_BYTES: usize = 16 * 1024;
-const MAX_ARGUMENTS_BYTES: usize = 64 * 1024;
-const MAX_TOOL_ARGUMENTS_TOTAL_BYTES: usize = 2 * 1024 * 1024;
-const MAX_TITLE_BYTES: usize = 120;
 /// Claude Code records this title before a session has a real one.
 const PLACEHOLDER_TITLE: &str = "New session";
 /// A tool the model provider runs is recorded as `server:<name>`.
@@ -761,6 +755,9 @@ pub struct PlannedInteraction {
     /// [`PlannedInteraction::user_prompt`].
     pub stimulus: Vec<StimulusPart>,
     pub model_name: Option<String>,
+    /// The model's reasoning and text, and the arguments of its tool calls
+    /// (compact JSON), all raw: neither scrubbed nor bounded. The ingest step
+    /// scrubs each in full and only then bounds it (see `fields`).
     pub model_cot: Option<String>,
     pub model_response: Option<String>,
     pub tool_executions: Vec<ToolExecution>,
@@ -795,6 +792,7 @@ pub struct Plan {
     /// response, so its tool names and results stay in view for the next
     /// response's stimulus. Never moves backwards within one session.
     pub cursor_offset: u64,
+    /// The title Claude Code recorded, raw.
     pub title: Option<String>,
     /// First human prompt in the window, for conversation titling.
     pub first_human_prompt: Option<String>,
@@ -827,9 +825,7 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
     // the user set wins over one Claude Code generated.
     let latest_title = |wanted: TitleSource| {
         lines.iter().rev().find_map(|line| match line {
-            ParsedLine::Title { text, source } if *source == wanted => {
-                Some(bounded_text(text, MAX_TITLE_BYTES))
-            }
+            ParsedLine::Title { text, source } if *source == wanted => Some(text.clone()),
             _ => None,
         })
     };
@@ -1066,10 +1062,9 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
                 }
             }
         }
-        let model_response = join_bounded(&texts, MAX_TEXT_BYTES);
-        let model_cot = join_bounded(&thoughts, MAX_TEXT_BYTES);
+        let model_response = join_texts(&texts);
+        let model_cot = join_texts(&thoughts);
 
-        let mut budget = MAX_TOOL_ARGUMENTS_TOTAL_BYTES;
         let mut tool_executions = Vec::with_capacity(tool_uses.len());
         let mut context_items: Vec<ContextItem> = Vec::new();
         let mut commit_candidates: Vec<String> = Vec::new();
@@ -1111,7 +1106,7 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
                     "native".to_owned()
                 },
                 tool_name: call.name.to_owned(),
-                arguments: bounded_arguments(call.input, &mut budget),
+                arguments: call.input.to_string(),
                 status,
             });
             if let Some(item) = context_item_for(call.name, call.input, input, &id) {
@@ -1227,7 +1222,7 @@ fn is_hex_token(token: &str) -> bool {
     (7..=40).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn join_bounded(parts: &[&str], max: usize) -> Option<String> {
+fn join_texts(parts: &[&str]) -> Option<String> {
     let joined = parts
         .iter()
         .filter(|part| !part.trim().is_empty())
@@ -1237,38 +1232,7 @@ fn join_bounded(parts: &[&str], max: usize) -> Option<String> {
     if joined.is_empty() {
         None
     } else {
-        Some(bounded_text(&joined, max))
-    }
-}
-
-/// Serializes tool input as JSON that stays valid after size bounding.
-fn bounded_arguments(input: &Value, budget: &mut usize) -> String {
-    let mut value = input.clone();
-    bound_strings(&mut value, MAX_ARGUMENT_STRING_BYTES);
-    let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
-    if serialized.len() > MAX_ARGUMENTS_BYTES || serialized.len() > *budget {
-        return serde_json::json!({
-            "cvc_truncated": true,
-            "bytes": input.to_string().len(),
-        })
-        .to_string();
-    }
-    *budget -= serialized.len();
-    serialized
-}
-
-fn bound_strings(value: &mut Value, max: usize) {
-    match value {
-        Value::String(text) => {
-            if text.len() > max {
-                *text = bounded_text(text, max);
-            }
-        }
-        Value::Array(items) => items.iter_mut().for_each(|item| bound_strings(item, max)),
-        Value::Object(fields) => fields
-            .values_mut()
-            .for_each(|item| bound_strings(item, max)),
-        _ => {}
+        Some(joined)
     }
 }
 
@@ -1353,42 +1317,9 @@ fn worktree_relative(
     Some(rendered)
 }
 
-fn truncate_to_boundary(text: &str, max: usize) -> &str {
-    if text.len() <= max {
-        return text;
-    }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
-fn bounded_text(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_owned();
-    }
-    let kept = truncate_to_boundary(text, max);
-    format!(
-        "{kept}\n…[cvc: truncated {} bytes]",
-        text.len() - kept.len()
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bounded_helpers_respect_char_boundaries() {
-        let text = "héllo wörld";
-        assert_eq!(truncate_to_boundary(text, 2), "h");
-        assert!(bounded_text(text, 3).starts_with("hé"));
-        let long = "a".repeat(100) + "é" + &"b".repeat(100);
-        let rendered = bounded_text(&long, 10);
-        assert!(rendered.starts_with(&"a".repeat(10)));
-        assert!(rendered.contains("truncated 192 bytes"));
-    }
 
     #[test]
     fn derived_ids_are_stable_and_session_scoped() {
