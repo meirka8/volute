@@ -18,6 +18,12 @@
 export const RENDER_LIMITS = {
   /** Blocks of one step's stimulus (prompts, notes, groups of tool results). */
   stimulusBlocks: 100,
+  /**
+   * Pieces (text, and the notes a capture leaves where it cut) of one part of a stimulus whose markers verified.
+   * A capture writes at most three for a part, its head, a note and its tail, so a part with more is one the
+   * grammar allows and no capture wrote: it draws a page of them at a time like any other list.
+   */
+  contentPieces: 3,
   /** Tool results drawn in one group of them. */
   toolResultsPerGroup: 20,
   /** Items of one TodoWrite checklist. */

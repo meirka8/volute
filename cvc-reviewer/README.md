@@ -90,23 +90,48 @@ Nodes shaped like Claude Code transcript steps are laid out as stimulus (what it
 to) → reasoning (when the model exposed it) → response → tool calls. The stimulus is usually
 a prompt or the previous step's tool results, so a tool's result appears on the **next**
 step. Tool results are folded to a one-line summary only on steps that tool output started;
-on steps a person started they stay open, as the two can be hard to tell apart. Edit and Write
-cards show what the call asked for, not necessarily the change that reached the PR.
+on steps a person took part in they stay open (in an older capture the two can be hard to tell
+apart). Edit and Write cards show what the call asked for, not necessarily the change that
+reached the PR.
 
-Tool results are marked in the text itself, so a fetched web page can imitate the markers.
-Each result must match a call of the previous step by tool name and by whether it failed, or
-the stimulus is shown undivided, with a note; if that step is not in the timeline, it is
-divided by its markers, unchecked. A result claiming a server-side call never matches: the
-model provider runs those calls and delivers their results inside the assistant's own
-message, so the capture never writes a tool result for them. A `[meta]` or
+**Newer captures mark every part of the stimulus verifiably.** A person's words, a subagent's
+task, context the harness injected, a compaction summary and each tool result all start with a
+boundary token that tool output cannot have contained when it was written, and the Reviewer
+trusts a marker only when its token checks out against the step's own id. So a person's words
+are drawn as prose and are never something a tool printed; a subagent's task is labelled
+**Task** and described as an instruction from the agent that delegated the work, since nobody
+types into a subagent; tool results, context and compaction summaries are drawn as before; and
+a note says where the capture cut a part (**… N bytes truncated**), could not scrub it
+(**Withheld: this part could not be scrubbed**) or left parts out (**N more parts not
+recorded**). The token itself is never shown. Tool output that imitates markers stays output.
+The check against the previous step's calls (below) does not undo this division: it puts a note
+on a result that none of that step's calls accounts for, and on that result only. The token is
+a consistency check, not a signature. It is computed from public values, so it exposes tool
+output that imitates the structure, and text changed after it was captured, and it does not say
+who wrote the text. It does not cover the name or the error flag in a marker.
+
+A stimulus that carries such tokens but does not verify (changed after it was captured,
+damaged, or written for another step) is shown undivided, under **Unverified stimulus**: one
+block of monospace text with the note **Shown undivided: this step's markers could not be
+verified.**, folded the way tool results are. It is never drawn as a prompt, and never split by
+the older rules below.
+
+**Older captures** (before the boundary token) mark tool results in the text itself, so a
+fetched web page can imitate the markers. They are read by the rules in the rest of this
+section, which are unchanged. Each result must match a call of the previous step by tool name
+and by whether it failed, or the stimulus is shown undivided, with a note; if that step is not
+in the timeline, it is divided by its markers, unchecked. A result claiming a server-side call
+never matches: the model provider runs those calls and delivers their results inside the
+assistant's own message, so the capture never writes a tool result for them. A `[meta]` or
 `[compaction summary]` part after tool results is drawn inside them as plain output, marker
 and all, not as **Context** or **Compaction summary**. No check catches every imitation,
 because the markers are plain text.
 
-In a step a person started, only the last `[Request interrupted by user…]` line starts a
-prompt, and only if no tool result follows it; otherwise the text stays together, and the
-step says when it cannot tell where the prompt starts. Elsewhere that line and plain text
-(**Unmarked text**) are monospace, never a prompt.
+In an older capture of a step a person started, only the last `[Request interrupted by user…]`
+line starts a prompt, and only if no tool result follows it; otherwise the text stays
+together, and the step says when it cannot tell where the prompt starts. Elsewhere that line
+and plain text (**Unmarked text**) are monospace, never a prompt. (In a newer capture the line
+is part of the person's text.)
 
 The Reviewer infers this layout from the shape of the node, because the synced record does
 not say which tool captured it. It is a display choice, not a provenance or trust signal.
@@ -126,4 +151,19 @@ content the capture does not record does (`[image]`).
 Where the capture hit a limit, the step says so:
 **Arguments not recorded: N bytes exceeded the capture limit** replaces tool arguments too
 large to keep, and `…[cvc: truncated N bytes]` marks where text was cut. Privacy redactions
-appear as `[CVC_REDACTED:v1:<kind>:<id>]`.
+appear as `[CVC_REDACTED:v1:<kind>:<id>]`, and can replace part of a longer text, such as a
+key block inside numbered output, so line numbers can skip.
+
+A field the capture could not scrub is not recorded, and the step says so in words:
+**Arguments withheld: N bytes could not be scrubbed.** on the call, and **Withheld: N bytes
+could not be scrubbed.** for a response or its reasoning. A step records at most 255 tool
+calls and 256 context items. When it left some out, the capture ends the calls with a record of
+its own, and the Tool calls end with a note such as **45 more tool calls and 44 context items
+were not recorded**. That record is not a call the model made, so it is no card and is not
+counted as a call or a failure; only the exact record counts (the `cvc` protocol, the name
+`cvc-omitted`, its fixed arguments, as the last entry), so anything that merely resembles it is
+drawn as the ordinary call it is. The results of the calls it stands for are not held against
+the previous step. A response the capture could not store at all is recorded as a stand-in: its
+stimulus, no model name, no reasoning, no tool calls, and a note in place of the response,
+which the step words as **This response was withheld: it could not be scrubbed within the
+capture limits.**

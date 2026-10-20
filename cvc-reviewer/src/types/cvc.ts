@@ -29,8 +29,9 @@ export interface ContextItem {
 
 export interface ToolExecution {
   /**
-   * What ran the tool: `mcp` (an MCP server), `native` (the harness) or `server` (the model
-   * provider, with the status its result block reported). Free text on the wire: a value not
+   * What ran the tool: `mcp` (an MCP server), `native` (the harness), `server` (the model
+   * provider, with the status its result block reported) or `cvc` (not a tool: the capture's own
+   * record that it left calls out, see `omittedCounts`). Free text on the wire: a value not
    * listed here is not an error.
    */
   tool_protocol: string;

@@ -14,6 +14,9 @@
  * - when one call's input is too large, `arguments` is exactly
  *   `{"bytes":<N>,"cvc_truncated":true}` (the producer writes keys in
  *   alphabetical order) and nothing else is recorded;
+ * - when one call's input could not be scrubbed, `arguments` is exactly
+ *   `{"bytes":<N>,"cvc_withheld":true}`, with the same conventions: the call is
+ *   kept, its input is not;
  * - privacy redactions can appear inline as `[CVC_REDACTED:v1:<kind>:<uuid>]`.
  *   They are ordinary text here and are never expanded.
  *
@@ -34,6 +37,8 @@ export type ParsedArguments =
   | { kind: 'object'; value: Record<string, unknown> }
   /** The capture limit was exceeded; `bytes` is the size of the dropped input. */
   | { kind: 'truncated'; bytes: number }
+  /** The input could not be scrubbed and was not recorded; `bytes` is its size. */
+  | { kind: 'withheld'; bytes: number }
   /** Not a JSON object: invalid JSON, an array, a primitive, or empty. Shown verbatim. */
   | { kind: 'raw'; text: string };
 
@@ -42,16 +47,17 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * The exact `{"bytes":N,"cvc_truncated":true}` sentinel, and nothing that merely
- * resembles it. Found by parsing, never by comparing text, so key order and
- * spacing do not matter.
+ * The exact `{"bytes":N,"cvc_truncated":true}` and `{"bytes":N,"cvc_withheld":true}`
+ * sentinels, and nothing that merely resembles them. Found by parsing, never by
+ * comparing text, so key order and spacing do not matter.
  */
-function truncationSentinel(value: Record<string, unknown>): number | null {
+function sentinel(value: Record<string, unknown>): { kind: 'truncated' | 'withheld'; bytes: number } | null {
   const keys = Object.keys(value);
-  if (keys.length !== 2 || !keys.includes('cvc_truncated') || !keys.includes('bytes')) return null;
+  if (keys.length !== 2 || !keys.includes('bytes')) return null;
+  const kind = keys.includes('cvc_truncated') ? 'truncated' : keys.includes('cvc_withheld') ? 'withheld' : null;
+  if (kind === null || value[kind === 'truncated' ? 'cvc_truncated' : 'cvc_withheld'] !== true) return null;
   const bytes = value.bytes;
-  if (value.cvc_truncated !== true) return null;
-  return typeof bytes === 'number' && Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : null;
+  return typeof bytes === 'number' && Number.isSafeInteger(bytes) && bytes >= 0 ? { kind, bytes } : null;
 }
 
 export function parseToolArguments(raw: string | null | undefined): ParsedArguments {
@@ -67,9 +73,81 @@ export function parseToolArguments(raw: string | null | undefined): ParsedArgume
   }
   if (!isPlainObject(value)) return { kind: 'raw', text: raw };
 
-  const bytes = truncationSentinel(value);
-  if (bytes !== null) return { kind: 'truncated', bytes };
+  const marker = sentinel(value);
+  if (marker !== null) return marker;
   return { kind: 'object', value };
+}
+
+// ---------------------------------------------------------------------------
+// What the capture left out
+// ---------------------------------------------------------------------------
+
+/** The `tool_protocol` and `tool_name` of the record a capture ends a response's tool calls with when it left some out. */
+export const OMITTED_PROTOCOL = 'cvc';
+export const OMITTED_TOOL_NAME = 'cvc-omitted';
+
+/**
+ * The arguments of that record, exactly as the capture writes them: compact, keys in alphabetical
+ * order, no others, and counts without leading zeros. (The producer's counts are far below the 15
+ * digits taken here, which is what keeps them whole numbers a double holds exactly.)
+ */
+const OMITTED_ARGUMENTS = /^\{"context_items":(0|[1-9][0-9]{0,14}),"cvc_omitted":true,"tool_calls":(0|[1-9][0-9]{0,14})\}$/;
+
+/** What a response left out when it was captured. */
+export interface OmittedCounts {
+  /** Tool calls past the 255 a response records. */
+  toolCalls: number;
+  /** Context items (paths a call read or edited) past the 256 a response records, or that could not be scrubbed. */
+  contextItems: number;
+}
+
+/**
+ * The counts, when `exec` is the capture's record of what a response left out, and `null` for any other
+ * tool execution.
+ *
+ * A capture holds at most 255 tool calls of a response and 256 of its context items; when it left any
+ * out, the response ends with one more tool record that says how many. It is NOT a call the model made:
+ * it is not drawn as a tool card and is not counted as a call or a failure. All of it must match, so that
+ * a record that merely resembles it (another protocol or name, a key more or less, a count that is
+ * not a whole number, no count above zero) stays what it is, an ordinary call drawn as such, and nothing
+ * a publisher records can pass for the capture's note.
+ */
+export function omittedCounts(
+  exec: Pick<ToolExecution, 'tool_protocol' | 'tool_name' | 'arguments'> | null | undefined,
+): OmittedCounts | null {
+  if (exec?.tool_protocol !== OMITTED_PROTOCOL || exec.tool_name !== OMITTED_TOOL_NAME) return null;
+  if (typeof exec.arguments !== 'string') return null;
+  const match = OMITTED_ARGUMENTS.exec(exec.arguments);
+  if (match === null) return null;
+  const contextItems = Number(match[1]);
+  const toolCalls = Number(match[2]);
+  return toolCalls > 0 || contextItems > 0 ? { toolCalls, contextItems } : null;
+}
+
+/**
+ * A step's tool executions as the calls the model made, and what the capture says it left out. The
+ * record is always the LAST entry (see `omittedCounts`); one anywhere else is not the capture's note,
+ * and stays an ordinary call.
+ */
+export function splitOmitted<T extends Pick<ToolExecution, 'tool_protocol' | 'tool_name' | 'arguments'>>(
+  executions: readonly T[],
+): { calls: readonly T[]; omitted: OmittedCounts | null } {
+  const omitted = executions.length > 0 ? omittedCounts(executions[executions.length - 1]) : null;
+  return omitted === null ? { calls: executions, omitted: null } : { calls: executions.slice(0, -1), omitted };
+}
+
+const count = (value: number) => value.toLocaleString('en-US');
+
+/**
+ * What to tell a reader about a response's `omitted` counts: "45 more tool calls and 44 context items
+ * were not recorded". A count of nothing is left out of the sentence, and a single thing was, not were.
+ */
+export function describeOmitted({ toolCalls, contextItems }: OmittedCounts): string {
+  const things: string[] = [];
+  if (toolCalls > 0) things.push(`${count(toolCalls)} more tool ${toolCalls === 1 ? 'call' : 'calls'}`);
+  if (contextItems > 0) things.push(`${count(contextItems)} context ${contextItems === 1 ? 'item' : 'items'}`);
+  const one = things.length === 1 && (toolCalls === 1 || contextItems === 1);
+  return `${things.join(' and ')} ${one ? 'was' : 'were'} not recorded`;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +386,8 @@ export type ToolCallBody =
   | { kind: 'fields'; fields: ToolField[] }
   /** The capture limit was exceeded. */
   | { kind: 'truncated'; bytes: number }
+  /** The input could not be scrubbed, so it was not recorded. */
+  | { kind: 'withheld'; bytes: number }
   /** No input was recorded: empty `arguments`, or the JSON text `null` (a tool call without an input). */
   | { kind: 'none' }
   /**
@@ -631,6 +711,7 @@ export function describeToolCall(
 
   const parsed = parseToolArguments(recorded);
   if (parsed.kind === 'truncated') return { kind: 'truncated', bytes: parsed.bytes, tool, title, extras: [] };
+  if (parsed.kind === 'withheld') return { kind: 'withheld', bytes: parsed.bytes, tool, title, extras: [] };
   if (parsed.kind === 'raw') {
     // A tool_use without an input is recorded as the JSON text `null`.
     const text = parsed.text.trim();

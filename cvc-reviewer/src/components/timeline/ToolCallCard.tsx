@@ -273,6 +273,9 @@ function ToolCallBodyView({ view }: { view: ToolCallView }) {
     case 'truncated':
       return <Muted>{`Arguments not recorded: ${view.bytes} bytes exceeded the capture limit.`}</Muted>;
 
+    case 'withheld':
+      return <Muted>{`Arguments withheld: ${view.bytes} bytes could not be scrubbed.`}</Muted>;
+
     case 'none':
       return <Muted>No arguments recorded.</Muted>;
 
