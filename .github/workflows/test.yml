@@ -215,6 +215,26 @@ jobs:
           done
           exit "$failed"
 
+  claude-code-plugin:
+    name: Claude Code plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      # Not the VS Code extension (the `plugin` job above): this checks the
+      # Claude Code plugin in plugins/claude-code and the Claude Code plugin
+      # marketplace in .claude-plugin/marketplace.json. Claude Code itself is not
+      # installed here; the script enforces the documented manifest and hook
+      # contract and keeps the plugin version equal to cvc-cli's.
+      - name: Self-test the Claude Code plugin checker
+        run: node .github/scripts/check-claude-plugin.mjs --self-test
+      - name: Check the Claude Code plugin and marketplace
+        run: node .github/scripts/check-claude-plugin.mjs
+
   installer-windows:
     name: PowerShell installer (Windows)
     runs-on: windows-latest
