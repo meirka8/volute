@@ -63,9 +63,10 @@ impl RepositoryLayout {
                 // Never mistake recognizable repository metadata for an ordinary
                 // outside-repository invocation, since callers may otherwise
                 // proceed without validating its storage boundary.
-                if has_git_marker(path.as_ref()) {
+                if let Some(marker) = git_marker(path.as_ref()) {
                     return Err(RepositoryLayoutError::Metadata(format!(
-                        "Git metadata is present but repository discovery failed: {error}"
+                        "Git cannot open the repository at {}: {error}",
+                        marker.display()
                     )));
                 }
                 return Err(RepositoryLayoutError::NotRepository);
@@ -167,9 +168,11 @@ pub fn worktree_origin_fingerprint(worktree_root: &Path) -> Result<String, Repos
     Ok(hex::encode(hash.finalize()))
 }
 
-fn has_git_marker(path: &Path) -> bool {
+/// The nearest `.git` entry at or above `path`, if there is one.
+fn git_marker(path: &Path) -> Option<PathBuf> {
     path.ancestors()
-        .any(|directory| fs::symlink_metadata(directory.join(".git")).is_ok())
+        .map(|directory| directory.join(".git"))
+        .find(|marker| fs::symlink_metadata(marker).is_ok())
 }
 
 /// Fallible compatibility helper for callers that have a `git2::Repository`.

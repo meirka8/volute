@@ -6,6 +6,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
+/// Claude Code exports these to its Bash tool and to its hooks, so a test run
+/// from a session inherits them. Each changes what `cvc` and its Git hooks
+/// print or do (`CLAUDECODE=1` makes the post-commit hook name the commit;
+/// `CLAUDE_PROJECT_DIR` confines hook mode to the repository the session was
+/// started in; `CLAUDE_PLUGIN_ROOT` is not read by `cvc`, but is part of a
+/// plugin hook's environment), so no command a test spawns may see them unless
+/// the test sets them itself.
+const CLAUDE_CODE_ENV: [&str; 3] = ["CLAUDECODE", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR"];
+
 struct Fixture {
     temp: TempDir,
     home: PathBuf,
@@ -75,6 +84,9 @@ impl Fixture {
             if name.to_string_lossy().starts_with("GIT_") {
                 command.env_remove(name);
             }
+        }
+        for name in CLAUDE_CODE_ENV {
+            command.env_remove(name);
         }
         command
             .current_dir(cwd)

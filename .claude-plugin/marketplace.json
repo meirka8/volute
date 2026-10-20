@@ -1,0 +1,15 @@
+{
+  "name": "volute",
+  "description": "Claude Code plugins from CVC (Volute), an independent open-source project.",
+  "owner": {
+    "name": "Volute",
+    "url": "https://github.com/meirka8/volute"
+  },
+  "plugins": [
+    {
+      "name": "cvc",
+      "source": "./plugins/claude-code",
+      "description": "Records Claude Code sessions, as Claude Code's transcript exposes them, into CVC's local, private-by-default history linked to your Git commits, in repositories where you ran cvc init and acknowledged capture. Requires the cvc CLI 0.7.1+ on PATH."
+    }
+  ]
+}

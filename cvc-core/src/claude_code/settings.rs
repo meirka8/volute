@@ -32,8 +32,10 @@ pub const HOOK_EVENTS: [&str; 3] = ["PostToolUse", "Stop", "SessionEnd"];
 /// Explicit per-hook timeout: `SessionEnd` hooks otherwise share a budget of
 /// under two seconds, which a contended database could exceed.
 pub const HOOK_TIMEOUT_SECS: u64 = 30;
-/// How installed entries are recognized regardless of the binary path.
-const HOOK_SIGNATURE: &str = "ingest claude-code --hook";
+/// How installed entries are recognized regardless of the binary path. Public
+/// so that what else runs the same command (the Claude Code plugin's
+/// `hooks/hooks.json`) can be checked against it.
+pub const HOOK_SIGNATURE: &str = "ingest claude-code --hook";
 const EXCLUDE_LINE: &str = "/.claude/settings.local.json";
 /// A settings file is a few kilobytes; this only bounds what is read.
 const MAX_SETTINGS_BYTES: u64 = 4 * 1024 * 1024;

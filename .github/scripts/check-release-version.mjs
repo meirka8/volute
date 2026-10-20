@@ -18,6 +18,8 @@ const cargoManifests = [
   'cvc-mcp/Cargo.toml',
 ];
 
+const claudePluginManifest = 'plugins/claude-code/.claude-plugin/plugin.json';
+
 function cargoVersion(file) {
   const manifest = readFileSync(file, 'utf8');
   const matches = [...manifest.matchAll(/^version\s*=\s*"([^"]+)"\s*$/gm)];
@@ -33,6 +35,9 @@ const versions = [
   ...cargoManifests.map(file => [file, cargoVersion(file)]),
   ['cvc-plugin/package.json', packageVersion('cvc-plugin/package.json')],
   ['npm/cvc-mcp/package.json', packageVersion('npm/cvc-mcp/package.json')],
+  // The Claude Code plugin's manifest version is what Claude Code compares to
+  // decide whether installed copies need updating, so it must move with the CLI.
+  [claudePluginManifest, packageVersion(claudePluginManifest)],
 ];
 
 const mismatches = versions.filter(([, version]) => version !== expected);
@@ -40,4 +45,4 @@ if (mismatches.length > 0) {
   throw new Error(`Release tag ${tag} does not match: ${mismatches.map(([file, version]) => `${file}=${version}`).join(', ')}.`);
 }
 
-console.log(`Release version gate passed: ${tag} matches all ${versions.length} package manifests.`);
+console.log(`Release version gate passed: ${tag} matches all ${versions.length} release manifests.`);

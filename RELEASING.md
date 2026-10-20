@@ -129,7 +129,7 @@ git pull --ff-only origin main
 git checkout -b release/vX.Y.Z
 ```
 
-Set `X.Y.Z` identically in these six release-version locations, then regenerate the
+Set `X.Y.Z` identically in these seven release-version locations, then regenerate the
 listed lockfiles:
 
 1. `cvc-core/Cargo.toml`
@@ -139,11 +139,26 @@ listed lockfiles:
 5. `cvc-plugin/package.json` and `cvc-plugin/package-lock.json`
 6. `npm/cvc-mcp/package.json` (the version of both npm packages, `@volute_cvc/cvc-mcp`
    and `@volute_cvc/cvc`, which is staged from it: there is no second manifest to bump)
+7. `plugins/claude-code/.claude-plugin/plugin.json` (the Claude Code plugin; its
+   `version` lives only here, and the entry in `.claude-plugin/marketplace.json`
+   deliberately carries none)
 
 Also update `Cargo.lock`. The reviewer is tested by CI but is not separately
 version-published. Use the package manager to preserve lockfile consistency (for
 example, run `npm version X.Y.Z --no-git-tag-version` in `cvc-plugin`); do not create
 the release tag from that command.
+
+The Claude Code plugin's version tracks the CLI release it requires, so it moves with
+every other manifest at release time. Users get the plugin in two ways that behave
+differently. An existing install receives changes to `plugins/claude-code` only when a
+release bumps the plugin version, because Claude Code treats an installed plugin as
+outdated only when the `version` in its manifest changes. A new install or a reinstall
+gets the plugin as it is on the default branch at that moment, whatever its version.
+The Claude Code plugin marketplace is read from this repository's default branch, so
+it is live from `main` the moment a change merges. A plugin change that needs a newer
+CLI should therefore merge with, or right before, the release that ships that CLI. A
+merged release PR is likewise visible to new installs before the tag workflow has
+published the matching `cvc` binaries, so push the tag promptly after the merge.
 
 Prepare the curated GitHub Release body at `docs/releases/vX.Y.Z.md`. This file is
 mandatory and is used as the release body without generator text transformation; the workflow deliberately does
@@ -173,8 +188,18 @@ cargo check --workspace --all-targets
 (cd cvc-reviewer && npm ci && npm run lint && npm test -- --run && npm run build)
 (cd npm/cvc-mcp && node --check bin/cvc-mcp.js && node --check bin/cvc.js && node --check bin/cvc-lsp.js && npm test && npm pack --dry-run)
 node .github/scripts/generate-third-party-notices.mjs --check
+node .github/scripts/check-claude-plugin.mjs --self-test
+node .github/scripts/check-claude-plugin.mjs
 node .github/scripts/check-release-version.mjs vX.Y.Z
 ```
+
+The two `check-claude-plugin.mjs` commands are CI's `claude-code-plugin` job. They
+check the Claude Code plugin marketplace (`.claude-plugin/marketplace.json`), the
+plugin manifest, and `plugins/claude-code/hooks/hooks.json` against the documented
+contract, and require the plugin version to equal the `cvc-cli` version. CI does not
+install Claude Code, so a maintainer who has it should also run
+`claude plugin validate .` and `claude plugin validate plugins/claude-code` before
+opening the release PR.
 
 CI's `npm-wrapper` job also fails if npm would rewrite the manifest of either published
 package while publishing: `npm/cvc-mcp/package.json` itself, or the `@volute_cvc/cvc`
@@ -185,13 +210,13 @@ release uses against the live registry. If a manifest check fails, run `npm pkg 
 `npm/cvc-mcp` and commit the result.
 
 The last command in the block above is the release version gate: it requires the tag
-spelling and the four Cargo manifests, extension manifest, and npm wrapper manifest
-to match exactly (the npm manifest is the one both npm names take their version from).
-Inspect the resulting diff, including both lockfiles. Commit with
-DCO sign-off, push the branch, and open a PR to `main`:
+spelling and the four Cargo manifests, extension manifest, npm wrapper manifest, and
+Claude Code plugin manifest to match exactly (the npm manifest is the one both npm
+names take their version from). Inspect the resulting diff, including both lockfiles.
+Commit with DCO sign-off, push the branch, and open a PR to `main`:
 
 ```bash
-git add cvc-core/Cargo.toml cvc-cli/Cargo.toml cvc-lsp/Cargo.toml cvc-mcp/Cargo.toml Cargo.lock cvc-plugin/package.json cvc-plugin/package-lock.json npm/cvc-mcp/package.json docs/releases/vX.Y.Z.md
+git add cvc-core/Cargo.toml cvc-cli/Cargo.toml cvc-lsp/Cargo.toml cvc-mcp/Cargo.toml Cargo.lock cvc-plugin/package.json cvc-plugin/package-lock.json npm/cvc-mcp/package.json plugins/claude-code/.claude-plugin/plugin.json docs/releases/vX.Y.Z.md
 git commit -s -m "chore: release vX.Y.Z"
 git push origin release/vX.Y.Z
 ```
@@ -400,6 +425,12 @@ After all jobs complete, verify:
   instead of `HOME`.
 - The VS Code Marketplace shows Apache-2.0 and all four target variants for publisher
   `volute` at the expected version.
+- The Claude Code plugin has no publish job; it is distributed from this repository
+  by the Claude Code plugin marketplace named `volute`. In a disposable environment,
+  `claude plugin marketplace add meirka8/volute` and
+  `claude plugin install cvc@volute` must install the plugin at version X.Y.Z. This
+  adds a marketplace and a plugin to that Claude Code installation, so do not run it
+  against a configuration you want to keep unchanged.
 
 For the first public GitHub/Apache-2.0 OSS release, the expected version is `v0.4.2`.
 Existing npm `0.4.1` metadata is immutable and reflects the old `UNLICENSED` license

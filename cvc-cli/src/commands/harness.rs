@@ -670,7 +670,7 @@ pub(crate) fn discover_initialized_at(path: &std::path::Path) -> Result<Reposito
 pub(crate) fn require_capture_acknowledged(layout: &RepositoryLayout) -> Result<()> {
     if !privacy::capture_acknowledged(layout.repository())? {
         bail!(
-            "consent-required: Claude Code transcript capture is passive collection and needs the repository-local capture acknowledgement; run `cvc privacy acknowledge-capture` first (or `cvc harness uninstall claude-code` to stop the hooks)"
+            "consent-required: Claude Code transcript capture is passive collection and needs the repository-local capture acknowledgement; run `cvc privacy acknowledge-capture` first (or stop the hooks: `/plugin disable cvc@volute` for the Claude Code plugin, `cvc harness uninstall claude-code` for this checkout's hooks)"
         );
     }
     Ok(())

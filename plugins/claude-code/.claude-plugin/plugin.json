@@ -1,0 +1,20 @@
+{
+  "name": "cvc",
+  "version": "0.7.0",
+  "description": "Records Claude Code sessions, as Claude Code's transcript exposes them, into CVC's local, private-by-default history linked to your Git commits, in repositories where you ran cvc init and acknowledged capture. Requires the cvc CLI 0.7.1+ on PATH.",
+  "author": {
+    "name": "Volute",
+    "url": "https://github.com/meirka8/volute"
+  },
+  "homepage": "https://github.com/meirka8/volute",
+  "repository": "https://github.com/meirka8/volute",
+  "license": "Apache-2.0",
+  "keywords": [
+    "cvc",
+    "git",
+    "commits",
+    "transcripts",
+    "hooks",
+    "claude-code"
+  ]
+}
