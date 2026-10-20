@@ -12,7 +12,8 @@
 //!
 //! * [`transcript`] parses transcript lines and plans captures without touching
 //!   the filesystem or the database;
-//! * [`ingest`] applies a plan to a store idempotently;
+//! * [`ingest`] applies a plan to a store idempotently, under a per-session
+//!   lock so that concurrent runs on one session take turns;
 //! * [`settings`] installs and removes the hook entries in the checkout-local
 //!   Claude Code settings file;
 //! * [`harness_record`] is the repository-wide record that the harness is
@@ -21,8 +22,10 @@
 pub mod harness_record;
 pub mod ingest;
 pub mod links;
+mod session_lock;
 pub mod settings;
 pub mod transcript;
 
-pub use ingest::{ingest, IngestError, IngestMode, IngestReport};
+pub use ingest::{ingest, ingest_waiting, IngestError, IngestMode, IngestReport};
+pub use session_lock::SESSION_LOCK_WAIT;
 pub use transcript::HARNESS;
