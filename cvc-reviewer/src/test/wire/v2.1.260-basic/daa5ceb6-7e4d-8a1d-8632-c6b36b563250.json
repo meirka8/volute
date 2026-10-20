@@ -1,0 +1,36 @@
+{
+  "interaction": {
+    "id": "daa5ceb6-7e4d-8a1d-8632-c6b36b563250",
+    "conversation_id": "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60",
+    "parent_id": "44f4f161-a377-855d-bda5-bcf80f761c63",
+    "timestamp": "2026-09-10T10:00:05Z",
+    "author": "system",
+    "user_prompt": "[tool_result Edit error] String to replace not found in file.",
+    "model_name": "claude-fixture-1",
+    "model_cot": null,
+    "model_response": "The edit failed; I'll write the file instead.",
+    "source_request_id": "req_C"
+  },
+  "context_items": [
+    {
+      "id": 3,
+      "interaction_id": "daa5ceb6-7e4d-8a1d-8632-c6b36b563250",
+      "file_path": "src/lib.rs",
+      "git_blob_sha": null,
+      "dirty_patch": null,
+      "start_line": null,
+      "end_line": null
+    }
+  ],
+  "tool_executions": [
+    {
+      "id": 3,
+      "interaction_id": "daa5ceb6-7e4d-8a1d-8632-c6b36b563250",
+      "tool_protocol": "native",
+      "tool_name": "Write",
+      "arguments": "{\"content\":\"fn main() { println!(\\\"hi\\\"); }\\n\",\"file_path\":\"/work/repo/src/lib.rs\"}",
+      "status": "success"
+    }
+  ],
+  "artifact_links": []
+}

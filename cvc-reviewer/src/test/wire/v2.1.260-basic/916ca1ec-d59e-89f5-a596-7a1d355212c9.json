@@ -1,0 +1,36 @@
+{
+  "interaction": {
+    "id": "916ca1ec-d59e-89f5-a596-7a1d355212c9",
+    "conversation_id": "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60",
+    "parent_id": null,
+    "timestamp": "2026-09-10T10:00:01Z",
+    "author": "human",
+    "user_prompt": "Add a greeting to lib.rs\n\n[meta] <system-reminder>Fixture reminder text.</system-reminder>",
+    "model_name": "claude-fixture-1",
+    "model_cot": "I should read lib.rs first.",
+    "model_response": "I'll read the file first.",
+    "source_request_id": "req_A"
+  },
+  "context_items": [
+    {
+      "id": 1,
+      "interaction_id": "916ca1ec-d59e-89f5-a596-7a1d355212c9",
+      "file_path": "src/lib.rs",
+      "git_blob_sha": null,
+      "dirty_patch": null,
+      "start_line": 1,
+      "end_line": 20
+    }
+  ],
+  "tool_executions": [
+    {
+      "id": 1,
+      "interaction_id": "916ca1ec-d59e-89f5-a596-7a1d355212c9",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/work/repo/src/lib.rs\",\"limit\":20,\"offset\":1}",
+      "status": "success"
+    }
+  ],
+  "artifact_links": []
+}

@@ -24,6 +24,11 @@ const TITLED_289: &str = include_str!("fixtures/claude-code/v2.1.289/titled.json
 const TITLED_289_SESSION: &str = "9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43";
 const CACHED_300: &str = include_str!("fixtures/claude-code/v2.1.300/cached-requests.jsonl");
 const CACHED_300_SESSION: &str = "4c8e1f2a-9b7d-4e6f-a3c5-1d2e3f4a5b6c";
+/// Synthetic (public issue 134): provider-side tool calls and their result
+/// blocks, shaped as the Claude API reference documents them. No real session
+/// was recorded; every third-party text in it carries the token `THIRD-PARTY`.
+const SERVER_300: &str = include_str!("fixtures/claude-code/v2.1.300/server-tools.jsonl");
+const SERVER_300_SESSION: &str = "2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d";
 const BASIC_SESSION: &str = "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60";
 
 struct Fixture {
@@ -415,6 +420,190 @@ fn chainless_cache_entries_of_2_1_300_are_skipped_and_never_captured() {
         }
         other => panic!("expected malformed, got {other:?}"),
     }
+}
+
+/// The calls of a capture as `(name, protocol, status)`, in recorded order.
+fn call_summary(calls: &[cvc_core::models::ToolExecution]) -> Vec<(&str, &str, ToolStatus)> {
+    calls
+        .iter()
+        .map(|call| {
+            (
+                call.tool_name.as_str(),
+                call.tool_protocol.as_str(),
+                call.status.clone(),
+            )
+        })
+        .collect()
+}
+
+/// What `SERVER_300`'s first response records, call by call.
+fn expected_server_calls() -> Vec<(&'static str, &'static str, ToolStatus)> {
+    vec![
+        // A list of hits.
+        ("server:web_search", "server", ToolStatus::Success),
+        // `max_uses_exceeded`, an error object in `content`.
+        ("server:web_search", "server", ToolStatus::Failure),
+        ("server:web_fetch", "server", ToolStatus::Success),
+        // Exit code 0, then 2.
+        ("server:bash_code_execution", "server", ToolStatus::Success),
+        ("server:bash_code_execution", "server", ToolStatus::Failure),
+        (
+            "server:text_editor_code_execution",
+            "server",
+            ToolStatus::Success,
+        ),
+        // No result block in the response: never finished.
+        ("server:web_search", "server", ToolStatus::Failure),
+        // An ordinary client tool beside them, unchanged.
+        ("Read", "native", ToolStatus::Success),
+    ]
+}
+
+/// Public issue 134: a provider-side call (`server_tool_use`) never gets a
+/// user-side `tool_result`, so its status was always `failure`. Its outcome is
+/// the result block the API delivers inside the same assistant message.
+#[test]
+fn server_side_calls_take_their_status_from_the_result_block_of_their_response() {
+    let fixture = Fixture::new();
+    let window = parse(&fixture.render(SERVER_300), SERVER_300_SESSION).unwrap();
+    let plan = transcript::plan(
+        &window.lines,
+        0,
+        &PlanInput {
+            session_id: SERVER_300_SESSION,
+            worktree_root: &fixture.root,
+            path_aliases: &[],
+            final_mode: true,
+        },
+    );
+    assert_eq!(plan.title.as_deref(), Some("Server tool outcomes"));
+    assert_eq!(plan.pending_responses, 0);
+    assert_eq!(plan.interactions.len(), 2);
+
+    let a = &plan.interactions[0];
+    assert_eq!(call_summary(&a.tool_executions), expected_server_calls());
+    assert_eq!(
+        a.tool_executions[0].arguments,
+        r#"{"query":"fixture query"}"#
+    );
+    // Each result block adds its placeholder, in order, and nothing else.
+    assert_eq!(
+        a.model_response.as_deref(),
+        Some(
+            "Searching and fetching.\n\n[web_search_tool_result]\n\n[web_search_tool_result]\n\n\
+             [web_fetch_tool_result]\n\n[bash_code_execution_tool_result]\n\n\
+             [bash_code_execution_tool_result]\n\n[text_editor_code_execution_tool_result]"
+        )
+    );
+    assert!(a.unrecorded_blocks.is_empty(), "{:?}", a.unrecorded_blocks);
+    // The client Read still becomes file context; the provider's calls do not.
+    assert_eq!(a.context_items.len(), 1);
+    assert_eq!(a.context_items[0].file_path, "src/lib.rs");
+
+    let b = &plan.interactions[1];
+    assert_eq!(b.user_prompt, "[tool_result Read]      1\tfn main() {}");
+    assert_eq!(
+        call_summary(&b.tool_executions),
+        vec![("server:web_search", "server", ToolStatus::Success)]
+    );
+    assert_eq!(
+        b.model_response.as_deref(),
+        Some("Summary of the lookups.\n\n[web_search_tool_result]")
+    );
+    assert!(b.unrecorded_blocks.is_empty());
+
+    // What the provider fetched for the model is third-party text and is not
+    // recorded anywhere: only the placeholders above reach a capture.
+    let captured = format!("{plan:?}");
+    assert!(!captured.contains("THIRD-PARTY"), "{captured}");
+    assert!(!captured.contains("example.invalid/a"), "{captured}");
+}
+
+#[test]
+fn ingest_records_server_side_outcomes_and_waits_for_the_response_to_end() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let policy = fixture.policy();
+    let content = fixture.render(SERVER_300);
+    let path = fixture.write_transcript(&format!("{SERVER_300_SESSION}.jsonl"), &content);
+
+    // A hook run before the client tool's result is written finds the response
+    // with its provider-side calls still open, and records nothing yet.
+    let cut = content.find("\"uuid\":\"u2\"").unwrap();
+    let line_start = content[..cut].rfind('\n').unwrap() + 1;
+    fs::write(&path, &content[..line_start]).unwrap();
+    let early = ingest(
+        &fixture.layout,
+        &store,
+        &policy,
+        &path,
+        None,
+        IngestMode::Incremental,
+    )
+    .unwrap();
+    assert_eq!(
+        (early.inserted, early.pending_responses),
+        (0, 1),
+        "{early:?}"
+    );
+
+    fs::write(&path, &content).unwrap();
+    let report = ingest(
+        &fixture.layout,
+        &store,
+        &policy,
+        &path,
+        None,
+        IngestMode::Final,
+    )
+    .unwrap();
+    assert_eq!(report.inserted, 2, "{report:?}");
+    assert_eq!(report.unrecorded_blocks, 0, "{report:?}");
+    assert!(report.unrecorded_block_types.is_empty());
+
+    let a_id = derived_interaction_id(SERVER_300_SESSION, "req_A");
+    let calls = store.get_tool_executions(&a_id).unwrap();
+    assert_eq!(call_summary(&calls), expected_server_calls());
+    let b_id = derived_interaction_id(SERVER_300_SESSION, "req_B");
+    assert_eq!(
+        call_summary(&store.get_tool_executions(&b_id).unwrap()),
+        vec![("server:web_search", "server", ToolStatus::Success)]
+    );
+
+    // Third-party text never reaches the store, in prompts, responses or
+    // arguments; the placeholders do.
+    let conn = rusqlite::Connection::open(fixture.layout.db_path()).unwrap();
+    let leaked: i64 = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM interactions WHERE user_prompt LIKE '%THIRD-PARTY%' \
+             OR model_response LIKE '%THIRD-PARTY%' OR model_cot LIKE '%THIRD-PARTY%') \
+             + (SELECT COUNT(*) FROM tool_executions WHERE arguments LIKE '%THIRD-PARTY%')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(leaked, 0);
+    let stored = store.get_interaction(&a_id).unwrap().unwrap();
+    assert!(stored
+        .model_response
+        .unwrap()
+        .contains("[web_fetch_tool_result]"));
+
+    // Rows are never replaced: a second pass changes nothing.
+    let again = ingest(
+        &fixture.layout,
+        &store,
+        &policy,
+        &path,
+        None,
+        IngestMode::Final,
+    )
+    .unwrap();
+    assert_eq!(again.inserted, 0, "{again:?}");
+    assert_eq!(
+        call_summary(&store.get_tool_executions(&a_id).unwrap()),
+        expected_server_calls()
+    );
 }
 
 #[test]

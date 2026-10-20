@@ -1,0 +1,36 @@
+{
+  "interaction": {
+    "id": "44f4f161-a377-855d-bda5-bcf80f761c63",
+    "conversation_id": "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60",
+    "parent_id": "916ca1ec-d59e-89f5-a596-7a1d355212c9",
+    "timestamp": "2026-09-10T10:00:03Z",
+    "author": "system",
+    "user_prompt": "[tool_result Read]      1\tfn main() {}",
+    "model_name": "claude-fixture-1",
+    "model_cot": null,
+    "model_response": null,
+    "source_request_id": "req_B"
+  },
+  "context_items": [
+    {
+      "id": 2,
+      "interaction_id": "44f4f161-a377-855d-bda5-bcf80f761c63",
+      "file_path": "src/lib.rs",
+      "git_blob_sha": null,
+      "dirty_patch": null,
+      "start_line": null,
+      "end_line": null
+    }
+  ],
+  "tool_executions": [
+    {
+      "id": 2,
+      "interaction_id": "44f4f161-a377-855d-bda5-bcf80f761c63",
+      "tool_protocol": "native",
+      "tool_name": "Edit",
+      "arguments": "{\"file_path\":\"/work/repo/src/lib.rs\",\"new_string\":\"fn main() { println!(\\\"hi\\\"); }\",\"old_string\":\"fn main() {}\"}",
+      "status": "failure"
+    }
+  ],
+  "artifact_links": []
+}
