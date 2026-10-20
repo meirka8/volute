@@ -13,6 +13,11 @@ use git2::Repository;
 use std::fs;
 use tempfile::tempdir;
 
+/// What an import that saw no tracking ref pins: a projection that starts empty.
+fn unpublished(repo: &Repository) -> sync::ImportedBaseline {
+    sync::ImportedBaseline::observe(repo, "refs/remotes/unpublished/cvc/main").unwrap()
+}
+
 const ID: &str = "3c2b1a09-8f7e-8d6c-9b5a-4f3e2d1c0b9a";
 const DESTINATION: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const FAKE_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIEfakeFAKEfake0123456789\nKEYBODYLINE0123456789abcdefghijklmnop\n-----END RSA PRIVATE KEY-----";
@@ -522,7 +527,7 @@ fn projection_and_import_keep_a_verified_stimulus_verified() {
         .share_conversation_for_remote("conversation", DESTINATION, FutureSharePolicy::Private)
         .unwrap();
     let sync::ProjectionResult::Candidate { oid, candidate, .. } =
-        sync::push_projection_to_ref(&repo, &source, "", DESTINATION).unwrap()
+        sync::push_projection_to_ref(&repo, &source, &unpublished(&repo), DESTINATION).unwrap()
     else {
         panic!("expected a projection")
     };

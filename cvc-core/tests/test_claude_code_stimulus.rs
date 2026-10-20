@@ -18,6 +18,11 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+/// What an import that saw no tracking ref pins: a projection that starts empty.
+fn unpublished(repo: &Repository) -> sync::ImportedBaseline {
+    sync::ImportedBaseline::observe(repo, "refs/remotes/unpublished/cvc/main").unwrap()
+}
+
 const SESSION: &str = "5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a";
 const AGENT: &str = "agent-a0bd78e0693c35eed";
 const DESTINATION: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -767,7 +772,7 @@ fn a_node_with_withheld_fields_is_published_and_imported_as_it_is() {
     // The published bytes pass the same checks any node does, and say the same.
     let repo = fixture.layout.repository();
     let sync::ProjectionResult::Candidate { oid, candidate, .. } =
-        sync::push_projection_to_ref(repo, &store, "", DESTINATION).unwrap()
+        sync::push_projection_to_ref(repo, &store, &unpublished(repo), DESTINATION).unwrap()
     else {
         panic!("expected a projection")
     };
@@ -1590,7 +1595,7 @@ fn a_stand_in_is_published_and_imported_like_any_node() {
         .unwrap();
     let repo = fixture.layout.repository();
     let sync::ProjectionResult::Candidate { oid, candidate, .. } =
-        sync::push_projection_to_ref(repo, &store, "", DESTINATION).unwrap()
+        sync::push_projection_to_ref(repo, &store, &unpublished(repo), DESTINATION).unwrap()
     else {
         panic!("expected a projection")
     };
@@ -1715,7 +1720,7 @@ fn a_read_with_extreme_offset_and_limit_is_recorded_and_its_node_is_pushed() {
         .unwrap();
     let repo = fixture.layout.repository();
     let sync::ProjectionResult::Candidate { oid, candidate, .. } =
-        sync::push_projection_to_ref(repo, &store, "", DESTINATION).unwrap()
+        sync::push_projection_to_ref(repo, &store, &unpublished(repo), DESTINATION).unwrap()
     else {
         panic!("expected a projection")
     };

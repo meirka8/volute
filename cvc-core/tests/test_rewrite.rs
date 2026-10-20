@@ -225,10 +225,15 @@ fn v5_rewrite_events_project_import_and_remain_remote_assertions() -> anyhow::Re
         format!("{old} {new}\n").as_bytes(),
     )?;
 
-    let projection = sync::push_projection_to_ref(&repo, &source, "", DESTINATION)?;
+    let projection = sync::push_projection_to_ref(
+        &repo,
+        &source,
+        &sync::ImportedBaseline::observe(&repo, "refs/remotes/unpublished/cvc/main")?,
+        DESTINATION,
+    )?;
     let oid = match projection {
         sync::ProjectionResult::Candidate { oid, .. } => oid,
-        sync::ProjectionResult::NoChanges => unreachable!("new source must project"),
+        sync::ProjectionResult::NoChanges { .. } => unreachable!("new source must project"),
     };
     repo.reference("refs/cvc/rewrite-v5", oid, true, "test remote")?;
     let tree = repo.find_commit(oid)?.tree()?;
@@ -255,8 +260,13 @@ fn v5_rewrite_events_project_import_and_remain_remote_assertions() -> anyhow::Re
     // Imported proof is destination-scoped evidence, never authority to publish
     // it onward from this clone.
     assert!(matches!(
-        sync::push_projection_to_ref(&repo, &imported, "refs/cvc/rewrite-v5", DESTINATION)?,
-        sync::ProjectionResult::NoChanges
+        sync::push_projection_to_ref(
+            &repo,
+            &imported,
+            &sync::ImportedBaseline::observe(&repo, "refs/cvc/rewrite-v5")?,
+            DESTINATION,
+        )?,
+        sync::ProjectionResult::NoChanges { .. }
     ));
     Ok(())
 }

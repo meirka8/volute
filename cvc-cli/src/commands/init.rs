@@ -19,7 +19,7 @@ pub async fn run() -> Result<()> {
         }
     };
     // Fail before mutating common storage when discovery found a bare repository.
-    let worktree_root = layout.worktree_root()?;
+    layout.worktree_root()?;
     let cvc_dir = layout.cvc_dir();
     let db_path = layout.db_path();
     println!("Initializing CVC database at {:?}", db_path);
@@ -28,7 +28,10 @@ pub async fn run() -> Result<()> {
     // them before creating shared state, so an unusable hooksPath cannot leave
     // a fresh repository looking initialized. Existing state is never removed
     // if this step fails or if the later database creation/open fails.
-    let outcomes = hooks::install(worktree_root).context("Failed to install hooks")?;
+    //
+    // `init` is the one command that installs every managed hook, including
+    // `post-checkout`, which `harness install` later gives something to do.
+    let outcomes = hooks::install_all(&layout).context("Failed to install hooks")?;
 
     if !cvc_dir.exists() {
         fs::create_dir_all(&cvc_dir).context("Failed to create .git/cvc directory")?;
@@ -44,10 +47,17 @@ pub async fn run() -> Result<()> {
                 "Appended CVC hook to existing {} at {:?}",
                 outcome.hook_name, outcome.hook_path
             ),
+            HookAction::Updated => println!(
+                "Updated CVC hook in existing {} at {:?}",
+                outcome.hook_name, outcome.hook_path
+            ),
             HookAction::AlreadyPresent => println!(
                 "CVC hook already present in {} at {:?}",
                 outcome.hook_name, outcome.hook_path
             ),
+            HookAction::SkippedNotShell => {
+                eprintln!("{}", super::hook::not_shell_warning(&outcome, None))
+            }
         }
     }
 

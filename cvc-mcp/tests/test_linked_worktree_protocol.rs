@@ -42,7 +42,12 @@ fn project_fixture_to_ref(
     ref_name: &str,
     destination: &str,
 ) {
-    let projection = cvc_core::sync::push_projection_to_ref(repo, store, "", destination).unwrap();
+    // No remote baseline: pin a tracking ref that does not exist.
+    let baseline =
+        cvc_core::sync::ImportedBaseline::observe(repo, "refs/remotes/unpublished/cvc/main")
+            .unwrap();
+    let projection =
+        cvc_core::sync::push_projection_to_ref(repo, store, &baseline, destination).unwrap();
     let cvc_core::sync::ProjectionResult::Candidate { oid, candidate, .. } = projection else {
         panic!("fixture expected projection candidate");
     };

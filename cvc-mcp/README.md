@@ -26,7 +26,7 @@ Common client locations include workspace `.vscode/mcp.json`, client settings, a
 
 ## Tools and privacy boundary
 
-- `commit_thought` saves a concise task record, reasoning supplied by the client, and an optional result locally.
+- `commit_thought` saves a concise task record, reasoning supplied by the client, and an optional result locally. A client that manages its own sessions may name the conversation with `conversation_id`: 1 to 256 ASCII letters, digits, `.`, `_`, `-` or `:`; any other id is refused before anything is recorded.
 - `read_history` reads local saved history.
 - `get_context` inspects Git-backed context for one file.
 - `setup_cvc` initializes CVC storage and hooks.

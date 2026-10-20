@@ -9,6 +9,12 @@ use serde_json::json;
 use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
 
+/// "No remote baseline": pins a tracking ref that does not exist, so the
+/// projection starts from an empty tree and verifies that nothing appeared.
+fn no_baseline(repo: &Repository) -> cvc_core::sync::ImportedBaseline {
+    cvc_core::sync::ImportedBaseline::observe(repo, "refs/remotes/unpublished/cvc/main").unwrap()
+}
+
 trait CaptureFixture {
     fn create_conversation(&self, _: &Conversation) -> cvc_core::db::Result<()>;
     fn create_interaction(&self, interaction: &Interaction) -> cvc_core::db::Result<()>;
@@ -35,7 +41,9 @@ impl CaptureFixture for CvcStore {
 }
 
 fn project_fixture_to_ref(repo: &Repository, store: &CvcStore, ref_name: &str, destination: &str) {
-    let projection = cvc_core::sync::push_projection_to_ref(repo, store, "", destination).unwrap();
+    let projection =
+        cvc_core::sync::push_projection_to_ref(repo, store, &no_baseline(repo), destination)
+            .unwrap();
     let cvc_core::sync::ProjectionResult::Candidate { oid, candidate, .. } = projection else {
         panic!("fixture expected projection candidate");
     };
@@ -130,6 +138,193 @@ async fn test_commit_thought() {
         "Thinking process"
     );
     assert_eq!(interactions[0].user_prompt, "User query");
+}
+
+fn commit_thought_in(conversation_id: &str) -> serde_json::Value {
+    json!({
+        "name": "commit_thought",
+        "arguments": {
+            "reasoning": "Thinking process",
+            "task": "User query",
+            "conversation_id": conversation_id,
+        }
+    })
+}
+
+/// What the client is told when the id it chose is outside the rule.
+const CONVERSATION_ID_ERROR: &str =
+    "Invalid 'conversation_id': use 1 to 256 ASCII letters, digits, '.', '_', '-' or ':'.";
+
+#[tokio::test]
+async fn test_a_conversation_id_that_could_alter_what_a_terminal_shows_is_refused() {
+    let (dir, state) = make_state();
+    start_session(&state, "test-client").unwrap();
+
+    // The id becomes the conversation's title and is named in the phrase typed
+    // to share it, and the client chooses it. Every one of these is a control
+    // (Cc), format (Cf) or separator (Zl, Zp) character, in the middle of an
+    // id that is otherwise fine.
+    for id in [
+        "has\u{1b}[2Jescape",
+        "line\nbreak",
+        "carriage\rreturn",
+        "tab\there",
+        "nul\0byte",
+        "delete\u{7f}",
+        "c1\u{9b}control",
+        "bidi\u{202e}override",
+        "isolate\u{2066}isolate",
+        "zero\u{200b}width",
+        "soft\u{ad}hyphen",
+        "byte\u{feff}order",
+        "tag\u{e0041}character",
+        "line\u{2028}separator",
+        "paragraph\u{2029}separator",
+    ] {
+        let error = call_tool(commit_thought_in(id), state.clone())
+            .await
+            .expect_err(&format!("{id:?} was accepted"));
+        assert_eq!(error.code, -32602, "{id:?}");
+        assert_eq!(error.message, CONVERSATION_ID_ERROR, "{id:?}");
+    }
+
+    // Nothing was recorded for any of them.
+    assert!(fixture_store(dir.path())
+        .get_floating_interactions()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn test_an_ordinary_conversation_id_is_still_recorded() {
+    let (dir, state) = make_state();
+    start_session(&state, "test-client").unwrap();
+
+    // Every character the rule allows, a UUID (which is what the server itself
+    // uses when the client does not choose), and the longest id there is.
+    let longest = "a".repeat(256);
+    let ids = [
+        "client-session_42",
+        "harness.session:7",
+        "A1b2C3",
+        "0123456789.:_-abcXYZ",
+        "3f2b8c1e-5d4a-4b7e-9c0d-1a2b3c4d5e6f",
+        longest.as_str(),
+    ];
+    for id in ids {
+        let res = call_tool(commit_thought_in(id), state.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{id:?} was refused: {}", error.message));
+        assert!(res["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Thought recorded"));
+    }
+    let recorded: Vec<String> = fixture_store(dir.path())
+        .get_floating_interactions()
+        .unwrap()
+        .into_iter()
+        .map(|interaction| interaction.conversation_id)
+        .collect();
+    for id in ids {
+        assert!(recorded.iter().any(|recorded| recorded == id), "{id:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_spaces_and_other_characters_outside_the_capture_rule_are_refused() {
+    let (dir, state) = make_state();
+    start_session(&state, "test-client").unwrap();
+
+    // Core's capture policy has never accepted any of these in a conversation
+    // id, so the server says so up front and records nothing, instead of
+    // pretending printable characters are fine and failing in the capture.
+    let too_long = "a".repeat(257);
+    for id in [
+        "my session 1",
+        " leading",
+        "trailing ",
+        "\u{a0}no-break space",
+        "\u{3000}ideographic space",
+        "\u{c9}clair \u{fc} \u{2713} \u{5e9}\u{5dc}\u{5d5}\u{5dd}",
+        "emoji \u{1f680}",
+        "with/slash",
+        "back\\slash",
+        "quo'te",
+        "dq\"uote",
+        "at@sign",
+        "per%cent",
+        "pl+us",
+        "eq=ual",
+        "co,mma",
+        "tilde~",
+        "semi;colon",
+        "",
+        too_long.as_str(),
+    ] {
+        let error = call_tool(commit_thought_in(id), state.clone())
+            .await
+            .expect_err(&format!("{id:?} was accepted"));
+        assert_eq!(error.code, -32602, "{id:?}");
+        assert_eq!(error.message, CONVERSATION_ID_ERROR, "{id:?}");
+    }
+    assert!(fixture_store(dir.path())
+        .get_floating_interactions()
+        .unwrap()
+        .is_empty());
+}
+
+/// The rule the tool applies is the rule the capture applies, because it is
+/// the same function; this pins that the function says what the capture does,
+/// for ids on both sides of every boundary.
+#[tokio::test]
+async fn test_the_tool_and_the_capture_agree_on_which_ids_are_acceptable() {
+    let (_dir, state) = make_state();
+    start_session(&state, "test-client").unwrap();
+    let capture_dir = tempdir().unwrap();
+    Repository::init(capture_dir.path()).unwrap();
+    let capture_store = fixture_store(capture_dir.path());
+
+    let longest = "b".repeat(256);
+    let too_long = "b".repeat(257);
+    for id in [
+        "plain",
+        "with-dash_and.dot:and-colon",
+        longest.as_str(),
+        too_long.as_str(),
+        "",
+        "with space",
+        "tab\t",
+        "\u{e9}",
+        "slash/",
+        "new\nline",
+        "\u{200b}",
+    ] {
+        let by_the_rule = cvc_core::privacy::is_safe_identifier(id);
+        let by_the_tool = match call_tool(commit_thought_in(id), state.clone()).await {
+            Ok(_) => true,
+            Err(error) => {
+                assert_eq!(error.message, CONVERSATION_ID_ERROR, "{id:?}");
+                false
+            }
+        };
+        let by_the_capture = capture_store
+            .create_interaction(&Interaction {
+                id: InteractionId::new(),
+                conversation_id: id.to_owned(),
+                parent_id: None,
+                timestamp: Utc::now(),
+                author: Author::Agent,
+                user_prompt: "x".into(),
+                model_name: None,
+                model_cot: None,
+                model_response: None,
+                source_request_id: None,
+            })
+            .is_ok();
+        assert_eq!(by_the_tool, by_the_rule, "{id:?}: tool and rule");
+        assert_eq!(by_the_capture, by_the_rule, "{id:?}: capture and rule");
+    }
 }
 
 #[tokio::test]

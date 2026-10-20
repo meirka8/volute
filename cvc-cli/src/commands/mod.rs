@@ -1,4 +1,5 @@
 pub mod conversations;
+pub mod failure;
 pub mod harness;
 pub mod hook;
 pub mod ingest;
