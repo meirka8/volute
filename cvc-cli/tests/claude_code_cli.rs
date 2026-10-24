@@ -418,7 +418,22 @@ fn harness_install_from_the_launcher_cache_prefers_the_stable_binary() {
     let settings_path = fixture.repo.join(".claude/settings.local.json");
     // Runs `harness <args>` as `program`; the stdout must contain `expected`.
     let run = |program: &PathBuf, args: &[&str], expected: &str| {
-        let output = fixture.command(program).args(args).output().unwrap();
+        // A binary written a moment ago may still be open for writing in a
+        // process that another test thread is in the middle of forking (the
+        // descriptor is closed on exec, which that child has not reached), and
+        // then cannot be executed: "text file busy". It clears in milliseconds.
+        let mut attempts = 0;
+        let output = loop {
+            match fixture.command(program).args(args).output() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 100 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => break other.unwrap(),
+            }
+        };
         assert!(
             output.status.success(),
             "{}",
