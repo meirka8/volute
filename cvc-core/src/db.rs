@@ -901,6 +901,17 @@ impl CvcStore {
             |r| r.get::<_, i64>(0),
         )? as usize)
     }
+    /// How many of the conversation's interactions were recorded through MCP
+    /// (`capture_source = 'mcp'`). Future sharing never extends to a thought
+    /// recorded through MCP, so a front that records future sharing for the
+    /// conversation can say that later ones will stay private.
+    pub fn conversation_mcp_capture_count(&self, conversation_id: &str) -> Result<usize> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM interactions WHERE conversation_id=?1 AND capture_source='mcp'",
+            params![conversation_id],
+            |r| r.get::<_, i64>(0),
+        )? as usize)
+    }
 
     // --- Interactions ---
 
@@ -1066,6 +1077,9 @@ impl CvcStore {
         }
     }
 
+    /// Records a thought received through the MCP server. It is stored private
+    /// and never joins its conversation's future sharing, whichever conversation
+    /// the client named; only an explicit share of that conversation covers it.
     pub fn capture_mcp(&self, capture: crate::privacy::McpCapture) -> Result<InteractionId> {
         self.capture(capture.into_capture())
     }
@@ -1271,8 +1285,16 @@ impl CvcStore {
         if Self::is_tombstoned_tx(tx, &capture.interaction.id)? {
             return Err(DbError::Migration("interaction is tombstoned".into()));
         }
+        // Every source titles a conversation it creates. Only a source that may
+        // rename an existing one (`CaptureSource::refreshes_conversation_title`)
+        // overwrites its title; an MCP thought leaves it exactly as it was.
+        let conversation_sql = if capture.source.refreshes_conversation_title() {
+            "INSERT INTO conversations (id,title,created_at) VALUES (?1,?2,?3) ON CONFLICT(id) DO UPDATE SET title=excluded.title"
+        } else {
+            "INSERT INTO conversations (id,title,created_at) VALUES (?1,?2,?3) ON CONFLICT(id) DO NOTHING"
+        };
         tx.execute(
-            "INSERT INTO conversations (id,title,created_at) VALUES (?1,?2,?3) ON CONFLICT(id) DO UPDATE SET title=excluded.title",
+            conversation_sql,
             params![
                 capture.conversation.id,
                 capture.conversation.title,
@@ -1289,7 +1311,13 @@ impl CvcStore {
             .replace('"', "");
         let visibility = "private";
         tx.execute("INSERT INTO interactions (id,conversation_id,parent_id,timestamp,author,user_prompt,model_name,model_cot,model_response,source_request_id,visibility,capture_source,scrubber_version,capture_worktree) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13)", params![i.id.to_string(),i.conversation_id,parent,i.timestamp.timestamp(),author,i.user_prompt,i.model_name,i.model_cot,i.model_response,i.source_request_id,visibility,source,capture.capture_worktree])?;
-        tx.execute("INSERT OR IGNORE INTO interaction_shares(interaction_id,remote_fingerprint) SELECT ?1,remote_fingerprint FROM conversation_shares WHERE conversation_id=?2 AND share_future=1", params![i.id.to_string(), i.conversation_id])?;
+        // The conversation's future sharing extends only to captures whose
+        // trusted source takes part in it (`CaptureSource::inherits_future_sharing`).
+        // Every other capture, an MCP thought above all, is stored private and is
+        // shared only when an explicit share names its conversation again.
+        if capture.source.inherits_future_sharing() {
+            tx.execute("INSERT OR IGNORE INTO interaction_shares(interaction_id,remote_fingerprint) SELECT ?1,remote_fingerprint FROM conversation_shares WHERE conversation_id=?2 AND share_future=1", params![i.id.to_string(), i.conversation_id])?;
+        }
         for x in &capture.context_items {
             tx.execute("INSERT INTO context_items (interaction_id,file_path,git_blob_sha,dirty_patch,start_line,end_line) VALUES (?1,?2,?3,?4,?5,?6)",params![i.id.to_string(),x.file_path,x.git_blob_sha,x.dirty_patch,x.start_line,x.end_line])?;
         }
@@ -3104,8 +3132,132 @@ impl CvcStore {
 #[cfg(test)]
 mod trusted_api_tests {
     use super::*;
-    use crate::models::Evidence;
+    use crate::models::{CaptureSource, Evidence};
     use crate::privacy::{McpCapture, PreparedPolicy};
+
+    /// One thought from `source` into `conversation_id`, carrying `title` for
+    /// its conversation, as the source's front would hand it to the store.
+    fn fixture_capture(
+        source: CaptureSource,
+        conversation_id: &str,
+        title: &str,
+    ) -> (InteractionId, Capture) {
+        let id = InteractionId::new();
+        let capture = Capture {
+            conversation: Conversation {
+                id: conversation_id.into(),
+                title: title.into(),
+                created_at: Utc::now(),
+            },
+            interaction: Interaction {
+                id: id.clone(),
+                conversation_id: conversation_id.into(),
+                parent_id: None,
+                timestamp: Utc::now(),
+                author: Author::Agent,
+                user_prompt: format!("{source:?}"),
+                model_name: None,
+                model_cot: None,
+                model_response: None,
+                source_request_id: None,
+            },
+            context_items: Vec::new(),
+            tool_executions: Vec::new(),
+            source,
+            policy: PreparedPolicy::built_ins_only(),
+            capture_worktree: Some("0".repeat(64)),
+        };
+        (id, capture)
+    }
+
+    /// Every source titles a conversation it creates. Only the sources that
+    /// observe a session rename one that already exists; a thought recorded
+    /// through MCP and a capture whose source is not known leave its title
+    /// exactly as it was, an empty one included.
+    #[test]
+    fn only_the_sources_that_observe_a_session_rename_an_existing_conversation(
+    ) -> anyhow::Result<()> {
+        let store = CvcStore::open(":memory:")?;
+        let title_of = |conversation: &str| -> anyhow::Result<String> {
+            Ok(store
+                .get_conversation(conversation)?
+                .ok_or_else(|| anyhow::anyhow!("no conversation {conversation}"))?
+                .title)
+        };
+        for (source, renames) in [
+            (CaptureSource::Mcp, false),
+            (CaptureSource::Legacy, false),
+            (CaptureSource::VscodePassive, true),
+            (CaptureSource::VscodeExplicit, true),
+            (CaptureSource::ClaudeCode, true),
+            (CaptureSource::CliRun, true),
+            (CaptureSource::SyncImport, true),
+        ] {
+            assert_eq!(source.refreshes_conversation_title(), renames, "{source:?}");
+            let conversation = format!("{source:?}");
+            store.capture(fixture_capture(source, &conversation, "created as").1)?;
+            assert_eq!(title_of(&conversation)?, "created as", "{source:?}");
+            for existing in ["created as", ""] {
+                store.conn.execute(
+                    "UPDATE conversations SET title=?2 WHERE id=?1",
+                    params![conversation, existing],
+                )?;
+                store.capture(fixture_capture(source, &conversation, "named again").1)?;
+                let expected = if renames { "named again" } else { existing };
+                assert_eq!(
+                    title_of(&conversation)?,
+                    expected,
+                    "{source:?} {existing:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The one write boundary decides, for every trusted source, whether a
+    /// capture joins its conversation's future sharing. A thought recorded
+    /// through MCP and a capture whose source is not known (`Legacy`, the
+    /// default, which no public constructor produces) are stored private; the
+    /// other sources join the destinations whose future sharing is on, and only
+    /// those.
+    #[test]
+    fn future_sharing_extends_only_to_the_sources_that_take_part_in_it() -> anyhow::Result<()> {
+        let store = CvcStore::open(":memory:")?;
+        let future_shared = "7".repeat(64);
+        let future_private = "8".repeat(64);
+        // Recorded before anything is in the conversation, as `cvc share
+        // policy --future` would record it.
+        store.share_exact_snapshot("policy", &future_shared, &[], FutureSharePolicy::Shared)?;
+        store.share_exact_snapshot("policy", &future_private, &[], FutureSharePolicy::Private)?;
+        assert_eq!(CaptureSource::default(), CaptureSource::Legacy);
+        for (source, inherits) in [
+            (CaptureSource::Mcp, false),
+            (CaptureSource::Legacy, false),
+            (CaptureSource::VscodePassive, true),
+            (CaptureSource::VscodeExplicit, true),
+            (CaptureSource::ClaudeCode, true),
+            (CaptureSource::CliRun, true),
+            (CaptureSource::SyncImport, true),
+        ] {
+            assert_eq!(source.inherits_future_sharing(), inherits, "{source:?}");
+            let (id, capture) = fixture_capture(source, "policy", "policy");
+            store.capture(capture)?;
+            let shares: Vec<String> = store
+                .conn
+                .prepare(
+                    "SELECT remote_fingerprint FROM interaction_shares WHERE interaction_id=?1",
+                )?
+                .query_map(params![id.as_str()], |row| row.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            let expected = if inherits {
+                vec![future_shared.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(shares, expected, "{source:?}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn squash_queue_capacity_is_classified_as_retryable() {

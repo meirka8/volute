@@ -6,12 +6,19 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+/// What `commit_thought` says about the privacy of what it records, in its
+/// description and in every result. The store records each thought received
+/// through MCP private, whatever the conversation it names; future sharing of
+/// that conversation does not extend to it.
+const THOUGHTS_STAY_PRIVATE: &str =
+    "Thoughts recorded through MCP stay private until shared with `cvc share`.";
+
 pub fn list_tools() -> Value {
     json!({
         "tools": [
             {
                 "name": "commit_thought",
-                "description": "You MUST call this after every meaningful step: forming a plan, making a non-trivial decision, rejecting an approach, or finishing a subtask -- not only once at the very end. This is the only durable record of your reasoning. If you skip it, the plan, the rationale, and the paths you considered and rejected are gone the moment this session ends, unrecoverable by you or by anyone (including you, on another machine, via another harness) picking up this work later. Log liberally rather than sparingly; keep each entry concise and focused, not exhaustive.",
+                "description": format!("You MUST call this after every meaningful step: forming a plan, making a non-trivial decision, rejecting an approach, or finishing a subtask -- not only once at the very end. This is the only durable record of your reasoning. If you skip it, the plan, the rationale, and the paths you considered and rejected are gone the moment this session ends, unrecoverable by you or by anyone (including you, on another machine, via another harness) picking up this work later. Log liberally rather than sparingly; keep each entry concise and focused, not exhaustive. {THOUGHTS_STAY_PRIVATE}"),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -33,7 +40,7 @@ pub fn list_tools() -> Value {
                         },
                         "conversation_id": {
                             "type": "string",
-                            "description": "Optional conversation ID for clients/harnesses that manage their own sessions instead of using the server's default per-process session. Created if it doesn't already exist. Use 1 to 256 ASCII letters, digits, '.', '_', '-' or ':'; anything else is refused."
+                            "description": format!("Optional conversation ID for clients/harnesses that manage their own sessions instead of using the server's default per-process session. A conversation that does not exist yet is created. Either way the thought is recorded private: it does not take on the conversation's sharing, including sharing of its future thoughts. {THOUGHTS_STAY_PRIVATE} Use 1 to 256 ASCII letters, digits, '.', '_', '-' or ':'; anything else is refused.")
                         },
                         "parent_id": {
                             "type": "string",
@@ -177,7 +184,8 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
     // Clients/harnesses that manage their own sessions can override the server's
     // default per-process session and chaining behavior.
     //
-    // The id becomes the conversation's title ("Session <id>"), is shown in
+    // The id titles the conversation ("Session <id>") only when the thought
+    // creates it; an existing conversation keeps its title. The id is shown in
     // terminals, and is named in the phrase that is typed to share or unshare the
     // conversation. A client (a model, in effect) chooses it. It is held to the
     // rule core's capture policy applies to every conversation id, with the very
@@ -254,8 +262,13 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
     match res {
         Ok(id) => {
             *state.last_interaction_id.lock().unwrap() = Some(id.clone());
+            // The first block stays exactly what clients already read the id
+            // from; the privacy statement is a block of its own.
             Ok(json!({
-                "content": [{ "type": "text", "text": format!("Thought recorded. ID: {}", id) }]
+                "content": [
+                    { "type": "text", "text": format!("Thought recorded. ID: {}", id) },
+                    { "type": "text", "text": THOUGHTS_STAY_PRIVATE }
+                ]
             }))
         }
         Err(e) => Err(tool_failure("Failed to record thought", e)),

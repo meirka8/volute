@@ -230,7 +230,7 @@ CREATE TABLE artifact_links (
 
 ### 7.1 Current privacy and publication schema
 
-The implemented schema adds `interactions.visibility` (`private` by default), `capture_source`, and `scrubber_version`. Conversation and interaction share records are keyed by a destination fingerprint; publication is independently tracked as `pending`, `published`, or `unknown` for that exact destination. This prevents a consent, share, or observed publication at one URL from authorizing another URL, including a changed push URL.
+The implemented schema adds `interactions.visibility` (`private` by default), `capture_source`, and `scrubber_version`. Conversation and interaction share records are keyed by a destination fingerprint; publication is independently tracked as `pending`, `published`, or `unknown` for that exact destination. A new interaction takes on its conversation's future-sharing records only when its trusted `capture_source` takes part in future sharing; an MCP capture (`mcp`), whose conversation the client names, never does, and neither does a source that is not known (`legacy`). This prevents a consent, share, or observed publication at one URL from authorizing another URL, including a changed push URL.
 
 `tombstones` are local-only or destination-scoped for remote suppression. Their immutable wire form is `cvc.tombstone/v1` and contains an interaction UUID, timestamp, small reason code, and optional prior node object ID—never prompt or path text. Tombstones take precedence over every node, link, index, derivation event, and range-source representation during import and projection. Destination authority is not transitive: a share, publication observation, authorization, or tombstone from destination A grants nothing at destination B.
 
@@ -586,7 +586,7 @@ Scans maintain a cursor per worktree and symbolic branch. Newly discovered candi
 
 - **The Need:** A user may want to commit the code publicly but keep the conversation private (e.g., "Explain this basic concept to me").
     
-- **Implemented:** Interactions are private by default. Sharing records an exact current conversation snapshot for one remote; `--future` separately opts future turns into sharing for that remote. Consent is a separate, destination-fingerprinted acknowledgement, and auto-push is off until separately acknowledged.
+- **Implemented:** Interactions are private by default. Sharing records an exact current conversation snapshot for one remote; `--future` separately opts future turns that passive capture records (VS Code, Claude Code) into sharing for that remote. Thoughts recorded through MCP are always recorded private and stay private until the conversation is shared again. Consent is a separate, destination-fingerprinted acknowledgement, and auto-push is off until separately acknowledged.
     
 
 ### 13.5 Large Context Blobs

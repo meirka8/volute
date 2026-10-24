@@ -4,16 +4,20 @@
 //! Fixtures are synthetic transcripts shaped like the Claude Code versions
 //! named by their directory; `__WORKTREE__` is substituted with the fixture
 //! repository's canonical root at test time.
+use chrono::Utc;
 use cvc_core::claude_code::settings::{self, ExcludeAction, InstallAction};
 use cvc_core::claude_code::transcript::{
     self, derived_interaction_id, ParsedLine, PlanInput, TranscriptError,
 };
 use cvc_core::claude_code::{ingest, IngestError, IngestMode};
 use cvc_core::db::CvcStore;
-use cvc_core::models::{Author, ToolStatus};
-use cvc_core::privacy::PreparedPolicy;
+use cvc_core::models::{
+    Author, Conversation, FutureSharePolicy, Interaction, InteractionId, ToolStatus,
+};
+use cvc_core::privacy::{McpCapture, PreparedPolicy};
 use cvc_core::repository::RepositoryLayout;
 use git2::Repository;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -738,6 +742,113 @@ fn ingest_is_incremental_idempotent_and_policy_filtered() {
         )
         .unwrap();
     assert_eq!((sources, origins), (7, 7));
+}
+
+#[test]
+fn future_sharing_extends_to_later_ingests_of_the_session_but_not_to_mcp_thoughts_in_it() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let policy = fixture.policy();
+    let destination = "7".repeat(64);
+    let content = fixture.render(BASIC);
+    let cut = content.find("\"uuid\":\"s7\"").unwrap();
+    let line_start = content[..cut].rfind('\n').unwrap() + 1;
+    let transcript_path =
+        fixture.write_transcript(&format!("{BASIC_SESSION}.jsonl"), &content[..line_start]);
+    let first = ingest(
+        &fixture.layout,
+        &store,
+        &policy,
+        &transcript_path,
+        None,
+        IngestMode::Incremental,
+    )
+    .unwrap();
+    assert_eq!(first.inserted, 3, "{first:?}");
+    let title = || {
+        store
+            .get_conversation(BASIC_SESSION)
+            .unwrap()
+            .unwrap()
+            .title
+    };
+    assert_eq!(title(), "Add a greeting to lib.rs");
+
+    // The session is shared with its future thoughts, as `cvc share <session>
+    // --future` records it.
+    let snapshot = store.share_snapshot(BASIC_SESSION).unwrap();
+    store
+        .share_exact_snapshot(
+            BASIC_SESSION,
+            &destination,
+            &snapshot,
+            FutureSharePolicy::Shared,
+        )
+        .unwrap();
+
+    // A model in that session calls `commit_thought` naming its own session id,
+    // which it can read from its transcript's path.
+    let through_mcp = InteractionId::new();
+    store
+        .capture_mcp(McpCapture::new(
+            Conversation {
+                id: BASIC_SESSION.into(),
+                title: format!("Session {BASIC_SESSION}"),
+                created_at: Utc::now(),
+            },
+            Interaction {
+                id: through_mcp.clone(),
+                conversation_id: BASIC_SESSION.into(),
+                parent_id: None,
+                timestamp: Utc::now(),
+                author: Author::Agent,
+                user_prompt: "recorded through MCP".into(),
+                model_name: Some("agent".into()),
+                model_cot: Some("reasoning".into()),
+                model_response: None,
+                source_request_id: None,
+            },
+            Vec::new(),
+            Vec::new(),
+            PreparedPolicy::built_ins_only(),
+            "0".repeat(64),
+        ))
+        .unwrap();
+    // It leaves the session's title as it was.
+    assert_eq!(title(), "Add a greeting to lib.rs");
+
+    // The rest of the transcript, ingested later, joins the share as it is
+    // recorded; the MCP thought does not.
+    fs::write(&transcript_path, &content).unwrap();
+    let rest = ingest(
+        &fixture.layout,
+        &store,
+        &policy,
+        &transcript_path,
+        None,
+        IngestMode::Final,
+    )
+    .unwrap();
+    assert_eq!(rest.inserted, 4, "{rest:?}");
+    assert_eq!(
+        store.conversation_interaction_count(BASIC_SESSION).unwrap(),
+        8
+    );
+    let ingested: HashSet<InteractionId> = [
+        "req_A", "req_B", "req_C", "req_D", "req_E", "req_F", "req_G",
+    ]
+    .into_iter()
+    .map(|key| derived_interaction_id(BASIC_SESSION, key))
+    .collect();
+    let shared: HashSet<InteractionId> = store
+        .projection_interaction_ids(&destination)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(shared, ingested);
+    assert!(!shared.contains(&through_mcp));
+    // Ingestion still renames the session once its own title appears.
+    assert_eq!(title(), "Greeting work");
 }
 
 #[test]
