@@ -367,10 +367,16 @@ fn run_post_commit_logic(current_dir: &std::path::Path) -> Result<()> {
     // Name the commit, so the line this hook leaves in an agent's tool output
     // is exact evidence even when the agent committed quietly (`-q` prints no
     // summary): Claude Code transcript ingestion links the committing response
-    // from it. Printed whenever something was linked, and on every commit in a
-    // checkout whose Claude Code harness is installed, where that evidence is
-    // needed.
-    if count > 0 || cvc_core::claude_code::settings::installed(&layout) {
+    // from it. Printed whenever something was linked, and on every commit that
+    // a Claude Code session may be capturing, where that evidence is needed:
+    // in a checkout whose own harness is installed, or, for the user-scoped
+    // Claude Code plugin, which leaves no trace in the checkout, on a commit
+    // made from a Claude Code session (`CLAUDECODE=1` in its environment) in a
+    // repository where capture is acknowledged.
+    if count > 0
+        || cvc_core::claude_code::settings::installed(&layout)
+        || commit_from_capturing_claude_code_session(repo)
+    {
         match head_short_sha(repo) {
             Some(short) => println!("CVC: Linked {count} thought(s) to commit {short}."),
             None => println!("CVC: Linked {count} thought(s) to this commit."),
@@ -383,6 +389,16 @@ fn run_post_commit_logic(current_dir: &std::path::Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether this commit was made from a Claude Code session in a repository
+/// that has acknowledged capture, so a plugin may be ingesting that session.
+/// Claude Code sets `CLAUDECODE=1` for the commands its Bash tool runs, and
+/// Git's hooks inherit it. An acknowledgement that cannot be read counts as
+/// none: the line is evidence for capture, which that would refuse anyway.
+fn commit_from_capturing_claude_code_session(repo: &Repository) -> bool {
+    env::var_os("CLAUDECODE").is_some_and(|value| value == "1")
+        && privacy::capture_acknowledged(repo).unwrap_or(false)
 }
 
 /// The first twelve hex digits of HEAD's commit id: unambiguous in practice,

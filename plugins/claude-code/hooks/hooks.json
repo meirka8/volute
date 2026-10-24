@@ -1,0 +1,50 @@
+{
+  "description": "CVC: records Claude Code sessions started in a repository where CVC is initialized and capture is acknowledged; elsewhere the hooks record nothing. Requires cvc 0.7.1 or later in an absolute directory on PATH.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/check-cvc.sh\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run-cvc.sh\" ingest claude-code --hook; s=$?; [ \"$s\" -ne 2 ] || s=1; exit \"$s\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run-cvc.sh\" ingest claude-code --hook; s=$?; [ \"$s\" -ne 2 ] || s=1; exit \"$s\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run-cvc.sh\" ingest claude-code --hook; s=$?; [ \"$s\" -ne 2 ] || s=1; exit \"$s\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

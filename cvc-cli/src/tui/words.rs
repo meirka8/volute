@@ -1983,19 +1983,34 @@ pub fn remote_rows(
 // Empty states
 // ---------------------------------------------------------------------------
 
-/// What `cvc conversations` prints, before any screen is entered, when there is
-/// nothing to list: the fact, and the one thing to do next.
-pub fn empty_state(capture_acknowledged: bool, harness_installed: bool) -> [&'static str; 2] {
-    [
-        "No conversations captured yet.",
-        if !capture_acknowledged {
-            "Passive capture is off. Turn it on with: cvc privacy acknowledge-capture"
-        } else if !harness_installed {
-            "To record Claude Code sessions here: cvc harness install claude-code"
-        } else {
-            "Conversations appear here after a session has been captured."
-        },
-    ]
+/// What `cvc conversations` prints, one line each and before any screen is
+/// entered, when there is nothing to list: the fact, and what to do next. With
+/// capture on but no harness in this checkout, that names both ways to record
+/// Claude Code sessions, since the user-scoped plugin leaves nothing in the
+/// checkout to tell it from not recording at all. The plugin takes two
+/// commands in Claude Code (the marketplace has to be added before `cvc@volute`
+/// can be installed), so they are given one to a line, ready to paste. Every
+/// line fits an 80-column terminal.
+pub fn empty_state(capture_acknowledged: bool, harness_installed: bool) -> &'static [&'static str] {
+    if !capture_acknowledged {
+        &[
+            "No conversations captured yet.",
+            "Passive capture is off. Turn it on with: cvc privacy acknowledge-capture",
+        ]
+    } else if !harness_installed {
+        &[
+            "No conversations captured yet.",
+            "To record Claude Code sessions, run these in Claude Code:",
+            "  /plugin marketplace add meirka8/volute",
+            "  /plugin install cvc@volute",
+            "or, for this checkout only, run in a shell: cvc harness install claude-code",
+        ]
+    } else {
+        &[
+            "No conversations captured yet.",
+            "Conversations appear here after a session has been captured.",
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -3946,13 +3961,38 @@ mod tests {
                 "Passive capture is off. Turn it on with: cvc privacy acknowledge-capture"
             ]
         );
+        // Capture on, no checkout harness: both routes, the plugin's two
+        // commands one to a line.
         assert_eq!(
-            empty_state(true, false)[1],
-            "To record Claude Code sessions here: cvc harness install claude-code"
+            empty_state(true, false),
+            [
+                "No conversations captured yet.",
+                "To record Claude Code sessions, run these in Claude Code:",
+                "  /plugin marketplace add meirka8/volute",
+                "  /plugin install cvc@volute",
+                "or, for this checkout only, run in a shell: cvc harness install claude-code",
+            ]
         );
         assert_eq!(
-            empty_state(true, true)[1],
-            "Conversations appear here after a session has been captured."
+            empty_state(true, true),
+            [
+                "No conversations captured yet.",
+                "Conversations appear here after a session has been captured."
+            ]
         );
+    }
+
+    #[test]
+    fn every_empty_state_line_fits_an_80_column_terminal() {
+        for (acknowledged, installed) in [(false, false), (true, false), (true, true)] {
+            for line in empty_state(acknowledged, installed) {
+                assert!(
+                    line.chars().count() <= 80,
+                    "{} columns: {line}",
+                    line.chars().count()
+                );
+                assert_eq!(*line, line.trim_end());
+            }
+        }
     }
 }

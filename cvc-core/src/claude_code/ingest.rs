@@ -5,6 +5,7 @@
 //! deterministic ids), and commits the new captures together with the advanced
 //! cursor in one transaction. A run that fails changes nothing.
 use super::links;
+use super::session_lock::{SessionLock, SESSION_LOCK_WAIT};
 use super::transcript::{self, ParsedLine, PlanInput, TranscriptError, HARNESS};
 use crate::db::{CvcStore, DbError, HarnessCursorUpdate};
 use crate::models::{Conversation, Interaction, InteractionId};
@@ -15,6 +16,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 
 /// One read never buffers more than this; a transcript beyond it is treated as
@@ -50,6 +52,18 @@ pub enum IngestError {
     Db(#[from] DbError),
     #[error("transcript I/O: {0}")]
     Io(#[from] std::io::Error),
+    /// The per-session lock could not be taken for a reason other than another
+    /// run holding it (the CVC directory is a link or someone else's, say).
+    #[error("cannot lock Claude Code session {session} for ingestion: {source}")]
+    SessionLock {
+        session: String,
+        source: std::io::Error,
+    },
+    /// Another run was still ingesting this session when the wait for it ended.
+    /// That run is making progress, so nothing is lost: whatever it does not
+    /// reach, the next ingest of the session picks up from the cursor.
+    #[error("another cvc process is still ingesting Claude Code session {session} and did not finish within {waited_secs} s; run this again once it has")]
+    SessionBusy { session: String, waited_secs: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +108,12 @@ struct Target<'a> {
 /// `session_id` defaults to the transcript's file stem, which is how Claude
 /// Code names session files; every entry must agree with it. The policy is the
 /// exact `.thoughtignore` snapshot handed to persistence.
+///
+/// Runs on the same session in the same repository are serialized by a lock in
+/// the repository's CVC directory, held from reading the cursor to committing
+/// the advanced one, subagent transcripts included. A run that finds it held
+/// waits up to [`SESSION_LOCK_WAIT`], then fails with
+/// [`IngestError::SessionBusy`].
 pub fn ingest(
     layout: &RepositoryLayout,
     store: &CvcStore,
@@ -101,6 +121,27 @@ pub fn ingest(
     transcript_path: &Path,
     session_id: Option<&str>,
     mode: IngestMode,
+) -> Result<IngestReport, IngestError> {
+    ingest_waiting(
+        layout,
+        store,
+        policy,
+        transcript_path,
+        session_id,
+        mode,
+        SESSION_LOCK_WAIT,
+    )
+}
+
+/// [`ingest`] with an explicit bound on the wait for the session's lock.
+pub fn ingest_waiting(
+    layout: &RepositoryLayout,
+    store: &CvcStore,
+    policy: &PreparedPolicy,
+    transcript_path: &Path,
+    session_id: Option<&str>,
+    mode: IngestMode,
+    lock_wait: Duration,
 ) -> Result<IngestReport, IngestError> {
     let session = session_id
         .map(str::to_owned)
@@ -114,6 +155,19 @@ pub fn ingest(
     if !privacy::is_safe_identifier(&session) {
         return Err(IngestError::InvalidSession(session));
     }
+
+    // Held until this function returns: the cursors of the session and of its
+    // subagents are read and advanced under it.
+    let _lock = match SessionLock::acquire(&layout.cvc_dir(), HARNESS, &session, lock_wait) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return Err(IngestError::SessionBusy {
+                session,
+                waited_secs: lock_wait.as_secs(),
+            })
+        }
+        Err(source) => return Err(IngestError::SessionLock { session, source }),
+    };
 
     let mut report = ingest_target(
         layout,
@@ -455,4 +509,167 @@ fn derive_title(prompt: &str) -> Option<String> {
         end -= 1;
     }
     Some(format!("{}…", &line[..end]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git2::Repository;
+    use std::time::Instant;
+    use tempfile::TempDir;
+
+    const BASIC: &str = include_str!("../../tests/fixtures/claude-code/v2.1.260/basic.jsonl");
+    const SESSION: &str = "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60";
+    const SHORT: Duration = Duration::from_millis(100);
+
+    struct Fixture {
+        _temp: TempDir,
+        layout: RepositoryLayout,
+        store: CvcStore,
+        policy: PreparedPolicy,
+        transcript: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self::build(true)
+        }
+
+        /// `on_disk`: the store is the repository's own, in its CVC directory;
+        /// otherwise it is in memory and the repository has no CVC directory.
+        fn build(on_disk: bool) -> Self {
+            let temp = TempDir::new().unwrap();
+            Repository::init(temp.path()).unwrap();
+            let layout = RepositoryLayout::discover(temp.path()).unwrap();
+            let root = layout.worktree_root().unwrap().to_path_buf();
+            let store = if on_disk {
+                CvcStore::open(layout.db_path()).unwrap()
+            } else {
+                CvcStore::open(":memory:").unwrap()
+            };
+            let policy = PreparedPolicy::load(&root).unwrap();
+            let transcript = root.join(format!("{SESSION}.jsonl"));
+            fs::write(
+                &transcript,
+                BASIC.replace("__WORKTREE__", root.to_str().unwrap()),
+            )
+            .unwrap();
+            Self {
+                _temp: temp,
+                layout,
+                store,
+                policy,
+                transcript,
+            }
+        }
+
+        fn ingest(&self, wait: Duration) -> Result<IngestReport, IngestError> {
+            ingest_waiting(
+                &self.layout,
+                &self.store,
+                &self.policy,
+                &self.transcript,
+                None,
+                IngestMode::Final,
+                wait,
+            )
+        }
+
+        fn lock(&self, session: &str) -> SessionLock {
+            SessionLock::acquire(&self.layout.cvc_dir(), HARNESS, session, SHORT)
+                .unwrap()
+                .expect("nothing else holds it")
+        }
+
+        fn cursor(&self) -> Option<u64> {
+            self.store
+                .harness_ingest_cursor(HARNESS, SESSION)
+                .unwrap()
+                .map(|cursor| cursor.byte_offset)
+        }
+    }
+
+    /// A run that cannot get the session's lock in time records nothing, says
+    /// which session and for how long, and leaves the cursor where it was: the
+    /// holder is making progress and the next ingest resumes from the cursor.
+    #[test]
+    fn a_run_that_waits_in_vain_for_the_sessions_lock_changes_nothing() {
+        let fixture = Fixture::new();
+        let held = fixture.lock(SESSION);
+
+        let started = Instant::now();
+        let error = fixture.ingest(SHORT).unwrap_err();
+        assert!(started.elapsed() >= SHORT, "it waited for its time");
+        match &error {
+            IngestError::SessionBusy {
+                session,
+                waited_secs,
+            } => {
+                assert_eq!(session, SESSION);
+                assert_eq!(*waited_secs, 0, "a sub-second wait reads as 0 s");
+            }
+            other => panic!("{other:?}"),
+        }
+        let text = error.to_string();
+        assert!(
+            text.contains(SESSION) && text.contains("another cvc process"),
+            "{text}"
+        );
+        assert_eq!(fixture.cursor(), None);
+        assert!(!fixture
+            .store
+            .interaction_exists(&first_id(&fixture))
+            .unwrap());
+
+        // Released, the same call goes through and records the session.
+        drop(held);
+        let report = fixture.ingest(SHORT).unwrap();
+        assert_eq!(report.inserted, 7);
+        assert!(fixture.cursor().is_some());
+    }
+
+    #[test]
+    fn the_wait_is_for_the_same_session_only() {
+        let fixture = Fixture::new();
+        let _other = fixture.lock("another-session");
+        let report = fixture.ingest(SHORT).unwrap();
+        assert_eq!(report.inserted, 7);
+    }
+
+    /// The default wait is below the hooks' own timeout (30 s), so a waiting
+    /// hook gives up on its terms rather than being killed mid-wait.
+    #[test]
+    fn the_default_wait_ends_before_the_hooks_timeout() {
+        assert!(SESSION_LOCK_WAIT < Duration::from_secs(super::super::settings::HOOK_TIMEOUT_SECS));
+        assert!(SESSION_LOCK_WAIT >= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_taken_for_another_reason_is_a_different_error() {
+        let fixture = Fixture::build(false);
+        assert!(!fixture.layout.cvc_dir().exists());
+        let error = fixture.ingest(SHORT).unwrap_err();
+        assert!(
+            matches!(error, IngestError::SessionLock { ref session, .. } if session == SESSION),
+            "{error:?}"
+        );
+    }
+
+    /// The id of the first interaction the fixture's transcript produces.
+    fn first_id(fixture: &Fixture) -> InteractionId {
+        let bytes = fs::read(&fixture.transcript).unwrap();
+        let window = transcript::parse_window(&bytes, 0, SESSION, false).unwrap();
+        let root = fixture.layout.worktree_root().unwrap();
+        let plan = transcript::plan(
+            &window.lines,
+            0,
+            &PlanInput {
+                session_id: SESSION,
+                worktree_root: root,
+                path_aliases: &[],
+                final_mode: true,
+            },
+        );
+        plan.interactions[0].id.clone()
+    }
 }

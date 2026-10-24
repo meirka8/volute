@@ -79,6 +79,7 @@ body:
         - MCP Server
         - Language Server
         - VS Code Extension
+        - Claude Code plugin
         - Reviewer
         - Repository / Cross-component
     validations:
