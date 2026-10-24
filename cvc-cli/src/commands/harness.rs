@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use cvc_core::claude_code::harness_record;
 use cvc_core::claude_code::settings::{self, ExcludeAction, InstallAction, WorktreeState};
 use cvc_core::hooks::{self, HookAction};
-use cvc_core::privacy;
+use cvc_core::privacy::{self, CaptureAcknowledgement};
 use cvc_core::repository::RepositoryLayout;
 use std::cmp::Ordering;
 use std::env;
@@ -667,13 +667,26 @@ pub(crate) fn discover_initialized_at(path: &std::path::Path) -> Result<Reposito
     Ok(layout)
 }
 
+/// The one line the CLI adds where it says capture is not acknowledged and an
+/// acknowledgement is on record that was not given for this checkout and user
+/// (`privacy::CaptureAcknowledgement::OtherCheckoutOrUser`): a copied, moved or
+/// restored repository, another user, or an acknowledgement from cvc 0.7.0 or
+/// earlier.
+pub(crate) const ACKNOWLEDGED_ELSEWHERE: &str = "capture was acknowledged for another checkout or user, or by an older cvc; run `cvc privacy acknowledge-capture` here";
+
+/// How to stop the Claude Code hooks, which end every `consent-required`.
+const STOP_THE_HOOKS: &str = "(or stop the hooks: `/plugin disable cvc@volute` for the Claude Code plugin, `cvc harness uninstall claude-code` for this checkout's hooks)";
+
 pub(crate) fn require_capture_acknowledged(layout: &RepositoryLayout) -> Result<()> {
-    if !privacy::capture_acknowledged(layout.repository())? {
-        bail!(
-            "consent-required: Claude Code transcript capture is passive collection and needs the repository-local capture acknowledgement; run `cvc privacy acknowledge-capture` first (or stop the hooks: `/plugin disable cvc@volute` for the Claude Code plugin, `cvc harness uninstall claude-code` for this checkout's hooks)"
-        );
+    match privacy::capture_acknowledgement(layout.repository())? {
+        CaptureAcknowledgement::Acknowledged => Ok(()),
+        CaptureAcknowledgement::NotAcknowledged => bail!(
+            "consent-required: Claude Code transcript capture is passive collection and needs the repository-local capture acknowledgement; run `cvc privacy acknowledge-capture` first {STOP_THE_HOOKS}"
+        ),
+        CaptureAcknowledgement::OtherCheckoutOrUser => bail!(
+            "consent-required: Claude Code transcript capture is passive collection and needs the repository-local capture acknowledgement; {ACKNOWLEDGED_ELSEWHERE} {STOP_THE_HOOKS}"
+        ),
     }
-    Ok(())
 }
 
 #[cfg(test)]

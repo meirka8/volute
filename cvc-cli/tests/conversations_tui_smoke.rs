@@ -285,6 +285,24 @@ fn an_empty_repository_says_so_with_one_hint_and_never_takes_over_the_screen() {
     }
     assert!(!output.contains("Passive capture is off"), "{output}");
 
+    // A copy of the repository carries the acknowledgement, which does not
+    // count there: the hint is the unacknowledged one, with the reason.
+    let copy = fixture.copy_repo("copy");
+    let mut command = tui_command(&fixture, &["conversations"]);
+    command.current_dir(&copy);
+    let (status, output) = PtySession::spawn_sized(command, b"", 120, 40).wait_exit();
+    assert!(status.success(), "{output}");
+    assert!(!output.contains(ENTER_ALTERNATE_SCREEN), "{output:?}");
+    for line in [
+        "No conversations captured yet.",
+        "Passive capture is off. Turn it on with: cvc privacy acknowledge-capture",
+        "It was acknowledged for another checkout or user, or by an older cvc.",
+    ] {
+        assert!(output.contains(line), "{line:?} in {output}");
+    }
+    let output = empty(&fixture);
+    assert!(!output.contains("another checkout"), "{output}");
+
     // Both are done.
     fixture.cvc_ok(&["harness", "install", "claude-code"]);
     let output = empty(&fixture);

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use cvc_core::claude_code::{harness_record, settings};
 use cvc_core::db::CvcStore;
 use cvc_core::linker;
-use cvc_core::privacy;
+use cvc_core::privacy::{self, CaptureAcknowledgement};
 use cvc_core::repository::{RepositoryLayout, RepositoryLayoutError};
 use git2::Repository;
 use std::env;
@@ -130,10 +130,18 @@ fn propagate_claude_code_harness(cwd: &Path) -> Result<Propagation> {
     }
     // Hook-driven ingestion needs the repository-local acknowledgement, and
     // installing hooks that would only report `consent-required` is no use.
-    if !privacy::capture_acknowledged(layout.repository())? {
-        return Ok(Propagation::Declined(
-            "local capture is not acknowledged for this repository".into(),
-        ));
+    match privacy::capture_acknowledgement(layout.repository())? {
+        CaptureAcknowledgement::Acknowledged => {}
+        CaptureAcknowledgement::NotAcknowledged => {
+            return Ok(Propagation::Declined(
+                "local capture is not acknowledged for this repository".into(),
+            ))
+        }
+        CaptureAcknowledgement::OtherCheckoutOrUser => {
+            return Ok(Propagation::Declined(
+                super::harness::ACKNOWLEDGED_ELSEWHERE.into(),
+            ))
+        }
     }
     // Create-only: this runs unattended inside Git, so it never merges into a
     // settings file that is already there.

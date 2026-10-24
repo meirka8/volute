@@ -1021,3 +1021,297 @@ fn a_remote_destination_never_prints_its_url() {
     // The URL is still there for the code that has to use it.
     assert!(destination.effective_url.contains("tok-secret"));
 }
+
+// ---------------------------------------------------------------------------
+// The capture acknowledgement is bound to the checkout and the user
+// ---------------------------------------------------------------------------
+
+/// Copies the tree at `from` to `to`, file and directory permissions included,
+/// as an archive, `cp -a` or a backup restore does.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &target).unwrap();
+        } else {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(entry.path()).unwrap(), &target).unwrap();
+            #[cfg(not(unix))]
+            panic!("unexpected entry {}", entry.path().display());
+        }
+    }
+    std::fs::set_permissions(to, std::fs::metadata(from).unwrap().permissions()).unwrap();
+}
+
+fn privacy_file(repo: &Repository) -> std::path::PathBuf {
+    repo.commondir().join("cvc").join("privacy.json")
+}
+
+fn privacy_json(repo: &Repository) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(privacy_file(repo)).unwrap()).unwrap()
+}
+
+/// Replaces the privacy state with `text`, keeping the file private.
+fn write_privacy_json(repo: &Repository, text: &str) {
+    use std::io::Write;
+    let path = privacy_file(repo);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(&path)
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+}
+
+fn status_of(repo: &Repository) -> cvc_core::privacy::PrivacyStatus {
+    cvc_core::privacy::privacy_status_for_fingerprint(repo, &"0".repeat(64)).unwrap()
+}
+
+#[test]
+fn a_capture_acknowledgement_copied_with_a_repository_grants_nothing_in_the_copy() {
+    use cvc_core::privacy::{
+        acknowledge_capture, capture_acknowledged, capture_acknowledgement, CaptureAcknowledgement,
+    };
+    let temp = tempdir().unwrap();
+    let original_dir = temp.path().join("original");
+    let original = Repository::init(&original_dir).unwrap();
+    acknowledge_capture(&original).unwrap();
+    assert!(capture_acknowledged(&original).unwrap());
+    assert_eq!(
+        capture_acknowledgement(&original).unwrap(),
+        CaptureAcknowledgement::Acknowledged
+    );
+    assert!(status_of(&original).capture_acknowledged);
+
+    // The privacy state alone, put into another repository.
+    let other = Repository::init(temp.path().join("other")).unwrap();
+    std::fs::create_dir(other.commondir().join("cvc")).unwrap();
+    std::fs::copy(privacy_file(&original), privacy_file(&other)).unwrap();
+    assert!(!capture_acknowledged(&other).unwrap());
+    assert_eq!(
+        capture_acknowledgement(&other).unwrap(),
+        CaptureAcknowledgement::OtherCheckoutOrUser
+    );
+    let status = status_of(&other);
+    assert!(!status.capture_acknowledged);
+    assert_eq!(
+        status.capture_acknowledgement,
+        CaptureAcknowledgement::OtherCheckoutOrUser
+    );
+
+    // The whole repository, `.git` and all, copied to another path.
+    let copy_dir = temp.path().join("copy");
+    copy_tree(&original_dir, &copy_dir);
+    let copy = Repository::open(&copy_dir).unwrap();
+    assert_eq!(privacy_json(&copy), privacy_json(&original));
+    assert!(!capture_acknowledged(&copy).unwrap());
+    assert_eq!(
+        capture_acknowledgement(&copy).unwrap(),
+        CaptureAcknowledgement::OtherCheckoutOrUser
+    );
+    // The original keeps its own.
+    assert!(capture_acknowledged(&original).unwrap());
+
+    // Acknowledging in the copy binds the copy, and the original's is left as
+    // it was.
+    let original_state = privacy_json(&original);
+    acknowledge_capture(&copy).unwrap();
+    assert!(capture_acknowledged(&copy).unwrap());
+    assert!(capture_acknowledged(&original).unwrap());
+    assert_eq!(privacy_json(&original), original_state);
+    assert_ne!(
+        privacy_json(&copy)["capture_acknowledged_binding"],
+        original_state["capture_acknowledged_binding"]
+    );
+    // And neither counts in the third repository.
+    assert!(!capture_acknowledged(&other).unwrap());
+}
+
+#[test]
+fn an_acknowledgement_recorded_without_a_binding_is_not_one() {
+    use cvc_core::privacy::{
+        acknowledge_capture, capture_acknowledged, capture_acknowledgement, CaptureAcknowledgement,
+    };
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    repo.remote("origin", "https://example.test/one.git")
+        .unwrap();
+    let fingerprint = privacy_status(&repo, "origin").unwrap().remote_fingerprint;
+    // What cvc 0.7.0 wrote: the notice version, and nothing about for whom.
+    write_privacy_json(
+        &repo,
+        &format!(
+            r#"{{"version":1,"capture_acknowledged_version":1,"sharing":[{{"fingerprint":"{fingerprint}","notice_version":1,"auto_push":false}}]}}"#
+        ),
+    );
+    assert!(!capture_acknowledged(&repo).unwrap());
+    assert_eq!(
+        capture_acknowledgement(&repo).unwrap(),
+        CaptureAcknowledgement::OtherCheckoutOrUser
+    );
+    let status = privacy_status(&repo, "origin").unwrap();
+    assert!(!status.capture_acknowledged);
+    // The rest of the file still reads as it did.
+    assert!(status.sharing_consented);
+
+    // A file that records no acknowledgement at all is the plain case.
+    write_privacy_json(
+        &repo,
+        r#"{"version":1,"capture_acknowledged_version":null,"sharing":[]}"#,
+    );
+    assert_eq!(
+        capture_acknowledgement(&repo).unwrap(),
+        CaptureAcknowledgement::NotAcknowledged
+    );
+
+    // Acknowledging again records it for this checkout and user.
+    acknowledge_capture(&repo).unwrap();
+    assert!(capture_acknowledged(&repo).unwrap());
+}
+
+#[test]
+fn a_binding_that_is_not_exactly_this_checkouts_grants_nothing() {
+    use cvc_core::privacy::{
+        acknowledge_capture, capture_acknowledged, capture_acknowledgement, CaptureAcknowledgement,
+    };
+    use serde_json::{json, Value};
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    acknowledge_capture(&repo).unwrap();
+    let genuine = privacy_json(&repo);
+    let binding = genuine["capture_acknowledged_binding"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut flipped = binding.clone().into_bytes();
+    flipped[63] = if flipped[63] == b'0' { b'1' } else { b'0' };
+    let flipped = String::from_utf8(flipped).unwrap();
+    let mut tampered: Vec<Value> = vec![
+        Value::Null,
+        json!(""),
+        json!("not a binding"),
+        json!(flipped),
+        json!(format!("{binding} ")),
+        json!(&binding[..63]),
+        json!(format!("{binding}0")),
+    ];
+    if binding.to_uppercase() != binding {
+        tampered.push(json!(binding.to_uppercase()));
+    }
+    for value in tampered {
+        let mut state = genuine.clone();
+        state["capture_acknowledged_binding"] = value.clone();
+        write_privacy_json(&repo, &state.to_string());
+        assert!(!capture_acknowledged(&repo).unwrap(), "{value}");
+        assert_eq!(
+            capture_acknowledgement(&repo).unwrap(),
+            CaptureAcknowledgement::OtherCheckoutOrUser,
+            "{value}"
+        );
+        assert!(!status_of(&repo).capture_acknowledged, "{value}");
+    }
+    // A binding that is not even a string leaves the state unreadable, which is
+    // an error, never a grant.
+    for value in [json!(42), json!([binding]), json!({ "binding": binding })] {
+        let mut state = genuine.clone();
+        state["capture_acknowledged_binding"] = value.clone();
+        write_privacy_json(&repo, &state.to_string());
+        assert!(capture_acknowledged(&repo).is_err(), "{value}");
+    }
+    // The genuine state, put back, counts again: nothing else was at stake.
+    write_privacy_json(&repo, &genuine.to_string());
+    assert!(capture_acknowledged(&repo).unwrap());
+}
+
+#[test]
+fn consent_changes_keep_the_capture_acknowledgement_and_its_binding() {
+    use cvc_core::privacy::{acknowledge_capture, capture_acknowledged, set_auto_push};
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    repo.remote("origin", "https://example.test/one.git")
+        .unwrap();
+    acknowledge_capture(&repo).unwrap();
+    let binding = privacy_json(&repo)["capture_acknowledged_binding"].clone();
+    assert!(binding.is_string());
+    acknowledge_sharing(&repo, "origin").unwrap();
+    set_auto_push(&repo, "origin", true).unwrap();
+    set_auto_push(&repo, "origin", false).unwrap();
+    assert!(capture_acknowledged(&repo).unwrap());
+    assert_eq!(privacy_json(&repo)["capture_acknowledged_binding"], binding);
+}
+
+fn git(home: &std::path::Path, dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", home.join("empty.gitconfig"))
+        .env("GIT_TEMPLATE_DIR", home.join("templates"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed: {status}");
+}
+
+#[test]
+fn linked_worktrees_share_one_capture_acknowledgement() {
+    use cvc_core::privacy::{acknowledge_capture, capture_acknowledged};
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let main = temp.path().join("main");
+    std::fs::create_dir_all(home.join("templates")).unwrap();
+    std::fs::create_dir(&main).unwrap();
+    git(&home, &main, &["init"]);
+    git(
+        &home,
+        &main,
+        &["config", "user.email", "test@example.invalid"],
+    );
+    git(&home, &main, &["config", "user.name", "CVC test"]);
+    std::fs::write(main.join("tracked"), "one\n").unwrap();
+    git(&home, &main, &["add", "tracked"]);
+    git(&home, &main, &["commit", "-m", "initial"]);
+    let add = |name: &str| {
+        let path = temp.path().join(name);
+        git(
+            &home,
+            &main,
+            &["worktree", "add", "-b", name, path.to_str().unwrap()],
+        );
+        Repository::open(path).unwrap()
+    };
+    let before = add("before");
+    let main_repo = Repository::open(&main).unwrap();
+
+    // Given in a linked worktree, it is the repository's.
+    acknowledge_capture(&before).unwrap();
+    assert!(capture_acknowledged(&before).unwrap());
+    assert!(capture_acknowledged(&main_repo).unwrap());
+    // A worktree created afterwards has it too, and so does a worktree when it
+    // was given in the main one.
+    let after = add("after");
+    assert!(capture_acknowledged(&after).unwrap());
+    acknowledge_capture(&main_repo).unwrap();
+    for repo in [&main_repo, &before, &after] {
+        assert!(capture_acknowledged(repo).unwrap());
+    }
+    // One binding, whichever worktree recorded it.
+    let recorded = privacy_json(&main_repo)["capture_acknowledged_binding"].clone();
+    acknowledge_capture(&after).unwrap();
+    assert_eq!(
+        privacy_json(&main_repo)["capture_acknowledged_binding"],
+        recorded
+    );
+}

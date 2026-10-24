@@ -118,8 +118,9 @@ pub(crate) fn run(start: Start<'_>) -> Result<Launch> {
     let data = load(&ctx, remotes, remote.as_deref())?;
     if data.summaries.iter().all(|summary| summary.thoughts == 0) {
         // Nothing to list: say so on the main screen, with the one next step.
-        let capture_acknowledged = privacy::capture_acknowledged(start.repo).unwrap_or(false);
-        for line in words::empty_state(capture_acknowledged, start.harness_installed) {
+        // State that cannot be read counts as never acknowledged.
+        let capture = privacy::capture_acknowledgement(start.repo).unwrap_or_default();
+        for line in words::empty_state(capture, start.harness_installed) {
             println!("{line}");
         }
         return Ok(Launch::Finished);
@@ -480,6 +481,7 @@ mod tests {
     fn now(sharing_consented: bool, auto_push: bool) -> privacy::PrivacyStatus {
         privacy::PrivacyStatus {
             capture_acknowledged: true,
+            capture_acknowledgement: privacy::CaptureAcknowledgement::Acknowledged,
             sharing_consented,
             auto_push,
             remote_fingerprint: "f".repeat(64),
