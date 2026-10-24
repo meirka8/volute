@@ -1,5 +1,5 @@
 {
-  "description": "CVC: records Claude Code sessions started in a repository where CVC is initialized and capture is acknowledged; elsewhere the hooks record nothing. Requires cvc 0.7.1 or later on PATH.",
+  "description": "CVC: records Claude Code sessions started in a repository where CVC is initialized and capture is acknowledged; elsewhere the hooks record nothing. Requires cvc 0.7.1 or later in an absolute directory on PATH.",
   "hooks": {
     "SessionStart": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/check-cvc.sh\"",
+            "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/check-cvc.sh\"",
             "timeout": 30
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cvc ingest claude-code --hook",
+            "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run-cvc.sh\" ingest claude-code --hook; s=$?; [ \"$s\" -ne 2 ] || s=1; exit \"$s\"",
             "timeout": 30
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cvc ingest claude-code --hook",
+            "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run-cvc.sh\" ingest claude-code --hook; s=$?; [ \"$s\" -ne 2 ] || s=1; exit \"$s\"",
             "timeout": 30
           }
         ]
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cvc ingest claude-code --hook",
+            "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run-cvc.sh\" ingest claude-code --hook; s=$?; [ \"$s\" -ne 2 ] || s=1; exit \"$s\"",
             "timeout": 30
           }
         ]
