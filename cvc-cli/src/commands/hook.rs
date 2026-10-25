@@ -92,8 +92,10 @@ pub async fn post_checkout(previous: &str, _new: &str, flag: &str) -> Result<()>
 
 /// Installs the Claude Code hook entries into the worktree at `cwd` when the
 /// repository's harness record asks for them. Reads one small file and the
-/// repository's consent state; it opens no database and touches no network,
-/// because it runs inside `git worktree add`.
+/// repository's consent state; it opens no database and, except that asking
+/// Git in a partial clone may fetch an ignore file the sparse checkout left
+/// out (as `git status` would), uses no network, because it runs inside
+/// `git worktree add`.
 fn propagate_claude_code_harness(cwd: &Path) -> Result<Propagation> {
     let layout = match RepositoryLayout::discover(cwd) {
         Ok(layout) => layout,
@@ -145,9 +147,14 @@ fn propagate_claude_code_harness(cwd: &Path) -> Result<Propagation> {
             settings::InstallAction::AlreadyPresent => Propagation::Nothing,
         }),
         // A settings file the checkout itself carries, tracked or not, is the
-        // user's (or the branch's), not ours.
+        // user's (or the branch's), not ours. Nor is one created that Git is
+        // not known to ignore, since a commit could carry it: Git said it does
+        // not ignore it, or could not be asked.
         Err(error)
-            if error.is::<settings::TrackedSettings>() || error.is::<settings::SettingsExist>() =>
+            if error.is::<settings::TrackedSettings>()
+                || error.is::<settings::SettingsExist>()
+                || error.is::<settings::SettingsNotIgnored>()
+                || error.is::<settings::SettingsIgnoreUnknown>() =>
         {
             Ok(Propagation::Declined(error.to_string()))
         }
