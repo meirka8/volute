@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use cvc_core::claude_code;
 use cvc_core::db::{ConversationSummary, CvcStore};
-use cvc_core::privacy::{self, PrivacyError};
+use cvc_core::privacy;
 use cvc_core::repository::RepositoryLayout;
 use git2::Repository;
 use std::env;
@@ -83,6 +83,29 @@ pub(crate) fn render_line(summary: &ConversationSummary, with_destination: bool)
     )
 }
 
+/// Moves, for every remote of the repository, the records an earlier version
+/// kept under its destination's legacy fingerprint to its fingerprint
+/// (`sync::adopt_legacy_records`), before anything is listed, so that the share
+/// state, the publication counts and the authorization the listing and the
+/// interactive view show read as they did. This is the one write of
+/// `cvc conversations`, and it happens at most once per destination: a remote
+/// without user information in its push URL has nothing to move, and nothing is
+/// written for it.
+///
+/// Best effort, like the listing: a remote that cannot be resolved, or whose
+/// records cannot be moved now, is listed as it stands, and the next command
+/// that acts on it moves them or says why it cannot.
+fn adopt_legacy_records_of_every_remote(repo: &Repository, store: &CvcStore) {
+    let Ok(names) = repo.remotes() else {
+        return;
+    };
+    for name in names.iter().flatten() {
+        if let Ok(destination) = privacy::remote_destination(repo, name) {
+            let _ = cvc_core::sync::adopt_legacy_records(repo, store, &destination);
+        }
+    }
+}
+
 /// Resolve the destination fingerprint for display, tolerating repositories
 /// with no usable remote: the listing is read-only and must still work there.
 pub(crate) fn display_destination(
@@ -149,6 +172,7 @@ pub async fn run(requested: Option<&str>, limit: Option<usize>, plain: bool) -> 
     // repository below. Only the view asks.
     let harness_installed = interactive && claude_code::settings::installed(&layout);
     let repo = layout.into_repository();
+    adopt_legacy_records_of_every_remote(&repo, &store);
 
     // The interactive view, from a terminal and unless `--plain` was given. It
     // takes over the whole command, except when the terminal is too small for
@@ -209,10 +233,10 @@ pub async fn run(requested: Option<&str>, limit: Option<usize>, plain: bool) -> 
 pub(crate) struct RemoteOverview {
     /// The remote's name as configured.
     pub name: String,
-    /// The destination fingerprint (the SHA-256 of the effective push URL and
-    /// ref that consent is bound to), or the reason the remote cannot be a
-    /// destination, such as `remote has no push URL`. The reason is plain text
-    /// meant for display.
+    /// The destination fingerprint (the SHA-256 of the effective push URL
+    /// without its user information, and of the ref, that consent is bound
+    /// to), or the reason the remote cannot be a destination, such as
+    /// `remote has no push URL`. The reason is plain text meant for display.
     pub fingerprint: std::result::Result<String, String>,
     /// Where the remote points, for display only: `host[:port]/path`,
     /// `host:path` or a local path, with user information (the user and any
@@ -251,7 +275,7 @@ impl RemoteOverview {
             Err(reason) => bail!("remote '{}' is unusable: {reason}", self.name),
         };
         let destination = privacy::remote_destination(repo, &self.name)
-            .map_err(|error| anyhow!("remote '{}': {}", self.name, display_reason(error)))?;
+            .map_err(|error| anyhow!("remote '{}': {error}", self.name))?;
         if &destination.fingerprint != shown {
             bail!(
                 "remote '{}' now resolves to a different destination than the one listed; refresh the remote list before acting",
@@ -298,11 +322,11 @@ fn overview_of(repo: &Repository, name: &str) -> RemoteOverview {
         .and_then(|destination| privacy::display_location(&destination.effective_url));
     let fingerprint = destination
         .map(|destination| destination.fingerprint)
-        .map_err(display_reason);
+        .map_err(|error| error.to_string());
     let (sharing_consented, auto_push, consent_error) = match &fingerprint {
         Ok(fingerprint) => match privacy::privacy_status_for_fingerprint(repo, fingerprint) {
             Ok(status) => (status.sharing_consented, status.auto_push, None),
-            Err(error) => (false, false, Some(display_reason(error))),
+            Err(error) => (false, false, Some(error.to_string())),
         },
         Err(_) => (false, false, None),
     };
@@ -313,16 +337,6 @@ fn overview_of(repo: &Repository, name: &str) -> RemoteOverview {
         sharing_consented,
         auto_push,
         consent_error,
-    }
-}
-
-/// The message of a privacy error without the `invalid .thoughtignore:` prefix
-/// its `Display` puts on every policy failure, which is wrong for a remote or
-/// consent problem.
-fn display_reason(error: PrivacyError) -> String {
-    match error {
-        PrivacyError::Policy(reason) => reason,
-        other => other.to_string(),
     }
 }
 

@@ -39,9 +39,10 @@ fn open(cwd: &Path) -> Result<(Repository, CvcStore)> {
     Ok((layout.into_repository(), store))
 }
 pub async fn privacy_status(requested: Option<&str>) -> Result<()> {
-    let (repo, _) = open(&env::current_dir()?)?;
+    let (repo, store) = open(&env::current_dir()?)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let s = privacy::privacy_status_for_fingerprint(&repo, &destination.fingerprint)?;
     println!("capture_acknowledged: {}\nsharing_consented: {}\nauto_push: {}\nremote: {}\ndestination_fingerprint: {}", s.capture_acknowledged, s.sharing_consented, s.auto_push, name, s.remote_fingerprint);
     Ok(())
@@ -54,10 +55,10 @@ pub async fn acknowledge_capture() -> Result<()> {
     Ok(())
 }
 pub async fn acknowledge_sharing(requested: Option<&str>) -> Result<()> {
-    let (repo, _) = open(&env::current_dir()?)?;
+    let (repo, store) = open(&env::current_dir()?)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
-    acknowledge_sharing_for(&repo, &destination)
+    acknowledge_sharing_for(&repo, &store, &destination)
 }
 
 /// What `cvc privacy acknowledge-sharing --remote <destination.name>` does once
@@ -65,10 +66,17 @@ pub async fn acknowledge_sharing(requested: Option<&str>) -> Result<()> {
 /// `I AUTHORIZE SHARING <fingerprint>` challenge before recording the consent.
 /// The consent is bound to `destination.fingerprint` and grants nothing for
 /// any other destination; it does not enable automatic push.
+///
+/// Records an earlier version kept for the destination under its legacy
+/// fingerprint are moved to its fingerprint first
+/// (`sync::adopt_legacy_records`), as in every flow that reads or writes a
+/// destination's consent or publication state.
 pub(crate) fn acknowledge_sharing_for(
     repo: &Repository,
+    store: &CvcStore,
     destination: &privacy::RemoteDestination,
 ) -> Result<()> {
+    sync::adopt_legacy_records(repo, store, destination)?;
     let s = privacy::privacy_status_for_fingerprint(repo, &destination.fingerprint)?;
     println!("Acknowledging immutable publication to remote '{}' (fingerprint {}). This does not enable automatic push.", sanitize_for_terminal(&destination.name), s.remote_fingerprint);
     typed_acknowledgement(&format!("I AUTHORIZE SHARING {}", s.remote_fingerprint))?;
@@ -228,9 +236,10 @@ pub async fn set_auto_push(value: &str, requested: Option<&str>) -> Result<()> {
         "off" => false,
         _ => bail!("auto-push must be 'on' or 'off'"),
     };
-    let (repo, _) = open(&env::current_dir()?)?;
+    let (repo, store) = open(&env::current_dir()?)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     typed_acknowledgement(&format!(
         "I AUTHORIZE AUTO PUSH {} {}",
         if enabled { "ON" } else { "OFF" },
@@ -256,6 +265,8 @@ pub async fn share(
     // implicit destination is origin; an explicit --remote is authoritative.
     let name = requested.unwrap_or("origin");
     let destination = privacy::remote_destination(&repo, name)?;
+    // Before the picker reads what is shared for the destination.
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let picked;
     let id = match id {
         Some(id) => id,
@@ -307,6 +318,7 @@ pub(crate) fn share_conversation(
     future: FutureSharePolicy,
     publish_after: bool,
 ) -> Result<ShareOutcome> {
+    sync::adopt_legacy_records(repo, store, destination)?;
     // Make the consent legible: title and activity range alongside the
     // snapshot count already embedded in the challenge below.
     if let Some(summary) = store
@@ -398,6 +410,7 @@ pub(crate) fn unshare_conversation(
     destination: &privacy::RemoteDestination,
     id: &str,
 ) -> Result<usize> {
+    sync::adopt_legacy_records(repo, store, destination)?;
     let _operation_lock = privacy::destination_operation_lock(repo, &destination.fingerprint)?;
     typed_acknowledgement(&format!("I UNSHARE {id} {}", destination.fingerprint))?;
     let made_private = store.unshare_conversation_for_remote(id, &destination.fingerprint)?;
@@ -482,6 +495,7 @@ pub async fn redact(
     let (repo, store) = open(&env::current_dir()?)?;
     let id: InteractionId = id.parse().context("invalid interaction id")?;
     let destination = privacy::remote_destination(&repo, remote_name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let _operation_lock = privacy::destination_operation_lock(&repo, &destination.fingerprint)?;
     // Fresh authenticated advertisement/fetch is both the baseline proof and the
     // stale-plan lease. This command deliberately has no push path.
@@ -537,6 +551,7 @@ pub async fn redact(
 pub async fn verify_redaction_plan(path: &Path, remote_name: &str) -> Result<()> {
     let (repo, store) = open(&env::current_dir()?)?;
     let destination = privacy::remote_destination(&repo, remote_name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let _operation_lock = privacy::destination_operation_lock(&repo, &destination.fingerprint)?;
     let plan = read_redaction_plan(path)?;
     if plan.destination_fingerprint != destination.fingerprint {
@@ -585,6 +600,7 @@ pub async fn auto_push_remote(cwd: &Path, requested: Option<&str>) -> Result<()>
     let (repo, store) = open(cwd)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let status = privacy::privacy_status_for_fingerprint(&repo, &destination.fingerprint)?;
     if !status.sharing_consented || !status.auto_push {
         eprintln!("CVC: auto publication disabled for '{}'.", name);
@@ -653,6 +669,7 @@ fn push_destination(
     destination: &privacy::RemoteDestination,
     trigger: PublicationTrigger,
 ) -> Result<PublishOutcome> {
+    sync::adopt_legacy_records(repo, store, destination)?;
     let _operation_lock = privacy::destination_operation_lock(repo, &destination.fingerprint)?;
     let status = privacy::privacy_status_for_fingerprint(repo, &destination.fingerprint)?;
     if !status.sharing_consented {
@@ -925,6 +942,7 @@ pub async fn reconcile(requested: Option<&str>) -> Result<()> {
     let (repo, store) = open(&env::current_dir()?)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let _operation_lock = privacy::destination_operation_lock(&repo, &destination.fingerprint)?;
     reconcile_destination(&repo, &store, &destination)?;
     println!("Reconciled publication state for '{}'.", name);
@@ -934,6 +952,7 @@ pub async fn pull() -> Result<()> {
     let (repo, mut store) = open(&env::current_dir()?)?;
     let name = remote(&repo, None)?;
     let destination = privacy::remote_destination(&repo, &name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let _operation_lock = privacy::destination_operation_lock(&repo, &destination.fingerprint)?;
     let n = sync::fetch_and_pull_destination(&repo, &store, &destination)?;
     let _ =
@@ -948,6 +967,7 @@ pub async fn observe_range(base: &str, tip: &str, requested: Option<&str>) -> Re
     let tip = repo.revparse_single(tip)?.peel_to_commit()?.id();
     let authorization = if let Some(name) = requested {
         let destination = privacy::remote_destination(&repo, name)?;
+        sync::adopt_legacy_records(&repo, &store, &destination)?;
         typed_acknowledgement(&format!(
             "I AUTHORIZE RANGE {} {} {}",
             base, tip, destination.fingerprint

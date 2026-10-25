@@ -315,13 +315,7 @@ fn pulled_publication_does_not_grant_sharing_to_another_remote() {
     project_fixture_to_ref(&repo, &source, "refs/cvc/source", &source_fingerprint);
 
     let imported = CvcStore::open(dir.path().join("imported.db")).unwrap();
-    sync::pull_from_ref_for_remote(
-        &repo,
-        &imported,
-        "refs/cvc/source",
-        Some(&source_fingerprint),
-    )
-    .unwrap();
+    sync::pull_from_ref(&repo, &imported, "refs/cvc/source", &source_fingerprint).unwrap();
     let other_fingerprint = privacy_status(&repo, "other").unwrap().remote_fingerprint;
     assert!(imported
         .projection_interaction_ids(&other_fingerprint)
@@ -1009,6 +1003,7 @@ fn a_remote_destination_never_prints_its_url() {
         name: "origin".into(),
         effective_url: "https://user:tok-secret@host.example/o/r.git".into(),
         fingerprint: "f".repeat(64),
+        legacy_fingerprint: Some("e".repeat(64)),
         ref_name: "refs/cvc/main".into(),
     };
     let debug = format!("{destination:?}");
@@ -1018,6 +1013,655 @@ fn a_remote_destination_never_prints_its_url() {
     );
     assert!(!debug.contains("tok-secret"), "{debug}");
     assert!(!debug.contains("host.example"), "{debug}");
+    // The legacy fingerprint is a hash over the credential-bearing URL: that a
+    // destination has one is said, never what it is.
+    assert!(!debug.contains(&"e".repeat(64)), "{debug}");
+    assert!(debug.contains("legacy_fingerprint: Some"), "{debug}");
     // The URL is still there for the code that has to use it.
     assert!(destination.effective_url.contains("tok-secret"));
+}
+
+// --- Destination fingerprints and user information ------------------------
+
+/// The fingerprint `https://github.com/example/project.git` has, computed by
+/// every version so far as hex SHA-256 of
+/// `remote-url:https://github.com/example/project.git\nref:refs/cvc/main`.
+/// A URL without user information keeps it, byte for byte.
+const ORDINARY_FINGERPRINT: &str =
+    "4a8e172ddb7c66ae2248ca8796bc8e4ca0d0af15f14d1c7c4184bfa438538f37";
+/// The fingerprint `https://user:token@github.com/example/project.git` had
+/// while user information was part of the hashed URL: what records made then
+/// are kept under.
+const LEGACY_FINGERPRINT: &str = "4ba2b26313bb6382ba4392ad125c285d0ac991385bbd371c523c3acb8fde7ccf";
+
+/// The fingerprint formula as it was before user information was taken out:
+/// over the text of the URL as it is.
+fn hash_of(url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(
+        format!("remote-url:{url}\nref:refs/cvc/main").as_bytes(),
+    ))
+}
+
+fn destination_for(url: &str) -> (tempfile::TempDir, cvc_core::privacy::RemoteDestination) {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    repo.remote("origin", url).unwrap();
+    let destination = cvc_core::privacy::remote_destination(&repo, "origin").unwrap();
+    (dir, destination)
+}
+
+#[test]
+fn a_remote_without_user_information_keeps_its_fingerprint() {
+    let (_dir, destination) = destination_for("https://github.com/example/project.git");
+    assert_eq!(destination.fingerprint, ORDINARY_FINGERPRINT);
+    assert_eq!(
+        hash_of("https://github.com/example/project.git"),
+        ORDINARY_FINGERPRINT
+    );
+    assert_eq!(destination.legacy_fingerprint, None);
+    // Every other form without user information is hashed as it always was,
+    // and has no legacy fingerprint, so no record is ever moved for it. An
+    // scp-like remote's user, and a transport-helper address, are left as they
+    // are.
+    for url in [
+        "https://github.com/example/project.git?x=1#f",
+        "ssh://github.com:2222/example/project.git",
+        "git://github.com/example/project.git",
+        "git@github.com:example/project.git",
+        "user@host.example:~/repo",
+        "/srv/repos/project.git",
+        "../sibling.git",
+        "file:///srv/repos/project.git",
+        "C:/repos/project.git",
+        "persistent-https::https://user:token@github.com/example/project.git",
+        "ext::ssh -l git host %S repo",
+    ] {
+        let (_dir, destination) = destination_for(url);
+        assert_eq!(destination.fingerprint, hash_of(url), "{url}");
+        assert_eq!(destination.legacy_fingerprint, None, "{url}");
+    }
+}
+
+#[test]
+fn user_information_is_not_part_of_the_fingerprint() {
+    let url = "https://user:token@github.com/example/project.git";
+    let (_dir, destination) = destination_for(url);
+    assert_eq!(destination.fingerprint, ORDINARY_FINGERPRINT);
+    assert_eq!(
+        destination.legacy_fingerprint.as_deref(),
+        Some(LEGACY_FINGERPRINT)
+    );
+    assert_eq!(hash_of(url), LEGACY_FINGERPRINT);
+    // Fetching and pushing still use the whole URL.
+    assert_eq!(destination.effective_url, url);
+
+    // Whatever user information the URL carries, it is the same destination.
+    for url in [
+        "https://other:s3cret@github.com/example/project.git",
+        "https://ghp_0123456789abcdefghijklmnopqrstuvwxyz@github.com/example/project.git",
+        "https://x-access-token:abc@github.com/example/project.git",
+        "https://@github.com/example/project.git",
+        "https://a@b@github.com/example/project.git",
+    ] {
+        let (_dir, destination) = destination_for(url);
+        assert_eq!(destination.fingerprint, ORDINARY_FINGERPRINT, "{url}");
+        assert_eq!(destination.legacy_fingerprint, Some(hash_of(url)), "{url}");
+    }
+    // Anything else in it still makes another destination.
+    for url in [
+        "https://user:token@github.com/example/other.git",
+        "https://user:token@gitlab.com/example/project.git",
+        "https://user:token@github.com:8443/example/project.git",
+        "http://user:token@github.com/example/project.git",
+        "https://user:token@GitHub.com/example/project.git",
+        "https://user:token@github.com/example/project.git?x=1",
+    ] {
+        let (_dir, destination) = destination_for(url);
+        assert_ne!(destination.fingerprint, ORDINARY_FINGERPRINT, "{url}");
+    }
+    // An ssh URL's user goes the same way.
+    let (_dir, with_user) = destination_for("ssh://git@github.com/example/project.git");
+    let (_dir, without) = destination_for("ssh://github.com/example/project.git");
+    assert_eq!(with_user.fingerprint, without.fingerprint);
+    assert!(with_user.legacy_fingerprint.is_some());
+}
+
+#[test]
+fn url_without_userinfo_removes_exactly_the_user_information() {
+    use cvc_core::privacy::url_without_userinfo;
+    for (url, expected) in [
+        ("https://user:token@host/o/r.git", "https://host/o/r.git"),
+        ("https://token@host/o/r.git", "https://host/o/r.git"),
+        ("https://@host/o/r.git", "https://host/o/r.git"),
+        ("ssh://git@host:2222/o/r.git", "ssh://host:2222/o/r.git"),
+        ("git+ssh://git@host/r", "git+ssh://host/r"),
+        ("https://u:p@[::1]:8443/r.git", "https://[::1]:8443/r.git"),
+        // libgit2 takes the host from after the last `@`.
+        ("https://a@b:c@host/r", "https://host/r"),
+        ("https://us%40er:p%3Ass@host/r", "https://host/r"),
+        (
+            "https://github.com?@evil.example/o/r.git",
+            "https://evil.example/o/r.git",
+        ),
+        ("https://u:p\\x@host/r", "https://host/r"),
+        // Everything after the authority, and the case of what is kept, stay.
+        (
+            "https://u:p@host/r.git?x=1#frag",
+            "https://host/r.git?x=1#frag",
+        ),
+        (
+            "HTTPS://User:Pw@Host.Example/O/R.git",
+            "HTTPS://Host.Example/O/R.git",
+        ),
+        ("https://u@host/a@b/c", "https://host/a@b/c"),
+        ("https://u@host", "https://host"),
+        ("https://u@host:8443", "https://host:8443"),
+    ] {
+        assert_eq!(url_without_userinfo(url).unwrap(), expected, "{url}");
+    }
+    for url in [
+        "https://host/o/r.git",
+        "https://host/a@b",
+        "https://host",
+        "https://",
+        "git@github.com:o/r.git",
+        "user:secret@host:path",
+        "token@github.com/o/r",
+        "/srv/r.git",
+        "/srv/a://user:pw@host/r",
+        "ht tp://user:pw@host/r",
+        "C:\\repos\\x.git",
+        "file:///srv/r.git",
+        "persistent-https::https://user:pw@host/r",
+        "ext::sshpass -p hunter2 ssh -l git host %S repo",
+    ] {
+        assert_eq!(url_without_userinfo(url).unwrap(), url, "{url}");
+    }
+}
+
+#[test]
+fn a_url_without_its_user_information_names_the_host_libgit2_contacts() {
+    use cvc_core::privacy::url_without_userinfo;
+    // Each combination glues user information to a host, a port and what may
+    // follow. Taking the user information out must leave the host libgit2
+    // contacts for the whole URL, no `@` in the authority, nothing of the
+    // secret, and the rest exactly as it was.
+    let mut stripped = 0;
+    for scheme in ["https", "ssh", "git", "git+ssh"] {
+        for userinfo in [
+            "",
+            "@",
+            "u@",
+            "u:s3cret@",
+            "a@b:s3cret@",
+            "u:s%40cret@",
+            "github.com?@",
+            "x\\:s3cret@",
+            "tok#s3cret@",
+        ] {
+            for host in ["github.com", "[::1]", "evil.example"] {
+                for port in ["", ":8443"] {
+                    for tail in ["", "/", "/o/r.git", "/o/r.git?q=@x#f@y", "/a@b"] {
+                        let raw = format!("{scheme}://{userinfo}{host}{port}{tail}");
+                        let location = url_without_userinfo(&raw).unwrap();
+                        assert_eq!(libgit2_host(&location), libgit2_host(&raw), "{raw}");
+                        let (front, rest) = location.split_once("://").unwrap();
+                        assert_eq!(front, scheme, "{raw}");
+                        let authority = rest.split('/').next().unwrap();
+                        assert_eq!(authority, format!("{host}{port}"), "{raw}");
+                        assert!(location.ends_with(tail), "{raw} -> {location}");
+                        assert!(!location.contains("s3cret"), "{raw} -> {location}");
+                        assert!(!location.contains("s%40cret"), "{raw} -> {location}");
+                        if userinfo.is_empty() {
+                            assert_eq!(location, raw);
+                        } else {
+                            stripped += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(stripped > 900, "{stripped} stripped");
+}
+
+#[test]
+fn a_url_whose_host_cannot_be_located_is_refused_without_repeating_it() {
+    use cvc_core::privacy::{url_without_userinfo, PrivacyError};
+    for url in [
+        "://user:s3cret@host/r",
+        "://host/r",
+        "https://user:s3cret@/r",
+        "https://user:s3cret@",
+        "https://user@:443/r",
+        "ssh://git:s3cret@:22/r",
+    ] {
+        let error = url_without_userinfo(url).unwrap_err();
+        assert!(matches!(error, PrivacyError::Remote(_)), "{url}: {error:?}");
+        assert_eq!(
+            error.to_string(),
+            "remote push URL has no host that can be located"
+        );
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("remote.origin.url", url)
+            .unwrap();
+        let resolved = cvc_core::privacy::remote_destination(&repo, "origin").unwrap_err();
+        for text in [
+            error.to_string(),
+            resolved.to_string(),
+            format!("{resolved:?}"),
+        ] {
+            for part in ["s3cret", "user", "git:", "://", "443", "/r"] {
+                assert!(!text.contains(part), "{url}: {text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn no_privacy_error_about_a_remote_repeats_its_url() {
+    // Every refusal on the way to a destination has a fixed text.
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let mut config = repo.config().unwrap();
+    config.set_str("remote.blank.url", "  ").unwrap();
+    config
+        .set_str("remote.nohost.url", "https://deploy:s3cret@/o/r.git")
+        .unwrap();
+    for (name, expected) in [
+        ("typo", "remote is not configured"),
+        ("blank", "remote has an empty push URL"),
+        ("nohost", "remote push URL has no host that can be located"),
+    ] {
+        let error = cvc_core::privacy::remote_destination(&repo, name).unwrap_err();
+        assert!(
+            matches!(error, cvc_core::privacy::PrivacyError::Remote(_)),
+            "{error:?}"
+        );
+        assert_eq!(error.to_string(), expected);
+        assert!(!error.to_string().contains(".thoughtignore"));
+    }
+    let error = cvc_core::privacy::destination_operation_lock(&repo, "https://u:s3cret@h/r")
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "invalid destination fingerprint");
+}
+
+// --- Moving records from the legacy fingerprint ---------------------------
+
+/// Every column of the local database that holds a destination fingerprint.
+const DESTINATION_COLUMNS: [(&str, &str); 10] = [
+    ("conversation_shares", "remote_fingerprint"),
+    ("interaction_shares", "remote_fingerprint"),
+    ("publications", "remote_fingerprint"),
+    ("tombstones", "remote_fingerprint"),
+    ("derivation_authorizations", "remote_fingerprint"),
+    ("range_authorizations", "remote_fingerprint"),
+    ("derivation_observations", "source_fingerprint"),
+    ("derivation_observations", "source_key"),
+    ("range_observations", "source_key"),
+    ("range_observations", "source_remote"),
+];
+
+/// How many rows hold `fingerprint`, per column of [`DESTINATION_COLUMNS`].
+fn rows_under(db: &std::path::Path, fingerprint: &str) -> Vec<i64> {
+    let connection = rusqlite::Connection::open(db).unwrap();
+    DESTINATION_COLUMNS
+        .iter()
+        .map(|(table, column)| {
+            connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                    [fingerprint],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn every_column_that_names_a_destination_is_one_records_are_moved_from() {
+    // A new table or column that records a destination must be added to the
+    // move, or records kept in it stay under the legacy fingerprint.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let _store = CvcStore::open(&path).unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let tables: Vec<String> = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut found = Vec::new();
+    for table in tables {
+        let columns: Vec<String> = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for column in columns {
+            if column.contains("fingerprint") || column == "source_remote" {
+                found.push((table.clone(), column));
+            }
+        }
+    }
+    for (table, column) in &found {
+        assert!(
+            DESTINATION_COLUMNS
+                .iter()
+                .any(|(t, c)| t == table && c == column),
+            "{table}.{column} names a destination but is not moved"
+        );
+    }
+    assert_eq!(found.len(), 8, "{found:?}");
+}
+
+/// A repository whose `origin` pushes to a URL with user information, holding
+/// what an earlier version recorded for it under the legacy fingerprint:
+/// sharing consent with auto-push on, a conversation shared with its future
+/// turns, one turn published and one of unknown state, a remote tombstone,
+/// derivation and range authorizations, and what a pull observed.
+struct Legacy {
+    repo: Repository,
+    db: std::path::PathBuf,
+    store: CvcStore,
+    destination: cvc_core::privacy::RemoteDestination,
+    legacy: String,
+    turns: Vec<InteractionId>,
+    /// Last, so the directory goes after what is open in it.
+    _dir: tempfile::TempDir,
+}
+
+fn legacy_records() -> Legacy {
+    use cvc_core::models::{PublicationState, Tombstone, TombstoneReasonCode};
+    use cvc_core::privacy::{
+        acknowledge_sharing_destination, remote_destination, set_auto_push_destination,
+        RemoteDestination,
+    };
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    repo.remote("origin", "https://github.com/example/project.git")
+        .unwrap();
+    repo.remote_set_pushurl(
+        "origin",
+        Some("https://user:token@github.com/example/project.git"),
+    )
+    .unwrap();
+    let destination = remote_destination(&repo, "origin").unwrap();
+    assert_eq!(destination.fingerprint, ORDINARY_FINGERPRINT);
+    let legacy = destination.legacy_fingerprint.clone().unwrap();
+    assert_eq!(legacy, LEGACY_FINGERPRINT);
+
+    // What the earlier version recorded, under the fingerprint it computed.
+    let earlier = RemoteDestination {
+        fingerprint: legacy.clone(),
+        legacy_fingerprint: None,
+        ..destination.clone()
+    };
+    acknowledge_sharing_destination(&repo, &earlier).unwrap();
+    set_auto_push_destination(&repo, &earlier, true).unwrap();
+    let db = repo.path().join("cvc").join("index.db");
+    let store = CvcStore::open(&db).unwrap();
+    let turns: Vec<InteractionId> = (0..2)
+        .map(|_| {
+            let id = InteractionId::new();
+            store
+                .capture_mcp(McpCapture::new(
+                    Conversation {
+                        id: "shared-before".into(),
+                        title: "shared before".into(),
+                        created_at: Utc::now(),
+                    },
+                    interaction(id.clone(), "shared-before"),
+                    Vec::new(),
+                    Vec::new(),
+                    PreparedPolicy::built_ins_only(),
+                    "0".repeat(64),
+                ))
+                .unwrap();
+            id
+        })
+        .collect();
+    store
+        .share_conversation_for_remote("shared-before", &legacy, FutureSharePolicy::Shared)
+        .unwrap();
+    store
+        .mark_publication(&turns[..1], &legacy, PublicationState::Published)
+        .unwrap();
+    store
+        .mark_publication(&turns[1..], &legacy, PublicationState::Unknown)
+        .unwrap();
+    store
+        .apply_tombstones(
+            &[Tombstone::new(
+                InteractionId::new(),
+                TombstoneReasonCode::UserRequested,
+                None,
+            )],
+            "fixture",
+            Some(&legacy),
+        )
+        .unwrap();
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(&format!(
+            "INSERT INTO derivation_authorizations(event_id, remote_fingerprint, source_event_id) VALUES('event-1', '{legacy}', 'event-1');
+             INSERT INTO range_authorizations(range_id, remote_fingerprint) VALUES('range-1', '{legacy}');
+             INSERT INTO derivation_observations(event_id, source_fingerprint, source_key, origin, trusted_local) VALUES('event-1', '{legacy}', '{legacy}', 'remote_sync', 0);
+             INSERT INTO range_observations(range_id, source_key, origin, trusted_local, source_ref, source_remote) VALUES('range-1', '{legacy}', 'remote_sync', 0, NULL, '{legacy}');"
+        ))
+        .unwrap();
+    Legacy {
+        repo,
+        db,
+        store,
+        destination,
+        legacy,
+        turns,
+        _dir: dir,
+    }
+}
+
+fn privacy_json(repo: &Repository) -> String {
+    std::fs::read_to_string(repo.path().join("cvc").join("privacy.json")).unwrap()
+}
+
+#[test]
+fn records_kept_under_the_legacy_fingerprint_move_to_the_fingerprint_once() {
+    use cvc_core::privacy::privacy_status_for_fingerprint;
+    let legacy = legacy_records();
+    let fingerprint = legacy.destination.fingerprint.clone();
+    let kept = rows_under(&legacy.db, &legacy.legacy);
+    assert!(kept.iter().all(|&count| count > 0), "{kept:?}");
+    assert!(rows_under(&legacy.db, &fingerprint)
+        .iter()
+        .all(|&count| count == 0));
+    let before = privacy_status_for_fingerprint(&legacy.repo, &fingerprint).unwrap();
+    assert!(!before.sharing_consented && !before.auto_push);
+
+    sync::adopt_legacy_records(&legacy.repo, &legacy.store, &legacy.destination).unwrap();
+
+    // Consent, with its auto-push setting, reads as it did.
+    let after = privacy_status_for_fingerprint(&legacy.repo, &fingerprint).unwrap();
+    assert!(after.sharing_consented && after.auto_push);
+    let gone = privacy_status_for_fingerprint(&legacy.repo, &legacy.legacy).unwrap();
+    assert!(!gone.sharing_consented && !gone.auto_push);
+    let state = privacy_json(&legacy.repo);
+    assert!(!state.contains(&legacy.legacy), "{state}");
+    // Every row moved, and nothing is left under the legacy fingerprint.
+    assert_eq!(rows_under(&legacy.db, &fingerprint), kept);
+    assert!(rows_under(&legacy.db, &legacy.legacy)
+        .iter()
+        .all(|&count| count == 0));
+    // So shares and publications read as they did.
+    let summary = legacy
+        .store
+        .list_conversation_summaries(Some(&fingerprint), 10)
+        .unwrap()
+        .into_iter()
+        .find(|summary| summary.id == "shared-before")
+        .unwrap();
+    assert!(summary.shared);
+    assert_eq!(summary.share_future, Some(true));
+    assert_eq!((summary.published, summary.unconfirmed), (1, 1));
+    assert_eq!(
+        legacy
+            .store
+            .uncertain_publication_ids(&fingerprint)
+            .unwrap(),
+        vec![legacy.turns[1].clone()]
+    );
+    assert_eq!(
+        legacy
+            .store
+            .tombstones_for_projection(&fingerprint)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Once only: a second run changes nothing.
+    let rows = rows_under(&legacy.db, &fingerprint);
+    sync::adopt_legacy_records(&legacy.repo, &legacy.store, &legacy.destination).unwrap();
+    assert_eq!(rows_under(&legacy.db, &fingerprint), rows);
+    assert_eq!(privacy_json(&legacy.repo), state);
+}
+
+#[test]
+fn records_already_kept_under_the_fingerprint_win_and_nothing_is_merged() {
+    use cvc_core::models::PublicationState;
+    use cvc_core::privacy::{acknowledge_sharing_destination, privacy_status_for_fingerprint};
+    let legacy = legacy_records();
+    let fingerprint = legacy.destination.fingerprint.clone();
+    // Both fingerprints hold records: consent without auto-push and one
+    // publication are kept under the fingerprint already.
+    acknowledge_sharing_destination(&legacy.repo, &legacy.destination).unwrap();
+    legacy
+        .store
+        .mark_publication(&legacy.turns[..1], &fingerprint, PublicationState::Pending)
+        .unwrap();
+    let kept = rows_under(&legacy.db, &legacy.legacy);
+    let current = rows_under(&legacy.db, &fingerprint);
+    let state = privacy_json(&legacy.repo);
+
+    sync::adopt_legacy_records(&legacy.repo, &legacy.store, &legacy.destination).unwrap();
+
+    assert_eq!(rows_under(&legacy.db, &legacy.legacy), kept);
+    assert_eq!(rows_under(&legacy.db, &fingerprint), current);
+    assert_eq!(privacy_json(&legacy.repo), state);
+    let status = privacy_status_for_fingerprint(&legacy.repo, &fingerprint).unwrap();
+    assert!(status.sharing_consented && !status.auto_push);
+}
+
+#[test]
+fn a_store_left_behind_by_an_interrupted_move_is_moved_by_the_next_run() {
+    use cvc_core::privacy::privacy_status_for_fingerprint;
+    // The database moved, privacy.json did not.
+    let legacy = legacy_records();
+    let fingerprint = legacy.destination.fingerprint.clone();
+    let kept = rows_under(&legacy.db, &legacy.legacy);
+    let connection = rusqlite::Connection::open(&legacy.db).unwrap();
+    for (table, column) in DESTINATION_COLUMNS {
+        connection
+            .execute(
+                &format!("UPDATE {table} SET {column} = ?2 WHERE {column} = ?1"),
+                [&legacy.legacy, &fingerprint],
+            )
+            .unwrap();
+    }
+    sync::adopt_legacy_records(&legacy.repo, &legacy.store, &legacy.destination).unwrap();
+    let status = privacy_status_for_fingerprint(&legacy.repo, &fingerprint).unwrap();
+    assert!(status.sharing_consented && status.auto_push);
+    assert_eq!(rows_under(&legacy.db, &fingerprint), kept);
+
+    // privacy.json moved, the database did not.
+    let legacy = legacy_records();
+    let fingerprint = legacy.destination.fingerprint.clone();
+    let kept = rows_under(&legacy.db, &legacy.legacy);
+    let path = legacy.repo.path().join("cvc").join("privacy.json");
+    let moved = privacy_json(&legacy.repo).replace(&legacy.legacy, &fingerprint);
+    std::fs::write(&path, moved).unwrap();
+    sync::adopt_legacy_records(&legacy.repo, &legacy.store, &legacy.destination).unwrap();
+    assert_eq!(rows_under(&legacy.db, &fingerprint), kept);
+    assert!(rows_under(&legacy.db, &legacy.legacy)
+        .iter()
+        .all(|&count| count == 0));
+    let status = privacy_status_for_fingerprint(&legacy.repo, &fingerprint).unwrap();
+    assert!(status.sharing_consented && status.auto_push);
+}
+
+#[test]
+fn a_destination_without_user_information_takes_no_migration_path() {
+    let legacy = legacy_records();
+    // The same repository's fetch URL has no user information.
+    legacy.repo.remote_set_pushurl("origin", None).unwrap();
+    let plain = cvc_core::privacy::remote_destination(&legacy.repo, "origin").unwrap();
+    assert_eq!(plain.fingerprint, ORDINARY_FINGERPRINT);
+    assert_eq!(plain.legacy_fingerprint, None);
+    let kept = rows_under(&legacy.db, &legacy.legacy);
+    let state = privacy_json(&legacy.repo);
+    let entries = |repo: &Repository| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(repo.path().join("cvc"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let files = entries(&legacy.repo);
+
+    sync::adopt_legacy_records(&legacy.repo, &legacy.store, &plain).unwrap();
+
+    // Nothing was read into a move, locked or written.
+    assert_eq!(rows_under(&legacy.db, &legacy.legacy), kept);
+    assert!(rows_under(&legacy.db, ORDINARY_FINGERPRINT)
+        .iter()
+        .all(|&count| count == 0));
+    assert_eq!(privacy_json(&legacy.repo), state);
+    assert_eq!(entries(&legacy.repo), files);
+    assert!(
+        !files.iter().any(|name| name.starts_with("publish-")),
+        "{files:?}"
+    );
+}
+
+#[test]
+fn a_destination_whose_fingerprints_are_not_its_urls_is_refused() {
+    let legacy = legacy_records();
+    let kept = rows_under(&legacy.db, &legacy.legacy);
+    let state = privacy_json(&legacy.repo);
+    let bogus = "0".repeat(64);
+    for destination in [
+        // A legacy fingerprint that is not the one of the URL.
+        cvc_core::privacy::RemoteDestination {
+            legacy_fingerprint: Some(bogus.clone()),
+            ..legacy.destination.clone()
+        },
+        // A fingerprint that is not the one of the URL.
+        cvc_core::privacy::RemoteDestination {
+            fingerprint: bogus.clone(),
+            ..legacy.destination.clone()
+        },
+        // A URL without user information has no legacy fingerprint.
+        cvc_core::privacy::RemoteDestination {
+            effective_url: "https://github.com/example/project.git".into(),
+            ..legacy.destination.clone()
+        },
+    ] {
+        let error = sync::adopt_legacy_records(&legacy.repo, &legacy.store, &destination)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "destination fingerprints do not match its push URL");
+    }
+    assert_eq!(rows_under(&legacy.db, &legacy.legacy), kept);
+    assert_eq!(privacy_json(&legacy.repo), state);
 }

@@ -357,6 +357,19 @@ async fn sync_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRp
 
         let destination = cvc_core::privacy::remote_destination(&repo, &remote_name)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // Records an earlier version kept under the destination's legacy
+        // fingerprint move to its fingerprint before anything is recorded for
+        // it. This takes the operation lock itself, so it comes first.
+        state_for_store
+            .revalidate()
+            .map_err(|_| anyhow::anyhow!("repository binding changed"))?;
+        state_for_store.with_store(|store| {
+            Ok(cvc_core::sync::adopt_legacy_records(
+                &repo,
+                store,
+                &destination,
+            )?)
+        })?;
         let _operation_lock =
             cvc_core::privacy::destination_operation_lock(&repo, &destination.fingerprint)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;

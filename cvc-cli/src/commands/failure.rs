@@ -11,7 +11,6 @@
 //! exact message, and a unit test pins each against the real code.
 
 use cvc_core::db::DbError;
-use cvc_core::privacy::PrivacyError;
 use std::error::Error;
 use std::fmt;
 
@@ -199,8 +198,8 @@ pub(crate) enum FlowFailure {
     /// "nothing was recorded" on its own, as [`FlowFailure::NotConfirmed`] does,
     /// only describes the publication here.
     SharedButNotPublished(Box<FlowFailure>),
-    /// Anything else, as one line of text with the misleading prefixes
-    /// (`Migration error:`, `invalid .thoughtignore:`) removed.
+    /// Anything else, as one line of text with the misleading `Migration error:`
+    /// prefix removed.
     Other(String),
 }
 
@@ -240,18 +239,16 @@ pub(crate) fn classify_failure(error: &anyhow::Error) -> FlowFailure {
     FlowFailure::Other(plain_message(error))
 }
 
-/// The error chain as the commands print it (`outer: inner`), except that the
-/// two variants whose `Display` adds a prefix that is wrong for the user
-/// (`Migration error:` on a refusal, `invalid .thoughtignore:` on any policy
-/// problem) contribute their bare message.
+/// The error chain as the commands print it (`outer: inner`), except that
+/// `DbError::Migration`, whose `Display` adds a `Migration error:` prefix that
+/// is wrong for the user on a refusal, contributes its bare message. A privacy
+/// error needs no such help: each kind of problem has its own variant, and only
+/// a `.thoughtignore` problem says `invalid .thoughtignore:`.
 fn plain_message(error: &anyhow::Error) -> String {
     error
         .chain()
         .map(|cause| {
             if let Some(DbError::Migration(message)) = cause.downcast_ref::<DbError>() {
-                message.clone()
-            } else if let Some(PrivacyError::Policy(message)) = cause.downcast_ref::<PrivacyError>()
-            {
                 message.clone()
             } else {
                 cause.to_string()
@@ -270,7 +267,7 @@ mod tests {
     use cvc_core::models::{
         Author, Conversation, FutureSharePolicy, Interaction, InteractionId, PublicationState,
     };
-    use cvc_core::privacy::{McpCapture, PreparedPolicy};
+    use cvc_core::privacy::{McpCapture, PreparedPolicy, PrivacyError};
 
     fn capture(store: &CvcStore, conversation: &str) -> InteractionId {
         let id = InteractionId::new();
@@ -575,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn other_failures_lose_the_misleading_prefixes_but_keep_their_context() {
+    fn other_failures_lose_the_misleading_prefix_but_keep_their_context() {
         let migration = DbError::Migration("something else went wrong".into());
         assert!(migration.to_string().starts_with("Migration error:"));
         assert_eq!(
@@ -583,9 +580,13 @@ mod tests {
             FlowFailure::Other("something else went wrong".into())
         );
 
-        let policy = PrivacyError::Policy("privacy state permissions are insecure".into());
-        assert!(policy.to_string().starts_with("invalid .thoughtignore:"));
-        let wrapped = Err::<(), _>(policy)
+        // A consent-state problem reads as one, as it is, through the context.
+        let consent = PrivacyError::ConsentState("privacy state permissions are insecure".into());
+        assert_eq!(
+            consent.to_string(),
+            "privacy state permissions are insecure"
+        );
+        let wrapped = Err::<(), _>(consent)
             .context("cannot read consent")
             .unwrap_err();
         assert_eq!(
@@ -594,6 +595,10 @@ mod tests {
                 "cannot read consent: privacy state permissions are insecure".into()
             )
         );
+        assert_eq!(
+            format!("{wrapped:#}"),
+            "cannot read consent: privacy state permissions are insecure"
+        );
 
         // The terminal check is not a typed failure; it keeps its text.
         assert_eq!(
@@ -601,6 +606,53 @@ mod tests {
                 "acknowledgement requires an interactive TTY"
             )),
             FlowFailure::Other("acknowledgement requires an interactive TTY".into())
+        );
+    }
+
+    /// What the flows print for a remote that cannot be a destination, from the
+    /// real code: the remote problem, with no `.thoughtignore` in it, and the
+    /// same text whether the command prints it or a caller classifies it.
+    #[test]
+    fn a_remote_problem_reads_as_one() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(directory.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("remote.blank.url", "  ")
+            .unwrap();
+        for (name, expected) in [
+            ("typo", "remote is not configured"),
+            ("blank", "remote has an empty push URL"),
+        ] {
+            let error = cvc_core::privacy::remote_destination(&repo, name).unwrap_err();
+            assert!(matches!(error, PrivacyError::Remote(_)), "{error:?}");
+            let error = anyhow::Error::from(error);
+            assert_eq!(format!("{error:#}"), expected);
+            assert_eq!(
+                classify_failure(&error),
+                FlowFailure::Other(expected.into())
+            );
+        }
+    }
+
+    /// A `.thoughtignore` problem is the one privacy error that says so.
+    #[test]
+    fn a_thoughtignore_problem_keeps_its_prefix() {
+        let directory = tempfile::TempDir::new().unwrap();
+        std::fs::write(directory.path().join(".thoughtignore"), "nonsense").unwrap();
+        let error = match PreparedPolicy::load(directory.path()) {
+            Ok(_) => panic!("an unknown directive is refused"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, PrivacyError::Policy(_)), "{error:?}");
+        let error = anyhow::Error::from(error);
+        assert_eq!(
+            format!("{error:#}"),
+            "invalid .thoughtignore: unknown directive"
+        );
+        assert_eq!(
+            classify_failure(&error),
+            FlowFailure::Other("invalid .thoughtignore: unknown directive".into())
         );
     }
 }

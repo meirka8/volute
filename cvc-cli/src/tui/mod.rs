@@ -375,9 +375,8 @@ fn run_flow(ctx: &Context, screen: &mut Screen, model: &mut Model, flow: Flow) -
         Flow::Publish => {
             sync::publish_manually(ctx.repo, ctx.store, &destination).map(Report::Published)
         }
-        Flow::Authorize => {
-            sync::acknowledge_sharing_for(ctx.repo, &destination).map(|()| Report::Authorized)
-        }
+        Flow::Authorize => sync::acknowledge_sharing_for(ctx.repo, ctx.store, &destination)
+            .map(|()| Report::Authorized),
     };
 
     let report = match outcome {

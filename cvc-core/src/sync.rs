@@ -44,6 +44,9 @@ pub enum SyncError {
         "the remote CVC ref for '{0}' changed while publishing; nothing was published. Run the command again."
     )]
     BaselineMoved(String),
+    /// The destination or its consent state, in the privacy module's own words.
+    #[error(transparent)]
+    Privacy(#[from] crate::privacy::PrivacyError),
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
@@ -1932,16 +1935,19 @@ fn build_by_commit_tree(
     root.write().map_err(Into::into)
 }
 
-pub fn pull_from_ref(repo: &Repository, db: &CvcStore, ref_name: &str) -> Result<()> {
-    pull_from_ref_with_limits(repo, db, ref_name, None, SyncReadLimits::default())
-}
-/// Import a remote baseline and record proof that every node seen there was published
-/// to this exact destination. Remote payloads never participate in local consent.
-pub fn pull_from_ref_for_remote(
+/// Import `ref_name` as the CVC state of the destination `remote_fingerprint`,
+/// and record proof that every node seen there was published to that exact
+/// destination. Remote payloads never participate in local consent.
+///
+/// There is no import without a destination: every imported conversation id is
+/// namespaced as `remote:<remote_fingerprint>:<id>`, so a remote session id can
+/// never become, or join, a local conversation and its share policy. The
+/// fingerprint must have the form of one (64 hex digits).
+pub fn pull_from_ref(
     repo: &Repository,
     db: &CvcStore,
     ref_name: &str,
-    remote_fingerprint: Option<&str>,
+    remote_fingerprint: &str,
 ) -> Result<()> {
     pull_from_ref_with_limits(
         repo,
@@ -1954,11 +1960,12 @@ pub fn pull_from_ref_for_remote(
 
 /// Pull with caller-supplied decoding bounds.  This is primarily useful to
 /// embed CVC in resource-constrained processes and for deterministic tests.
+/// Like [`pull_from_ref`], it always namespaces what it imports.
 pub fn pull_from_ref_with_limits(
     repo: &Repository,
     db: &CvcStore,
     ref_name: &str,
-    remote_fingerprint: Option<&str>,
+    remote_fingerprint: &str,
     limits: SyncReadLimits,
 ) -> Result<()> {
     if !validate_ref_name(ref_name) {
@@ -1970,13 +1977,21 @@ pub fn pull_from_ref_with_limits(
 /// The import itself. Returns what it read: the commit (or direct tree) `ref_name`
 /// resolved to, or `None` when the ref is absent. The tree that is decoded and the
 /// returned id come from the same peel, so the id names exactly the imported state.
+///
+/// Everything it imports is recorded for `remote_fingerprint`, which also
+/// namespaces the imported conversation ids; it refuses one that does not have
+/// the form of a destination fingerprint before it reads anything.
 fn import_ref_with_limits(
     repo: &Repository,
     db: &CvcStore,
     ref_name: &str,
-    remote_fingerprint: Option<&str>,
+    remote_fingerprint: &str,
     limits: SyncReadLimits,
 ) -> Result<Option<git2::Oid>> {
+    if !crate::privacy::is_destination_fingerprint(remote_fingerprint) {
+        return Err(SyncError::Ref("invalid destination fingerprint".into()));
+    }
+    let remote_fingerprint = Some(remote_fingerprint);
     // 1. Resolve Ref. Only a ref that is really absent means "nothing to pull";
     // any other lookup failure must not be mistaken for an empty remote. The name
     // is validated once the ref exists, as the pre-existing destination path did.
@@ -2874,6 +2889,69 @@ fn inspect_final_strings(bytes: &[u8]) -> Result<()> {
     visit(&serde_json::from_slice(bytes)?)
 }
 
+/// Moves the records this repository keeps for `destination` from its legacy
+/// fingerprint to its fingerprint, once.
+///
+/// A destination's fingerprint used to be computed over its whole push URL,
+/// user information included; it is now computed over the URL without it (see
+/// `privacy::RemoteDestination`). For a push URL that has user information the
+/// two differ, and whatever an earlier version recorded is kept under the
+/// legacy one: the sharing consent in `privacy.json` (its auto-push setting
+/// with it), and the rows of the local database that name a destination
+/// (shares, publication state, remote tombstones, authorizations and what
+/// pulls observed). This moves them to the fingerprint, so that consent,
+/// shares and publications read the same as before.
+///
+/// Every operation that reads or writes the consent or publication state of a
+/// destination calls this first, before it takes the destination's operation
+/// lock itself: a share, an unshare, a publication (manual, bundled with a
+/// share, or by the pre-push hook), a pull or a reconciliation, a redaction,
+/// a range authorization, `cvc privacy status`, `acknowledge-sharing` and
+/// `set-auto-push`, and the listing of `cvc conversations`. It must not be
+/// called while that lock is held: it takes the lock, and the lock is not
+/// reentrant.
+///
+/// - A destination without a legacy fingerprint has nothing to move, and
+///   nothing is read, locked or written.
+/// - Otherwise the legacy fingerprint must be the one the destination's own
+///   push URL had (`privacy::verified_legacy_fingerprint`); a destination
+///   assembled with any other pair is refused.
+/// - When neither store keeps anything under the legacy fingerprint that would
+///   be moved, which is the case after the first run, it returns after reading
+///   both, without taking a lock or writing anything.
+/// - Otherwise, under the destination's operation lock, and under the lock of
+///   the legacy fingerprint too (so that no operation of an earlier version
+///   that still uses it runs at the same time), each store is moved
+///   separately, and only when it keeps something under the legacy
+///   fingerprint and nothing under the fingerprint: what is kept under the
+///   fingerprint wins and nothing is merged into it. The database is moved in
+///   one transaction, then `privacy.json` is rewritten. Each store is checked
+///   again under the locks, so this is idempotent, and one interrupted between
+///   the two stores finishes the other at its next run.
+///
+/// It prints nothing. Conversation ids that a pull namespaced with
+/// `remote:<legacy fingerprint>:` keep their ids.
+pub fn adopt_legacy_records(
+    repo: &Repository,
+    db: &CvcStore,
+    destination: &crate::privacy::RemoteDestination,
+) -> Result<()> {
+    let Some(legacy) = crate::privacy::verified_legacy_fingerprint(destination)? else {
+        return Ok(());
+    };
+    let fingerprint = destination.fingerprint.as_str();
+    if !db.destination_rows_pending_adoption(legacy, fingerprint)?
+        && !crate::privacy::legacy_sharing_consent_pending(repo, legacy, fingerprint)?
+    {
+        return Ok(());
+    }
+    let _destination_lock = crate::privacy::destination_operation_lock(repo, fingerprint)?;
+    let _legacy_lock = crate::privacy::destination_operation_lock(repo, legacy)?;
+    db.adopt_destination_fingerprint(legacy, fingerprint)?;
+    crate::privacy::adopt_legacy_sharing_consent(repo, legacy, fingerprint)?;
+    Ok(())
+}
+
 /// Fetch using the already snapshotted effective destination.  The named remote is
 /// intentionally not reopened, preventing a config race from changing consent or
 /// transport after approval.
@@ -2959,7 +3037,7 @@ pub fn pull_destination_pinned(
         repo,
         db,
         &remote_tracking_ref,
-        Some(&destination.fingerprint),
+        &destination.fingerprint,
         SyncReadLimits::default(),
     )?;
     let new_count = db
