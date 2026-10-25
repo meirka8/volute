@@ -184,9 +184,11 @@ export function PRReviewPage() {
         label: "Open PR on GitHub",
         icon: <ExternalLink size={14} className="text-muted" />,
         onSelect: () => {
+          // The page that opens gets no reference to this one (noopener) and is not told which page sent it (noreferrer).
           window.open(
             `https://github.com/${owner}/${repo}/pull/${prNumber}`,
             "_blank",
+            "noopener,noreferrer",
           );
         },
         group: "Actions",

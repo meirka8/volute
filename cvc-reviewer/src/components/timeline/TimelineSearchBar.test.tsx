@@ -111,6 +111,19 @@ describe('Copy link to this view', () => {
     expect(new URL(written[0]).hash).toBe('#section-2&q=needle');
   });
 
+  it('leaves our names out of the query string of the link and keeps the rest of it, whenever they got there', async () => {
+    const written = clipboard();
+    render(<ShadowTimeline interactions={STEPS} />);
+    // Put there after the page opened (the page tidies the address when the timeline opens, and the link is made from what the address is now).
+    window.history.replaceState(null, '', '/pr/acme/shop/7?tab=files&q=leftover&tool=Read&utm=x%20y');
+    typeQuery('needle');
+    await press(copyButton());
+    const link = new URL(written[0]);
+    expect(link.search).toBe('?tab=files&utm=x%20y');
+    expect(written[0]).not.toContain('leftover');
+    expect(new URLSearchParams(link.hash.slice(1)).get('q')).toBe('needle');
+  });
+
   it('writes the file that is open for a filter that follows it', async () => {
     const written = clipboard();
     render(<ShadowTimeline interactions={[step(1, { context_items: [{ file_path: '/w/src/a.ts' }] })]} openFile="src/a.ts" />);

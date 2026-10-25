@@ -945,12 +945,32 @@ describe('the address', () => {
     expect(window.location.search).toBe('?tab=files');
   });
 
-  it('does not read a search from the query string, which it never wrote', () => {
+  it('does not read a search from the query string, which it never wrote, and takes it out of the address', () => {
     window.history.replaceState(null, '', '/?q=needle&tool=Bash');
     const { container } = render(<ShadowTimeline interactions={FIVE} />);
     expect(box()).toHaveValue('');
     expect(stepsOf(container)).toEqual([5, 4, 3, 2, 1]);
-    expect(window.location.search).toBe('?q=needle&tool=Bash');
+    // Nothing of ours is in the part of the address that a server is sent, and no one is told that it was there.
+    expect(window.location.search).toBe('');
+    expect(window.location.pathname).toBe('/');
+    expect(screen.queryByText(/opened from a link/)).not.toBeInTheDocument();
+  });
+
+  it('takes every one of its own names out of the query string when it opens, and leaves the rest of it as it was', () => {
+    window.history.replaceState(null, '', '/pr/o/r/1?tab=files&q=needle&conv=abc&origin=prompt&tool=Bash&link=temporal&commit=abcdef0&file=a.ts&utm=x%20y#top');
+    render(<ShadowTimeline interactions={FIVE} />);
+    expect(window.location.search).toBe('?tab=files&utm=x%20y');
+    expect(window.location.hash).toBe('#top');
+    expect(window.location.pathname).toBe('/pr/o/r/1');
+  });
+
+  it('does not touch a query string that has none of its names', () => {
+    window.history.replaceState(null, '', '/pr/o/r/1?tab=files&&x=1&Q=upper');
+    const replace = vi.spyOn(window.history, 'replaceState');
+    render(<ShadowTimeline interactions={FIVE} />);
+    expect(window.location.search).toBe('?tab=files&&x=1&Q=upper');
+    expect(replace).not.toHaveBeenCalled();
+    replace.mockRestore();
   });
 
   it('ignores a value it can not use, without a word, and uses the rest', () => {

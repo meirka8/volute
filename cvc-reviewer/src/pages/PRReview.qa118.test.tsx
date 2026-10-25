@@ -260,6 +260,26 @@ describe('the page and the timeline', () => {
   });
 });
 
+describe('the commands of the page that open another page', () => {
+  it('opens the pull request on GitHub in a new tab that cannot reach back to this one', () => {
+    vi.useFakeTimers({ toFake: ['requestAnimationFrame', 'cancelAnimationFrame', 'setTimeout', 'clearTimeout'] });
+    window.history.replaceState(null, '', '/pr/acme/shop/1');
+    const open = vi.fn(() => null);
+    vi.stubGlobal('open', open);
+    page();
+    fireEvent.keyDown(document.body, { key: 'k', ctrlKey: true });
+    fireEvent.click(screen.getByText('Open PR on GitHub'));
+    expect(open).toHaveBeenCalledTimes(1);
+    const [url, target, features] = open.mock.calls[0] as unknown as [string, string, string | undefined];
+    expect(url).toBe('https://github.com/acme/shop/pull/1');
+    expect(target).toBe('_blank');
+    // The new page gets no handle on this one (window.opener), and no referrer that carries this page's address.
+    const words = String(features ?? '').split(/[,\s]+/);
+    expect(words).toContain('noopener');
+    expect(words).toContain('noreferrer');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // One pull request, then another
 // ---------------------------------------------------------------------------

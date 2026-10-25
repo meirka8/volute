@@ -6,7 +6,18 @@
 import { describe, expect, it } from 'vitest';
 import { stripHidden } from './hiddenChars';
 import { NO_FILTERS, type Filters } from './timelineSearch';
-import { EMPTY_SEARCH, encodeSearchState, MAX_QUERY_LENGTH, readSearchState, SEARCH_PARAMS, withFragmentParams, type SearchState } from './timelineSearchUrl';
+import {
+  EMPTY_SEARCH,
+  encodeSearchState,
+  MAX_QUERY_LENGTH,
+  readSearchState,
+  SEARCH_PARAMS,
+  viewLink,
+  withFragmentParams,
+  withoutSearchParams,
+  type AddressParts,
+  type SearchState,
+} from './timelineSearchUrl';
 
 function rng(seed: number) {
   let a = seed >>> 0;
@@ -107,7 +118,9 @@ describe('hostile addresses', () => {
   const HOSTILE = [
     '#q=<script>alert(1)</script>',
     '#q="><img src=x onerror=alert(1)>',
-    "?q='; DROP TABLE steps; --",
+    "#q='; DROP TABLE steps; --",
+    // The query string is not read, whatever it holds: a `?` at the start of a fragment is a character of the first name.
+    '#?q=secret&?tool=Bash',
     '#q=javascript:alert(1)',
     '#q=data:text/html,<script>alert(1)</script>',
     '#q=${process.env.SECRET}&q=%7B%7Bconstructor.constructor(%22alert(1)%22)()%7D%7D',
@@ -144,6 +157,15 @@ describe('hostile addresses', () => {
     }
     // And it can be written back without failing.
     expect(() => encodeSearchState(got, null)).not.toThrow();
+  });
+
+  it('does not read the query string, and a `?` that starts a fragment is part of a name and not a way into the query string', () => {
+    expect(read('?q=secret')).toBe(EMPTY_SEARCH);
+    expect(read('#?q=secret')).toBe(EMPTY_SEARCH);
+    expect(read('#?q=secret&tool=Bash').q).toBe('');
+    expect(read('#?q=secret&tool=Bash').filters.tool).toEqual(['Bash']);
+    expect(read('#&?q=secret')).toBe(EMPTY_SEARCH);
+    expect(read('#x=1?q=secret&q=real').q).toBe('real');
   });
 
   it('keeps hostile text as the text it is, exactly', () => {
@@ -209,7 +231,7 @@ describe('writing', () => {
 });
 
 describe('what is written is what is read', () => {
-  const ALPHABET = ['a', 'B', ' ', '&', '=', '+', '%', '#', '#', '/', '"', "'", '<', '>', '日', '本', '😀', 'é', '\\', ':', ';', ',', '.', '_', '-', '*', '[', ']', '(', ')', '~', '!', '@', '$', '^', '|', '{', '}'];
+  const ALPHABET = ['a', 'B', ' ', '&', '=', '+', '%', '#', '?', '/', '"', "'", '<', '>', '日', '本', '😀', 'é', '\\', ':', ';', ',', '.', '_', '-', '*', '[', ']', '(', ')', '~', '!', '@', '$', '^', '|', '{', '}'];
   const text = (rand: () => number, max: number) => {
     let out = '';
     for (let n = Math.floor(rand() * max); n > 0; n--) out += ALPHABET[Math.floor(rand() * ALPHABET.length)];
@@ -261,7 +283,7 @@ describe('what is written is what is read', () => {
   });
 });
 
-describe('rewriting the query string of the page', () => {
+describe('rewriting the fragment of the page', () => {
   it('keeps every parameter that is not ours, in order, byte for byte, and puts ours last', () => {
     const search = '#tab=files&a=b%20c+d&x[]=1&x[]=2&empty&=weird&a=b=c&utm=%E2%9C%93&Q=upper&qq=2&q2=3&q+x=y&q%20=z';
     const out = withFragmentParams(search, 'q=new&tool=Bash');
@@ -274,7 +296,7 @@ describe('rewriting the query string of the page', () => {
     expect(withFragmentParams(search, 'q=x')).toBe('#tab=1&Conv=keep&z=9&q=x');
   });
 
-  it('gives nothing back, not a lone question mark, when nothing is left', () => {
+  it('gives nothing back, not a lone #, when nothing is left', () => {
     expect(withFragmentParams('#q=a&tool=b', '')).toBe('');
     expect(withFragmentParams('', '')).toBe('');
     expect(withFragmentParams('#', '')).toBe('');
@@ -282,7 +304,7 @@ describe('rewriting the query string of the page', () => {
     expect(withFragmentParams('q=a', 'q=b')).toBe('#q=b');
   });
 
-  it('is idempotent, and does not mind a search string with or without its question mark', () => {
+  it('is idempotent, and does not mind a fragment with or without its #', () => {
     const once = withFragmentParams('#a=1&q=old', 'q=new');
     expect(withFragmentParams(once, 'q=new')).toBe(once);
     expect(withFragmentParams('a=1&q=old', 'q=new')).toBe(once);
@@ -303,5 +325,151 @@ describe('rewriting the query string of the page', () => {
     expect(performance.now() - started).toBeLessThan(2_000);
     expect(out.endsWith('&q=z')).toBe(true);
     expect(out.split('&')).toHaveLength(100_000 - Math.ceil(100_000 / 7) + 1);
+  });
+});
+
+describe('rewriting the query string of the page', () => {
+  // A link from before the filters moved to the fragment may carry ours in the query string, which is the part of an address a
+  // server reads. They are never read from there; they are taken out of it, and the rest of it is left as it was.
+  it('leaves a query string that has none of our names exactly as it is, whatever else is in it', () => {
+    for (const search of [
+      '',
+      '?',
+      '??',
+      '?tab=files',
+      'tab=files',
+      '?a=1&&b=2',
+      '?a=1&',
+      '?&a=1',
+      '?x=%zz&y=%E0%A4%A&z=%',
+      '?Q=upper&qq=2&q2=3&q+x=y&q%20=z&file2=1&tools=2&Conv=3&Origin=prompt&query=1&filter=2&links=3&commits=4',
+      '?a[]=1&a[]=2&=x&=&empty&a=b=c',
+      '?utm_source=%E2%9C%93&redirect=https%3A%2F%2Fexample.com%2F%3Fq%3Dsecret',
+      '??q=1',
+      '?a=1&?q=2',
+    ]) {
+      expect(withoutSearchParams(search), JSON.stringify(search)).toBe(search);
+    }
+  });
+
+  it('takes ours out wherever they are, however they are spelled, and however many there are, and no others', () => {
+    const search = '?q=a&tab=1&%71=b&conv=1&Conv=keep&or%69gin=prompt&tool=t&tool=u&link=generated&commit=abcdef1&file=f&q&file&z=9&to+ol=x&to%6Fl';
+    expect(withoutSearchParams(search)).toBe('?tab=1&Conv=keep&z=9&to+ol=x');
+    for (const name of SEARCH_PARAMS) {
+      expect(withoutSearchParams(`?${name}=v&keep=1`), name).toBe('?keep=1');
+      expect(withoutSearchParams(`?keep=1&${name}=v`), name).toBe('?keep=1');
+      expect(withoutSearchParams(`?keep=1&${name}=v&keep=2`), name).toBe('?keep=1&keep=2');
+      expect(withoutSearchParams(`?${name}&keep=1`), `${name} with no value`).toBe('?keep=1');
+      expect(withoutSearchParams(`?${name}=`), `${name} with an empty value`).toBe('');
+      expect(withoutSearchParams(`?${name.toUpperCase()}=v`), `${name.toUpperCase()} is another name`).toBe(`?${name.toUpperCase()}=v`);
+    }
+  });
+
+  it('gives nothing back, not a lone ?, when nothing is left; and starts what it gives with a ?, as the address does', () => {
+    expect(withoutSearchParams('?q=a&tool=b')).toBe('');
+    expect(withoutSearchParams('q=a')).toBe('');
+    expect(withoutSearchParams('?q')).toBe('');
+    expect(withoutSearchParams('?&q=1&&')).toBe('');
+    expect(withoutSearchParams('q=a&tab=1')).toBe('?tab=1');
+    expect(withoutSearchParams('?q=a&tab=1')).toBe('?tab=1');
+  });
+
+  it('keeps the other parameters byte for byte, and drops only the empty pairs when it has taken something out', () => {
+    expect(withoutSearchParams('?x=%E2%9C%93&q=1&y=a+b&z=%20&w=%zz&v=a%2Bb')).toBe('?x=%E2%9C%93&y=a+b&z=%20&w=%zz&v=a%2Bb');
+    expect(withoutSearchParams('?a=1&&q=2&b=2&')).toBe('?a=1&b=2');
+    expect(withoutSearchParams('?redirect=https%3A%2F%2Fexample.com%2F%3Fq%3Dsecret&q=1')).toBe('?redirect=https%3A%2F%2Fexample.com%2F%3Fq%3Dsecret');
+  });
+
+  it('is idempotent, and agrees with the names a browser reads, on any query string made of the parts addresses are made of', () => {
+    const rand = rng(1801);
+    const NAMES = ['q', 'conv', 'origin', 'tool', 'link', 'commit', 'file', 'Q', 'qq', 'tab', 'x', '%71', 'or%69gin', 'to%6Fl', 'q+', '%zz', 'q%', '%', '', 'file%2', 'a[]', '?q', '?tab', 'q%00', 'com%6dit', 'c%6fnv', '%C3%A9', 'q%C3'];
+    const VALUES = ['', '1', 'secret', 'a%20b', 'a+b', '%zz', '%E2%9C%93', 'https%3A%2F%2Fx', '=', 'a=b'];
+    const own = new Set<string>(SEARCH_PARAMS);
+    /** The name of a pair as a browser reads it (the way every query string is read on a server). */
+    const nameOfPair = (pair: string) => [...new URLSearchParams(`&${pair}`).keys()][0] ?? '';
+    let touched = 0;
+    for (let k = 0; k < 4_000; k++) {
+      const pairs = Array.from({ length: 1 + Math.floor(rand() * 6) }, () => {
+        const name = NAMES[Math.floor(rand() * NAMES.length)];
+        return rand() < 0.2 ? name : `${name}=${VALUES[Math.floor(rand() * VALUES.length)]}`;
+      });
+      if (rand() < 0.15) pairs.splice(Math.floor(rand() * pairs.length), 0, '');
+      const search = (rand() < 0.85 ? '?' : '') + pairs.join('&');
+      const body = search.startsWith('?') ? search.slice(1) : search;
+      const all = body.split('&');
+      const expected = all.some((pair) => own.has(nameOfPair(pair))) ? (all.filter((pair) => pair !== '' && !own.has(nameOfPair(pair))).length === 0 ? '' : `?${all.filter((pair) => pair !== '' && !own.has(nameOfPair(pair))).join('&')}`) : search;
+      const got = withoutSearchParams(search);
+      expect(got, JSON.stringify(search)).toBe(expected);
+      expect(withoutSearchParams(got), `again: ${JSON.stringify(got)}`).toBe(got);
+      if (got !== search) touched++;
+      // And what is left says none of ours, to a server.
+      for (const name of new URLSearchParams(got).keys()) expect(own.has(name), `${name} in ${JSON.stringify(got)}`).toBe(false);
+    }
+    expect(touched).toBeGreaterThan(1_500);
+  });
+
+  it('takes time in proportion to the address: a hundred thousand parameters is a fraction of a second', () => {
+    const big = `?${Array.from({ length: 100_000 }, (_, k) => (k % 7 === 0 ? `q=${k}` : `p${k}=v`)).join('&')}`;
+    const started = performance.now();
+    const out = withoutSearchParams(big);
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(out.split('&')).toHaveLength(100_000 - Math.ceil(100_000 / 7));
+    expect(out.startsWith('?p1=v')).toBe(true);
+  });
+});
+
+describe('the link to a view', () => {
+  const address = (search: string, hash = ''): AddressParts => ({ origin: 'https://reviewer.example', pathname: '/pr/acme/shop/7', search, hash });
+  const BASE = 'https://reviewer.example/pr/acme/shop/7';
+
+  it('is the address with the text and the filters in the fragment, and the rest of the address as it was', () => {
+    expect(viewLink(address(''), state('refund', { tool: ['Edit'] }), null, true)).toBe(`${BASE}#q=refund&tool=Edit`);
+    expect(viewLink(address('?tab=files'), state('refund', { tool: ['Edit'] }), null, true)).toBe(`${BASE}?tab=files#q=refund&tool=Edit`);
+    expect(viewLink(address('?tab=files&x=%E2%9C%93', '#section'), state('refund', { origin: ['prompt'] }), null, true)).toBe(`${BASE}?tab=files&x=%E2%9C%93#section&q=refund&origin=prompt`);
+  });
+
+  it('leaves the text out when it is asked to, and the filters stay', () => {
+    expect(viewLink(address('?tab=files'), state('refund', { tool: ['Edit'] }), null, false)).toBe(`${BASE}?tab=files#tool=Edit`);
+    expect(viewLink(address(''), state('refund'), null, false)).toBe(BASE);
+    expect(viewLink(address('?tab=files', '#section'), state('refund'), null, false)).toBe(`${BASE}?tab=files#section`);
+  });
+
+  it('has none of ours in the query string, whatever the address had in it, and nothing else of it changed', () => {
+    const link = viewLink(address('?q=old&tab=files&tool=Bash&%71=x&conv=1&file=f', '#q=older&section'), state('refund', { tool: ['Edit'] }), null, true);
+    expect(link).toBe(`${BASE}?tab=files#section&q=refund&tool=Edit`);
+    expect(new URL(link).search).toBe('?tab=files');
+    // Nothing is left of the address but our own words, and a bare "?" does not stay behind.
+    expect(viewLink(address('?q=old&tool=Bash'), state('refund', { tool: ['Edit'] }), null, true)).toBe(`${BASE}#q=refund&tool=Edit`);
+    expect(viewLink(address('?q=old&tool=Bash'), state('', {}), null, true)).toBe(BASE);
+    expect(viewLink(address('?q=old'), state('refund'), null, false)).toBe(BASE);
+  });
+
+  it('never has a search text or a filter anywhere a server reads, for any address and any view, and reads back as the view', () => {
+    const rand = rng(404);
+    const SEARCHES = ['', '?', '?tab=files', '?q=leak&tab=files', '?tool=Bash&q=leak', '?%71=leak', '?conv=c1&x=1&file=src%2Fa.ts', '?a=1&&q=2', '??q=1'];
+    const HASHES = ['', '#', '#section', '#q=older&tool=Old', '#a=1&q=2&b=3'];
+    const TEXTS = ['', 'refund', 'retry limit', 'pássword sécret', 'a&b=c#d?e', '日本語', 'x'.repeat(500), 'x'.repeat(501)];
+    let checked = 0;
+    for (let k = 0; k < 600; k++) {
+      const text = TEXTS[Math.floor(rand() * TEXTS.length)];
+      const view = state(text, { tool: rand() < 0.5 ? ['Edit', 'Bash'] : [], origin: rand() < 0.5 ? ['prompt'] : [], conv: rand() < 0.3 ? ['c1:agent-a'] : [] });
+      const parts = address(SEARCHES[Math.floor(rand() * SEARCHES.length)], HASHES[Math.floor(rand() * HASHES.length)]);
+      const withText = rand() < 0.6;
+      const link = viewLink(parts, view, null, withText);
+      const url = new URL(link);
+      expect(link.startsWith(`${BASE}`)).toBe(true);
+      for (const name of new URLSearchParams(url.search).keys()) expect(SEARCH_PARAMS as readonly string[], `${name} in ${link}`).not.toContain(name);
+      expect(url.search.includes('leak'), link).toBe(false);
+      // The query string's other parameters are in it, as they were.
+      expect(url.search).toBe(withoutSearchParams(parts.search) === '?' ? '' : withoutSearchParams(parts.search));
+      // The fragment reads back as the view it is the link to (the text only when it was put in, and only up to what the box takes).
+      const read = readSearchState(url.hash);
+      expect(read.filters.tool).toEqual(view.filters.tool);
+      expect(read.filters.origin).toEqual(view.filters.origin);
+      expect(read.filters.conv).toEqual(view.filters.conv);
+      expect(read.q).toBe(withText && text.length <= MAX_QUERY_LENGTH ? text : '');
+      checked++;
+    }
+    expect(checked).toBe(600);
   });
 });

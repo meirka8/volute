@@ -201,17 +201,17 @@ describe('4. the chips of a tool call', () => {
 
 describe('5. a zero-width non-joiner or joiner that prose keeps', () => {
   it.each([
-    ['Persian, which is written with the non-joiner', 'می‌خواهم', 'میخواهم'],
-    ['an emoji sequence joined with the zero-width joiner', 'family \u{1F468}‍\u{1F469}‍\u{1F467} here', '\u{1F468}\u{1F469}\u{1F467}'],
+    ['Persian, which is written with the non-joiner', 'می\u200cخواهم', 'میخواهم'],
+    ['an emoji sequence joined with the zero-width joiner', 'family \u{1F468}\u200d\u{1F469}\u200d\u{1F467} here', '\u{1F468}\u{1F469}\u{1F467}'],
   ])('%s: typed exactly as drawn, it is found and it is marked', (_name, response, withoutJoiners) => {
     const node = makeNode({ id: '1f0e5c3a-9d2b-8c4e-a1b7-000000000005', author: 'human', model_name: 'claude-opus-4-5-20251101', user_prompt: 'say it', model_response: response });
     const { container } = render(<ShadowTimeline interactions={[node]} />);
     // The person types the word as it is on the screen.
-    const word = response.includes('family') ? '\u{1F468}‍\u{1F469}‍\u{1F467}' : response;
+    const word = response.includes('family') ? '\u{1F468}\u200d\u{1F469}\u200d\u{1F467}' : response;
     typeQuery(word);
     expect(screen.getByRole('status')).toHaveTextContent('1 of 1');
     // Found, and nothing says where: no token is drawn for these characters in prose, and no mark.
-    expect(marked(container).join('').replaceAll('‌', '').replaceAll('‍', '')).toBe(withoutJoiners);
+    expect(marked(container).join('').replaceAll('\u200c', '').replaceAll('\u200d', '')).toBe(withoutJoiners);
   });
 });
 

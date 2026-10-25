@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { Filters } from '../lib/timelineSearch';
-import { encodeFilters, withFragmentParams } from '../lib/timelineSearchUrl';
+import { encodeFilters, withFragmentParams, withoutSearchParams } from '../lib/timelineSearchUrl';
 
 /**
  * Keeps the fragment of the page's address saying which filters the timeline has on (issue #118), so that a reload,
@@ -11,8 +11,10 @@ import { encodeFilters, withFragmentParams } from '../lib/timelineSearchUrl';
  *   history (there is no typing to wait out, and no entry of its own to make).
  * - It is written only while the page is still the one the timeline was drawn on. A timeline goes away when the
  *   router has already moved on to the next page, and its last write must not land on that page's address.
- * - It leaves the path, the query string and every parameter of the fragment that is not ours alone, and does
- *   nothing when the address already says it.
+ * - It leaves the path, every parameter of the query string that is not ours and every parameter of the fragment
+ *   that is not ours alone, and does nothing when the address already says it. The parameters of ours that the
+ *   query string holds (a link from before the filters moved to the fragment) are taken out of it when the page
+ *   opens, so they stay out of the address and of the history; they are never read from there.
  *
  * `openFile` is the file the file filter means when it follows the open one. `revision` is raised by whoever has
  * just taken a state from the address (a link opened in this page): the address is then written again even though
@@ -28,9 +30,12 @@ export function useSearchUrlSync(filters: Filters, openFile: string | null, revi
     const { pathname, search, hash } = window.location;
     const next = withFragmentParams(hash, encoded);
     // A bare `#` says nothing, and is not worth rewriting the address for.
-    if (next === hash || (next === '' && hash === '#')) return;
+    const fragmentSaysIt = next === hash || (next === '' && hash === '#');
+    // Our names do not belong in the query string, where a server reads them: one left there by an older link goes now.
+    const query = withoutSearchParams(search);
+    if (fragmentSaysIt && query === search) return;
     try {
-      window.history.replaceState(window.history.state, '', `${pathname}${search}${next}`);
+      window.history.replaceState(window.history.state, '', `${pathname}${query}${fragmentSaysIt ? hash : next}`);
     } catch {
       // An address a page may not rewrite (a sandboxed frame): the view just is not in the address.
     }

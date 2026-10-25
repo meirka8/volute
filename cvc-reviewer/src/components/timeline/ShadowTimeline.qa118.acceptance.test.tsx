@@ -423,7 +423,8 @@ describe('acceptance: the address of a filtered view reproduces it on reload', (
     expect(window.location.pathname).toBe('/pr/acme/shop/7');
     expect(window.location.search).toBe('?tab=files&utm=a%20b+c');
     expect(window.location.hash.startsWith('#section&')).toBe(true);
-    expect(window.location.href).not.toContain('payments%22'); // (the file filter has "refund_handler" in its name: the text typed is the quoted phrase)
+    // The text typed is nowhere in it (the file filter has "payments/refund_handler" in its name, which is not the text).
+    expect(decodeURIComponent(window.location.href.replaceAll('+', ' ')).replace(FIXTURE_PATH, '')).not.toMatch(/refund|payments|path:/);
     const params = new URLSearchParams(window.location.hash.slice(1));
     expect(params.has('q')).toBe(false);
     expect(params.getAll('conv')).toEqual([FIXTURE_SESSION]);
@@ -674,6 +675,7 @@ describe('under StrictMode, as the app is mounted', () => {
     const listeners = (spy: typeof add, type: string) => spy.mock.calls.filter(([name]) => name === type).length;
     expect(listeners(remove, 'keydown')).toBe(listeners(add, 'keydown'));
     // (The window's hashchange, which a link pasted into the page's address is taken by, is taken off with the timeline.)
+    expect(listeners(addWindow, 'hashchange')).toBeGreaterThan(0);
     expect(listeners(removeWindow, 'hashchange')).toBe(listeners(addWindow, 'hashchange'));
   });
 });

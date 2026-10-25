@@ -219,26 +219,32 @@ window. When a search or filter begins the list opens at the top; when the last 
 were in it. Clearing from the empty state ("Clear search and filters") puts the keyboard in the box.
 
 **The address keeps the filters after the `#`, and never the search text.** The filters are kept in the fragment of the
-address so that a reload, or a step back to the page, finds them again: `#conv=…&origin=…&tool=…&link=…&commit=…&file=…`,
-one `conv`, `origin`, `tool`, `link` or `commit` for each value and a `file` path (for "touches the open file" it is the
-file that is open; a path from a link stays that file). The fragment is never sent to a server, and the page sends no
-referrer. They are written at once, replacing the history entry (a choice of a filter is not a history entry), and only
-while the page is still the one the timeline was drawn on; the path, the query string and any other parameter of the
-fragment are left as they were. A value that is not one its parameter holds (an unknown origin, an id with a space, a hash
-that is not hexadecimal) is ignored, and every value is shown as text, with hidden characters made visible; a value too
-long for the address, or that reading it would change, is left out of it and never written cut short. Back restores a
-page's filters, not what was typed in its box.
+address so that a reload, or a step back to the page, finds them again: `#conv=…&origin=…&tool=…&link=…&commit=…&file=…`, one
+`conv`, `origin`, `tool`, `link` or `commit` for each value and a `file` path (for "touches the open file" it is the file
+that is open; a path from a link stays that file). The fragment is never sent to a server, and the page sends no referrer.
+They are written at once, replacing the history entry (a choice of a filter is not a history entry), and only while the page
+is still the one the timeline was drawn on; the path, the parameters of the query string that are not ours (`?tab=files`) and
+any other parameter of the fragment are left as they were. A value that is not one its parameter holds (an unknown origin, an
+id with a space, a hash that is not hexadecimal) is ignored, and every value is shown as text, with hidden characters made
+visible; a value too long for the address, or that reading it would change, is left out of it and never written cut short.
+Back restores a page's filters, not what was typed in its box.
 
 What you typed is not in the address: a search is often a word from a log, a name or a secret, and the address goes to the
 history, to the screen and to whoever the page is shared with. **"Copy link"** (the button beside the filters) is how a
 view is shared: it copies the address with the filters *and* the search text, as `q=` in the fragment. Before it puts a text
-that looks like a secret (a private key, a token with a known prefix, a JWT, a password assignment, or a long run of letters
-and digits) into a link it asks, in a line you can reach with the keyboard, whether to copy without the search text (the
-default) or anyway. That is a nudge and not a guarantee: a secret that does not look like one passes. Where the browser
-does not let the page write to the clipboard, the link is shown in a field, selected, to copy from; "Link copied" is
-announced in the count's live region.
+that looks like a secret (a private key, a token with a known prefix, a JWT, a password assignment, or a long run of mixed-case
+letters and digits that is not a hash: a commit hash, a SHA-256 and a UUID are not taken for one) into a link it asks, in a
+line you can reach with the keyboard, whether to copy without the search text (the default) or anyway. That is a nudge and
+not a guarantee: a secret that does not look like one passes (a short password does). Where the browser does not let the
+page write to the clipboard, the link is shown in a field, selected, to copy from; "Link copied" is announced in the count's
+live region.
 
 A link that brings a search or filters (a fragment with `q=` or any of the parameters above, opened in a new tab, in this
 one, or pasted into its address bar) is applied, the search text leaves the address at once, and a line under the bar says
 "This view was opened from a link with a search and filters applied" with a **Clear** button, until you change the search or
-the filters: a crafted link can not narrow the timeline without your seeing it. The old `?q=` of the query string is not read.
+the filters: a crafted link can not narrow the timeline without your seeing it. None of these names (`q`, `conv`, `origin`,
+`tool`, `link`, `commit`, `file`) is read from the query string, the old `?q=` included. The page takes them out of it when it
+opens, so that a leftover one, from a link made before the filters moved to the fragment, is not kept in the address and the
+history, and "Copy link" leaves them out of the query string of the link and keeps every other parameter as it was: a query
+string is what a server is sent. Whoever opens a copied link keeps its search text in their own browser history, which a page
+can not prevent.

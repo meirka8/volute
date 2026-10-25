@@ -20,7 +20,9 @@
  * - What is written is what is read: a value that the reader would refuse or change (too long, not the shape
  *   of an id, with a hidden character in it) is left out of the address, never written cut.
  * - Writing keeps the parameters of the fragment that are not ours, byte for byte; ours are written last, in
- *   this order, and only when they have a value. The query string of the address is not touched or read.
+ *   this order, and only when they have a value. The query string of the address is never read for a search or a
+ *   filter; the parameters of ours that one holds (a link from before the filters moved to the fragment) are taken
+ *   out of it, and the rest of it is left as it was (`withoutSearchParams`).
  *
  * Pure: the code that reads and writes `window.location` is `hooks/useSearchUrl`.
  */
@@ -180,6 +182,21 @@ export function withFragmentParams(fragment: string, encoded: string): string {
   return kept.length === 0 ? '' : `#${kept.join('&')}`;
 }
 
+/**
+ * `search` (an address's `?...`, with or without the `?`) without the parameters that are ours (`q`, `conv`, `origin`,
+ * `tool`, `link`, `commit`, `file`), and with every other parameter exactly as it was. They are not read from the query
+ * string (see `readSearchState`), so one found there was left by a link from before the filters moved to the fragment, and
+ * the query string is the part of an address that is sent to a server. The result starts with `?`, or is empty when nothing
+ * is left; an address that has none of our names is returned as it is, byte for byte.
+ */
+export function withoutSearchParams(search: string): string {
+  const body = search.startsWith('?') ? search.slice(1) : search;
+  const pairs = body.split('&');
+  if (!pairs.some((pair) => OWN.has(nameOf(pair)))) return search;
+  const kept = pairs.filter((pair) => pair !== '' && !OWN.has(nameOf(pair)));
+  return kept.length === 0 ? '' : `?${kept.join('&')}`;
+}
+
 /** The parts of an address a link is made from. */
 export interface AddressParts {
   readonly origin: string;
@@ -190,10 +207,11 @@ export interface AddressParts {
 
 /**
  * The link to the view `state` is: the address as it is, with the filters and, if `withText`, the search text in
- * the fragment (`#q=...&conv=...`), where a server never sees them. Parameters of the fragment that are not ours
- * stay.
+ * the fragment (`#q=...&conv=...`), where a server never sees them. The parameters of the query string and of the
+ * fragment that are not ours stay, as they were; ours are taken out of the query string (see `withoutSearchParams`),
+ * so a link never sends to a server a search or a filter that an older link left there.
  */
 export function viewLink(address: AddressParts, state: SearchState, openFile: string | null, withText: boolean): string {
   const encoded = encodeSearchState(withText ? state : { q: '', filters: state.filters }, openFile);
-  return `${address.origin}${address.pathname}${address.search}${withFragmentParams(address.hash, encoded)}`;
+  return `${address.origin}${address.pathname}${withoutSearchParams(address.search)}${withFragmentParams(address.hash, encoded)}`;
 }

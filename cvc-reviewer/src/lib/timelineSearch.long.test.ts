@@ -6,6 +6,11 @@
  * The engine hashes a string of more than 16,383 characters by its length alone, so a `Map` of strings of one length is
  * one long chain; and the names of conversations were made by cutting each id a few characters at a time up to its
  * length, which for two ids of a mebibyte took 72 seconds. Both are what these tests are about.
+ *
+ * Each id, name and path is read once (the table of strings hashes all of a long one, with a seed that is the page's own; see
+ * `lib/stringTable`), so twenty of a mebibyte cost twenty mebibytes of reading in each place they are keyed: a fraction of a
+ * second on a machine with nothing else to do, and more on one that has. The time a case may take is a second, which is
+ * far under what a quadratic one costs (72 s), and each is the fastest of three runs, since noise only ever makes a run slower.
  */
 import { describe, expect, it } from 'vitest';
 import { buildFacets, conversationNameOf, filterChips, forgetLastSearch, getTimelineIndex, LABEL_LIMIT, NO_FILTERS, parseQuery, runSearch, type Filters } from './timelineSearch';
@@ -22,6 +27,16 @@ const time = (run: () => void) => {
   return performance.now() - started;
 };
 const only = (partial: Partial<Filters>): Filters => ({ ...NO_FILTERS, ...partial });
+/** What the slowest case may take, in milliseconds (see the top of this file). */
+const BUDGET = 1_000;
+/** The fastest of three runs of `run`, each on a copy of `nodes` (an index is kept for as long as its array lives). */
+const fastestOn = (nodes: readonly InteractionNode[], run: (copy: readonly InteractionNode[]) => void) =>
+  Math.min(
+    ...Array.from({ length: 3 }, () => {
+      const copy = [...nodes];
+      return time(() => run(copy));
+    }),
+  );
 
 describe.each([2, 20])('%i ids of a mebibyte that differ only at the end', (count) => {
   it('stay that many conversations, with that many different names, and the index, the facets and a filter take a fraction of a second', () => {
@@ -33,14 +48,14 @@ describe.each([2, 20])('%i ids of a mebibyte that differ only at the end', (coun
     ]);
     let found: string[] = [];
     let labels: string[] = [];
-    const elapsed = time(() => {
-      const index = getTimelineIndex(nodes);
+    const elapsed = fastestOn(nodes, (copy) => {
+      const index = getTimelineIndex(copy);
       const facets = buildFacets(index);
       labels = facets.conversations.map((option) => option.label);
       found = runSearch(index, { query: parseQuery(''), filters: only({ conv: [ids[count - 1]] }), file: null }).ids;
       filterChips(only({ conv: [ids[count - 1]] }), facets, null);
     });
-    expect(elapsed).toBeLessThan(300);
+    expect(elapsed).toBeLessThan(BUDGET);
     expect(found).toEqual([`a${count - 1}`, `b${count - 1}`]); // in the order the steps were given
     expect(labels).toHaveLength(count);
     expect(new Set(labels).size).toBe(count);
@@ -52,26 +67,26 @@ describe.each([2, 20])('%i ids of a mebibyte that differ only at the end', (coun
     }
   });
 
-  it('are told apart when they differ in the middle, where nothing that samples a string looks', () => {
+  it('are told apart when they differ in the middle, where a sample of a string would not look', () => {
     const base = 'm'.repeat(MIB);
     const ids = Array.from({ length: count }, (_, k) => `${base.slice(0, 500_000 + k)}Z${base.slice(500_001 + k)}`);
     const nodes = ids.map((id, k) => makeNode({ id: `n${k}`, conversation_id: id, timestamp: k }));
     let conversations = 0;
-    const elapsed = time(() => {
-      conversations = buildFacets(getTimelineIndex(nodes)).conversations.length;
+    const elapsed = fastestOn(nodes, (copy) => {
+      conversations = buildFacets(getTimelineIndex(copy)).conversations.length;
     });
     expect(conversations).toBe(count);
-    expect(elapsed).toBeLessThan(1_500);
+    expect(elapsed).toBeLessThan(BUDGET);
   });
 
   it('subagents of one very long session are named apart, and so are very long agent ids', () => {
     const session = 's'.repeat(MIB - 20);
     const nodes = Array.from({ length: count }, (_, k) => makeNode({ id: `n${k}`, conversation_id: `${session}:agent-${'a'.repeat(100_000)}${k}`, timestamp: k }));
     let labels: string[] = [];
-    const elapsed = time(() => {
-      labels = buildFacets(getTimelineIndex(nodes)).conversations.map((option) => option.label);
+    const elapsed = fastestOn(nodes, (copy) => {
+      labels = buildFacets(getTimelineIndex(copy)).conversations.map((option) => option.label);
     });
-    expect(elapsed).toBeLessThan(500);
+    expect(elapsed).toBeLessThan(BUDGET);
     expect(new Set(labels).size).toBe(count);
     for (const label of labels) expect(label.startsWith('Subagent ')).toBe(true);
   });
@@ -84,14 +99,14 @@ describe.each([2, 20])('%i tool names of a mebibyte that differ only at the end'
     let labels: string[] = [];
     let narrowed: string[] = [];
     let named: string[] = [];
-    const elapsed = time(() => {
-      const index = getTimelineIndex(nodes);
+    const elapsed = fastestOn(nodes, (copy) => {
+      const index = getTimelineIndex(copy);
       const tools = buildFacets(index).tools;
       labels = tools.map((option) => option.label);
       narrowed = runSearch(index, { query: parseQuery(''), filters: only({ tool: [names[count - 1]] }), file: null }).ids;
       named = runSearch(index, { query: parseQuery('tool:ttt'), filters: NO_FILTERS, file: null }).ids;
     });
-    expect(elapsed).toBeLessThan(300);
+    expect(elapsed).toBeLessThan(BUDGET);
     expect(labels).toHaveLength(count);
     expect(new Set(labels).size).toBe(count);
     for (const label of labels) expect(label.length).toBeLessThanOrEqual(LABEL_LIMIT + 8); // and the ellipsis and the number of a repeat
@@ -113,14 +128,14 @@ describe.each([2, 20])('%i paths of a mebibyte that differ only at the end', (co
     const wanted = `file${String(count - 1).padStart(4, '0')}.ts`;
     let touching: string[] = [];
     let byPath: string[] = [];
-    const elapsed = time(() => {
-      const index = getTimelineIndex(nodes);
+    const elapsed = fastestOn(nodes, (copy) => {
+      const index = getTimelineIndex(copy);
       buildFacets(index);
       forgetLastSearch(index);
       touching = runSearch(index, { query: parseQuery(''), filters: NO_FILTERS, file: wanted }).ids;
       byPath = runSearch(index, { query: parseQuery(`path:${wanted}`), filters: NO_FILTERS, file: null }).ids;
     });
-    expect(elapsed).toBeLessThan(600);
+    expect(elapsed).toBeLessThan(BUDGET);
     // The step that read all of them, and the step that read this one; in the order the steps were given.
     expect(touching).toEqual(['one', `m${count - 1}`]);
     expect(byPath).toEqual(['one', `m${count - 1}`]);

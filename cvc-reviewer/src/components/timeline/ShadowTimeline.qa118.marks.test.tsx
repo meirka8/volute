@@ -14,7 +14,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShadowTimeline } from './ShadowTimeline';
 import { MAX_MARKS_PER_BLOCK } from '../../lib/searchMarks';
 import { getTimelineIndex, NO_FILTERS, parseQuery, runSearch } from '../../lib/timelineSearch';
-import { nodeLayout } from '../../lib/transcriptNode';
 import * as fixtures from '../../test/fixtures';
 import { searchFixture } from '../../test/searchFixtures';
 import { normalizeInteraction, type CVCBlobData, type InteractionNode } from '../../types/cvc';
@@ -390,7 +389,7 @@ describe('the cap on marks', () => {
 // ---------------------------------------------------------------------------
 
 describe('a hidden character inside a match', () => {
-  const ZWSP = '​';
+  const ZWSP = '\u200b';
 
   it('is found, and is marked on both sides of the token: each half is text of its own on either side of it', () => {
     const node = makeNode({
@@ -417,7 +416,7 @@ describe('a hidden character inside a match', () => {
   });
 
   it('is found when it is the person who typed it, and when it is in a command only', () => {
-    const node = makeNode({ id: ID_SINK, author: 'human', model_name: MODEL, user_prompt: 'run it', tool_executions: [wireToolCall('Bash', { command: `rm -rf${'‮'} ./build` })] });
+    const node = makeNode({ id: ID_SINK, author: 'human', model_name: MODEL, user_prompt: 'run it', tool_executions: [wireToolCall('Bash', { command: `rm -rf${'\u202e'} ./build` })] });
     const { container } = search('"rm -rf ./build"', [node]);
     expect(screen.getByRole('status')).toHaveTextContent('1 of 1');
     // Round 3: the phrase is marked on both sides of the override that is drawn between its halves (it was not marked across).
@@ -440,7 +439,7 @@ describe('a hidden character inside a match', () => {
   });
 
   it('a query made of nothing but hidden characters is not a query, and marks nothing', () => {
-    const { container } = search(`${ZWSP}${ZWSP}‮`);
+    const { container } = search(`${ZWSP}${ZWSP}\u202e`);
     expect(screen.getByRole('status')).toHaveTextContent('');
     expect(marksIn(container)).toHaveLength(0);
     expect(container.querySelectorAll('ol > li')).toHaveLength(3);
@@ -480,13 +479,11 @@ describe('a step the search shows says why', () => {
   const nodes = [...new Map([...named, ...wire, ...searchFixture(6).nodes].map((node) => [node.id, node])).values()];
 
   /**
-   * Words the search finds in a step that the card does not draw: those that are only in the markers that divide the stimulus
-   * of the wire (`[tool_result Bash error]`, `[meta]`, `[compaction summary]`, `[no stimulus recorded]`), and a few more that
-   * are known: the status of a checklist item, which is drawn as an icon, and `null`, the arguments of a call made with no
-   * input (qa118.regressions.test.tsx, 10). Any other word that shows a step and marks nothing is a surface that is not marked.
+   * Round 3: the index holds what a card draws and nothing else, so there is nothing to allow for. (Before it, three kinds of
+   * word showed a step and marked nothing: those only in the markers of the wire, `null`, the arguments of a call made with no
+   * input, and the reasoning of a step the other layout draws without a "Why?". Each was allowed here; none is any more, and a
+   * word that shows a step and marks nothing is a surface that is not marked, or text that is searched and never drawn.)
    */
-  const KNOWN = new Set(['in_progress', 'null']);
-  const MARKER = /\[(?:tool_result [^\]]*|meta|compaction summary|no stimulus recorded)\]/g;
 
   it('by a mark, or by the count on the fold that holds the match, for every word of every step in the fixtures', () => {
     const wordsOf = (node: InteractionNode): string[] => {
@@ -504,18 +501,68 @@ describe('a step the search shows says why', () => {
         if (runSearch(index, { query: parseQuery(word), filters: NO_FILTERS, file: null }).ids.length === 0) continue;
         typeQuery(word);
         checked++;
-        if (marksIn(container).length > 0 || countLabels(container).length > 0 || KNOWN.has(word)) continue;
-        // A word that is only in a marker the card does not draw as it is written.
-        const outsideMarkers = [node.user_prompt?.replace(MARKER, ' '), node.model_cot, node.model_response, ...node.tool_executions.map((call) => call.arguments), ...node.tool_executions.map((call) => call.tool_name)].join('\n').toLowerCase();
-        if (!outsideMarkers.includes(word)) continue;
-        // The reasoning of a step of the other layout that is not the agent's is not drawn at all (there is no "Why?" for it).
-        const onlyReasoning = nodeLayout(node) === 'triad' && node.author !== 'agent' && ![node.user_prompt, node.model_response].some((text) => text?.toLowerCase().includes(word));
-        if (onlyReasoning) continue;
+        // (A card that says where it matched outside what it draws, "Matched in: ...", has said why.)
+        if (marksIn(container).length > 0 || countLabels(container).length > 0 || container.querySelector('[role="note"]')?.textContent?.startsWith('Matched in:')) continue;
         unexplained.push(`${node.id.slice(-8)}: ${word}`);
       }
       unmount();
     }
     expect(checked).toBeGreaterThan(400);
     expect(unexplained.join('\n')).toBe('');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The same word, typed another way
+// ---------------------------------------------------------------------------
+
+describe('a word typed another way finds the same steps and marks them', () => {
+  // Round 3: one fold serves the index, the terms and the marks, so a word in capitals, with a hidden character in the
+  // middle, or in full-width letters is the word. Checked on the words of the steps of the fixtures: what the plain word
+  // finds, each variant finds, and a step it shows says why (a mark or the count on a fold) just as it does for the plain word.
+  const RAW = import.meta.glob<string>('../../test/wire/*/*.json', { eager: true, query: '?raw', import: 'default' });
+  const wire = Object.values(RAW).map((raw) => normalizeInteraction(JSON.parse(raw) as CVCBlobData));
+  const named = Object.values(fixtures).filter((value): value is InteractionNode => typeof value === 'object' && value !== null && !Array.isArray(value) && 'artifact_links' in value && 'tool_executions' in value);
+  const nodes = [...new Map([...named, ...wire].map((node) => [node.id, node])).values()].slice(0, 70);
+
+  const fullWidth = (word: string) => Array.from(word, (character) => (character >= '!' && character <= '~' ? String.fromCharCode(character.charCodeAt(0) + 0xfee0) : character)).join('');
+  const withHidden = (word: string) => `${word.slice(0, Math.ceil(word.length / 2))}\u200b${word.slice(Math.ceil(word.length / 2))}`;
+  const VARIANTS: Array<[string, (word: string) => string]> = [
+    ['in capitals', (word) => word.toUpperCase()],
+    ['with a zero-width space in the middle', withHidden],
+    ['in full-width letters', fullWidth],
+  ];
+
+  it('for every variant of the words of every step', () => {
+    const wordsOf = (node: InteractionNode): string[] => {
+      const text = [node.user_prompt, node.model_response, ...node.tool_executions.map((call) => call.tool_name)].filter(Boolean).join(' ');
+      const words = new Set<string>();
+      for (const word of text.split(/[^A-Za-z0-9_./-]+/)) if (word.length >= 4 && word.length <= 20 && /[a-z]/.test(word)) words.add(word.toLowerCase());
+      return [...words].slice(0, 5);
+    };
+    let checked = 0;
+    const problems: string[] = [];
+    for (const node of nodes) {
+      const { container, unmount } = render(<ShadowTimeline interactions={[node]} />);
+      const index = getTimelineIndex([node]);
+      for (const word of wordsOf(node)) {
+        const found = (query: string) => runSearch(index, { query: parseQuery(query), filters: NO_FILTERS, file: null }).ids.length > 0;
+        if (!found(word)) continue;
+        for (const [label, variant] of VARIANTS) {
+          const typed = variant(word);
+          checked++;
+          if (!found(typed)) {
+            problems.push(`${node.id.slice(-8)}: ${label}: ${JSON.stringify(typed)} is not found`);
+            continue;
+          }
+          typeQuery(typed);
+          const explained = marksIn(container).length > 0 || countLabels(container).length > 0 || container.querySelector('[role="note"]')?.textContent?.startsWith('Matched in:') === true;
+          if (!explained) problems.push(`${node.id.slice(-8)}: ${label}: ${JSON.stringify(typed)} shows the step and says nothing`);
+        }
+      }
+      unmount();
+    }
+    expect(checked).toBeGreaterThan(150);
+    expect(problems.join('\n')).toBe('');
   });
 });

@@ -3,11 +3,14 @@
  * puts the text of a search into a link that anyone who has the link will read.
  *
  * The patterns are the high-signal ones of `scrub` in `cvc-core/src/privacy.rs` (read, not shared): a PEM private
- * key, the access keys and tokens that begin with a known prefix (AWS, GitHub, OpenAI, Slack, Google), a JSON web
- * token, an authorization header or bearer token, credentials in a URL, and an assignment to a name such as
- * `password`, `token` or `api_key`; and, for the secrets that have no shape of their own, a long run of letters
- * and digits that has both. It is a nudge and not a guarantee: a secret in another shape passes, and a long hash
- * is taken for one.
+ * key, the access keys and tokens that begin with a known prefix (AWS, GitHub, GitLab, OpenAI, Slack, Google), a JSON
+ * web token, an authorization header or bearer token, credentials in a URL, and an assignment to a name such as
+ * `password`, `token` or `api_key`; and, for the secrets that have no shape of their own (an AWS secret key, a
+ * random key from a service with no prefix), a long run of the characters of base64 text that has an upper-case
+ * letter, a lower-case letter and a digit. A hash is not taken for one: a commit hash, a SHA-256 and a UUID are all
+ * hexadecimal digits (and dashes), and are searched for all the time, and a warning on every search for an id would
+ * teach people to ignore it. It is a nudge and not a guarantee: a secret in another shape passes (a short password is
+ * one), and a long mixed-case word with a digit in it is taken for one.
  *
  * Pure, and no regular expression: the text is typed by a person, but the same code reads whatever the address
  * brought, and it reads at most the first `LOOKED_AT` characters, once each.
@@ -15,8 +18,12 @@
 
 /** The text read: a search box takes 500 characters; a text longer than this is judged by its beginning. */
 const LOOKED_AT = 2_000;
-/** A run of letters and digits this long, with both, is taken for a secret (a UUID's longest run is twelve). */
-const LONG_RUN = 32;
+/**
+ * A run of base64 characters this long, that has an upper-case letter, a lower-case letter and a digit and is not all
+ * hexadecimal, is taken for a secret: the length of an AWS secret access key, which is the shortest of the kind. (A SHA-256 is
+ * sixty-four hexadecimal digits, a commit hash forty, and a UUID thirty-six with its dashes, and none of them is one.)
+ */
+const LONG_RUN = 40;
 
 const isDigit = (code: number) => code >= 0x30 && code <= 0x39;
 const isLetter = (code: number) => (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a);
@@ -24,6 +31,28 @@ const isAlphanumeric = (code: number) => isDigit(code) || isLetter(code);
 /** What `\w` matches. */
 const isWord = (code: number) => isAlphanumeric(code) || code === 0x5f;
 const isSpace = (code: number) => code === 0x20 || (code >= 0x09 && code <= 0x0d);
+
+const isHexDigit = (code: number) => isDigit(code) || (code >= 0x41 && code <= 0x46) || (code >= 0x61 && code <= 0x66);
+/** The characters of base64 text, in its two alphabets: [A-Za-z0-9+/=_-]. */
+const isBase64Char = (code: number) => isAlphanumeric(code) || code === 0x2b || code === 0x2f || code === 0x3d || code === 0x5f || code === 0x2d;
+
+/**
+ * `text` with `A` to `Z` in lower case and every other character as it is: always as long as `text`, so that a place in
+ * one is the same place in the other. (`toLowerCase` makes the two characters `i` and a dot of `İ`, and every place after
+ * it in the lower-case copy is one too many.)
+ */
+function asciiLower(text: string): string {
+  let out = '';
+  let from = 0;
+  for (let at = 0; at < text.length; at++) {
+    const code = text.charCodeAt(at);
+    if (code >= 0x41 && code <= 0x5a) {
+      out += text.slice(from, at) + String.fromCharCode(code + 0x20);
+      from = at + 1;
+    }
+  }
+  return from === 0 ? text : out + text.slice(from);
+}
 
 /** A word boundary before `at`, as `\b` means it before a word character. */
 const startsWord = (text: string, at: number) => at === 0 || !isWord(text.charCodeAt(at - 1));
@@ -90,14 +119,17 @@ function hasJwt(text: string): boolean {
 function hasKnownToken(text: string): boolean {
   for (const kind of ['ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_']) if (prefixed(text, kind, isAlphanumeric, 20)) return true;
   if (prefixed(text, 'github_pat_', (code) => isAlphanumeric(code) || code === 0x5f, 20)) return true;
+  if (prefixed(text, 'glpat-', tokenChar, 20)) return true;
   if (prefixed(text, 'sk-proj-', tokenChar, 20) || prefixed(text, 'sk-', tokenChar, 20)) return true;
-  for (const kind of ['b', 'a', 'p', 'r', 's']) if (prefixed(text, `xox${kind}-`, dashChar, 10)) return true;
+  for (const kind of ['b', 'a', 'p', 'r', 's', 'e']) if (prefixed(text, `xox${kind}-`, dashChar, 10)) return true;
+  // A Google API key is `AIza` and thirty-five more, and any of them can be a dash or an underscore.
+  if (prefixed(text, 'AIza', tokenChar, 35)) return true;
   return prefixed(text, 'ya29.', tokenChar, 20);
 }
 
 /** `authorization:` or `bearer ` (in any case) followed by a token of twelve characters or more. */
 function hasAuthorization(text: string): boolean {
-  const lower = text.toLowerCase();
+  const lower = asciiLower(text);
   for (const at of occurrences(lower, 'bearer')) {
     if (!startsWord(text, at)) continue;
     const gap = runOf(text, at + 6, isSpace);
@@ -137,7 +169,7 @@ const SECRET_NAMES = ['aws_secret_access_key', 'api_key', 'api-key', 'apikey', '
 
 /** `password = hunter2hunter2`, `token: abc...`: a name that holds a secret, and a value of eight characters or more. */
 function hasSecretAssignment(text: string): boolean {
-  const lower = text.toLowerCase();
+  const lower = asciiLower(text);
   for (const name of SECRET_NAMES) {
     for (const at of occurrences(lower, name)) {
       if (!startsWord(text, at)) continue;
@@ -152,23 +184,31 @@ function hasSecretAssignment(text: string): boolean {
   return false;
 }
 
-/** A run of letters and digits of `LONG_RUN` or more that has both. */
+/**
+ * A run of `LONG_RUN` characters or more of base64 text (either alphabet, and the padding) that has an upper-case letter, a
+ * lower-case letter and a digit, and that is not all hexadecimal digits: not a hash, which is.
+ */
 function hasLongRun(text: string): boolean {
   let at = 0;
   while (at < text.length) {
-    if (!isAlphanumeric(text.charCodeAt(at))) {
+    if (!isBase64Char(text.charCodeAt(at))) {
       at++;
       continue;
     }
     const start = at;
-    let letters = false;
-    let digits = false;
-    while (at < text.length && isAlphanumeric(text.charCodeAt(at))) {
-      if (isDigit(text.charCodeAt(at))) digits = true;
-      else letters = true;
-      at++;
+    let upper = false;
+    let lower = false;
+    let digit = false;
+    let notHex = false;
+    for (; at < text.length; at++) {
+      const code = text.charCodeAt(at);
+      if (!isBase64Char(code)) break;
+      if (code >= 0x41 && code <= 0x5a) upper = true;
+      else if (code >= 0x61 && code <= 0x7a) lower = true;
+      else if (isDigit(code)) digit = true;
+      if (!isHexDigit(code)) notHex = true;
     }
-    if (at - start >= LONG_RUN && letters && digits) return true;
+    if (at - start >= LONG_RUN && upper && lower && digit && notHex) return true;
   }
   return false;
 }

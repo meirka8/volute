@@ -580,7 +580,7 @@ describe('the index and the search, against a brute-force oracle', () => {
       author: 'human',
       tool_executions: [toolCall('Bash', { command: 'echo hi', timeout: 120000, run_in_background: true, nested: { deep: ['inner value'] } })],
     });
-    for (const absent of ['command', 'timeout', '120000', 'run_in_background', 'nested', 'runs in background']) expect(search([node], absent), absent).toEqual([]);
+    for (const absent of ['command', 'timeout', '120000', 'true', 'run_in_background', 'nested', 'runs in background']) expect(search([node], absent), absent).toEqual([]);
     for (const present of ['echo hi', 'inner value', 'bash', '120s', 'deep']) expect(search([node], present), present).toEqual(['args']);
   });
 

@@ -80,10 +80,24 @@ function computeFold(codePoint: number): string {
   return current;
 }
 
+/** What the code points below U+10000 fold to: there are 65,536 of them, so this takes no more room than that. */
 const BMP_CACHE: Array<string | undefined> = new Array<string | undefined>(0x10000);
+
+/**
+ * The most code points above U+FFFF whose fold is remembered at a time. There are a million of them, and a text can use as
+ * many as it has room for (about 4 MiB of distinct ones keeps 90 MiB of cache alive), so the cache is emptied when it fills,
+ * as the cache of `timelineSearch` for short strings is: a text that uses fewer than this (emoji, the rare Chinese
+ * characters, the mathematical letters) never notices, and one that uses more has the rest worked out again.
+ */
+export const ASTRAL_CACHE_LIMIT = 4096;
 const ASTRAL_CACHE = new Map<number, string>();
 
-/** What a code point folds to: '' (left out), ' ', or its letters. Remembered, so each is worked out once. */
+/** How many code points above U+FFFF are remembered now: never more than `ASTRAL_CACHE_LIMIT`. Exported for the tests. */
+export function astralCacheSize(): number {
+  return ASTRAL_CACHE.size;
+}
+
+/** What a code point folds to: '' (left out), ' ', or its letters. Remembered (see the caches above), so most are worked out once. */
 export function foldCodePoint(codePoint: number): string {
   if (codePoint < 0x10000) {
     let folded = BMP_CACHE[codePoint];
@@ -96,6 +110,7 @@ export function foldCodePoint(codePoint: number): string {
   let folded = ASTRAL_CACHE.get(codePoint);
   if (folded === undefined) {
     folded = computeFold(codePoint);
+    if (ASTRAL_CACHE.size >= ASTRAL_CACHE_LIMIT) ASTRAL_CACHE.clear();
     ASTRAL_CACHE.set(codePoint, folded);
   }
   return folded;

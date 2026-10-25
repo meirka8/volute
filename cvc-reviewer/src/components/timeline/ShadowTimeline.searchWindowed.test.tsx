@@ -17,6 +17,9 @@ import type { InteractionNode } from '../../types/cvc';
 
 vi.mock('framer-motion', async () => (await import('../../test/motionStub')).framerMotionStub);
 
+// Heavy jsdom rendering; the default timeout is not a performance budget.
+vi.setConfig({ testTimeout: 30_000 });
+
 beforeEach(() => {
   installDomStubs();
   FakeResizeObserver.instances = [];

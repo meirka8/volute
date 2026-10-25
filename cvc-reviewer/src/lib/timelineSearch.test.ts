@@ -1037,7 +1037,8 @@ describe('terms: the work, and what is said of the terms that are not used', () 
     expect(parseQuery('ab '.repeat(350_000)).terms).toHaveLength(1);
     expect(parseQuery(`${'x'.repeat(500_000)}:${'y '.repeat(250_000)}`).terms.length).toBeLessThanOrEqual(16);
     expect(parseQuery('a'.repeat(1_000_000)).terms[0].text).toHaveLength(512);
-    expect(performance.now() - started).toBeLessThan(1_500);
+    // A third of a second on a machine with nothing else to do; a quadratic reading of a megabyte takes minutes.
+    expect(performance.now() - started).toBeLessThan(5_000);
   });
 
   it('does not take a phrase of nothing but spaces, or of spaces and hidden characters, for a term', () => {

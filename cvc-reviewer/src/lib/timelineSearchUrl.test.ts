@@ -14,6 +14,7 @@ import {
   SEARCH_PARAMS,
   viewLink,
   withFragmentParams,
+  withoutSearchParams,
   type SearchState,
 } from './timelineSearchUrl';
 
@@ -239,6 +240,76 @@ describe('the filters are in the fragment, and the text of the search is never i
 
     it('is the address itself when there is nothing to say', () => {
       expect(viewLink(address, EMPTY_SEARCH, null, true)).toBe('https://reviewer.example/pr/acme/shop/7?tab=files');
+    });
+
+    it('does not carry our names in the query string, which a server is sent, and keeps every other parameter as it was', () => {
+      // A link from before the filters moved to the fragment left a `q` (and the rest) there.
+      const old = { ...address, search: '?tab=files&q=password%3Dhunter2hunter2&conv=abc&origin=prompt&tool=Bash&link=temporal&commit=abcdef0&file=a.ts&utm=x%20y' };
+      const link = viewLink(old, state('retry limit', { tool: ['Bash'] }), null, true);
+      expect(link).toBe('https://reviewer.example/pr/acme/shop/7?tab=files&utm=x%20y#q=retry+limit&tool=Bash');
+      expect(new URL(link).search).toBe('?tab=files&utm=x%20y');
+      // Without the text, or without anything to say, the query string is as clean.
+      expect(viewLink(old, state('retry limit'), null, false)).toBe('https://reviewer.example/pr/acme/shop/7?tab=files&utm=x%20y');
+      expect(viewLink({ ...address, search: '?q=old' }, EMPTY_SEARCH, null, true)).toBe('https://reviewer.example/pr/acme/shop/7');
+    });
+
+    it('does not send a leftover search text to the server, whatever else the query string says, and however the name is spelled', () => {
+      for (const search of ['?q=secret', '?a=1&q=secret', '?q=secret&a=1', '?%71=secret', '?q', '?a=1&q&b=2', '?q=secret&q=again', '?conv=abc&file=src%2Fa.ts']) {
+        const link = viewLink({ ...address, search }, EMPTY_SEARCH, null, true);
+        expect(new URL(link).search, search).not.toMatch(/(^|[?&])(q|%71|conv|file)([=&]|$)/);
+      }
+      expect(viewLink({ ...address, search: '?a=1&%71=secret&b=2' }, EMPTY_SEARCH, null, true)).toBe('https://reviewer.example/pr/acme/shop/7?a=1&b=2');
+    });
+  });
+
+  describe('the query string of an address', () => {
+    it('is returned as it is, byte for byte, when none of our names is in it', () => {
+      for (const search of ['', '?', '??', '?tab=files', '?a=1&&b=2', '?a=1&', '?Q=upper&Conv=x', '?query=1&filetype=2&tooling=3', '?%E2%82%AC=1&x=%zz', '?q2=1&xq=2', '?tab=files&utm=x%20y+z']) {
+        expect(withoutSearchParams(search), search).toBe(search);
+      }
+    });
+
+    it('is the same without its question mark as a fragment is without its hash', () => {
+      expect(withoutSearchParams('tab=files&q=x')).toBe('?tab=files');
+      expect(withoutSearchParams('q=x')).toBe('');
+    });
+
+    it('loses each of our names, with every value it has, and keeps the others in their order', () => {
+      expect(withoutSearchParams('?q=x')).toBe('');
+      expect(withoutSearchParams('?q=x&conv=a&origin=prompt&tool=Bash&link=temporal&commit=abcdef0&file=a.ts')).toBe('');
+      expect(withoutSearchParams('?a=1&q=x&b=2&conv=a&conv=b&c=3')).toBe('?a=1&b=2&c=3');
+      expect(withoutSearchParams('?tool=Bash&tool=Read&tab=files')).toBe('?tab=files');
+      expect(withoutSearchParams('?tab=files&utm=x%20y+z&q=1')).toBe('?tab=files&utm=x%20y+z');
+    });
+
+    it('knows our names however they are spelled in the address, and none that merely begin or end the same', () => {
+      expect(withoutSearchParams('?%71=secret&a=1')).toBe('?a=1');
+      expect(withoutSearchParams('?c%6Fnv=a&a=1')).toBe('?a=1');
+      expect(withoutSearchParams('?fi%6Ce=a.ts&a=1')).toBe('?a=1');
+      expect(withoutSearchParams('?q%5B%5D=1&a=1')).toBe('?q%5B%5D=1&a=1');
+      expect(withoutSearchParams('?q2=1&a=1&xq=2&Q=3')).toBe('?q2=1&a=1&xq=2&Q=3');
+    });
+
+    it('takes a name with no value, and an empty one, out too, and leaves no stray separator', () => {
+      expect(withoutSearchParams('?q&a=1')).toBe('?a=1');
+      expect(withoutSearchParams('?a=1&q=&b=2')).toBe('?a=1&b=2');
+      expect(withoutSearchParams('?q=1&&&a=1&')).toBe('?a=1');
+    });
+
+    it('survives a name that does not decode, which is not ours', () => {
+      expect(withoutSearchParams('?%E0%A4%A=1&q=2')).toBe('?%E0%A4%A=1');
+      expect(withoutSearchParams('?%zz=1&a=2')).toBe('?%zz=1&a=2');
+    });
+
+    it('leaves out exactly the names the codec owns', () => {
+      for (const name of SEARCH_PARAMS) expect(withoutSearchParams(`?${name}=x&keep=1`), name).toBe('?keep=1');
+    });
+
+    it('takes time in proportion to its length', () => {
+      const long = `?${'a=1&'.repeat(100_000)}q=x`;
+      const started = performance.now();
+      expect(withoutSearchParams(long)).toBe(`?${'a=1&'.repeat(100_000).slice(0, -1)}`);
+      expect(performance.now() - started).toBeLessThan(1_000);
     });
   });
 
