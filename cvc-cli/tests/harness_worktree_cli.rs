@@ -42,10 +42,26 @@ const TRACKED_LINE: &str = "`.claude/settings.local.json` is tracked by Git in t
 const EXISTS_LINE: &str = "`.claude/settings.local.json` already exists in this worktree; CVC only creates it in a new worktree (run `cvc harness install claude-code` here to add the hooks)";
 const DECLINED: &str = "CVC: Claude Code hooks not installed in this worktree: ";
 const SETTINGS: &str = ".claude/settings.local.json";
+const EXCLUDE_ENTRY: &str = "/.claude/settings.local.json";
+/// What the hook says when a `.gitignore` rule of the new worktree overrides the
+/// `info/exclude` entry (the text after [`DECLINED`]).
+const NOT_IGNORED_LINE: &str = "`.claude/settings.local.json` would not be ignored by Git in this worktree: a `.gitignore` rule overrides the entry CVC adds to `.git/info/exclude`; CVC writes a machine-specific path there and will not create a file that a commit could carry (fix the rule, then run `cvc harness install claude-code` here)";
+/// What the hook says when `git` gave no verdict on whether the new worktree
+/// ignores the settings file (the text after [`DECLINED`]).
+const IGNORE_UNKNOWN_LINE: &str = "could not ask Git whether `.claude/settings.local.json` is ignored in this worktree; CVC writes a machine-specific path there and creates nothing it cannot confirm Git ignores (run `cvc harness install claude-code` here)";
+/// What `cvc harness install claude-code` says on stderr in the same case.
+const NOT_IGNORED_WARNING: &str = "  warning: Git does not ignore .claude/settings.local.json in this checkout: a .gitignore rule overrides the entry CVC added to .git/info/exclude. The file holds a machine-specific path; do not commit it, or fix the rule.";
+/// What `cvc harness install claude-code` says on stdout when it adds the entry.
+const ADDED_ENTRY_LINE: &str = "  added .claude/settings.local.json to the repository's info/exclude so the machine-specific path is never committed";
+/// A `.gitignore` rule that leaves the settings file visible to Git whatever
+/// `info/exclude` says.
+const OVERRIDING_RULE: &str = "!/.claude/settings.local.json\n";
 
 /// One finished command.
 struct Run {
     success: bool,
+    /// The exit status; `None` when a signal ended the command.
+    code: Option<i32>,
     stdout: String,
     stderr: String,
 }
@@ -169,6 +185,20 @@ impl Fixture {
     }
 
     fn run(&self, program: impl AsRef<OsStr>, cwd: &Path, path: &Path, args: &[&str]) -> Run {
+        self.run_exporting(program, cwd, path, args, &[])
+    }
+
+    /// [`Fixture::run`] with `exported` added to the command's environment
+    /// once this process's own `GIT_*` variables have been taken out of it:
+    /// what a command started from inside Git would see.
+    fn run_exporting(
+        &self,
+        program: impl AsRef<OsStr>,
+        cwd: &Path,
+        path: &Path,
+        args: &[&str],
+        exported: &[(&str, &Path)],
+    ) -> Run {
         let mut command = Command::new(program);
         for (name, _) in std::env::vars_os() {
             if name.to_string_lossy().starts_with("GIT_") {
@@ -188,9 +218,13 @@ impl Fixture {
             .env("GIT_CONFIG_GLOBAL", self.home.join("empty.gitconfig"))
             .env("GIT_TEMPLATE_DIR", self.home.join("templates"))
             .stdin(Stdio::null());
+        for (name, value) in exported {
+            command.env(name, value);
+        }
         let output = output_retrying(&mut command);
         Run {
             success: output.status.success(),
+            code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }
@@ -260,7 +294,9 @@ impl Fixture {
     }
 
     /// Commits `(mode, path, content)` files on a new branch built with
-    /// plumbing, so no working tree (the main checkout's included) changes.
+    /// plumbing, so no working tree (the main checkout's included) changes. For
+    /// mode `160000` (a submodule) `content` is the id of the commit the entry
+    /// names, which does not have to exist in this repository.
     fn branch_with(&self, branch: &str, files: &[(&str, &str, &str)]) {
         let index = self.root.join(format!("index-{branch}"));
         let git = |args: &[&str], stdin: Option<&str>| -> String {
@@ -306,7 +342,11 @@ impl Fixture {
         };
         git(&["read-tree", "HEAD"], None);
         for (mode, path, content) in files {
-            let blob = git(&["hash-object", "-w", "--stdin"], Some(content));
+            let blob = if *mode == "160000" {
+                (*content).to_owned()
+            } else {
+                git(&["hash-object", "-w", "--stdin"], Some(content))
+            };
             git(
                 &[
                     "update-index",
@@ -972,6 +1012,7 @@ fn real_git_keeps_the_status_of_a_users_hook_and_runs_under_set_u_without_home()
             .unwrap();
         Run {
             success: output.status.success(),
+            code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }
@@ -1565,6 +1606,987 @@ fn committed_claude_links_are_never_followed_out_of_a_new_worktree() {
         "something was written through a committed link"
     );
     assert!(!missing.exists(), "a dangling target was created");
+}
+
+// ---- a `.gitignore` rule that overrides the `info/exclude` entry ----
+//
+// CVC keeps `.claude/settings.local.json` out of commits with an entry in the
+// repository's `info/exclude`, which it adds whenever that exact line is
+// missing, whatever else ignores the path. Git reads the `.gitignore` files of a
+// checkout in preference to that file, so a rule such as
+// `!/.claude/settings.local.json` leaves the settings file visible to Git
+// although the entry is there. Once the entry is in, `git check-ignore` is asked
+// once: the hook for a new worktree creates the file only when Git says it is
+// ignored, and declines when Git says it is not or gives no verdict at all
+// (`git` cannot be run, ends with some other status, or refuses to judge the
+// path, as it does inside a submodule). These tests use the fixture's empty
+// `HOME` and switched-off global Git configuration, and take what is ignored,
+// and what a commit could carry, from `git` itself.
+
+impl Fixture {
+    /// Commits a `.gitignore` holding `rules` in the main checkout.
+    fn commit_gitignore(&self, rules: &str) {
+        fs::write(self.repo.join(".gitignore"), rules).unwrap();
+        self.git_ok(&self.repo, &["add", ".gitignore"]);
+        self.git_ok(&self.repo, &["commit", "-m", "ignore rules"]);
+    }
+
+    /// How many times the repository's `info/exclude` lists the settings file.
+    fn exclude_entries(&self) -> usize {
+        fs::read_to_string(self.repo.join(".git/info/exclude"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.trim() == EXCLUDE_ENTRY)
+            .count()
+    }
+
+    /// Whether Git ignores the settings file in `checkout`: the exit status of
+    /// `git check-ignore -q` (0 ignored, 1 not ignored; a failure says so on
+    /// stderr). The index is consulted, as `git add` and `git status` do, so a
+    /// sparse checkout's ignore files that only the index holds count.
+    fn git_ignores_settings(&self, checkout: &Path) -> bool {
+        let run = self.git(checkout, &["check-ignore", "-q", "--", SETTINGS]);
+        assert!(
+            run.success || run.stderr.is_empty(),
+            "git check-ignore failed: {}",
+            run.stderr
+        );
+        run.success
+    }
+
+    /// The commit `HEAD` of the main checkout names.
+    fn head_oid(&self) -> String {
+        self.git_ok(&self.repo, &["rev-parse", "HEAD"])
+            .stdout
+            .trim()
+            .to_owned()
+    }
+
+    /// Records the wrapper for new worktrees, as an install would, without
+    /// installing anything in the main checkout: no settings file there and
+    /// nothing in `info/exclude`, so whatever the hook leaves in the new
+    /// worktree and in `info/exclude` is its own doing.
+    fn record_without_installing(&self) {
+        let layout = cvc_core::repository::RepositoryLayout::discover(&self.repo).unwrap();
+        cvc_core::claude_code::harness_record::write_record(&layout, &self.wrapper).unwrap();
+    }
+
+    /// A `PATH` directory named `name` holding a stand-in `git` that, when
+    /// `FAKE_GIT_LOG` names a file in its environment, appends its arguments
+    /// (one `ARGS:` line) and the `GIT_` variables of its environment to that
+    /// file, and then runs `body`, a piece of `sh` such as `exit 1`. No other
+    /// variable is logged: the rest of an environment can hold secrets, and a
+    /// failed assertion prints the log.
+    fn fake_git(&self, name: &str, body: &str) -> PathBuf {
+        let dir = self.root.join(name);
+        let script = dir.join("git");
+        executable(
+            &script,
+            &format!(
+                "#!/bin/sh\nif [ -n \"${{FAKE_GIT_LOG:-}}\" ]; then\n  {{ printf 'ARGS: %s\\n' \"$*\"; /usr/bin/env | while IFS= read -r line; do case $line in GIT_*) printf '%s\\n' \"$line\";; esac; done; }} >> \"$FAKE_GIT_LOG\"\nfi\n{body}\n"
+            ),
+        );
+        // A sibling thread's fork can hold the script's write descriptor for a
+        // moment, and a start of the finished file then fails with "Text file
+        // busy" (see `output_retrying`). Start it once here, where that is
+        // retried, so the starts that count do not meet the race.
+        let mut start = Command::new(&script);
+        start.env_remove("FAKE_GIT_LOG");
+        output_retrying(&mut start);
+        dir
+    }
+
+    /// `git status --porcelain -uall` in `checkout`: what a commit made there
+    /// could carry.
+    fn status(&self, checkout: &Path) -> String {
+        self.git_ok(checkout, &["status", "--porcelain", "-uall"])
+            .stdout
+    }
+
+    /// `git worktree add <root>/<branch> <branch>` for a branch that exists.
+    fn worktree_add_existing(&self, branch: &str) -> (PathBuf, Run) {
+        let worktree = self.root.join(branch);
+        let run = self.git(
+            &self.repo,
+            &["worktree", "add", worktree.to_str().unwrap(), branch],
+        );
+        (fs::canonicalize(&worktree).unwrap_or(worktree), run)
+    }
+
+    /// `cvc harness install claude-code --binary <wrapper>` in `cwd` with
+    /// `exported` in its environment, whether or not it succeeds.
+    fn install_exporting(&self, cwd: &Path, exported: &[(&str, &Path)]) -> Run {
+        self.run_exporting(
+            env!("CARGO_BIN_EXE_cvc"),
+            cwd,
+            &self.git_only,
+            &[
+                "harness",
+                "install",
+                "claude-code",
+                "--binary",
+                self.wrapper.to_str().unwrap(),
+            ],
+            exported,
+        )
+    }
+
+    /// Whether this Git knows the global option `--no-lazy-fetch` (Git 2.44),
+    /// which it hands on to its hooks as `GIT_NO_LAZY_FETCH=1`.
+    fn git_knows_no_lazy_fetch(&self) -> bool {
+        self.git(&self.repo, &["--no-lazy-fetch", "rev-parse", "--git-dir"])
+            .success
+    }
+
+    /// A blobless, sparse clone of the main checkout in `<root>/<name>`: Git
+    /// fetches an object the clone lacks from the main checkout when it needs
+    /// one, and only the files at the top level are checked out, so the ignore
+    /// files in directories are in the index and nowhere else. Set up as
+    /// [`Fixture::ready`] sets up the main checkout (`cvc init`, capture
+    /// acknowledged), with the wrapper recorded for new worktrees and nothing
+    /// installed. `None` when this Git cannot make such a clone.
+    fn partial_clone(&self, name: &str) -> Option<PathBuf> {
+        // A clone over `file://` gets the filter it asks for only when the
+        // repository it clones from allows filters, and the objects the clone
+        // lacks are later asked for one by one, by id.
+        for (key, value) in [
+            ("uploadpack.allowFilter", "true"),
+            ("uploadpack.allowAnySHA1InWant", "true"),
+        ] {
+            self.git_ok(&self.repo, &["config", key, value]);
+        }
+        let clone = self.root.join(name);
+        let url = format!("file://{}", self.repo.display());
+        let cloned = self.git(
+            &self.root,
+            &[
+                "clone",
+                "--quiet",
+                "--filter=blob:none",
+                "--sparse",
+                &url,
+                clone.to_str().unwrap(),
+            ],
+        );
+        if !cloned.success {
+            eprintln!("this Git could not clone: {}", cloned.stderr);
+            return None;
+        }
+        // A server that ignores the filter leaves a clone with every object.
+        let promisor = self.git(&clone, &["config", "--get", "remote.origin.promisor"]);
+        if promisor.stdout.trim() != "true" {
+            eprintln!("the clone is not a partial clone; its remote gave every object");
+            return None;
+        }
+        self.cvc_ok(&clone, &["init"]);
+        let repository = git2::Repository::open(&clone).unwrap();
+        cvc_core::privacy::acknowledge_capture(&repository).unwrap();
+        let layout = cvc_core::repository::RepositoryLayout::discover(&clone).unwrap();
+        cvc_core::claude_code::harness_record::write_record(&layout, &self.wrapper).unwrap();
+        Some(fs::canonicalize(&clone).unwrap_or(clone))
+    }
+}
+
+/// How many lines of `text` are exactly `line`.
+fn lines_equal_to(text: &str, line: &str) -> usize {
+    text.lines().filter(|candidate| *candidate == line).count()
+}
+
+#[test]
+fn harness_install_warns_when_a_gitignore_rule_leaves_the_settings_file_visible_to_git() {
+    let fixture = Fixture::ready();
+    fixture.commit_gitignore(OVERRIDING_RULE);
+
+    // Exit 0 (`install` asserts it), and the warning once on stderr.
+    let installed = fixture.install(&fixture.repo);
+    assert_eq!(
+        lines_equal_to(&installed.stderr, NOT_IGNORED_WARNING),
+        1,
+        "{}",
+        installed.stderr
+    );
+    // The install went through all the same: the file holds the hook entries...
+    assert_hooks_run(&fixture.repo, &fixture.wrapper);
+    // ...and Git lists it as a new file, which is what the warning says.
+    assert!(!fixture.git_ignores_settings(&fixture.repo));
+    assert_eq!(fixture.status(&fixture.repo), format!("?? {SETTINGS}\n"));
+    assert_eq!(fixture.exclude_entries(), 1);
+
+    // Run again, it reports the same and adds no second entry.
+    let again = fixture.install(&fixture.repo);
+    assert!(again.stdout.contains("already present"), "{}", again.stdout);
+    assert_eq!(
+        lines_equal_to(&again.stderr, NOT_IGNORED_WARNING),
+        1,
+        "{}",
+        again.stderr
+    );
+    assert_eq!(fixture.exclude_entries(), 1);
+}
+
+#[test]
+fn a_new_worktree_whose_branch_overrides_the_exclude_entry_gets_no_settings_file() {
+    let fixture = Fixture::ready();
+    fixture.install(&fixture.repo);
+    fixture.branch_with(
+        "overriding-rule",
+        &[("100644", ".gitignore", OVERRIDING_RULE)],
+    );
+
+    // `git worktree add` exits 0 and the hook says why it installed nothing:
+    // one line, on stderr.
+    let (wt, run) = fixture.worktree_add_existing("overriding-rule");
+    assert!(run.success, "{}", run.stderr);
+    let declined = format!("{DECLINED}{NOT_IGNORED_LINE}");
+    assert_eq!(lines_equal_to(&run.stderr, &declined), 1, "{}", run.stderr);
+    assert_eq!(run.cvc_lines(), [declined.as_str()], "{}", run.all());
+    // The worktree has no `.claude` at all, hence nothing a commit could carry.
+    assert!(!wt.join(".claude").exists());
+    assert_eq!(fixture.status(&wt), "");
+    assert_eq!(fixture.exclude_entries(), 1);
+
+    // The entry is added when it is missing, with the rest of the file kept,
+    // and a second declined worktree adds no second one.
+    let exclude = fixture.repo.join(".git/info/exclude");
+    fs::write(&exclude, "# mine\n").unwrap();
+    for branch in ["second", "third"] {
+        let wt = fixture.root.join(branch);
+        let run = fixture.git(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                wt.to_str().unwrap(),
+                "overriding-rule",
+            ],
+        );
+        assert!(run.success, "{branch}: {}", run.stderr);
+        assert_eq!(
+            run.cvc_lines(),
+            [declined.as_str()],
+            "{branch}: {}",
+            run.all()
+        );
+        assert!(!wt.join(".claude").exists(), "{branch}");
+        assert_eq!(fixture.exclude_entries(), 1, "{branch}");
+        assert!(
+            fs::read_to_string(&exclude)
+                .unwrap()
+                .starts_with("# mine\n"),
+            "{branch}"
+        );
+    }
+}
+
+#[test]
+fn a_new_worktree_is_declined_for_each_way_its_branch_can_override_the_exclude_entry() {
+    let fixture = Fixture::ready();
+    fixture.install(&fixture.repo);
+    // (branch, file it commits, rules in it)
+    let cases = [
+        (
+            "nested-rule",
+            ".claude/.gitignore",
+            "!settings.local.json\n",
+        ),
+        ("wildcard-rule", ".gitignore", "!/.claude/*.json\n"),
+        (
+            "re-included",
+            ".gitignore",
+            ".claude/*\n!.claude/settings.local.json\n",
+        ),
+    ];
+    for (branch, file, rules) in cases {
+        fixture.branch_with(branch, &[("100644", file, rules)]);
+
+        let (wt, run) = fixture.worktree_add_existing(branch);
+        assert!(run.success, "{branch}: {}", run.stderr);
+        assert_eq!(
+            run.cvc_lines(),
+            [format!("{DECLINED}{NOT_IGNORED_LINE}")],
+            "{branch}: {}",
+            run.all()
+        );
+        assert!(!wt.join(SETTINGS).exists(), "{branch}");
+        assert_eq!(fixture.status(&wt), "", "{branch}");
+    }
+    assert_eq!(fixture.exclude_entries(), 1);
+}
+
+#[test]
+fn a_new_worktree_without_an_overriding_rule_gets_the_hooks_and_a_clean_status() {
+    let fixture = Fixture::ready();
+    fixture.install(&fixture.repo);
+    // Branches with `.gitignore` files of their own, none of whose rules
+    // overrides the entry: the new worktree is set up as usual.
+    let cases = [
+        ("unrelated-rules", ".gitignore", "target/\n*.log\n"),
+        // Re-including a neighbour says nothing about the settings file.
+        (
+            "neighbour-rule",
+            ".gitignore",
+            ".claude/*\n!.claude/settings.json\n",
+        ),
+    ];
+    for (branch, file, rules) in cases {
+        fixture.branch_with(branch, &[("100644", file, rules)]);
+
+        let (wt, run) = fixture.worktree_add_existing(branch);
+        assert!(run.success, "{branch}: {}", run.stderr);
+        assert_eq!(run.cvc_lines(), [INSTALLED_LINE], "{branch}: {}", run.all());
+        assert_hooks_run(&wt, &fixture.wrapper);
+        assert!(fixture.git_ignores_settings(&wt), "{branch}");
+        assert_eq!(fixture.status(&wt), "", "{branch}");
+    }
+}
+
+#[test]
+fn the_remedy_the_declined_worktree_is_told_about_ends_the_warning() {
+    let fixture = Fixture::ready();
+    fixture.install(&fixture.repo);
+    fixture.branch_with(
+        "overriding-rule",
+        &[("100644", ".gitignore", OVERRIDING_RULE)],
+    );
+    let (wt, run) = fixture.worktree_add_existing("overriding-rule");
+    assert_eq!(
+        run.cvc_lines(),
+        [format!("{DECLINED}{NOT_IGNORED_LINE}")],
+        "{}",
+        run.all()
+    );
+
+    // The command the message names, run there with the rule still in place,
+    // writes the file and warns that Git lists it...
+    let installed = fixture.install(&wt);
+    assert_eq!(
+        lines_equal_to(&installed.stderr, NOT_IGNORED_WARNING),
+        1,
+        "{}",
+        installed.stderr
+    );
+    assert_hooks_run(&wt, &fixture.wrapper);
+    assert_eq!(fixture.status(&wt), format!("?? {SETTINGS}\n"));
+
+    // ...and once the rule is fixed, the same command has nothing to warn about
+    // and Git ignores the file.
+    fs::write(wt.join(".gitignore"), "# nothing about .claude here\n").unwrap();
+    let installed = fixture.install(&wt);
+    assert!(
+        installed.stdout.contains("already present"),
+        "{}",
+        installed.stdout
+    );
+    assert!(
+        !installed.stderr.contains("Git does not ignore"),
+        "{}",
+        installed.stderr
+    );
+    assert!(fixture.git_ignores_settings(&wt));
+    assert_eq!(fixture.status(&wt), " M .gitignore\n");
+    assert_eq!(fixture.exclude_entries(), 1);
+}
+
+/// What an install in the main checkout reported and left behind, given
+/// whether the checkout's `.gitignore` overrides the entry: the warning exactly
+/// when it does, the hook entries written either way, and `git` agreeing that
+/// the file is ignored exactly when it does not.
+fn assert_install_verdict(fixture: &Fixture, installed: &Run, overridden: bool, case: &str) {
+    assert!(installed.success, "{case}: {}", installed.stderr);
+    assert_eq!(
+        lines_equal_to(&installed.stderr, NOT_IGNORED_WARNING),
+        usize::from(overridden),
+        "{case}: {}",
+        installed.stderr
+    );
+    assert_hooks_run(&fixture.repo, &fixture.wrapper);
+    assert_eq!(
+        fixture.git_ignores_settings(&fixture.repo),
+        !overridden,
+        "{case}"
+    );
+    let expected = if overridden {
+        format!("?? {SETTINGS}\n")
+    } else {
+        String::new()
+    };
+    assert_eq!(fixture.status(&fixture.repo), expected, "{case}");
+}
+
+#[test]
+fn harness_install_gives_the_same_verdicts_with_git_dir_naming_the_checkouts_own_git_directory() {
+    for overridden in [false, true] {
+        for exported in [false, true] {
+            let case = format!("rule: {overridden}, GIT_DIR exported: {exported}");
+            let fixture = Fixture::ready();
+            if overridden {
+                fixture.commit_gitignore(OVERRIDING_RULE);
+            }
+            let git_dir = fixture.repo.join(".git");
+            let installed = if exported {
+                fixture.install_exporting(&fixture.repo, &[("GIT_DIR", git_dir.as_path())])
+            } else {
+                fixture.install_exporting(&fixture.repo, &[])
+            };
+            assert_install_verdict(&fixture, &installed, overridden, &case);
+        }
+    }
+}
+
+#[test]
+fn repository_variables_exported_to_the_install_do_not_change_the_verdict() {
+    // (variable, where it points inside a different repository, whether the
+    // checkout has the overriding rule). Each pairing is one where that other
+    // repository would turn Git's answer around if the variable reached the
+    // `git` that cvc asks.
+    let cases = [
+        ("GIT_DIR", ".git", false),
+        ("GIT_COMMON_DIR", ".git", false),
+        ("GIT_WORK_TREE", "", true),
+    ];
+    for (variable, inside, overridden) in cases {
+        let case = format!("{variable}, rule: {overridden}");
+        let fixture = Fixture::ready();
+        if overridden {
+            fixture.commit_gitignore(OVERRIDING_RULE);
+        }
+        let other = fixture.root.join("other-repository");
+        fixture.git_ok(&fixture.root, &["init", other.to_str().unwrap()]);
+        let value = if inside.is_empty() {
+            other.clone()
+        } else {
+            other.join(inside)
+        };
+
+        let installed = fixture.install_exporting(&fixture.repo, &[(variable, value.as_path())]);
+        assert_install_verdict(&fixture, &installed, overridden, &case);
+    }
+}
+
+#[test]
+fn harness_install_run_from_a_subdirectory_judges_the_file_at_the_checkout_root() {
+    for overridden in [false, true] {
+        let case = format!("rule: {overridden}");
+        let fixture = Fixture::ready();
+        if overridden {
+            fixture.commit_gitignore(OVERRIDING_RULE);
+        }
+        let nested = fixture.repo.join("src/nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        let installed = fixture.install_exporting(&nested, &[]);
+        assert_install_verdict(&fixture, &installed, overridden, &case);
+        assert!(!nested.join(".claude").exists(), "{case}");
+    }
+}
+
+#[test]
+fn harness_install_judges_the_file_without_git_when_git_cannot_be_run() {
+    let fixture = Fixture::ready();
+    let no_git = fixture.root.join("path-without-git");
+    fs::create_dir(&no_git).unwrap();
+
+    let installed = fixture.run(
+        env!("CARGO_BIN_EXE_cvc"),
+        &fixture.repo,
+        &no_git,
+        &[
+            "harness",
+            "install",
+            "claude-code",
+            "--binary",
+            fixture.wrapper.to_str().unwrap(),
+        ],
+    );
+    // With no `git` to ask, libgit2's answer stands: the entry it needs is
+    // added, the file counts as ignored, and Git agrees.
+    assert_install_verdict(&fixture, &installed, false, "no git on PATH");
+}
+
+#[test]
+fn harness_install_adds_the_info_exclude_entry_even_when_the_global_excludes_list_the_file() {
+    let fixture = Fixture::ready();
+    // The global excludes file, as the repository's own configuration names it,
+    // so that libgit2 reads it too.
+    let global = fixture.home.join("global-ignore");
+    fs::write(&global, ".claude/settings.local.json\n").unwrap();
+    fixture.git_ok(
+        &fixture.repo,
+        &["config", "core.excludesFile", global.to_str().unwrap()],
+    );
+    // The premise: Git ignores the file before CVC has added anything.
+    assert!(fixture.git_ignores_settings(&fixture.repo));
+    assert_eq!(fixture.exclude_entries(), 0);
+
+    let installed = fixture.install(&fixture.repo);
+    assert_eq!(
+        lines_equal_to(&installed.stdout, ADDED_ENTRY_LINE),
+        1,
+        "{}",
+        installed.stdout
+    );
+    assert!(
+        !installed.stderr.contains("Git does not ignore"),
+        "{}",
+        installed.stderr
+    );
+    assert_eq!(fixture.exclude_entries(), 1);
+    assert_hooks_run(&fixture.repo, &fixture.wrapper);
+
+    // Run again, the line is there and nothing is added or said.
+    let again = fixture.install(&fixture.repo);
+    assert_eq!(
+        lines_equal_to(&again.stdout, ADDED_ENTRY_LINE),
+        0,
+        "{}",
+        again.stdout
+    );
+    assert_eq!(fixture.exclude_entries(), 1);
+
+    // A new worktree is set up as usual and adds no second entry.
+    let (wt, run) = fixture.worktree_add("wt");
+    assert_eq!(run.cvc_lines(), [INSTALLED_LINE], "{}", run.all());
+    assert!(fixture.git_ignores_settings(&wt));
+    assert_eq!(fixture.exclude_entries(), 1);
+}
+
+#[test]
+fn global_options_given_to_git_worktree_add_do_not_change_what_the_new_worktree_gets() {
+    let fixture = Fixture::ready();
+    fixture.record_without_installing();
+    fixture.branch_with(
+        "overriding-rule",
+        &[("100644", ".gitignore", OVERRIDING_RULE)],
+    );
+    let one = Path::new("1");
+    // (case, options placed before `worktree`, variables exported to the
+    // command). Git passes each option on to its hooks as the variable of the
+    // same name. `git check-ignore` refuses to run with a pathspec one, and
+    // `GIT_NO_LAZY_FETCH` (from `--no-lazy-fetch`) keeps Git from fetching an
+    // object a partial clone lacks, which is not what the hook means to ask.
+    type Case<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, &'a Path)]);
+    let cases: [Case<'_>; 6] = [
+        ("--literal-pathspecs", &["--literal-pathspecs"], &[]),
+        ("--glob-pathspecs", &["--glob-pathspecs"], &[]),
+        ("--noglob-pathspecs", &["--noglob-pathspecs"], &[]),
+        ("--icase-pathspecs", &["--icase-pathspecs"], &[]),
+        (
+            "GIT_ICASE_PATHSPECS exported",
+            &[],
+            &[("GIT_ICASE_PATHSPECS", one)],
+        ),
+        ("--no-lazy-fetch", &["--no-lazy-fetch"], &[]),
+    ];
+    let knows_no_lazy_fetch = fixture.git_knows_no_lazy_fetch();
+    for (index, (case, options, exported)) in cases.into_iter().enumerate() {
+        if options.contains(&"--no-lazy-fetch") && !knows_no_lazy_fetch {
+            eprintln!("this Git has no --no-lazy-fetch; skipping that case");
+            continue;
+        }
+        let add = |branch: &str, start: &[&str]| {
+            let worktree = fixture.root.join(branch);
+            let mut args: Vec<&str> = options.to_vec();
+            args.extend(["worktree", "add", "-b", branch, worktree.to_str().unwrap()]);
+            args.extend(start.iter().copied());
+            let run = fixture.run_exporting(
+                real_git(),
+                &fixture.repo,
+                &fixture.git_only,
+                &args,
+                exported,
+            );
+            (fs::canonicalize(&worktree).unwrap_or(worktree), run)
+        };
+
+        // The branch's rule overrides the entry: the hook declines, as it does
+        // without the option, and nothing is created.
+        let (wt, run) = add(&format!("declined-{index}"), &["overriding-rule"]);
+        assert!(run.success, "{case}: {}", run.stderr);
+        assert_eq!(
+            run.cvc_lines(),
+            [format!("{DECLINED}{NOT_IGNORED_LINE}")],
+            "{case}: {}",
+            run.all()
+        );
+        assert!(!wt.join(".claude").exists(), "{case}");
+        assert_eq!(fixture.status(&wt), "", "{case}");
+        assert_eq!(fixture.exclude_entries(), 1, "{case}");
+
+        // No such rule: the worktree is set up as usual.
+        let (wt, run) = add(&format!("installed-{index}"), &[]);
+        assert!(run.success, "{case}: {}", run.stderr);
+        assert_eq!(run.cvc_lines(), [INSTALLED_LINE], "{case}: {}", run.all());
+        assert_hooks_run(&wt, &fixture.wrapper);
+        assert!(fixture.git_ignores_settings(&wt), "{case}");
+        assert_eq!(fixture.status(&wt), "", "{case}");
+        assert_eq!(fixture.exclude_entries(), 1, "{case}");
+    }
+}
+
+#[test]
+fn a_new_worktree_is_declined_while_git_cannot_be_run_and_gets_the_hooks_once_it_can() {
+    let fixture = Fixture::ready();
+    // Created before anything is recorded, so it has no settings of its own.
+    let (wt, run) = fixture.worktree_add("wt");
+    assert!(run.success && !run.all().contains("CVC"), "{}", run.all());
+    fixture.record_without_installing();
+    let head = fixture.git_ok(&wt, &["rev-parse", "HEAD"]).stdout;
+    let hook = |path: &Path| {
+        fixture.run(
+            env!("CARGO_BIN_EXE_cvc"),
+            &wt,
+            path,
+            &["hook", "post-checkout", NULL_OID, head.trim(), "1"],
+        )
+    };
+
+    // A `PATH` with no `git` in it: no verdict, so nothing is created. The
+    // entry was added before Git was asked, and stays.
+    let no_git = fixture.root.join("path-without-git");
+    fs::create_dir(&no_git).unwrap();
+    let run = hook(&no_git);
+    assert!(run.success, "{}", run.all());
+    assert_eq!(
+        run.cvc_lines(),
+        [format!("{DECLINED}{IGNORE_UNKNOWN_LINE}")],
+        "{}",
+        run.all()
+    );
+    assert_eq!(run.stdout, "");
+    assert!(!wt.join(".claude").exists());
+    assert_eq!(fixture.exclude_entries(), 1);
+
+    // The same command with `git` on `PATH` sets the worktree up.
+    let run = hook(&fixture.git_only);
+    assert!(run.success, "{}", run.all());
+    assert_eq!(run.stdout.trim_end(), INSTALLED_LINE);
+    assert_eq!(run.stderr, "");
+    assert_hooks_run(&wt, &fixture.wrapper);
+    assert!(fixture.git_ignores_settings(&wt));
+    assert_eq!(fixture.status(&wt), "");
+    assert_eq!(fixture.exclude_entries(), 1);
+}
+
+#[test]
+fn the_exit_status_of_git_decides_what_a_new_worktree_gets() {
+    let fixture = Fixture::ready();
+    // (what the stand-in `git` does, the line the hook declines with; `None`
+    // when the worktree gets the hooks)
+    let cases: [(&str, Option<&str>); 6] = [
+        ("exit 0", None),
+        ("exit 1", Some(NOT_IGNORED_LINE)),
+        ("exit 2", Some(IGNORE_UNKNOWN_LINE)),
+        ("exit 128", Some(IGNORE_UNKNOWN_LINE)),
+        ("exit 255", Some(IGNORE_UNKNOWN_LINE)),
+        ("kill -9 $$", Some(IGNORE_UNKNOWN_LINE)),
+    ];
+    // Created before anything is recorded, so none has settings of its own; one
+    // more than the cases, for the `git` that cannot be started.
+    let worktrees: Vec<PathBuf> = (0..=cases.len())
+        .map(|index| {
+            let (wt, run) = fixture.worktree_add(&format!("wt{index}"));
+            assert!(run.success && !run.all().contains("CVC"), "{}", run.all());
+            wt
+        })
+        .collect();
+    fixture.record_without_installing();
+    let head = fixture.head_oid();
+    let git_dir = fixture.repo.join(".git");
+    let index_file = fixture.root.join("some-index");
+    let one = Path::new("1");
+    let forwarded = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+        "GIT_NO_LAZY_FETCH",
+    ];
+
+    for (index, ((body, declined), wt)) in cases.iter().zip(&worktrees).enumerate() {
+        let case = *body;
+        let path = fixture.fake_git(&format!("path-fake-git-{index}"), body);
+        let log = fixture.root.join(format!("fake-git-{index}.log"));
+        // Every variable a surrounding Git command can export is exported to the
+        // hook command, and so is a `GIT_TERMINAL_PROMPT` that lets Git ask
+        // questions.
+        let run = fixture.run_exporting(
+            env!("CARGO_BIN_EXE_cvc"),
+            wt,
+            &path,
+            &["hook", "post-checkout", NULL_OID, head.as_str(), "1"],
+            &[
+                ("FAKE_GIT_LOG", log.as_path()),
+                ("GIT_DIR", git_dir.as_path()),
+                ("GIT_WORK_TREE", wt.as_path()),
+                ("GIT_COMMON_DIR", git_dir.as_path()),
+                ("GIT_INDEX_FILE", index_file.as_path()),
+                ("GIT_LITERAL_PATHSPECS", one),
+                ("GIT_GLOB_PATHSPECS", one),
+                ("GIT_NOGLOB_PATHSPECS", one),
+                ("GIT_ICASE_PATHSPECS", one),
+                ("GIT_NO_LAZY_FETCH", one),
+                ("GIT_TERMINAL_PROMPT", one),
+            ],
+        );
+        assert!(run.success, "{case}: {}", run.all());
+        match declined {
+            None => {
+                assert_eq!(run.stdout.trim_end(), INSTALLED_LINE, "{case}");
+                assert_eq!(run.stderr, "", "{case}");
+                assert_hooks_run(wt, &fixture.wrapper);
+            }
+            Some(line) => {
+                assert_eq!(
+                    run.cvc_lines(),
+                    [format!("{DECLINED}{line}")],
+                    "{case}: {}",
+                    run.all()
+                );
+                assert_eq!(run.stdout, "", "{case}");
+                assert!(!wt.join(".claude").exists(), "{case}");
+            }
+        }
+        assert_eq!(fixture.exclude_entries(), 1, "{case}");
+
+        // Git was asked once, about the settings file of this worktree, none
+        // of those variables reached it, and it was told never to prompt.
+        let logged = fs::read_to_string(&log).unwrap();
+        // The log holds the arguments and the `GIT_` variables, nothing else,
+        // so the messages below never print the rest of an environment, which
+        // can hold secrets. This check names no line that it finds.
+        let others = logged
+            .lines()
+            .filter(|line| !line.starts_with("ARGS: ") && !line.starts_with("GIT_"))
+            .count();
+        assert_eq!(
+            others, 0,
+            "{case}: the stand-in git logged {others} lines that are neither its arguments nor GIT_ variables"
+        );
+        let asked: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.starts_with("ARGS: "))
+            .collect();
+        let expected = format!(
+            "ARGS: -C {} check-ignore --quiet -- {SETTINGS}",
+            wt.display()
+        );
+        assert_eq!(asked, [expected.as_str()], "{case}");
+        // The log does show the `GIT_` variables: what the fixture sets is in it.
+        assert!(
+            logged.lines().any(|line| line == "GIT_CONFIG_NOSYSTEM=1"),
+            "{case}: {logged}"
+        );
+        for name in forwarded {
+            assert!(
+                !logged
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{name}="))),
+                "{case}: {name} reached git: {logged}"
+            );
+        }
+        // Nobody is there to answer a question, so Git is told never to ask
+        // one, although the environment of the hook exports `1`.
+        let prompts: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.starts_with("GIT_TERMINAL_PROMPT="))
+            .collect();
+        assert_eq!(prompts, ["GIT_TERMINAL_PROMPT=0"], "{case}: {logged}");
+    }
+
+    // A `git` that is there but cannot be started gives no verdict either.
+    let unstartable = fixture.root.join("path-unstartable-git");
+    fs::create_dir(&unstartable).unwrap();
+    fs::write(unstartable.join("git"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(unstartable.join("git"), fs::Permissions::from_mode(0o644)).unwrap();
+    let wt = worktrees.last().unwrap();
+    let run = fixture.run(
+        env!("CARGO_BIN_EXE_cvc"),
+        wt,
+        &unstartable,
+        &["hook", "post-checkout", NULL_OID, head.as_str(), "1"],
+    );
+    assert!(run.success, "{}", run.all());
+    assert_eq!(
+        run.cvc_lines(),
+        [format!("{DECLINED}{IGNORE_UNKNOWN_LINE}")],
+        "{}",
+        run.all()
+    );
+    assert!(!wt.join(".claude").exists());
+}
+
+#[test]
+fn a_new_worktree_whose_claude_is_a_submodule_is_declined_and_left_empty() {
+    let fixture = Fixture::ready();
+    fixture.record_without_installing();
+    fixture.branch_with(
+        "claude-submodule",
+        &[("160000", ".claude", fixture.head_oid().as_str())],
+    );
+
+    let (wt, run) = fixture.worktree_add_existing("claude-submodule");
+    assert!(run.success, "{}", run.stderr);
+    assert_eq!(
+        run.cvc_lines(),
+        [format!("{DECLINED}{IGNORE_UNKNOWN_LINE}")],
+        "{}",
+        run.all()
+    );
+    // Git left the empty directory it leaves for a submodule that was not
+    // cloned, and CVC put nothing in it.
+    assert!(wt.join(".claude").is_dir());
+    assert_eq!(fs::read_dir(wt.join(".claude")).unwrap().count(), 0);
+    assert!(!wt.join(SETTINGS).exists());
+    assert_eq!(fixture.status(&wt), "");
+    assert_eq!(fixture.exclude_entries(), 1);
+    // The premise: Git itself refuses to judge a path inside the submodule.
+    let asked = fixture.git(&wt, &["check-ignore", "-q", "--", SETTINGS]);
+    assert_eq!(asked.code, Some(128), "{}", asked.stderr);
+}
+
+#[test]
+fn a_sparse_worktree_is_judged_by_the_ignore_files_the_branch_keeps_in_the_index() {
+    let fixture = Fixture::ready();
+    fixture.record_without_installing();
+    // The branch's ignore file sits outside the sparse cone, so a worktree
+    // created from the main checkout's sparse state does not have it on disk.
+    fixture.branch_with(
+        "sparse-rule",
+        &[
+            ("100644", "src/lib.rs", "pub fn f() {}\n"),
+            ("100644", ".claude/.gitignore", "!settings.local.json\n"),
+        ],
+    );
+    let sparse = fixture.git(&fixture.repo, &["sparse-checkout", "set", "--cone", "src"]);
+    if !sparse.success {
+        eprintln!(
+            "this Git has no sparse-checkout: {}; skipping",
+            sparse.stderr
+        );
+        return;
+    }
+    let (wt, run) = fixture.worktree_add_existing("sparse-rule");
+    // Later commands in the main checkout see it whole again.
+    fixture.git_ok(&fixture.repo, &["sparse-checkout", "disable"]);
+    assert!(run.success, "{}", run.stderr);
+    if !wt.join("src/lib.rs").is_file() || wt.join(".claude/.gitignore").exists() {
+        eprintln!("this Git gave the new worktree no sparse checkout; skipping");
+        return;
+    }
+
+    assert_eq!(
+        run.cvc_lines(),
+        [format!("{DECLINED}{NOT_IGNORED_LINE}")],
+        "{}",
+        run.all()
+    );
+    assert!(!wt.join(".claude").exists());
+    assert_eq!(fixture.exclude_entries(), 1);
+    // The ignore file is in the index only, and Git, which reads it there, does
+    // not ignore the settings file.
+    let listed = fixture.git_ok(&wt, &["ls-files", "-t"]).stdout;
+    assert!(listed.contains("S .claude/.gitignore"), "{listed}");
+    assert!(!fixture.git_ignores_settings(&wt));
+
+    // The install the message names writes the file all the same, warns, and
+    // Git lists it as a new file.
+    let installed = fixture.install(&wt);
+    assert_eq!(
+        lines_equal_to(&installed.stderr, NOT_IGNORED_WARNING),
+        1,
+        "{}",
+        installed.stderr
+    );
+    assert_hooks_run(&wt, &fixture.wrapper);
+    assert_eq!(fixture.status(&wt), format!("?? {SETTINGS}\n"));
+}
+
+#[test]
+fn a_partial_clones_new_worktree_is_judged_by_the_fetched_ignore_file_even_under_no_lazy_fetch() {
+    let fixture = Fixture::new();
+    if !fixture.git_knows_no_lazy_fetch() {
+        eprintln!("this Git has no --no-lazy-fetch; skipping");
+        return;
+    }
+    // The branch's ignore file is in a directory that the sparse checkout of a
+    // clone leaves out, so a blobless clone has the file's place in the trees
+    // it fetched and no copy of the file: Git has to fetch it to read it.
+    fixture.branch_with(
+        "overriding-rule",
+        &[("100644", ".claude/.gitignore", "!settings.local.json\n")],
+    );
+    let ignore_file = fixture
+        .git_ok(
+            &fixture.repo,
+            &["rev-parse", "overriding-rule:.claude/.gitignore"],
+        )
+        .stdout
+        .trim()
+        .to_owned();
+    let one = Path::new("1");
+    // (case, options placed before `worktree`, variables exported to the
+    // command). Git fetches the ignore file when the hook asks, and the hook
+    // declines. It must do the same when the command told Git not to fetch,
+    // which Git hands on to the hook as `GIT_NO_LAZY_FETCH=1`: an ignore file
+    // that has not been fetched yet is not an ignore file that is not there.
+    type Case<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, &'a Path)]);
+    let cases: [Case<'_>; 3] = [
+        ("plain", &[], &[]),
+        ("--no-lazy-fetch", &["--no-lazy-fetch"], &[]),
+        (
+            "GIT_NO_LAZY_FETCH exported",
+            &[],
+            &[("GIT_NO_LAZY_FETCH", one)],
+        ),
+    ];
+    for (index, (case, options, exported)) in cases.into_iter().enumerate() {
+        // A clone for each case: once fetched, the file stays.
+        let Some(clone) = fixture.partial_clone(&format!("partial-{index}")) else {
+            eprintln!("this Git cannot make a blobless sparse clone; skipping");
+            return;
+        };
+        // Whether the clone holds the ignore file, asked without fetching it.
+        let holds_ignore_file = || {
+            fixture
+                .git(&clone, &["--no-lazy-fetch", "cat-file", "-e", &ignore_file])
+                .success
+        };
+        assert!(!holds_ignore_file(), "{case}: the clone has the file");
+
+        let worktree = fixture.root.join(format!("wt-{index}"));
+        let mut args: Vec<&str> = options.to_vec();
+        args.extend([
+            "worktree",
+            "add",
+            "-b",
+            "new",
+            worktree.to_str().unwrap(),
+            "origin/overriding-rule",
+        ]);
+        let run = fixture.run_exporting(real_git(), &clone, &fixture.git_only, &args, exported);
+        let wt = fs::canonicalize(&worktree).unwrap_or(worktree);
+
+        assert!(run.success, "{case}: {}", run.stderr);
+        assert_eq!(
+            run.cvc_lines(),
+            [format!("{DECLINED}{NOT_IGNORED_LINE}")],
+            "{case}: {}",
+            run.all()
+        );
+        // The `git` that the hook ran fetched the file, whatever the command
+        // told Git, and nothing is created in the new worktree.
+        assert!(holds_ignore_file(), "{case}: the hook fetched no file");
+        assert!(!wt.join(".claude").exists(), "{case}");
+        assert_eq!(fixture.status(&wt), "", "{case}");
+        let exclude = fs::read_to_string(clone.join(".git/info/exclude")).unwrap();
+        assert_eq!(lines_equal_to(&exclude, EXCLUDE_ENTRY), 1, "{case}");
+    }
 }
 
 #[test]
