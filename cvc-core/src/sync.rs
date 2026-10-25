@@ -518,9 +518,13 @@ fn prune_event_closure(
     outer.write().map_err(Into::into)
 }
 
-/// Immutable range payloads carry no interaction identity. Redaction follows
-/// event ownership/closure and removes a range only when no surviving event
-/// references it.
+/// Immutable range payloads carry no interaction identity, so the only tie
+/// between a range and an interaction is a derivation event that references it.
+/// Suppression follows that tie: it removes a range when an event it removes
+/// referenced the range and no surviving event still does. A range that no
+/// event of the tree references is not about a suppressed interaction, so it
+/// stays: it may be evidence another clone published ahead of its events, and a
+/// projection must keep what independent writers added.
 fn prune_range_sources(
     repo: &Repository,
     root: &Tree<'_>,
@@ -530,14 +534,20 @@ fn prune_range_sources(
         return Ok(None);
     };
     let mut bytes = 0;
-    let surviving = retain_event_closure(
-        collect_derivation_events(repo, root, &mut bytes, MAX_SYNC_TOTAL_BYTES)?,
-        suppressed,
-        &HashSet::new(),
-    );
-    let referenced: HashSet<_> = surviving
+    let events = collect_derivation_events(repo, root, &mut bytes, MAX_SYNC_TOTAL_BYTES)?;
+    let referenced_before: HashSet<String> = events
+        .iter()
+        .filter_map(|event| event.range_id.clone())
+        .collect();
+    let surviving = retain_event_closure(events, suppressed, &HashSet::new());
+    let referenced_after: HashSet<&str> = surviving
         .iter()
         .filter_map(|event| event.range_id.as_deref())
+        .collect();
+    let orphaned: HashSet<&str> = referenced_before
+        .iter()
+        .map(String::as_str)
+        .filter(|range_id| !referenced_after.contains(range_id))
         .collect();
     let mut outer = repo.treebuilder(Some(&ranges))?;
     for shard in ranges.iter() {
@@ -547,7 +557,7 @@ fn prune_range_sources(
         for entry in subtree.iter() {
             let range: RangeEvidence =
                 serde_json::from_slice(repo.find_blob(entry.id())?.content())?;
-            if !referenced.contains(range.range_id.as_str()) {
+            if orphaned.contains(range.range_id.as_str()) {
                 builder.remove(entry.name().unwrap_or_default())?;
             }
         }
@@ -1464,8 +1474,9 @@ fn push_ids_to_ref(
             )?),
         };
         add_sync_bytes(&mut emitted_bytes, bytes.len(), MAX_SYNC_TOTAL_BYTES)?;
-        // `prune_range_sources` drops every range no surviving baseline event
-        // references, so a range the projection re-adds may be unchanged.
+        // `prune_range_sources` drops a range once every baseline event that
+        // referenced it is gone, so a range the projection re-adds (a local
+        // event still references it) may be unchanged.
         if insert_blob_counting_new(b, &file, repo.blob(&bytes)?)?
             && !baseline_holds(repo, baseline_root_tree.as_ref(), "ranges", shard, &file)
         {
