@@ -313,7 +313,7 @@ Coverage: 297 Rust packages; 20 production npm packages; 181 unique evidence tex
 | npm &#40;production VSIX&#41; | @microsoft/fast-web-utilities@5.4.1 | MIT | git+https&#58;//github.com/Microsoft/fast.git |
 | npm &#40;production VSIX&#41; | @vscode/webview-ui-toolkit@1.4.0 | MIT | git+https&#58;//github.com/microsoft/vscode-webview-ui-toolkit.git |
 | npm &#40;production VSIX&#41; | balanced-match@4.0.4 | MIT | git&#58;//github.com/juliangruber/balanced-match.git |
-| npm &#40;production VSIX&#41; | brace-expansion@5.0.9 | MIT | git+https&#58;//github.com/juliangruber/brace-expansion.git |
+| npm &#40;production VSIX&#41; | brace-expansion@5.0.12 | MIT | git+https&#58;//github.com/juliangruber/brace-expansion.git |
 | npm &#40;production VSIX&#41; | exenv-es6@1.1.1 | MIT | git+https&#58;//github.com/chrisdholt/exenv-es6.git |
 | npm &#40;production VSIX&#41; | marked@12.0.2 | MIT | https&#58;//marked.js.org |
 | npm &#40;production VSIX&#41; | minimatch@10.2.6 | BlueOak-1.0.0 | git@github.com&#58;isaacs/minimatch |
@@ -6810,7 +6810,7 @@ published under these same licenses.
 ### Evidence SHA-256: 9c63a23124d68cd30cd316a94a1a0bca34f032786df6df69fc4b5f136bac8d2e
 
 Exact package/file provenance:
-- npm &#40;production VSIX&#41;&#58; brace-expansion@5.0.9 — MIT — LICENSE
+- npm &#40;production VSIX&#41;&#58; brace-expansion@5.0.12 — MIT — LICENSE
 
 ```text
 MIT License
