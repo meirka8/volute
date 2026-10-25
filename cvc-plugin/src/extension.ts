@@ -13,6 +13,7 @@ import {
 import { getActiveWorkspaceRoot } from "./setup/workspaceRoot";
 import { getTrustedGitPath } from "./setup/gitPath";
 import { BindingToken } from "./setup/bindingToken";
+import { resolveShareFlow } from "./setup/shareFlow";
 
 let client: VoluteLanguageClient | undefined;
 let chatSessionWatcher: ChatSessionWatcher | undefined;
@@ -254,6 +255,18 @@ export async function activate(
       if (!repositoryActionsAvailable() || !boundWorkspaceRoot) {
         return;
       }
+      // Where the CLI's interactive view can share (Linux and macOS, CLI 0.7.1
+      // or later), the view replaces the two input boxes: it picks the
+      // conversation and the remote, and every typed phrase is still asked by
+      // the CLI itself. Elsewhere, and whenever the CLI's version cannot be
+      // read, the input boxes below stay as they were.
+      const { flow, cliVersion } = await resolveShareFlow(process.platform, cvcBinary);
+      outputChannel.appendLine(`Share with Remote: ${flow} (${process.platform}, cvc ${cliVersion ?? "version not read"})`);
+      if (flow === "conversations-view") {
+        // A full-screen view needs the keyboard at once, so the terminal takes focus.
+        runCvcTask("Conversations", ["conversations"], { focus: true });
+        return;
+      }
       const conversationId = await vscode.window.showInputBox({ prompt: "Conversation ID to share" });
       if (!conversationId) {
         return;
@@ -359,8 +372,10 @@ export async function activate(
 /**
  * Run the CLI as a VS Code task and report whether it was started. An
  * unresolved CLI is told to the user instead of being a silent no-op.
+ * `presentation` overrides how the task's terminal is shown (for example to
+ * give it the keyboard focus).
  */
-function runCvcTask(name: string, args: string[]): boolean {
+function runCvcTask(name: string, args: string[], presentation?: vscode.TaskPresentationOptions): boolean {
   if (!repositoryActionsAvailable() || !boundWorkspaceRoot) {
     return false;
   }
@@ -373,6 +388,9 @@ function runCvcTask(name: string, args: string[]): boolean {
   const token = bindingToken;
   if (!token?.isActive()) {return false;}
   const task = new vscode.Task({ type: "cvc", task: name }, boundWorkspaceRoot, name, "CVC", new vscode.ProcessExecution(cvcBinary, args, { cwd: boundWorkspaceRoot.uri.fsPath }));
+  if (presentation) {
+    task.presentationOptions = presentation;
+  }
   void vscode.tasks.executeTask(task);
   return true;
 }
