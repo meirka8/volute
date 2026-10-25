@@ -446,6 +446,45 @@ impl Drop for PtySession {
     }
 }
 
+/// The characters a nonce is drawn from, and how many it has: what `cvc`
+/// defines as `tty::NONCE_ALPHABET` and `tty::NONCE_LENGTH`, which a test of the
+/// binary cannot import. A unit test there pins the same values.
+pub const NONCE_ALPHABET: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+pub const NONCE_LENGTH: usize = 5;
+
+/// A challenge that can be worked out in advance, split into that phrase and the
+/// nonce its prompt appended. Panics if it does not end with a nonce.
+pub fn split_nonce(challenge: &str) -> (&str, &str) {
+    let (phrase, nonce) = challenge
+        .rsplit_once(' ')
+        .unwrap_or_else(|| panic!("no nonce in {challenge:?}"));
+    assert!(
+        nonce.len() == NONCE_LENGTH && nonce.chars().all(|c| NONCE_ALPHABET.contains(c)),
+        "{challenge:?} does not end with a nonce"
+    );
+    (phrase, nonce)
+}
+
+/// `challenge` without the nonce its prompt appended: what can be worked out
+/// before the prompt is shown.
+pub fn without_nonce(challenge: &str) -> String {
+    split_nonce(challenge).0.to_owned()
+}
+
+/// `challenge` with another nonce in place of its own: every character moved one
+/// place along the alphabet, so it looks like a nonce and is not this one.
+pub fn with_another_nonce(challenge: &str) -> String {
+    let (phrase, nonce) = split_nonce(challenge);
+    let other: String = nonce
+        .chars()
+        .map(|c| {
+            let at = NONCE_ALPHABET.find(c).unwrap();
+            char::from(NONCE_ALPHABET.as_bytes()[(at + 1) % NONCE_ALPHABET.len()])
+        })
+        .collect();
+    format!("{phrase} {other}")
+}
+
 /// Every challenge string prompted so far, in display order.
 pub fn challenges(output: &str) -> Vec<String> {
     const LEAD: &str = "Type exactly '";

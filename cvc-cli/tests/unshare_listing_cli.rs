@@ -83,11 +83,12 @@ fn an_unshared_conversation_lists_as_private_and_the_picker_offers_it_again() {
     assert!(!entry.contains("[shared"), "{listing}");
     assert!(picker_offers(&fixture, &id));
 
-    // And it can be shared again, this time with future turns.
+    // And it can be shared again, this time with future turns, which its
+    // phrase names.
     answer_the_one_challenge(
         &fixture,
         &["share", &id, "--remote", "origin", "--future"],
-        "I SHARE ",
+        &format!("I SHARE FUTURE {id} "),
     );
     let listing = fixture.cvc_ok(&["conversations"]);
     assert!(
