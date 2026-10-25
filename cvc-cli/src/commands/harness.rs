@@ -485,12 +485,12 @@ pub async fn install_claude_code(binary: Option<PathBuf>) -> Result<()> {
 /// How many worktrees the install listing names before summarizing the rest.
 const WORKTREE_LIST_LIMIT: usize = 10;
 
-/// Control characters (a newline, an escape sequence) in a path or a message
-/// that came from outside this process must not reach the terminal as such.
+/// Control characters (a newline, an escape sequence) and format characters (a
+/// bidirectional override) in a path or a message that came from outside this
+/// process must not reach the terminal as such: the rule every other line `cvc`
+/// prints follows ([`crate::terminal_text::sanitize_for_terminal`]).
 fn printable(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect()
+    crate::terminal_text::sanitize_for_terminal(text).into_owned()
 }
 
 fn printable_path(path: &Path) -> String {

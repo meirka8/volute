@@ -44,7 +44,7 @@ pub async fn privacy_status(requested: Option<&str>) -> Result<()> {
     let destination = privacy::remote_destination(&repo, &name)?;
     sync::adopt_legacy_records(&repo, &store, &destination)?;
     let s = privacy::privacy_status_for_fingerprint(&repo, &destination.fingerprint)?;
-    println!("capture_acknowledged: {}\nsharing_consented: {}\nauto_push: {}\nremote: {}\ndestination_fingerprint: {}", s.capture_acknowledged, s.sharing_consented, s.auto_push, name, s.remote_fingerprint);
+    println!("{}", privacy_status_report(&s, &name));
     Ok(())
 }
 pub async fn acknowledge_capture() -> Result<()> {
@@ -345,11 +345,7 @@ pub async fn set_auto_push(value: &str, requested: Option<&str>) -> Result<()> {
     sync::adopt_legacy_records(&repo, &store, &destination)?;
     typed_acknowledgement(auto_push_challenge(enabled, &destination.fingerprint))?;
     privacy::set_auto_push_destination(&repo, &destination, enabled)?;
-    println!(
-        "Auto-push {} for remote '{}'.",
-        if enabled { "enabled" } else { "disabled" },
-        name
-    );
+    println!("{}", auto_push_line(enabled, &name));
     Ok(())
 }
 pub async fn share(
@@ -620,10 +616,7 @@ pub async fn redact(
             &destination.fingerprint,
             TombstoneReasonCode::UserRequested,
         )?;
-        println!(
-            "Remote tombstone is pending; run `cvc push --manual --remote {}` then rerun redact to build the local-only rewrite plan.",
-            destination.name
-        );
+        println!("{}", pending_tombstone_line(&destination.name));
         return Ok(());
     }
     let candidate =
@@ -707,7 +700,7 @@ pub async fn auto_push_remote(cwd: &Path, requested: Option<&str>) -> Result<()>
     sync::adopt_legacy_records(&repo, &store, &destination)?;
     let status = privacy::privacy_status_for_fingerprint(&repo, &destination.fingerprint)?;
     if !status.sharing_consented || !status.auto_push {
-        eprintln!("CVC: auto publication disabled for '{}'.", name);
+        eprintln!("{}", auto_publication_disabled_line(&name));
         return Ok(());
     }
     push_destination(&repo, &store, &destination, PublicationTrigger::Hook).map(|_| ())
@@ -899,6 +892,66 @@ fn nothing_to_publish_line(remote: &str, shared_total: usize) -> String {
     }
 }
 
+// The lines below name a remote. Its name is what the repository's configuration
+// says, or what Git passed a hook. libgit2 resolves a remote only by a name that
+// passes Git's ref-name rules, and of the controls those refuse only the ASCII
+// ones: a name can still carry format characters, line separators and C1
+// controls. So each line shows the name with every control and format character
+// replaced, and on the one line it belongs to.
+
+/// What `cvc privacy status` prints, one `key: value` per line.
+fn privacy_status_report(status: &privacy::PrivacyStatus, remote: &str) -> String {
+    format!(
+        "capture_acknowledged: {}\nsharing_consented: {}\nauto_push: {}\nremote: {}\ndestination_fingerprint: {}",
+        status.capture_acknowledged,
+        status.sharing_consented,
+        status.auto_push,
+        sanitize_for_terminal(remote),
+        status.remote_fingerprint
+    )
+}
+
+/// What `cvc privacy set-auto-push` prints once the setting is recorded.
+fn auto_push_line(enabled: bool, remote: &str) -> String {
+    format!(
+        "Auto-push {} for remote '{}'.",
+        if enabled { "enabled" } else { "disabled" },
+        sanitize_for_terminal(remote)
+    )
+}
+
+/// What `cvc redact` prints once it has recorded the pending remote tombstone.
+fn pending_tombstone_line(remote: &str) -> String {
+    format!(
+        "Remote tombstone is pending; run `cvc push --manual --remote {}` then rerun redact to build the local-only rewrite plan.",
+        sanitize_for_terminal(remote)
+    )
+}
+
+/// What the pre-push hook prints when the destination has no auto-push grant.
+fn auto_publication_disabled_line(remote: &str) -> String {
+    format!(
+        "CVC: auto publication disabled for '{}'.",
+        sanitize_for_terminal(remote)
+    )
+}
+
+/// What `cvc privacy reconcile` prints when it is done.
+fn reconciled_line(remote: &str) -> String {
+    format!(
+        "Reconciled publication state for '{}'.",
+        sanitize_for_terminal(remote)
+    )
+}
+
+/// What `cvc pull`, and so the post-merge hook, prints when it is done.
+fn pulled_line(count: usize, remote: &str) -> String {
+    format!(
+        "Pulled {count} interaction(s) from '{}'.",
+        sanitize_for_terminal(remote)
+    )
+}
+
 /// The typed phrase that authorizes one publication. The trailing number is the
 /// count of interactions this push adds to the destination (not the size of the
 /// whole shared projection); the candidate commit prefix pins the exact tree.
@@ -1050,7 +1103,7 @@ pub async fn reconcile(requested: Option<&str>) -> Result<()> {
     sync::adopt_legacy_records(&repo, &store, &destination)?;
     let _operation_lock = privacy::destination_operation_lock(&repo, &destination.fingerprint)?;
     reconcile_destination(&repo, &store, &destination)?;
-    println!("Reconciled publication state for '{}'.", name);
+    println!("{}", reconciled_line(&name));
     Ok(())
 }
 pub async fn pull() -> Result<()> {
@@ -1062,7 +1115,7 @@ pub async fn pull() -> Result<()> {
     let n = sync::fetch_and_pull_destination(&repo, &store, &destination)?;
     let _ =
         cvc_core::squash::scan_for(&repo, &mut store, false, std::time::Duration::from_secs(30))?;
-    println!("Pulled {n} interaction(s) from '{name}'.");
+    println!("{}", pulled_line(n, &name));
     Ok(())
 }
 
@@ -1591,11 +1644,13 @@ mod settle_tests {
 #[cfg(test)]
 mod output_tests {
     use super::{
-        describe_publication, ensure_phrase_can_be_shown, nothing_to_publish_line, share_summary,
-        PublicationPhase,
+        auto_publication_disabled_line, auto_push_line, describe_publication,
+        ensure_phrase_can_be_shown, nothing_to_publish_line, pending_tombstone_line,
+        privacy_status_report, pulled_line, reconciled_line, share_summary, PublicationPhase,
     };
     use crate::terminal_text::is_unsafe_for_terminal;
     use cvc_core::db::ConversationSummary;
+    use cvc_core::privacy::PrivacyStatus;
     use cvc_core::sync::ProjectionPublication;
 
     fn acts_on_a_terminal(text: &str) -> bool {
@@ -1664,6 +1719,88 @@ mod output_tests {
         assert_eq!(
             nothing_to_publish_line("origin", 0),
             "No new shared interactions to publish to 'origin'."
+        );
+    }
+
+    /// An erase, an OSC 52 clipboard write ended by BEL, a right-to-left override
+    /// and a line separator. libgit2 does not resolve a remote whose name holds
+    /// the ESC or the BEL (`cvc` then reports the remote as not configured,
+    /// without its name), but does resolve one with the other two, or with the
+    /// C1 forms of the first two; every line is held to the whole set.
+    const HOSTILE_NAME: &str = "or\u{1b}[2Jig\u{1b}]52;c;SGVsbG8=\u{7}in\u{202e}x\u{2028}y";
+
+    /// [`HOSTILE_NAME`] as every line shows it.
+    const SHOWN_NAME: &str = "or?[2Jig?]52;c;SGVsbG8=?in?x?y";
+
+    #[test]
+    fn every_line_that_names_a_remote_names_it_as_plain_text_on_its_line() {
+        let status = PrivacyStatus {
+            capture_acknowledged: true,
+            sharing_consented: false,
+            auto_push: false,
+            remote_fingerprint: "f".repeat(64),
+        };
+        let report = privacy_status_report(&status, HOSTILE_NAME);
+        assert!(!acts_on_a_terminal(&report), "{report:?}");
+        assert_eq!(
+            report,
+            format!(
+                "capture_acknowledged: true\nsharing_consented: false\nauto_push: false\nremote: {SHOWN_NAME}\ndestination_fingerprint: {}",
+                "f".repeat(64)
+            )
+        );
+        for (line, expected) in [
+            (
+                auto_push_line(true, HOSTILE_NAME),
+                format!("Auto-push enabled for remote '{SHOWN_NAME}'."),
+            ),
+            (
+                auto_push_line(false, HOSTILE_NAME),
+                format!("Auto-push disabled for remote '{SHOWN_NAME}'."),
+            ),
+            (
+                pending_tombstone_line(HOSTILE_NAME),
+                format!("Remote tombstone is pending; run `cvc push --manual --remote {SHOWN_NAME}` then rerun redact to build the local-only rewrite plan."),
+            ),
+            (
+                auto_publication_disabled_line(HOSTILE_NAME),
+                format!("CVC: auto publication disabled for '{SHOWN_NAME}'."),
+            ),
+            (
+                reconciled_line(HOSTILE_NAME),
+                format!("Reconciled publication state for '{SHOWN_NAME}'."),
+            ),
+            (
+                pulled_line(3, HOSTILE_NAME),
+                format!("Pulled 3 interaction(s) from '{SHOWN_NAME}'."),
+            ),
+        ] {
+            assert!(!acts_on_a_terminal(&line), "{line:?}");
+            assert!(!line.contains('\n'), "{line:?}");
+            assert_eq!(line, expected);
+        }
+
+        // An ordinary name is printed as it is.
+        let status = PrivacyStatus::default();
+        assert_eq!(
+            privacy_status_report(&status, "origin"),
+            "capture_acknowledged: false\nsharing_consented: false\nauto_push: false\nremote: origin\ndestination_fingerprint: "
+        );
+        assert_eq!(
+            auto_push_line(true, "origin"),
+            "Auto-push enabled for remote 'origin'."
+        );
+        assert_eq!(
+            auto_publication_disabled_line("origin"),
+            "CVC: auto publication disabled for 'origin'."
+        );
+        assert_eq!(
+            reconciled_line("origin"),
+            "Reconciled publication state for 'origin'."
+        );
+        assert_eq!(
+            pulled_line(0, "origin"),
+            "Pulled 0 interaction(s) from 'origin'."
         );
     }
 

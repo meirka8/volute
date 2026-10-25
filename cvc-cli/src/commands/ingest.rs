@@ -2,6 +2,7 @@
 //!
 //! Not to be confused with sync ingestion (`cvc pull`), which imports another
 //! machine's already-shared projection: this is first-party local capture.
+use crate::terminal_text::sanitize_for_terminal;
 use anyhow::{anyhow, bail, Context, Result};
 use cvc_core::claude_code::{ingest, IngestError, IngestMode, IngestReport};
 use cvc_core::db::CvcStore;
@@ -55,30 +56,47 @@ pub async fn claude_code(
         session.as_deref(),
         IngestMode::Final,
     )?;
-    println!(
+    for line in report_lines(&report) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// What `cvc ingest claude-code --transcript` prints of a run. The session id
+/// passed the capture policy's identifier rule, but the block types are
+/// whatever the transcript's `type` fields say, so both are shown with every
+/// control and format character replaced by `?`, each on the line it belongs
+/// to.
+fn report_lines(report: &IngestReport) -> Vec<String> {
+    let mut lines = vec![format!(
         "CVC: Claude Code session {}: {} new thought(s), {} already recorded, {} pending, {} linked to session commits; cursor at byte {} of {}",
-        report.session_id,
+        sanitize_for_terminal(&report.session_id),
         report.inserted,
         report.already_present,
         report.pending_responses,
         report.linked_from_commits,
         report.cursor,
         report.transcript_len
-    );
+    )];
     if report.subagent_sessions > 0 {
-        println!(
+        lines.push(format!(
             "  plus {} subagent session(s): {} new thought(s), {} linked to commits",
             report.subagent_sessions, report.subagent_inserted, report.subagent_linked
-        );
+        ));
     }
     if report.unrecorded_blocks > 0 {
-        println!(
+        let types: Vec<_> = report
+            .unrecorded_block_types
+            .iter()
+            .map(|kind| sanitize_for_terminal(kind))
+            .collect();
+        lines.push(format!(
             "  {} content block(s) of a type this version does not record were kept as placeholders: {}",
             report.unrecorded_blocks,
-            report.unrecorded_block_types.join(", ")
-        );
+            types.join(", ")
+        ));
     }
-    Ok(())
+    lines
 }
 
 /// Hook mode reads Claude Code's JSON payload from stdin and writes nothing to
@@ -491,6 +509,50 @@ mod tests {
         let input = read_payload(io::repeat(b' ').take(2 * 1024 * 1024).chain(Failing));
         assert!(input.read.is_ok());
         assert!(input.oversize);
+    }
+
+    fn report(session_id: &str, unrecorded_block_types: &[&str]) -> IngestReport {
+        IngestReport {
+            session_id: session_id.into(),
+            inserted: 2,
+            already_present: 1,
+            pending_responses: 0,
+            linked_from_commits: 0,
+            cursor: 10,
+            transcript_len: 10,
+            subagent_sessions: 0,
+            subagent_inserted: 0,
+            subagent_linked: 0,
+            unrecorded_blocks: unrecorded_block_types.len(),
+            unrecorded_block_types: unrecorded_block_types
+                .iter()
+                .map(|kind| (*kind).to_owned())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_report_shows_the_session_id_and_the_block_types_as_plain_text() {
+        let hostile = report(
+            "s\u{1b}[2J\u{202e}1",
+            &[
+                "mys\u{1b}[2Jtery\u{1b}]52;c;SGVsbG8=\u{7}",
+                "x\u{202e}y\u{2028}z",
+            ],
+        );
+        assert_eq!(
+            report_lines(&hostile),
+            [
+                "CVC: Claude Code session s?[2J?1: 2 new thought(s), 1 already recorded, 0 pending, 0 linked to session commits; cursor at byte 10 of 10",
+                "  2 content block(s) of a type this version does not record were kept as placeholders: mys?[2Jtery?]52;c;SGVsbG8=?, x?y?z",
+            ]
+        );
+        // What a run of a well-formed transcript reports is printed as it is.
+        assert_eq!(
+            report_lines(&report("7c1e9f5a-2b2f", &["mystery"]))[1],
+            "  1 content block(s) of a type this version does not record were kept as placeholders: mystery"
+        );
+        assert_eq!(report_lines(&report("7c1e9f5a-2b2f", &[])).len(), 1);
     }
 
     #[test]

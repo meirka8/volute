@@ -10,6 +10,7 @@
 //! also stands for refusals unrelated to migrations), the classifier matches the
 //! exact message, and a unit test pins each against the real code.
 
+use crate::terminal_text::without_url_userinfo;
 use cvc_core::db::DbError;
 use std::error::Error;
 use std::fmt;
@@ -244,8 +245,14 @@ pub(crate) fn classify_failure(error: &anyhow::Error) -> FlowFailure {
 /// is wrong for the user on a refusal, contributes its bare message. A privacy
 /// error needs no such help: each kind of problem has its own variant, and only
 /// a `.thoughtignore` problem says `invalid .thoughtignore:`.
+///
+/// As on the command line, a URL in it is without its user information
+/// ([`without_url_userinfo`]): a transport's error can quote the URL it was
+/// given, as libgit2 does for a `file://` URL it cannot resolve. Control and
+/// format characters are left to the view, which replaces them where it shows
+/// the text.
 fn plain_message(error: &anyhow::Error) -> String {
-    error
+    let message = error
         .chain()
         .map(|cause| {
             if let Some(DbError::Migration(message)) = cause.downcast_ref::<DbError>() {
@@ -255,7 +262,8 @@ fn plain_message(error: &anyhow::Error) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join(": ")
+        .join(": ");
+    without_url_userinfo(&message).into_owned()
 }
 
 #[cfg(test)]
@@ -508,6 +516,24 @@ mod tests {
         assert_eq!(
             classify(DbError::Migration("x".into())),
             FlowFailure::Other("x".into())
+        );
+    }
+
+    #[test]
+    fn a_failure_names_no_user_information_of_a_url_it_quotes() {
+        let quoted = "failed to resolve path 'file://deploy:s3cret@localhost/srv/x.git': No such file or directory";
+        let shown =
+            "failed to resolve path 'file://localhost/srv/x.git': No such file or directory";
+        assert_eq!(
+            classify_failure(&anyhow::anyhow!(quoted).context("while publishing")),
+            FlowFailure::Other(format!("while publishing: {shown}"))
+        );
+        let unsettled = anyhow::Error::from(PublicationOutcomeUnknown::new(
+            cvc_core::sync::SyncError::Ref(quoted.into()),
+        ));
+        assert_eq!(
+            classify_failure(&unsettled),
+            FlowFailure::OutcomeUnknown(format!("Reference error: {shown}"))
         );
     }
 

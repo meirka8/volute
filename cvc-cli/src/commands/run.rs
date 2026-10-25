@@ -1,3 +1,4 @@
+use crate::terminal_text::sanitize_error_for_terminal;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use cvc_core::db::CvcStore;
@@ -146,13 +147,18 @@ pub async fn run(args: Vec<String>) -> Result<()> {
                     policy,
                     capture_worktree,
                 )) {
-                    eprintln!("CVC Warning: Failed to save interaction: {}", e);
+                    // The child's output above is forwarded as it is; what CVC
+                    // says of its own failure is printed as any error is.
+                    eprintln!(
+                        "CVC Warning: Failed to save interaction: {}",
+                        sanitize_error_for_terminal(&e.to_string())
+                    );
                 }
             }
             Err(e) => {
                 eprintln!(
                     "CVC Warning: Failed to open database despite CVC initialization: {}",
-                    e
+                    sanitize_error_for_terminal(&e.to_string())
                 );
             }
         }
