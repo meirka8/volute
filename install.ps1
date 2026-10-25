@@ -224,7 +224,10 @@ function Publish-CvcNotices([string]$ShareDir, [hashtable]$Staged) {
         }
         foreach ($Name in @($Staged.Keys)) {
             $Target = Join-Path $ShareDir $Name
-            if ((Get-CvcPathKind $Target) -eq 'file') { [IO.File]::Replace($Temporary[$Name], $Target, $null) }
+            # The third argument is the backup file name, and "none" must be a real null
+            # string: PowerShell turns $null into "" for a .NET string parameter, and
+            # File.Replace rejects "" ("The path is not of a legal form").
+            if ((Get-CvcPathKind $Target) -eq 'file') { [IO.File]::Replace($Temporary[$Name], $Target, [NullString]::Value) }
             else { [IO.File]::Move($Temporary[$Name], $Target) }
             $Temporary.Remove($Name)
         }

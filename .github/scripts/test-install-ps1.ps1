@@ -25,6 +25,8 @@ $InstallScript = Join-Path $RepoRoot 'install.ps1'
 $TestRoot = Join-Path ([IO.Path]::GetTempPath()) ('cvc-install-ps1-test-' + [Guid]::NewGuid())
 $Failures = New-Object 'System.Collections.Generic.List[string]'
 $Started = New-Object 'System.Collections.Generic.List[System.Diagnostics.Process]'
+# Junctions the cases create, removed one by one before the tree (see the cleanup).
+$Junctions = New-Object 'System.Collections.Generic.List[string]'
 $Checks = 0
 
 # System executables with different contents: the "old" install, the "new"
@@ -205,7 +207,7 @@ try {
     [IO.File]::WriteAllText((Join-Path $JunctionTarget 'precious.txt'), 'must not be reached through a reparse point')
     $Junction = Join-Path $Dir '.cvc-old-cvc.exe-bbbbbbbbbbbbbbbb'
     $HaveJunction = $false
-    try { New-Item -ItemType Junction -Path $Junction -Value $JunctionTarget | Out-Null; $HaveJunction = $true } catch { Write-Host "  skip  junction look-alike: $($_.Exception.Message)" }
+    try { New-Item -ItemType Junction -Path $Junction -Value $JunctionTarget | Out-Null; $Junctions.Add($Junction); $HaveJunction = $true } catch { Write-Host "  skip  junction look-alike: $($_.Exception.Message)" }
     $SymlinkTarget = Join-Path $TestRoot 'symlink-target.txt'
     [IO.File]::WriteAllText($SymlinkTarget, 'must not be deleted through a symlink')
     $Symlink = Join-Path $Dir '.cvc-old-cvc-mcp.exe-cccccccccccccccc'
@@ -376,7 +378,7 @@ try {
     New-Item -ItemType Directory -Path (Join-Path $LinkPrefix 'share') | Out-Null
     $ShareLink = Join-Path (Join-Path $LinkPrefix 'share') 'cvc'
     $HaveShareLink = $false
-    try { New-Item -ItemType Junction -Path $ShareLink -Value $LinkTarget | Out-Null; $HaveShareLink = $true } catch { Write-Host "  skip  junction as the share directory: $($_.Exception.Message)" }
+    try { New-Item -ItemType Junction -Path $ShareLink -Value $LinkTarget | Out-Null; $Junctions.Add($ShareLink); $HaveShareLink = $true } catch { Write-Host "  skip  junction as the share directory: $($_.Exception.Message)" }
     if ($HaveShareLink) {
         $Result = Publish-CvcNotices -ShareDir $ShareLink -Staged $NoticeStaged 3>$null
         Assert-Bool $Result $false 'a junction in place of the share directory is refused'
@@ -390,6 +392,11 @@ catch {
 }
 finally {
     foreach ($Process in $Started) { Stop-Sleeper $Process }
+    # A recursive delete over a junction fails under both shells ("The parameter is
+    # incorrect"), so the cleanup below reported that it could not remove the tree.
+    # Each junction is deleted by itself first: a non-recursive delete removes only
+    # the link and never reaches what it points to.
+    foreach ($Link in $Junctions) { try { [IO.Directory]::Delete($Link) } catch { } }
     try { [IO.Directory]::Delete($TestRoot, $true) } catch { Write-Host "  note  could not remove ${TestRoot}: $($_.Exception.Message)" }
 }
 
