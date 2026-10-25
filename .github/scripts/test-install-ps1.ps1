@@ -5,6 +5,8 @@
 # The script is parsed, and only the function definitions it needs are lifted
 # out of the syntax tree and defined in this scope:
 #   Publish-CvcBinaries    rename-aside replacement of installed binaries
+#   Expand-OptionalNotice  staging LICENSE and THIRD-PARTY-NOTICES.md from the archive
+#   Publish-CvcNotices     installing those two files beside the install directory
 #   Read-CvcPathConsent    the PATH prompt that must not fail unattended
 # Everything runs in a throwaway directory under %TEMP%, never in ~/.cvc/bin.
 #
@@ -48,6 +50,13 @@ function Assert-Test([bool]$Condition, [string]$Message, [string]$Detail = '') {
         if ($Detail) { Write-Host "        $Detail" }
         $script:Failures.Add($Message)
     }
+}
+
+# install.ps1 tests some results with `if (...)`. A stray object in a function's
+# output would turn its result into an array, which is always true, so the
+# result must be exactly one boolean.
+function Assert-Bool($Actual, [bool]$Expected, [string]$Message) {
+    Assert-Test (($Actual -is [bool]) -and ($Actual -eq $Expected)) $Message ('result: ' + ($Actual | Out-String).Trim())
 }
 
 function Get-Sha([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
@@ -130,7 +139,7 @@ try {
     if (@($ParseErrors).Count -gt 0) { throw 'install.ps1 does not parse.' }
 
     $FunctionAsts = @($Ast.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false))
-    $Needed = @('Get-CvcPathKind', 'New-CvcRetiredPath', 'Remove-CvcRetiredImages', 'Publish-CvcBinaries', 'Read-CvcPathConsent')
+    $Needed = @('Get-CvcPathKind', 'New-CvcRetiredPath', 'Remove-CvcRetiredImages', 'Publish-CvcBinaries', 'Expand-OptionalNotice', 'Publish-CvcNotices', 'Read-CvcPathConsent')
     $ConsentSource = $null
     foreach ($Name in $Needed) {
         $Found = @($FunctionAsts | Where-Object { $_.Name -eq $Name })
@@ -156,6 +165,12 @@ try {
         ($null -eq $Parent) -or ($Parent.Name -ne 'Read-CvcPathConsent')
     })
     Assert-Test (($ReadHosts.Count -ge 1) -and ($Unguarded.Count -eq 0)) 'Read-Host is only called from inside Read-CvcPathConsent'
+
+    # The notices go in once, before the binaries are replaced, so a refused
+    # install has changed no notice either.
+    $NoticeCalls = @($Ast.FindAll({ param($Node) ($Node -is [System.Management.Automation.Language.CommandAst]) -and ($Node.GetCommandName() -eq 'Publish-CvcNotices') }, $true))
+    $BinaryCalls = @($Ast.FindAll({ param($Node) ($Node -is [System.Management.Automation.Language.CommandAst]) -and ($Node.GetCommandName() -eq 'Publish-CvcBinaries') }, $true))
+    Assert-Test (($NoticeCalls.Count -eq 1) -and ($BinaryCalls.Count -eq 1) -and ($NoticeCalls[0].Extent.StartOffset -lt $BinaryCalls[0].Extent.StartOffset)) 'install.ps1 installs the notices once, before it replaces the binaries'
 
     Write-Host 'first install into an empty directory'
     $Dir = New-CaseDir 'fresh'
@@ -297,6 +312,76 @@ try {
     $ChildText = ($ChildOutput | Out-String).Trim()
     Assert-Test ($ChildExit -eq 0) 'the prompt child process exits 0' "exit code $ChildExit"
     Assert-Test ($ChildText -eq 'RESULT=skip') 'Read-CvcPathConsent returns skip' "output: $ChildText"
+
+    Write-Host 'optional notices are staged from the archive only when it holds them'
+    $NoticeSources = New-CaseDir 'notice-sources'
+    [IO.File]::WriteAllText((Join-Path $NoticeSources 'LICENSE'), "license text`n")
+    [IO.File]::WriteAllText((Join-Path $NoticeSources 'THIRD-PARTY-NOTICES.md'), "# third-party notices`n")
+    [IO.File]::Copy($OldSource, (Join-Path $NoticeSources 'cvc.exe'), $false)
+    $ZipFull = Join-Path $TestRoot 'notices-full.zip'
+    $ZipBare = Join-Path $TestRoot 'notices-bare.zip'
+    $ZipEmpty = Join-Path $TestRoot 'notices-empty.zip'
+    Compress-Archive -LiteralPath (Join-Path $NoticeSources 'cvc.exe'), (Join-Path $NoticeSources 'LICENSE'), (Join-Path $NoticeSources 'THIRD-PARTY-NOTICES.md') -DestinationPath $ZipFull
+    Compress-Archive -LiteralPath (Join-Path $NoticeSources 'cvc.exe') -DestinationPath $ZipBare
+    # An archive whose LICENSE entry has no content.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $EmptyZip = [IO.Compression.ZipFile]::Open($ZipEmpty, 'Create')
+    try { [void]$EmptyZip.CreateEntry('LICENSE') } finally { $EmptyZip.Dispose() }
+    $NoticeOut = New-CaseDir 'notice-staged'
+    $NoticeLimit = 1MB
+    $Dest = Join-Path $NoticeOut 'LICENSE'
+    Assert-Bool (Expand-OptionalNotice $ZipFull 'LICENSE' $Dest $NoticeLimit) $true 'a notice the archive holds is staged'
+    Assert-Test ((Test-Path -LiteralPath $Dest) -and ((Get-Sha $Dest) -eq (Get-Sha (Join-Path $NoticeSources 'LICENSE')))) 'the staged notice has the content of the archive entry'
+    $Dest = Join-Path $NoticeOut 'missing'
+    Assert-Bool (Expand-OptionalNotice $ZipBare 'LICENSE' $Dest $NoticeLimit) $false 'an archive without the notice reports it as absent, without throwing'
+    Assert-Test (-not (Test-Path -LiteralPath $Dest)) 'and leaves no file behind'
+    $Dest = Join-Path $NoticeOut 'too-big'
+    Assert-Bool (Expand-OptionalNotice $ZipFull 'THIRD-PARTY-NOTICES.md' $Dest 4) $false 'a notice over the size limit is not staged'
+    Assert-Test (-not (Test-Path -LiteralPath $Dest)) 'and leaves no file behind'
+    $Dest = Join-Path $NoticeOut 'empty'
+    Assert-Bool (Expand-OptionalNotice $ZipEmpty 'LICENSE' $Dest $NoticeLimit) $false 'an empty notice is not staged'
+    Assert-Test (-not (Test-Path -LiteralPath $Dest)) 'and leaves no file behind'
+
+    Write-Host 'notices are installed beside the install directory and replaced in place'
+    $NoticeStaged = @{ 'LICENSE' = (Join-Path $NoticeSources 'LICENSE'); 'THIRD-PARTY-NOTICES.md' = (Join-Path $NoticeSources 'THIRD-PARTY-NOTICES.md') }
+    $ShareDir = Join-Path (Join-Path (New-CaseDir 'notice-prefix') 'share') 'cvc'
+    $Result = Publish-CvcNotices -ShareDir $ShareDir -Staged $NoticeStaged
+    Assert-Bool $Result $true 'the first install succeeds and creates the share directory'
+    $Held = @(Get-ChildItem -LiteralPath $ShareDir -Force | ForEach-Object { $_.Name } | Sort-Object)
+    Assert-Test (($Held -join ',') -eq 'LICENSE,THIRD-PARTY-NOTICES.md') 'exactly the two notice files are there, and no temporary copy' ('found: ' + ($Held -join ', '))
+    Assert-Test ((Get-Sha (Join-Path $ShareDir 'LICENSE')) -eq (Get-Sha (Join-Path $NoticeSources 'LICENSE'))) 'LICENSE has the staged content'
+    [IO.File]::WriteAllText((Join-Path $NoticeSources 'LICENSE'), "license text, newer`n")
+    $Result = Publish-CvcNotices -ShareDir $ShareDir -Staged $NoticeStaged
+    Assert-Bool $Result $true 'a re-run succeeds'
+    $Held = @(Get-ChildItem -LiteralPath $ShareDir -Force | ForEach-Object { $_.Name } | Sort-Object)
+    Assert-Test (($Held -join ',') -eq 'LICENSE,THIRD-PARTY-NOTICES.md') 'still exactly one copy of each notice, and no temporary copy' ('found: ' + ($Held -join ', '))
+    Assert-Test ((Get-Sha (Join-Path $ShareDir 'LICENSE')) -eq (Get-Sha (Join-Path $NoticeSources 'LICENSE'))) 'LICENSE was replaced in place with the new content'
+
+    Write-Host 'an unsafe notices destination is refused with a warning and nothing is replaced'
+    $ShareDir = Join-Path (Join-Path (New-CaseDir 'notice-unsafe') 'share') 'cvc'
+    $LicenseAsDirectory = Join-Path $ShareDir 'LICENSE'
+    New-Item -ItemType Directory -Path $LicenseAsDirectory | Out-Null
+    [IO.File]::WriteAllText((Join-Path $LicenseAsDirectory 'keep.txt'), 'keep')
+    $Result = Publish-CvcNotices -ShareDir $ShareDir -Staged $NoticeStaged 3>$null
+    Assert-Bool $Result $false 'a directory in place of LICENSE is refused'
+    Assert-Test (Test-Path -LiteralPath (Join-Path $LicenseAsDirectory 'keep.txt')) 'the directory is untouched'
+    Assert-Test (-not (Test-Path -LiteralPath (Join-Path $ShareDir 'THIRD-PARTY-NOTICES.md'))) 'the other notice was not installed either'
+    Assert-Test (@(Get-ChildItem -LiteralPath $ShareDir -Force | Where-Object { $_.Name -cmatch '^\.cvc-' }).Count -eq 0) 'no temporary copy is left behind'
+    $BlockedPrefix = New-CaseDir 'notice-blocked'
+    [IO.File]::WriteAllText((Join-Path $BlockedPrefix 'share'), 'a file where the directory should be')
+    $Result = Publish-CvcNotices -ShareDir (Join-Path (Join-Path $BlockedPrefix 'share') 'cvc') -Staged $NoticeStaged 3>$null
+    Assert-Bool $Result $false 'a share path blocked by a file is refused without throwing'
+    $LinkPrefix = New-CaseDir 'notice-link'
+    $LinkTarget = New-CaseDir 'notice-link-target'
+    New-Item -ItemType Directory -Path (Join-Path $LinkPrefix 'share') | Out-Null
+    $ShareLink = Join-Path (Join-Path $LinkPrefix 'share') 'cvc'
+    $HaveShareLink = $false
+    try { New-Item -ItemType Junction -Path $ShareLink -Value $LinkTarget | Out-Null; $HaveShareLink = $true } catch { Write-Host "  skip  junction as the share directory: $($_.Exception.Message)" }
+    if ($HaveShareLink) {
+        $Result = Publish-CvcNotices -ShareDir $ShareLink -Staged $NoticeStaged 3>$null
+        Assert-Bool $Result $false 'a junction in place of the share directory is refused'
+        Assert-Test (@(Get-ChildItem -LiteralPath $LinkTarget -Force).Count -eq 0) 'nothing was written through the junction'
+    }
 }
 catch {
     Write-Host "ERROR: $($_.Exception.Message)"
