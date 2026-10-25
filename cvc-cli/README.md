@@ -253,7 +253,7 @@ Everything else the push changes is named on the same line rather than counted i
 
 A push with no new interactions says so, as in `Publishing 3 commit link(s) and 1 tombstone(s) to 'origin' (no new shared interactions; 42 shared in total).`, and its challenge ends in `0`. A push that changes only the ref's format or index says `a format/index update of refs/cvc/main` instead. When nothing differs from the destination, `push` prints `No new shared interactions to publish to 'origin' (42 shared in total).` and asks for no challenge. Hooks and an acknowledged auto-push print the result line (`Published 21 new shared interaction(s) to 'origin' (42 shared in total).`) without a challenge.
 
-Reconcile ambiguous transport results before changing publication choices:
+A destination that declines the ref update, through a protected ref, a server hook, or a race lost after the advertisement, fails the push with the server's reason, publishes nothing, and leaves the affected rows in the unknown state until a reconciliation confirms what the destination holds. Reconcile ambiguous transport results before changing publication choices:
 
 ```bash
 cvc privacy reconcile --remote origin
