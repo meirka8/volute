@@ -2,8 +2,8 @@
 //! the wording can be reviewed and tested without a terminal.
 //!
 //! The vocabulary is fixed: the view says "thought" (with real plurals), never
-//! "turn" or "interaction"; those words belong to the CLI's own output, which
-//! the view only ever shows on the suspended main screen. There are no
+//! "turn" or "interaction", and the CLI's own output, which the view shows on
+//! the suspended main screen, says "thought(s)" as well. There are no
 //! contractions, sentences end with a period, header labels are lowercase and
 //! a remote's name is in single quotes inside a sentence and bare after
 //! `remote:`. Times are UTC. Every string built from the store or from Git goes
@@ -643,7 +643,8 @@ pub fn nothing_to_unshare(remote: &str) -> String {
 }
 
 /// Why `cvc unshare` would be refused for this conversation, or `None` when it
-/// would go ahead.
+/// would go ahead. The unshare bar shows it, and `cvc unshare` itself fails with
+/// it, before asking for a phrase.
 pub fn unshare_refusal(check: &UnshareCheck, remote: &str) -> Option<String> {
     if check.published > 0 {
         Some(format!(
@@ -1407,7 +1408,6 @@ pub fn banner(
             lines.push(format!(
                 "Effect   Sends the shared thoughts to {remote}, where anyone who can read it can read them. Published thoughts cannot be recalled, and scrubbing can miss secrets."
             ));
-            lines.push("Note     The summary below counts thoughts as \"interactions\".".to_owned());
         }
         FlowKind::Authorize => lines.push(format!(
             "Effect   Allows publishing to {remote} at this exact push URL; you are asked again if the URL changes. CVC checks only the URL, not who owns the repository or who can read it. Publishes nothing and does not turn on auto-push."
@@ -1739,10 +1739,6 @@ pub fn details_page(input: &DetailsInput, g: &Glyphs) -> Vec<Page> {
         "A thought is one recorded step (for Claude Code, one assistant response).".to_owned(),
     ));
     page.push(Page::Text(
-        "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\"."
-            .to_owned(),
-    ));
-    page.push(Page::Text(
         "Scrubbing can miss secrets. Published thoughts cannot be recalled.".to_owned(),
     ));
     page
@@ -1916,10 +1912,6 @@ pub fn help_page(g: &Glyphs) -> Vec<Page> {
         Page::Blank,
         Page::Text(
             "A thought is one recorded step (for Claude Code, one assistant response).".to_owned(),
-        ),
-        Page::Text(
-            "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\"."
-                .to_owned(),
         ),
     ]
 }
@@ -3205,11 +3197,11 @@ mod tests {
             publish[2],
             "Effect   Sends the shared thoughts to 'origin', where anyone who can read it can read them. Published thoughts cannot be recalled, and scrubbing can miss secrets."
         );
-        assert_eq!(
-            publish[3],
-            "Note     The summary below counts thoughts as \"interactions\"."
-        );
+        // The summary the command prints below counts thoughts too, so the
+        // banner has no note about another name for them.
+        assert_eq!(publish[3], "         An empty line and Enter cancels.");
         assert_eq!(publish.last().unwrap(), "Checking 'origin' first…");
+        assert!(!publish.join("\n").contains("interaction"));
         // Only a publish says the thoughts cannot be recalled.
         for kind in [FlowKind::Share, FlowKind::Unshare, FlowKind::Authorize] {
             let text = banner(kind, &dest(), None, &U).join("\n");
@@ -3709,7 +3701,6 @@ mod tests {
             "Unconfirmed: 3 thoughts from a publish that did not finish cleanly",
             "Auto-push: off",
             "A thought is one recorded step (for Claude Code, one assistant response).",
-            "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\".",
             "Scrubbing can miss secrets. Published thoughts cannot be recalled.",
         ] {
             assert!(
@@ -3905,7 +3896,7 @@ mod tests {
             "Two standing choices act later without a new phrase: +future shares new thoughts as they are captured, and auto-push (set with cvc privacy set-auto-push, never from this view) publishes shared thoughts at every git push to that remote.",
             "Scrubbing and .thoughtignore can miss secrets; they are not a guarantee.",
             "Counts in the header are this clone's view; publish re-checks the remote first.",
-            "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\".",
+            "A thought is one recorded step (for Claude Code, one assistant response).",
         ] {
             assert!(text.contains(expected), "missing {expected:?}");
         }

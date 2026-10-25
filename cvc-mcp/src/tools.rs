@@ -383,7 +383,7 @@ async fn sync_history(args: Value, state: Arc<AppState>) -> Result<Value, JsonRp
             "content": [{
                 "type": "text",
                 "text": format!(
-                    "Synced with remote '{}'. Pulled {} new interaction(s) into local history.",
+                    "Synced with remote '{}'. Pulled {} new thought(s) into local history.",
                     remote_name, new_count
                 )
             }]
