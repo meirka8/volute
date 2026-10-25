@@ -3229,6 +3229,490 @@ fn publication_summary_is_structural_only_for_a_format_upgrade() -> anyhow::Resu
     Ok(())
 }
 
+// --- Tombstoned pushes keep what other clones published (#125) -----------------
+
+/// A well-formed range body with its canonical ID. `seed` is a lowercase hex
+/// digit; it varies every hash-shaped field, so each seed has its own ID.
+fn range_fixture(seed: char) -> RangeEvidence {
+    assert!(seed.is_ascii_hexdigit() && !seed.is_ascii_uppercase());
+    let oid = |c: char| c.to_string().repeat(40);
+    let mut range = RangeEvidence {
+        range_id: String::new(),
+        format: "cvc.range-evidence/v2".into(),
+        version: 2,
+        repository_identity: seed.to_string().repeat(64),
+        object_format: "sha1".into(),
+        base_oid: CommitSha::new(oid('a')),
+        tip_oid: CommitSha::new(oid(seed)),
+        base_tree_oid: oid('b'),
+        result_tree_oid: oid(seed),
+        commits: vec![RangeMember {
+            commit_oid: CommitSha::new(oid(seed)),
+        }],
+        changeset_algorithm: "cvc.changeset/v1".into(),
+        changeset_digest: seed.to_string().repeat(64),
+    };
+    range.range_id = range.canonical_id();
+    assert!(range.verify_id());
+    range
+}
+
+/// Records `range` as an explicit local observation, so the projection
+/// publishes it once an authorized, locally trusted event references it.
+fn observe_range_locally(db_path: &std::path::Path, range: &RangeEvidence) -> anyhow::Result<()> {
+    let payload = serde_json::to_string(range)?;
+    let digest = hex::encode(Sha256::digest(payload.as_bytes()));
+    let db = Connection::open(db_path)?;
+    db.execute(
+        "INSERT INTO range_evidence(range_id,payload,payload_digest,changeset_algorithm,changeset_digest) VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![
+            range.range_id,
+            payload,
+            digest,
+            range.changeset_algorithm,
+            range.changeset_digest
+        ],
+    )?;
+    db.execute(
+        "INSERT INTO range_observations(range_id,source_key,origin,trusted_local) VALUES(?1,'fixture-local','explicit',1)",
+        [&range.range_id],
+    )?;
+    Ok(())
+}
+
+/// A squash event of `interaction_id` over `range`.
+fn squash_derivation(
+    interaction_id: &InteractionId,
+    commit: char,
+    source_event_ids: Vec<String>,
+    range: &RangeEvidence,
+) -> DerivationEvent {
+    let mut event = derivation(interaction_id, commit, source_event_ids);
+    event.relation = DerivationRelation::SquashExact;
+    event.origin = DerivationOrigin::LocalHook;
+    event.range_id = Some(range.range_id.clone());
+    event.event_id = event.canonical_id();
+    event
+}
+
+/// What another clone's push adds to the tip of `ref_name`: a new commit whose
+/// tree also holds `ranges/<id[0..2]>/<id>.json`. Returns the blob it wrote.
+fn publish_foreign_range(
+    repo: &Repository,
+    ref_name: &str,
+    range: &RangeEvidence,
+) -> anyhow::Result<git2::Oid> {
+    let tip = repo.find_reference(ref_name)?.peel_to_commit()?;
+    let tree = tip.tree()?;
+    let ranges = tree
+        .get_name("ranges")
+        .expect("a FORMAT5 tree always holds ranges/")
+        .to_object(repo)?
+        .peel_to_tree()?;
+    let shard = &range.range_id[..2];
+    let mut shard_builder = match ranges.get_name(shard) {
+        Some(entry) => repo.treebuilder(Some(&entry.to_object(repo)?.peel_to_tree()?))?,
+        None => repo.treebuilder(None)?,
+    };
+    let blob = repo.blob(&serde_json::to_vec(range)?)?;
+    shard_builder.insert(
+        format!("{}.json", range.range_id),
+        blob,
+        FileMode::Blob.into(),
+    )?;
+    let mut ranges_builder = repo.treebuilder(Some(&ranges))?;
+    ranges_builder.insert(shard, shard_builder.write()?, FileMode::Tree.into())?;
+    let mut root = repo.treebuilder(Some(&tree))?;
+    root.insert("ranges", ranges_builder.write()?, FileMode::Tree.into())?;
+    let signature = Signature::now("Other Clone", "other@example.com")?;
+    let commit = repo.commit(
+        None,
+        &signature,
+        &signature,
+        "another clone publishes a range",
+        &repo.find_tree(root.write()?)?,
+        &[&tip],
+    )?;
+    repo.reference(ref_name, commit, true, "fixture: another clone's range")?;
+    Ok(blob)
+}
+
+fn wire_range_ids(repo: &Repository, tree: &git2::Tree<'_>) -> anyhow::Result<Vec<String>> {
+    let Some(ranges) = tree.get_name("ranges") else {
+        return Ok(Vec::new());
+    };
+    let mut ids = Vec::new();
+    for shard in ranges.to_object(repo)?.peel_to_tree()?.iter() {
+        for entry in shard.to_object(repo)?.peel_to_tree()?.iter() {
+            let range: RangeEvidence =
+                serde_json::from_slice(entry.to_object(repo)?.peel_to_blob()?.content())?;
+            ids.push(range.range_id);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+fn sorted(mut ids: Vec<String>) -> Vec<String> {
+    ids.sort();
+    ids
+}
+
+/// A clone that holds a tombstone pushes over a tip carrying a range that no
+/// event references, which its own database never published. With
+/// `import_first` the database has also imported that tip, as the CLI does
+/// before every projection; the range is then known to it only as untrusted
+/// remote evidence, which is never projected.
+fn tombstoned_push_over_an_unreferenced_range(import_first: bool) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let kept = summary_interaction("kept", "stays");
+    let redacted = summary_interaction("redacted", "suppressed");
+    store.create_interaction(&kept)?;
+    store.create_interaction(&redacted)?;
+    project_and_accept(&repo, &store)?.expect("first candidate");
+
+    let foreign = range_fixture('1');
+    let foreign_blob = publish_foreign_range(&repo, SUMMARY_BASELINE, &foreign)?;
+    if import_first {
+        sync::pull_from_ref_for_remote(&repo, &store, SUMMARY_BASELINE, Some(TEST_DESTINATION))?;
+    }
+    store.tombstone_remote(
+        &redacted.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::UserRequested,
+        None,
+    )?;
+
+    let publication = project_and_accept(&repo, &store)?.expect("the tombstone is a change");
+    let tip = accepted_tip(&repo)?;
+    assert_eq!(
+        wire_range_ids(&repo, &tip)?,
+        vec![foreign.range_id.clone()],
+        "a range no event references is not about the tombstoned interaction, \
+         so a tombstoned push must keep it"
+    );
+    let path = format!(
+        "ranges/{}/{}.json",
+        &foreign.range_id[..2],
+        foreign.range_id
+    );
+    assert_eq!(
+        tip.get_path(std::path::Path::new(&path))?.id(),
+        foreign_blob,
+        "the kept range is the very blob the other clone published"
+    );
+    assert!(has_path(&tip, &tombstone_path(&redacted.id)));
+    assert!(!has_path(&tip, &node_path(&redacted.id)));
+    assert_eq!(publication.new_tombstones, 1);
+    assert_eq!(publication.removed_interactions, 1);
+    assert_eq!(
+        publication.removed_records, 0,
+        "the summary names removals as records of tombstoned interactions; \
+         the range is not one"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_tombstoned_push_keeps_a_range_no_event_references() -> anyhow::Result<()> {
+    tombstoned_push_over_an_unreferenced_range(false)
+}
+
+#[test]
+fn a_tombstoned_push_keeps_an_unreferenced_range_the_database_imported_as_remote_evidence(
+) -> anyhow::Result<()> {
+    tombstoned_push_over_an_unreferenced_range(true)
+}
+
+/// The tree a destination's accepted candidate holds.
+fn accepted_tip(repo: &Repository) -> anyhow::Result<git2::Tree<'_>> {
+    Ok(repo
+        .find_reference(SUMMARY_BASELINE)?
+        .peel_to_commit()?
+        .tree()?)
+}
+
+fn has_path(tree: &git2::Tree<'_>, path: &str) -> bool {
+    tree.get_path(std::path::Path::new(path)).is_ok()
+}
+
+fn node_path(id: &InteractionId) -> String {
+    format!("nodes/{}/{}.json", &id.to_string()[..2], id)
+}
+
+fn tombstone_path(id: &InteractionId) -> String {
+    format!("tombstones/{}/{}.json", &id.to_string()[..2], id)
+}
+
+/// What `publish_squash_scenario` put on the destination.
+struct SquashScenario {
+    redacted: Interaction,
+    kept: Interaction,
+    /// Referenced only by a squash event of `redacted`.
+    tied: RangeEvidence,
+    /// Referenced by a squash event of `redacted` and one of `kept`.
+    common: RangeEvidence,
+    /// Event IDs of `kept`, which must survive the tombstone of `redacted`.
+    kept_events: Vec<String>,
+}
+
+/// Publishes two interactions with squash evidence. A squash range is shared by
+/// every interaction whose commits it covers, so `common` belongs to both while
+/// `tied` belongs to `redacted` alone.
+fn publish_squash_scenario(
+    repo: &Repository,
+    store: &CvcStore,
+    db_path: &std::path::Path,
+) -> anyhow::Result<SquashScenario> {
+    let kept = summary_interaction("kept", "stays");
+    let redacted = summary_interaction("redacted", "suppressed");
+    store.create_interaction(&kept)?;
+    store.create_interaction(&redacted)?;
+    let tied = range_fixture('1');
+    let common = range_fixture('2');
+    for range in [&tied, &common] {
+        observe_range_locally(db_path, range)?;
+    }
+    let redacted_source = derivation(&redacted.id, 'a', Vec::new());
+    let redacted_tied = squash_derivation(
+        &redacted.id,
+        'b',
+        vec![redacted_source.event_id.clone()],
+        &tied,
+    );
+    let redacted_common = squash_derivation(
+        &redacted.id,
+        'c',
+        vec![redacted_source.event_id.clone()],
+        &common,
+    );
+    let kept_source = derivation(&kept.id, 'd', Vec::new());
+    let kept_common = squash_derivation(&kept.id, 'e', vec![kept_source.event_id.clone()], &common);
+    let kept_events = [&kept_source, &kept_common];
+    for event in [&redacted_source, &redacted_tied, &redacted_common]
+        .into_iter()
+        .chain(kept_events)
+    {
+        insert_event_fixture(db_path, event)?;
+        trust_and_authorize_event(db_path, event)?;
+    }
+    project_and_accept(repo, store)?.expect("first candidate");
+    let tip = accepted_tip(repo)?;
+    assert_eq!(
+        wire_range_ids(repo, &tip)?,
+        sorted(vec![tied.range_id.clone(), common.range_id.clone()]),
+        "the projection publishes both ranges"
+    );
+    assert_eq!(wire_event_ids(repo, &tip)?.len(), 5);
+    Ok(SquashScenario {
+        redacted,
+        kept,
+        tied,
+        common,
+        kept_events: kept_events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect(),
+    })
+}
+
+#[test]
+fn a_tombstone_prunes_the_ranges_only_its_events_referenced() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let db_path = temp_dir.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let scenario = publish_squash_scenario(&repo, &store, &db_path)?;
+
+    store.tombstone_remote(
+        &scenario.redacted.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::Security,
+        None,
+    )?;
+    let publication = project_and_accept(&repo, &store)?.expect("the tombstone is a change");
+    let tip = accepted_tip(&repo)?;
+
+    let ranges = wire_range_ids(&repo, &tip)?;
+    assert!(
+        !ranges.contains(&scenario.tied.range_id),
+        "the range only the tombstoned interaction's events referenced is pruned"
+    );
+    assert_eq!(
+        ranges,
+        vec![scenario.common.range_id.clone()],
+        "the range a surviving event also references stays"
+    );
+    assert_eq!(
+        wire_event_ids(&repo, &tip)?,
+        sorted(scenario.kept_events.clone()),
+        "no event of the tombstoned interaction survives"
+    );
+    assert!(has_path(&tip, &node_path(&scenario.kept.id)));
+    assert!(!has_path(&tip, &node_path(&scenario.redacted.id)));
+    assert_eq!(publication.removed_interactions, 1);
+    assert_eq!(
+        publication.removed_records, 4,
+        "three events and the one range they alone referenced"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_tombstoned_push_keeps_every_kind_of_entry_another_clone_published() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("this-clone.db"))?;
+    let kept = summary_interaction("kept", "stays");
+    let redacted = summary_interaction("redacted", "suppressed");
+    store.create_interaction(&kept)?;
+    store.create_interaction(&redacted)?;
+    project_and_accept(&repo, &store)?.expect("this clone publishes first");
+
+    // Another clone adds a node, an automatic link, a derivation event (and so
+    // `by-commit/` pointers), and a range. This clone's database never saw any
+    // of it.
+    let other_db = temp_dir.path().join("other-clone.db");
+    let other = CvcStore::open(&other_db)?;
+    let foreign = summary_interaction("foreign", "published elsewhere");
+    other.create_interaction(&foreign)?;
+    let linked_commit = "c".repeat(40);
+    other.link_interaction(
+        &foreign.id,
+        &CommitSha::new(linked_commit.clone()),
+        "generated",
+    )?;
+    let foreign_event = derivation(&foreign.id, 'f', Vec::new());
+    insert_event_fixture(&other_db, &foreign_event)?;
+    trust_and_authorize_event(&other_db, &foreign_event)?;
+    project_and_accept(&repo, &other)?.expect("the other clone publishes");
+    let foreign_range = range_fixture('1');
+    publish_foreign_range(&repo, SUMMARY_BASELINE, &foreign_range)?;
+
+    store.tombstone_remote(
+        &redacted.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::UserRequested,
+        None,
+    )?;
+    project_and_accept(&repo, &store)?.expect("the tombstone is a change");
+    let tip = accepted_tip(&repo)?;
+
+    assert!(
+        !has_path(&tip, &node_path(&redacted.id)),
+        "the tombstone still removes its node"
+    );
+    assert!(has_path(&tip, &tombstone_path(&redacted.id)));
+    assert!(has_path(&tip, &node_path(&kept.id)));
+
+    let mut dropped = Vec::new();
+    if !has_path(&tip, &node_path(&foreign.id)) {
+        dropped.push("nodes/");
+    }
+    if !has_path(
+        &tip,
+        &format!("links/{}/{}.json", foreign.id, linked_commit),
+    ) {
+        dropped.push("links/");
+    }
+    if !wire_event_ids(&repo, &tip)?.contains(&foreign_event.event_id) {
+        dropped.push("events/");
+    }
+    if !has_path(&tip, &format!("by-commit/{}/{}", linked_commit, foreign.id))
+        || !has_path(
+            &tip,
+            &format!("by-commit/{}/{}", "f".repeat(40), foreign.id),
+        )
+    {
+        dropped.push("by-commit/");
+    }
+    if !wire_range_ids(&repo, &tip)?.contains(&foreign_range.range_id) {
+        dropped.push("ranges/");
+    }
+    assert!(
+        dropped.is_empty(),
+        "a tombstoned push dropped what another clone published under {dropped:?}"
+    );
+
+    // A reader still accepts the result: the kept entries agree with the
+    // rebuilt `by-commit/` index.
+    let reader = CvcStore::open(temp_dir.path().join("reader.db"))?;
+    sync::pull_from_ref_for_remote(&repo, &reader, SUMMARY_BASELINE, Some(TEST_DESTINATION))?;
+    assert!(reader.get_interaction(&foreign.id)?.is_some());
+    assert!(reader.get_interaction(&kept.id)?.is_some());
+    assert!(reader.get_interaction(&redacted.id)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn hard_redaction_prunes_the_ranges_only_the_target_referenced_and_keeps_the_rest(
+) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let db_path = temp_dir.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let scenario = publish_squash_scenario(&repo, &store, &db_path)?;
+    let unredacted = accepted_tip(&repo)?;
+    let stale_events = unredacted.get_name("events").unwrap().id();
+    let stale_ranges = unredacted.get_name("ranges").unwrap().id();
+
+    store.tombstone_remote(
+        &scenario.redacted.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::Security,
+        None,
+    )?;
+    project_and_accept(&repo, &store)?.expect("the tombstone is a change");
+
+    // The destination tip a redaction plan starts from: it holds the tombstone
+    // but an older client left the target's derivation evidence next to it, and
+    // another clone has added a range of its own.
+    let suppressed = accepted_tip(&repo)?;
+    let mut stale = repo.treebuilder(Some(&suppressed))?;
+    stale.insert("events", stale_events, FileMode::Tree.into())?;
+    stale.insert("ranges", stale_ranges, FileMode::Tree.into())?;
+    let signature = Signature::now("Old Client", "old@example.com")?;
+    let tip = repo.find_reference(SUMMARY_BASELINE)?.peel_to_commit()?;
+    let stale_tip = repo.commit(
+        None,
+        &signature,
+        &signature,
+        "an older client leaves the derivation evidence",
+        &repo.find_tree(stale.write()?)?,
+        &[&tip],
+    )?;
+    repo.reference(SUMMARY_BASELINE, stale_tip, true, "stale fixture")?;
+    let foreign = range_fixture('3');
+    publish_foreign_range(&repo, SUMMARY_BASELINE, &foreign)?;
+
+    let candidate = sync::build_hard_redaction_plan(
+        &repo,
+        Some(SUMMARY_BASELINE),
+        TEST_DESTINATION,
+        &scenario.redacted.id,
+    )?;
+    let replacement = repo
+        .find_commit(git2::Oid::from_str(&candidate.plan.replacement_commit)?)?
+        .tree()?;
+    assert_eq!(
+        wire_event_ids(&repo, &replacement)?,
+        sorted(scenario.kept_events.clone()),
+        "no event of the target survives the replacement"
+    );
+    assert_eq!(
+        wire_range_ids(&repo, &replacement)?,
+        sorted(vec![
+            scenario.common.range_id.clone(),
+            foreign.range_id.clone()
+        ]),
+        "the replacement drops the range only the target referenced, keeps the one \
+         a surviving event references, and keeps the one nothing references"
+    );
+    Ok(())
+}
+
 // --- Baseline pinning and the publication-state guard (#106 round 2) -----------
 
 const PIN_TRACKING_REF: &str = "refs/remotes/fixture/cvc/main";
