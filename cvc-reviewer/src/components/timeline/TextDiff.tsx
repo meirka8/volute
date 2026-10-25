@@ -1,10 +1,13 @@
-import { useId, useMemo, useState } from 'react';
+import { useCallback, useId, useMemo } from 'react';
 import { clsx } from 'clsx';
 import { MAX_DIFF_LINES, planDiff, type DiffRow } from '../../lib/lineDiff';
 import { displayText, shouldCollapse } from '../../lib/textLines';
 import { CollapsibleCode } from './CollapsibleCode';
 import { ExpandToggle } from './ExpandToggle';
 import { HiddenText } from './HiddenText';
+import { usePersistentToggle } from './nodeUiState';
+import { Section } from './NodeUiScope';
+import { useMatchCount } from './searchHighlight';
 
 interface TextDiffProps {
   oldText: string;
@@ -83,7 +86,7 @@ function UnchangedText({ oldText, newText, maxRows }: { oldText: string; newText
 }
 
 function ChangedDiff({ oldText, newText, maxRows }: { oldText: string; newText: string; maxRows: number }) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = usePersistentToggle('expanded', false);
   const id = useId();
   // Line endings are folded first, so a Windows-style file does not show every
   // line as changed (nor a stray carriage return).
@@ -96,6 +99,10 @@ function ChangedDiff({ oldText, newText, maxRows }: { oldText: string; newText: 
     () => plan.rows(collapsible && !expanded ? maxRows : undefined),
     [plan, collapsible, expanded, maxRows],
   );
+  // While the diff is searched and folded: the matches in every line it has, which the toggle says. (The rows
+  // are all built only then, and only to count them; a diff is at most MAX_DIFF_LINES lines.)
+  const lineTexts = useCallback(() => plan.rows().flatMap((row) => (row.kind === 'gap' ? [] : [row.text])), [plan]);
+  const matches = useMatchCount(lineTexts, collapsible && !expanded);
 
   if (plan.tooLarge) {
     return (
@@ -103,11 +110,15 @@ function ChangedDiff({ oldText, newText, maxRows }: { oldText: string; newText: 
         <Note>Diff too large to compute. The old and new text are shown separately.</Note>
         <div>
           <div className="mb-1 text-[11px] uppercase tracking-[0.14em] text-muted">Old text</div>
-          <CollapsibleCode text={oldText} label="Old text" />
+          <Section name="old">
+            <CollapsibleCode text={oldText} label="Old text" />
+          </Section>
         </div>
         <div>
           <div className="mb-1 text-[11px] uppercase tracking-[0.14em] text-muted">New text</div>
-          <CollapsibleCode text={newText} label="New text" />
+          <Section name="new">
+            <CollapsibleCode text={newText} label="New text" />
+          </Section>
         </div>
       </div>
     );
@@ -134,6 +145,7 @@ function ChangedDiff({ oldText, newText, maxRows }: { oldText: string; newText: 
           onToggle={() => setExpanded((value) => !value)}
           collapsedLabel={`Show all ${plan.lineCount.toLocaleString('en-US')} lines`}
           controls={id}
+          matches={matches}
         />
       )}
     </div>

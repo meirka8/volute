@@ -33,7 +33,12 @@ export function PRReviewPage() {
   const { logout } = useAuth();
 
   // UI State
-  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  // The file open in the diff is open in THIS pull request: another pull request starts at its first file, not at a
+  // file of the last one (which the timeline's "touches the open file" filter would then offer).
+  const prKey = `${owner}/${repo}#${prNumber}`;
+  const [selection, setSelection] = useState<{ pr: string; file: string } | null>(null);
+  const selectedFile = selection !== null && selection.pr === prKey ? selection.file : null;
+  const setSelectedFile = useCallback((file: string) => setSelection({ pr: prKey, file }), [prKey]);
   const [viewedFiles, setViewedFiles] = useState<Set<string>>(new Set());
   const [selectedInteractionId, setSelectedInteractionId] = useState<
     string | null
@@ -89,9 +94,12 @@ export function PRReviewPage() {
   const { getNextFile, getPreviousFile } = useFileNavigation(fileNames);
 
   // Handlers
-  const handleSelectFile = useCallback((filename: string) => {
-    setSelectedFile(filename);
-  }, []);
+  const handleSelectFile = useCallback(
+    (filename: string) => {
+      setSelectedFile(filename);
+    },
+    [setSelectedFile],
+  );
 
   const handleToggleViewed = useCallback((filename: string) => {
     setViewedFiles((prev) => {
@@ -108,12 +116,12 @@ export function PRReviewPage() {
   const handleNextFile = useCallback(() => {
     const next = getNextFile(activeSelectedFile);
     if (next) setSelectedFile(next);
-  }, [activeSelectedFile, getNextFile]);
+  }, [activeSelectedFile, getNextFile, setSelectedFile]);
 
   const handlePreviousFile = useCallback(() => {
     const prev = getPreviousFile(activeSelectedFile);
     if (prev) setSelectedFile(prev);
-  }, [activeSelectedFile, getPreviousFile]);
+  }, [activeSelectedFile, getPreviousFile, setSelectedFile]);
 
   const handleExpandReasoning = useCallback(() => {
     // This would toggle the reasoning accordion on the selected interaction
@@ -263,11 +271,15 @@ export function PRReviewPage() {
         }
         rightPanel={
           <ShadowTimeline
+            // A search is about one pull request's steps: another pull request starts without it.
+            key={prKey}
             interactions={prInteractions || []}
             selectedInteractionId={selectedInteractionId}
             onSelectInteraction={setSelectedInteractionId}
             prTitle={prData?.pr?.title}
             isLoading={isLoading}
+            commits={prInteractionsResult?.commits}
+            openFile={activeSelectedFile}
             notice={
               prInteractionsResult?.truncated
                 ? "Showing partial history: this repository predates PR-scoped sync. Push again with an updated cvc-core to restore full, fast history."

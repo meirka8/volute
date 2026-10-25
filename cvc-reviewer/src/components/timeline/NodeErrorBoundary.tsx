@@ -50,7 +50,7 @@ export class NodeErrorBoundary extends Component<NodeErrorBoundaryProps, NodeErr
         <p>This step could not be displayed.</p>
         {typeof id === 'string' && (
           <p className="mt-1 break-all font-mono text-xs">
-            <HiddenText text={id} mode="strict" />
+            <HiddenText text={id} mode="strict" marks={false} />
           </p>
         )}
       </li>

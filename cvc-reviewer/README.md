@@ -127,3 +127,118 @@ Where the capture hit a limit, the step says so:
 **Arguments not recorded: N bytes exceeded the capture limit** replaces tool arguments too
 large to keep, and `…[cvc: truncated N bytes]` marks where text was cut. Privacy redactions
 appear as `[CVC_REDACTED:v1:<kind>:<id>]`.
+
+## Searching and filtering the timeline
+
+The box at the top of the timeline narrows the steps as you type, and the filters under it narrow them by who
+or what a step was. Neither fetches anything: they work on the steps already loaded, through an index built the
+first time the box or the filters are used (a timeline nobody searches pays nothing for it).
+
+**What is searched: what a card draws.** The index holds the text a step's card shows, and nothing else, so a step
+the search leaves always has something on its card that says why. For a step in the stimulus / reasoning / response
+layout that is the prompt, injected context, compaction summary and tool results of the stimulus (with the names the
+results are shown under), the reasoning, the response, and for each tool call the *values* it recorded as the card
+shows them: a command and its description, the lines of an edit's diff, the content of a write, a pattern, a URL, the
+rows of a checklist, the value of every other argument (numbers included: a field that holds `42` is found by "42"), and
+the value of an option where the card writes one ("timeout 120s", "glob *.ts"). For a step in the Thought / Action /
+Observation layout it is the prompt, the line the Action pane writes for each call (the name of the tool and the
+arguments as they were recorded, JSON and all), the response, and the reasoning of an AI agent, which is behind "Why?";
+a human's reasoning there is on no card and is not searched.
+
+What is **not** searched: the markers of the wire (`[tool_result Bash]`, `[meta]`, `[no stimulus recorded]`), the
+Reviewer's own words (labels, badges, placeholders such as "No recorded observation", "runs in background", "ignore
+case", "replace all occurrences"), the model name, and the *names* of a tool call's arguments (`command`, `file_path`:
+use `tool:` to find a call by what it is called). The names of the tools called, the files a step touched (the
+`file_path`, `path` and `notebook_path` of its calls, and its context items) and the hashes of the commits it is linked
+to are searched too. A file a step names only in its context items matches even though no card draws it: the card says
+so ("Matched in: context file paths, which this card does not show"). The *tool* and *commit* fields are shown in
+part (the name a card gives a tool is shorter than the name that was recorded, a commit chip shows seven characters of the
+hash): a term that is in the part that is not shown marks the whole of what is.
+
+**How text is compared.** Both the text and the terms are folded the same way, so what is found is what is marked:
+case in full (`ß` is "ss", the final sigma is a sigma, a Turkish capital `İ` is an `i` and a dot above), compatibility forms
+per character (full-width letters and ligatures are their letters; a precomposed `é` is the same as an `e` and the accent
+after it, and "cafe" finds both), every white-space character as a space (a no-break space in a phrase is a space), and every
+hidden or bidirectional character left out, so that an invisible character can not hide a match: `pass<ZWSP>word` is found
+by "password". The hidden characters are those of Unicode's Default_Ignorable_Code_Point property (and the C0 and C1
+controls and the interlinear annotation characters); a card draws them as visible `⟨U+…⟩` tokens, and a match that runs
+across one is marked on either side of its token. **Look-alike letters are not folded**: a Cyrillic `а` is not a Latin
+`a`, and a search for one does not find the other.
+
+**The query.** Terms are separated by white space; `"retry limit"` is one term. `path:`, `tool:` and `commit:` before a
+term (in any case) look in that field only: `path:src/net`, `tool:bash`, `commit:a1b2c3d`, or with a quoted value,
+`path:"my dir/a.ts"`. Any other `word:` is plain text (`http://example.com` is searched as it is). A prefix with nothing
+after it yet, an empty pair of quotes, and a phrase of nothing but spaces are ignored while you type them. Nothing is read
+as a regular expression: `.*` and `(a+)+$` are text. No more than 16 different terms are used ("Only the first 16 terms are
+used" says so when there are more), and a term is cut at 512 characters.
+
+**Marks.** What matches is marked in place in `<mark>` elements that hold only text, on every piece of wire text a card
+draws, at most 100 marks to a block of text and at most 500 on a card (the card says "Only the first 500 matches on this
+card are marked" when it stops: the step still matches, and the folds still count every match they hold). The Reviewer's
+own words are never marked, and neither are the names of arguments. A term with a prefix marks only the text of its
+field (`tool:` the names of the calls, `path:` file paths, `commit:` hashes). Folded text is never opened for you: a fold
+that holds matches says how many, on its control ("Tool results · Bash · 3 matches", "Show all 40 lines · 2 matches", "Why? · 1
+match"). The count on a "Show more", "Show all N lines" or diff toggle is of the whole block, matches already in view
+included. A control that draws the next page of a long list says how many matches the items not drawn yet hold ("Show 10
+more tool calls (53 not shown) · 1 match"). A diff draws a line at a time, so a phrase that runs from one line of it to the
+next is not a match there.
+
+**Next and previous.** The count (a live region) reads "3 of 12 · 12 of 300 steps" while there is a query and "12 of 300
+steps" when only filters narrow the list: whenever anything narrows the list, the bar says how many of the steps it
+shows. Enter in the box goes to the next match, Shift+Enter to the previous, wrapping round; the arrow buttons do the
+same, and the step is scrolled into view if it is not and outlined. The outline is not the selection: selecting a step is
+unchanged. Escape clears the box, and in an empty box leaves it. `/` anywhere on the page that does not use the key (not while
+typing in a box, text area, select or editable region, and not with a modifier) comes to the box.
+
+**Filters.** The "Filters" disclosure holds one group of check boxes for each kind; within a group a step needs *any* of the
+values ticked, and it needs one of each group that has a value ticked. Each value that is on is also a chip that removes it.
+
+- *Conversation*: named from its id alone, never from what its steps look like. "Subagent `<id>`" for
+  `<session>:agent-<id>`, with the session it belongs to as a note ("of session `<id>`"); "Session `<id>`" for every other
+  conversation (a Claude Code session, the MCP server, the editor, `cvc run`). Each shows the number of steps and the first
+  line of what its earliest step was asked. Conversation titles are not part of the synced record, so there are none to show;
+  ids are cut to their first characters, and no more than it takes to tell two apart (a note cuts its session's id as the
+  session's own name does). Ids that are the same as far as a name looks (it never looks past 64 characters) are told apart by
+  a number, "(2)".
+- *Stimulus origin*: Prompt (a person's), Tool results, and Other (MCP, VS Code and `cvc run` steps, compaction, context).
+- *Tool*: the names the cards show (`github · create_issue`, `web_search (server-side)`).
+- *Link type*: generated, temporal, verified, and publisher-asserted (any link that carries a derivation event), the same
+  split as the commit chips on a card. Only the kinds that are present are offered.
+- *Commit*: the pull request's commits, newest first, with the first line of the message when GitHub's commit list gave it
+  (no extra request), and how many steps are linked to each. A step linked to the commit stays linked to it whatever else is
+  filtered: a filter chooses steps, it never changes them.
+- *Touches the open file*: steps whose files include the file open in the diff pane, by path ending (the steps record where
+  the file was on the machine that wrote them, and the pull request names it from the repository root, so a root-level
+  `index.ts` also finds steps that touched `src/index.ts`). It follows the open file as you switch files, and another pull
+  request opens at its own first file, never at one of the last pull request's.
+
+**The list.** Steps that do not match are removed from the list, which is still windowed if it is long, and the steps that
+match keep their order. What you opened in a card (a fold, "Show more", "Show all N lines", a page of a long list, "Why?")
+is kept with the step, so it is still open when the card comes back, from a search or from being scrolled out of the
+window. When a search or filter begins the list opens at the top; when the last one is cleared, the list opens where you
+were in it. Clearing from the empty state ("Clear search and filters") puts the keyboard in the box.
+
+**The address keeps the filters after the `#`, and never the search text.** The filters are kept in the fragment of the
+address so that a reload, or a step back to the page, finds them again: `#conv=…&origin=…&tool=…&link=…&commit=…&file=…`,
+one `conv`, `origin`, `tool`, `link` or `commit` for each value and a `file` path (for "touches the open file" it is the
+file that is open; a path from a link stays that file). The fragment is never sent to a server, and the page sends no
+referrer. They are written at once, replacing the history entry (a choice of a filter is not a history entry), and only
+while the page is still the one the timeline was drawn on; the path, the query string and any other parameter of the
+fragment are left as they were. A value that is not one its parameter holds (an unknown origin, an id with a space, a hash
+that is not hexadecimal) is ignored, and every value is shown as text, with hidden characters made visible; a value too
+long for the address, or that reading it would change, is left out of it and never written cut short. Back restores a
+page's filters, not what was typed in its box.
+
+What you typed is not in the address: a search is often a word from a log, a name or a secret, and the address goes to the
+history, to the screen and to whoever the page is shared with. **"Copy link"** (the button beside the filters) is how a
+view is shared: it copies the address with the filters *and* the search text, as `q=` in the fragment. Before it puts a text
+that looks like a secret (a private key, a token with a known prefix, a JWT, a password assignment, or a long run of letters
+and digits) into a link it asks, in a line you can reach with the keyboard, whether to copy without the search text (the
+default) or anyway. That is a nudge and not a guarantee: a secret that does not look like one passes. Where the browser
+does not let the page write to the clipboard, the link is shown in a field, selected, to copy from; "Link copied" is
+announced in the count's live region.
+
+A link that brings a search or filters (a fragment with `q=` or any of the parameters above, opened in a new tab, in this
+one, or pasted into its address bar) is applied, the search text leaves the address at once, and a line under the bar says
+"This view was opened from a link with a search and filters applied" with a **Clear** button, until you change the search or
+the filters: a crafted link can not narrow the timeline without your seeing it. The old `?q=` of the query string is not read.

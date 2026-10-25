@@ -3,6 +3,7 @@ import { Bot, ExternalLink, User } from 'lucide-react';
 import { clsx } from 'clsx';
 import { usePaged } from '../../hooks/usePaged';
 import { formatTimestamp } from '../../lib/formatTimestamp';
+import { toolCallTexts } from '../../lib/timelineSearch';
 import {
   failedToolCount,
   hasText,
@@ -18,6 +19,9 @@ import { CardHeader, type CardSelection } from './CardHeader';
 import { ClampedText } from './ClampedText';
 import { HiddenCharsNotice, HiddenText } from './HiddenText';
 import { RENDER_LIMITS } from './limits';
+import { Section } from './NodeUiScope';
+import { useHiddenMatches } from './searchHighlight';
+import { SearchNotes } from './SearchNotes';
 import { ShowMore } from './ShowMore';
 import { StimulusPane } from './StimulusPane';
 import { ToolCallCard } from './ToolCallCard';
@@ -77,7 +81,7 @@ function TranscriptHeader({ interaction, origin, failedTools, selection }: Heade
         </>
       }
       time={formatTimestamp(interaction.timestamp)}
-      model={modelName ? <HiddenText text={modelName} mode="strict" /> : null}
+      model={modelName ? <HiddenText text={modelName} mode="strict" marks={false} /> : null}
     />
   );
 }
@@ -105,7 +109,8 @@ function TextPane({
 
 /** The tool cards of a step, a page at a time. The heading counts all of them. */
 function ToolCalls({ tools }: { tools: ToolExecution[] }) {
-  const { visible, remaining, showMore } = usePaged(tools.length, RENDER_LIMITS.toolCalls);
+  const { visible, remaining, showMore } = usePaged(tools.length, RENDER_LIMITS.toolCalls, 'calls');
+  const hiddenMatches = useHiddenMatches(tools, visible, toolCallTexts);
   return (
     <div className="rr-code min-w-0 rounded-[1.25rem] p-4">
       <div className={clsx(PANE_LABEL, 'text-action')}>
@@ -115,11 +120,13 @@ function ToolCalls({ tools }: { tools: ToolExecution[] }) {
       <ul className="mt-2 space-y-2">
         {tools.slice(0, visible).map((exec, index) => (
           <li key={index} className="min-w-0">
-            <ToolCallCard exec={exec} />
+            <Section name={`call-${index}`}>
+              <ToolCallCard exec={exec} />
+            </Section>
           </li>
         ))}
       </ul>
-      <ShowMore remaining={remaining} page={RENDER_LIMITS.toolCalls} one="tool call" many="tool calls" onShow={showMore} />
+      <ShowMore remaining={remaining} page={RENDER_LIMITS.toolCalls} one="tool call" many="tool calls" onShow={showMore} matches={hiddenMatches} />
     </div>
   );
 }
@@ -162,33 +169,44 @@ export function TranscriptNodeBody({ interaction, parentToolNames = null, select
     <>
       <TranscriptHeader interaction={interaction} origin={origin} failedTools={failedToolCount(interaction)} selection={selection} />
       <HiddenCharsNotice />
+      <SearchNotes interaction={interaction} />
       <div className="space-y-3" data-layout="transcript">
-        <StimulusPane
-          segments={segments}
-          origin={origin}
-          author={author}
-          promptIsEmbedded={!undivided && promptIsEmbedded(interaction, segments)}
-          undividedText={undivided && typeof interaction.user_prompt === 'string' ? interaction.user_prompt : null}
-        />
-        {hasText(interaction.model_cot) && (
-          <TextPane
-            label="Reasoning"
-            labelClass="text-muted"
-            text={interaction.model_cot}
-            lines={4}
-            textClass="font-serif text-sm leading-relaxed text-muted"
+        <Section name="stimulus">
+          <StimulusPane
+            segments={segments}
+            origin={origin}
+            author={author}
+            promptIsEmbedded={!undivided && promptIsEmbedded(interaction, segments)}
+            undividedText={undivided && typeof interaction.user_prompt === 'string' ? interaction.user_prompt : null}
           />
+        </Section>
+        {hasText(interaction.model_cot) && (
+          <Section name="reasoning">
+            <TextPane
+              label="Reasoning"
+              labelClass="text-muted"
+              text={interaction.model_cot}
+              lines={4}
+              textClass="font-serif text-sm leading-relaxed text-muted"
+            />
+          </Section>
         )}
         {hasText(interaction.model_response) && (
-          <TextPane
-            label="Response"
-            labelClass="text-action"
-            text={interaction.model_response}
-            lines={6}
-            textClass="font-serif text-sm leading-relaxed text-ink"
-          />
+          <Section name="response">
+            <TextPane
+              label="Response"
+              labelClass="text-action"
+              text={interaction.model_response}
+              lines={6}
+              textClass="font-serif text-sm leading-relaxed text-ink"
+            />
+          </Section>
         )}
-        {tools.length > 0 && <ToolCalls tools={tools} />}
+        {tools.length > 0 && (
+          <Section name="tools">
+            <ToolCalls tools={tools} />
+          </Section>
+        )}
         {children}
       </div>
     </>
