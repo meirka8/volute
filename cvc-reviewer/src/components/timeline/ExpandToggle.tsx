@@ -1,3 +1,5 @@
+import { matchesLabel } from './searchHighlight';
+
 interface ExpandToggleProps {
   expanded: boolean;
   onToggle: () => void;
@@ -6,6 +8,8 @@ interface ExpandToggleProps {
   expandedLabel?: string;
   /** Id of the element this button expands or collapses. */
   controls?: string;
+  /** While the timeline is searched: how many matches the folded text holds, said on the control while it is closed. */
+  matches?: number;
 }
 
 /**
@@ -22,6 +26,7 @@ export function ExpandToggle({
   collapsedLabel,
   expandedLabel = 'Show less',
   controls,
+  matches = 0,
 }: ExpandToggleProps) {
   return (
     <button
@@ -34,7 +39,7 @@ export function ExpandToggle({
       }}
       className="mt-2 text-xs text-action transition-colors hover:opacity-80"
     >
-      {expanded ? expandedLabel : collapsedLabel}
+      {expanded ? expandedLabel : collapsedLabel + matchesLabel(matches)}
     </button>
   );
 }

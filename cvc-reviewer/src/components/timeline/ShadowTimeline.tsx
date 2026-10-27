@@ -1,9 +1,15 @@
-import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import { memo, useCallback, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref, type RefObject } from 'react';
 import { AlertTriangle, Brain, GitPullRequest } from 'lucide-react';
-import { useWindowedList } from '../../hooks/useWindowedList';
+import { useTimelineSearch } from '../../hooks/useTimelineSearch';
+import { useWindowedList, type ListControls } from '../../hooks/useWindowedList';
+import type { CommitInfo } from '../../lib/timelineSearch';
 import { parentToolNamesByNode, type ParentToolCall } from '../../lib/transcriptNode';
 import { NodeErrorBoundary } from './NodeErrorBoundary';
+import { NodeUiProvider } from './NodeUiScope';
+import { NodeUiStore } from './nodeUiState';
+import { HighlightContext } from './searchHighlight';
 import { TimelineNode } from './TimelineNode';
+import { TimelineSearchBar } from './TimelineSearchBar';
 import type { InteractionNode } from '../../types/cvc';
 
 interface ShadowTimelineProps {
@@ -14,6 +20,10 @@ interface ShadowTimelineProps {
   isLoading?: boolean;
   /** Shown as a small warning banner, e.g. when history was capped for an older repo. */
   notice?: string;
+  /** The pull request's commits, oldest first, for the commit filter. Without them it offers the commits the steps are linked to. */
+  commits?: readonly CommitInfo[];
+  /** The file open in the diff pane, which the "touches the open file" filter means. */
+  openFile?: string | null;
 }
 
 interface TimelineItemProps {
@@ -27,6 +37,8 @@ interface TimelineItemProps {
   /** Where this step is among all of them (from 1) and how many there are, when the list is windowed. */
   position?: number;
   setSize?: number;
+  /** The search is on this step: it is outlined (and is not the selected one). */
+  isCurrent: boolean;
 }
 
 /**
@@ -47,6 +59,7 @@ const TimelineItem = memo(function TimelineItem({
   seen,
   position,
   setSize,
+  isCurrent,
 }: TimelineItemProps) {
   const id = interaction.id;
   const onSelect = useCallback(() => onSelectInteraction(id), [onSelectInteraction, id]);
@@ -66,6 +79,7 @@ const TimelineItem = memo(function TimelineItem({
         parentToolNames={parentToolNames}
         enter={enter}
         listPosition={listPosition}
+        isCurrent={isCurrent}
       />
     </NodeErrorBoundary>
   );
@@ -74,11 +88,22 @@ const TimelineItem = memo(function TimelineItem({
 const NO_STEPS: ReadonlySet<string> = new Set();
 
 interface TimelineListProps {
-  /** Every step, newest first. */
+  /** The steps to list, newest first: all of them, or the ones a search leaves. */
   interactions: readonly InteractionNode[];
+  /** The ids of `interactions`, in order. The same array for as long as the list is. */
+  ids: readonly string[];
+  /** The ids of every step, which is what "seen before" is judged against, whatever the search leaves of them. */
+  arrivalIds: readonly string[];
+  /** What the parent of each step called, over every step: a search does not change what the steps are checked against. */
   parentToolNames: ReadonlyMap<string, readonly ParentToolCall[] | null>;
   selectedInteractionId?: string | null;
+  /** The step the search is on. */
+  currentId?: string | null;
   onSelectInteraction: (id: string) => void;
+  /** Drawn in place of the list while it is empty (a search left nothing). */
+  empty?: ReactNode;
+  /** How the parent moves the reader in the list (to a match, back to where they were). */
+  ref?: Ref<ListControls>;
 }
 
 /**
@@ -89,19 +114,30 @@ interface TimelineListProps {
  * each step, the selection, the count in the header) is worked out by the caller
  * over every step; this only chooses which cards to put on the page.
  */
-function TimelineList({ interactions, parentToolNames, selectedInteractionId, onSelectInteraction }: TimelineListProps) {
-  const ids = useMemo(() => interactions.map((interaction) => interaction.id), [interactions]);
-  const { win, windowed, scrollerRef, listRef } = useWindowedList(ids);
-  // The steps of this list, for each card to ask whether its step came with it. Noted a frame after the
+function TimelineList({
+  interactions,
+  ids,
+  arrivalIds,
+  parentToolNames,
+  selectedInteractionId,
+  currentId = null,
+  onSelectInteraction,
+  empty,
+  ref,
+}: TimelineListProps) {
+  const { win, windowed, scrollerRef, listRef, controls } = useWindowedList(ids);
+  useImperativeHandle(ref, () => controls, [controls]);
+  // The steps the timeline has, for each card to ask whether its step came with it. Noted a frame after the
   // list is drawn, not at once: the cards drawn while it settles (the window grows by a card once the
-  // heights are measured) belong to the same arrival and should fade in with the rest.
+  // heights are measured) belong to the same arrival and should fade in with the rest. It is judged over
+  // every step, not the ones a search leaves: a card the search brings back is not arriving.
   const seen = useRef<ReadonlySet<string>>(NO_STEPS);
   useLayoutEffect(() => {
     const frame = requestAnimationFrame(() => {
-      seen.current = new Set(ids);
+      seen.current = new Set(arrivalIds);
     });
     return () => cancelAnimationFrame(frame);
-  }, [ids]);
+  }, [arrivalIds]);
 
   const mounted = windowed ? interactions.slice(win.start, win.end) : interactions;
   return (
@@ -112,26 +148,44 @@ function TimelineList({ interactions, parentToolNames, selectedInteractionId, on
         formatting context: the margins of the cards stay inside it and add up as the windowing assumes. The role
         is written out because a list with its bullets removed is not announced as one by every screen reader.
       */}
-      <ol
-        ref={listRef}
-        role="list"
-        aria-label="Interactions linked to this PR"
-        className="flow-root"
-        style={windowed ? { paddingTop: win.before, paddingBottom: win.after } : undefined}
-      >
-        {mounted.map((interaction, offset) => (
-          <TimelineItem
-            key={interaction.id}
-            interaction={interaction}
-            isSelected={selectedInteractionId === interaction.id}
-            onSelectInteraction={onSelectInteraction}
-            parentToolNames={parentToolNames.get(interaction.id) ?? null}
-            seen={seen}
-            position={windowed ? win.start + offset + 1 : undefined}
-            setSize={windowed ? interactions.length : undefined}
-          />
-        ))}
-      </ol>
+      {interactions.length === 0 ? (
+        empty
+      ) : (
+        <ol
+          ref={listRef}
+          role="list"
+          aria-label="Interactions linked to this PR"
+          className="flow-root"
+          style={windowed ? { paddingTop: win.before, paddingBottom: win.after } : undefined}
+        >
+          {mounted.map((interaction, offset) => (
+            <TimelineItem
+              key={interaction.id}
+              interaction={interaction}
+              isSelected={selectedInteractionId === interaction.id}
+              onSelectInteraction={onSelectInteraction}
+              parentToolNames={parentToolNames.get(interaction.id) ?? null}
+              seen={seen}
+              position={windowed ? win.start + offset + 1 : undefined}
+              setSize={windowed ? interactions.length : undefined}
+              isCurrent={currentId === interaction.id}
+            />
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+/** What the list says in place of the steps when a search or a filter leaves none. */
+function NoMatches({ onClear }: { onClear: () => void }) {
+  return (
+    <div className="flex flex-col items-center gap-2 px-6 py-10 text-center text-muted">
+      <p className="text-sm font-medium">No steps match</p>
+      <p className="text-xs">Nothing in this timeline has what the search and the filters ask for together.</p>
+      <button type="button" onClick={onClear} className="text-xs text-action transition-colors hover:opacity-80">
+        Clear search and filters
+      </button>
     </div>
   );
 }
@@ -143,6 +197,8 @@ export function ShadowTimeline({
   prTitle,
   isLoading = false,
   notice,
+  commits,
+  openFile = null,
 }: ShadowTimelineProps) {
   // Sort interactions by timestamp (newest first for review flow)
   const sortedInteractions = useMemo(() => {
@@ -158,6 +214,14 @@ export function ShadowTimeline({
     latestSelect.current = onSelectInteraction;
   }, [onSelectInteraction]);
   const selectInteraction = useCallback((id: string) => latestSelect.current?.(id), []);
+  // What the reader has opened in each step, which outlives the card (a search takes cards off the page, and so does scrolling).
+  const [store] = useState(() => new NodeUiStore());
+  const listControls = useRef<ListControls | null>(null);
+  const searchBox = useRef<HTMLInputElement | null>(null);
+  const search = useTimelineSearch({ steps: sortedInteractions, commits, openFile, listControls, parentToolNames });
+  const allIds = useMemo(() => sortedInteractions.map((interaction) => interaction.id), [sortedInteractions]);
+  const shown = search.steps;
+  const shownIds = useMemo(() => (shown === sortedInteractions ? allIds : shown.map((interaction) => interaction.id)), [shown, sortedInteractions, allIds]);
 
   if (isLoading) {
     return (
@@ -193,16 +257,34 @@ export function ShadowTimeline({
   }
 
   return (
-    <div className="h-full flex flex-col">
-      <TimelineHeader prTitle={prTitle} count={interactions.length} notice={notice} />
+    <NodeUiProvider store={store}>
+      <div className="h-full flex flex-col">
+        <TimelineHeader prTitle={prTitle} count={interactions.length} notice={notice} />
+        <TimelineSearchBar search={search} inputRef={searchBox} />
 
-      <TimelineList
-        interactions={sortedInteractions}
-        parentToolNames={parentToolNames}
-        selectedInteractionId={selectedInteractionId}
-        onSelectInteraction={selectInteraction}
-      />
-    </div>
+        <HighlightContext.Provider value={search.highlight}>
+          <TimelineList
+            ref={listControls}
+            interactions={shown}
+            ids={shownIds}
+            arrivalIds={allIds}
+            parentToolNames={parentToolNames}
+            selectedInteractionId={selectedInteractionId}
+            currentId={search.hasQuery ? search.currentId : null}
+            onSelectInteraction={selectInteraction}
+            empty={
+              <NoMatches
+                onClear={() => {
+                  search.clearAll();
+                  // The button is gone with the empty state: the keyboard goes to the box, where the next search starts.
+                  searchBox.current?.focus();
+                }}
+              />
+            }
+          />
+        </HighlightContext.Provider>
+      </div>
+    </NodeUiProvider>
   );
 }
 
