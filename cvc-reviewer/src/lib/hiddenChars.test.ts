@@ -6,14 +6,17 @@ import {
   hiddenCodePointLabel,
   hiddenTitle,
   hiddenToken,
+  isHiddenCodePoint,
   MAX_HIDDEN_TOKENS,
   splitHidden,
+  stripHidden,
   type HiddenMode,
   type HiddenSegment,
 } from './hiddenChars';
 
 // ---------------------------------------------------------------------------
-// The class, written out as the issue states it, independently of the module.
+// The class, written out independently of the module: Unicode's Default_Ignorable_Code_Point
+// property, the C0 and C1 controls, and the interlinear annotation characters.
 // ---------------------------------------------------------------------------
 
 type Range = readonly [number, number];
@@ -33,14 +36,15 @@ const BASELINE: readonly Range[] = [
   [0x180b, 0x180f],
   [0x200b, 0x200f],
   [0x202a, 0x202e],
-  [0x2060, 0x2064],
-  [0x2066, 0x206f],
+  [0x2060, 0x206f], // including the unassigned U+2065
   [0x3164, 0x3164],
   [0xfeff, 0xfeff],
   [0xffa0, 0xffa0],
-  [0xfff9, 0xfffb],
-  [0xe0000, 0xe007f], // tag characters
-  [0xe0100, 0xe01ef], // variation selectors supplement
+  [0xfff0, 0xfff8], // unassigned code points of the Specials block that the property lists
+  [0xfff9, 0xfffb], // interlinear annotation
+  [0x1bca0, 0x1bca3], // shorthand format controls
+  [0x1d173, 0x1d17a], // musical symbols: beams, ties, slurs and phrases
+  [0xe0000, 0xe0fff], // tag characters, variation selectors supplement, and the code points around them
 ];
 /** Hidden only where text is code-like. */
 const STRICT_ONLY: readonly Range[] = [
@@ -85,6 +89,48 @@ describe('the class of hidden characters', () => {
     expect(wrong).toEqual([]);
   });
 
+  it('covers every Default_Ignorable_Code_Point, and has no other member than the documented extras', () => {
+    // The oracle is the engine's own copy of Unicode's property: nothing of this module is used to build it.
+    const defaultIgnorable = /\p{Default_Ignorable_Code_Point}/u;
+    const missing: string[] = [];
+    const extra: number[] = [];
+    for (let codePoint = 0; codePoint <= 0x10ffff; codePoint++) {
+      if (codePoint >= 0xd800 && codePoint <= 0xdfff) continue; // a lone surrogate is not a code point of any text
+      const character = chr(codePoint);
+      const ignorable = defaultIgnorable.test(character);
+      const hidden = hasHiddenChars(character, 'strict');
+      if (ignorable && !hidden) missing.push(hiddenCodePointLabel(codePoint));
+      if (hidden && !ignorable) extra.push(codePoint);
+    }
+    expect(missing).toEqual([]);
+    // What the class holds besides the property: the C0 controls (but not tab, line feed and carriage return),
+    // delete, the C1 controls, and the interlinear annotation characters.
+    const documented = (codePoint: number) =>
+      (codePoint <= 0x1f && ![0x09, 0x0a, 0x0d].includes(codePoint)) || (codePoint >= 0x7f && codePoint <= 0x9f) || (codePoint >= 0xfff9 && codePoint <= 0xfffb);
+    expect(extra.filter((codePoint) => !documented(codePoint)).map(hiddenCodePointLabel)).toEqual([]);
+    expect(extra).toHaveLength(29 + 1 + 32 + 3);
+  });
+
+  it('keeps for prose the distinctions it always made: the joiners and the variation selectors are code, not text', () => {
+    const defaultIgnorable = /\p{Default_Ignorable_Code_Point}/u;
+    const keptByProse: number[] = [];
+    for (let codePoint = 0; codePoint <= 0xffff; codePoint++) {
+      if (defaultIgnorable.test(chr(codePoint)) && !hasHiddenChars(chr(codePoint), 'prose')) keptByProse.push(codePoint);
+    }
+    expect(keptByProse).toEqual([0x200c, 0x200d, ...Array.from({ length: 16 }, (_, k) => 0xfe00 + k)]);
+  });
+
+  it('answers the same for a code point as for the text that holds it (isHiddenCodePoint)', () => {
+    const wrong: string[] = [];
+    for (const mode of MODES) {
+      for (let codePoint = 0; codePoint <= 0x10ffff; codePoint++) {
+        if (codePoint >= 0xd800 && codePoint <= 0xdfff) continue;
+        if (isHiddenCodePoint(codePoint, mode) !== hasHiddenChars(chr(codePoint), mode)) wrong.push(`U+${codePoint.toString(16)} in ${mode}`);
+      }
+    }
+    expect(wrong).toEqual([]);
+  });
+
   it.each(MODES)('classifies the supplementary planes as the issue says (%s)', (mode) => {
     const wrong: string[] = [];
     // The whole block around the tag characters and the variation selectors, and the emoji planes.
@@ -93,22 +139,26 @@ describe('the class of hidden characters', () => {
         if (hasHiddenChars(chr(codePoint), mode) !== expectedHidden(codePoint, mode)) wrong.push(hiddenCodePointLabel(codePoint));
       }
     };
-    check(0xdff00, 0xe0fff);
+    check(0xdff00, 0xe1100);
+    check(0x1bc00, 0x1bd00);
+    check(0x1d100, 0x1d200);
     check(0x1f000, 0x1faff);
-    for (const codePoint of [0x10000, 0x1d173, 0x1d17a, 0x2ffff, 0x10ffff]) check(codePoint, codePoint);
+    for (const codePoint of [0x10000, 0x2ffff, 0x10ffff]) check(codePoint, codePoint);
     expect(wrong).toEqual([]);
   });
 
-  it('has the members the issue lists, counted', () => {
+  it('has the members listed above, counted', () => {
     // C0 29 (9 + 2 + 18), DEL 1, C1 32, three single characters, three short blocks (2 + 2 + 5),
-    // the zero-width block 5, bidi embeddings 5, invisible operators 5, isolates and deprecated controls 10,
-    // three single characters, the annotation block 3, tags 128, variation selectors supplement 240.
-    const baseline = 29 + 1 + 32 + 3 + (2 + 2 + 5) + 5 + 5 + 5 + 10 + 3 + 3 + 128 + 240;
-    expect(baseline).toBe(473);
+    // the zero-width block 5, bidi embeddings 5, the block from the word joiner to the deprecated format controls 16,
+    // three single characters, the reserved and annotation blocks of the Specials 12, shorthand format controls 4,
+    // musical symbols 8, and the plane-14 block of tags and selectors 4096.
+    const baseline = 29 + 1 + 32 + 3 + (2 + 2 + 5) + 5 + 5 + 16 + 3 + 12 + 4 + 8 + 4096;
+    expect(baseline).toBe(4223);
     // Strict adds U+FE00-U+FE0F; prose leaves out the joiner and non-joiner.
     expect(members('strict')).toHaveLength(baseline + 16);
     expect(members('prose')).toHaveLength(baseline - 2);
-    expect(members('strict').filter((codePoint) => !members('prose').includes(codePoint))).toHaveLength(18);
+    const prose = new Set(members('prose'));
+    expect(members('strict').filter((codePoint) => !prose.has(codePoint))).toHaveLength(18);
   });
 
   it.each([
@@ -127,17 +177,20 @@ describe('the class of hidden characters', () => {
     ['hair space', 0x200a],
     ['line separator', 0x2028],
     ['paragraph separator', 0x2029],
-    ['U+2065 (unassigned)', 0x2065],
     ['U+2070', 0x2070],
     ['U+3163', 0x3163],
     ['U+3165', 0x3165],
     ['U+FEFE', 0xfefe],
     ['U+FFA1', 0xffa1],
-    ['U+FFF8', 0xfff8],
     ['U+FFFC (object replacement)', 0xfffc],
-    ['U+E0080', 0xe0080],
-    ['U+E00FF', 0xe00ff],
-    ['U+E01F0', 0xe01f0],
+    ['U+FFEF', 0xffef],
+    ['U+FFFD (replacement character)', 0xfffd],
+    ['U+1BC9F', 0x1bc9f],
+    ['U+1BCA4', 0x1bca4],
+    ['U+1D172', 0x1d172],
+    ['U+1D17B', 0x1d17b],
+    ['U+E1000', 0xe1000],
+    ['U+DFFFF', 0xdffff],
     ['a letter', 0x61],
     ['a CJK ideograph', 0x4e2d],
   ])('does not hide %s, in either mode', (_label, codePoint) => {
@@ -175,6 +228,18 @@ describe('the class of hidden characters', () => {
     ['cancel tag', 0xe007f],
     ['variation selector 17', 0xe0100],
     ['variation selector 256', 0xe01ef],
+    ['U+2065 (unassigned)', 0x2065],
+    ['U+FFF0 (unassigned)', 0xfff0],
+    ['U+FFF8 (unassigned)', 0xfff8],
+    ['U+1BCA0', 0x1bca0],
+    ['U+1BCA3', 0x1bca3],
+    ['musical symbol begin beam', 0x1d173],
+    ['musical symbol end phrase', 0x1d17a],
+    ['U+E0002 (unassigned)', 0xe0002],
+    ['U+E0080 (unassigned)', 0xe0080],
+    ['U+E00FF (unassigned)', 0xe00ff],
+    ['U+E01F0 (unassigned)', 0xe01f0],
+    ['U+E0FFF (unassigned)', 0xe0fff],
   ])('hides %s, in both modes', (_label, codePoint) => {
     for (const mode of MODES) expect(hasHiddenChars(chr(codePoint), mode), `${hiddenCodePointLabel(codePoint)} ${mode}`).toBe(true);
   });
@@ -274,17 +339,50 @@ describe('splitHidden', () => {
     ]);
   });
 
-  it('reads the variation selectors supplement the same way, and tells the two blocks apart', () => {
+  it('reads the variation selectors supplement the same way, and the rest of plane 14 up to U+E0FFF', () => {
     expect(splitHidden(`x${chr(0xe0100)}${chr(0xe01ef)}`, 'prose')).toEqual([
       { kind: 'text', text: 'x' },
       { kind: 'hidden', codePoint: 0xe0100 },
       { kind: 'hidden', codePoint: 0xe01ef },
     ]);
-    // Just outside both blocks: the same high surrogate, other low surrogates.
-    const high = String.fromCharCode(0xdb40);
-    for (const low of [0xdbff, 0xdc80, 0xdcff, 0xddf0, 0xdfff]) {
-      expect(splitHidden(`a${high}${String.fromCharCode(low)}b`, 'strict'), `low ${low.toString(16)}`).toBeNull();
+    // Any low surrogate after one of the four high surrogates is a member (U+E0000-U+E0FFF) ...
+    for (const [high, low, codePoint] of [
+      [0xdb40, 0xdc80, 0xe0080],
+      [0xdb40, 0xddf0, 0xe01f0],
+      [0xdb41, 0xdc00, 0xe0400],
+      [0xdb42, 0xdfff, 0xe0bff],
+      [0xdb43, 0xdfff, 0xe0fff],
+    ] as const) {
+      const text = `a${String.fromCharCode(high)}${String.fromCharCode(low)}b`;
+      expect(splitHidden(text, 'strict'), `U+${codePoint.toString(16)}`).toEqual([
+        { kind: 'text', text: 'a' },
+        { kind: 'hidden', codePoint },
+        { kind: 'text', text: 'b' },
+      ]);
     }
+    // ... and nothing next to them is: a high surrogate that is not followed by a low one, and the block after.
+    const high = String.fromCharCode(0xdb40);
+    for (const unit of [0xdbff, 0xd800, 0x0041]) {
+      expect(splitHidden(`a${high}${String.fromCharCode(unit)}b`, 'strict'), `unit ${unit.toString(16)}`).toBeNull();
+    }
+    expect(splitHidden(`a${String.fromCharCode(0xdb44)}${String.fromCharCode(0xdc00)}b`, 'strict')).toBeNull(); // U+E1000
+  });
+
+  it('reads the musical symbols and the shorthand format controls, written as surrogate pairs, as the code points they are', () => {
+    expect(splitHidden(`a${chr(0x1d173)}${chr(0x1d17a)}b`, 'prose')).toEqual([
+      { kind: 'text', text: 'a' },
+      { kind: 'hidden', codePoint: 0x1d173 },
+      { kind: 'hidden', codePoint: 0x1d17a },
+      { kind: 'text', text: 'b' },
+    ]);
+    expect(splitHidden(`a${chr(0x1bca0)}${chr(0x1bca3)}b`, 'strict')).toEqual([
+      { kind: 'text', text: 'a' },
+      { kind: 'hidden', codePoint: 0x1bca0 },
+      { kind: 'hidden', codePoint: 0x1bca3 },
+      { kind: 'text', text: 'b' },
+    ]);
+    // The pairs on either side of them are ordinary characters.
+    for (const codePoint of [0x1d172, 0x1d17b, 0x1bc9f, 0x1bca4]) expect(splitHidden(`a${chr(codePoint)}b`, 'strict'), hiddenCodePointLabel(codePoint)).toBeNull();
   });
 
   it('does not misread lone and neighbouring surrogates', () => {
@@ -502,5 +600,64 @@ describe('cost', () => {
   it('is linear on the worst case for a scan that stops early: a hidden character at the very end', () => {
     const text = `${'x'.repeat(MIB - 1)}\u200B`;
     expect(time(() => expect(hasHiddenChars(text, 'strict')).toBe(true))).toBeLessThan(250);
+  });
+});
+
+describe('stripHidden', () => {
+  it('returns the very same string when there is nothing to leave out', () => {
+    const text = 'plain text, with a tab\t and a newline\n and \u00e9 and 😀';
+    for (const mode of MODES) expect(stripHidden(text, mode)).toBe(text);
+  });
+
+  it('leaves out every hidden character, so an invisible one cannot split a word', () => {
+    expect(stripHidden('pass\u200Bword', 'strict')).toBe('password');
+    expect(stripHidden('\u202Eab\u2066c\u2069d\ufeff', 'strict')).toBe('abcd');
+    expect(stripHidden(`x${chr(0xe0041)}${chr(0xe0100)}y`, 'strict')).toBe('xy');
+  });
+
+  it('keeps tab, line feed and carriage return, which are not in the class', () => {
+    expect(stripHidden('a\tb\nc\rd\u0000e', 'strict')).toBe('a\tb\nc\rde');
+  });
+
+  it('follows the two levels: prose keeps the joiners and the variation selectors', () => {
+    const family = '👨\u200D👩\u200D👧';
+    expect(stripHidden(family, 'prose')).toBe(family);
+    expect(stripHidden(family, 'strict')).toBe('👨👩👧');
+    expect(stripHidden('\u2764\ufe0f', 'prose')).toBe('\u2764\ufe0f');
+    expect(stripHidden('\u2764\ufe0f', 'strict')).toBe('\u2764');
+  });
+
+  it('agrees with the class for every code point, in both modes', () => {
+    // One walk over the whole code space with one assertion at the end: a test that makes an assertion
+    // for each of a million code points spends its time on the assertions.
+    const wrong: string[] = [];
+    for (const mode of MODES) {
+      for (let codePoint = 0; codePoint <= 0x10ffff; codePoint++) {
+        if (codePoint >= 0xd800 && codePoint <= 0xdfff) continue;
+        const text = `a${chr(codePoint)}b`;
+        if (stripHidden(text, mode) !== (expectedHidden(codePoint, mode) ? 'ab' : text)) wrong.push(`U+${codePoint.toString(16)} in ${mode}`);
+      }
+    }
+    expect(wrong).toEqual([]);
+  });
+
+  it('does not misread lone and neighbouring surrogates', () => {
+    expect(stripHidden('\ud800x', 'strict')).toBe('\ud800x');
+    expect(stripHidden('\udb40', 'strict')).toBe('\udb40');
+    expect(stripHidden('\udb40\udc41ok', 'strict')).toBe('ok');
+    expect(stripHidden('\udb43\udfffok', 'strict')).toBe('ok'); // U+E0FFF
+    expect(stripHidden('\udb44\udc00ok', 'strict')).toBe('\udb44\udc00ok'); // U+E1000
+  });
+
+  it('is linear on a mebibyte, whether it holds hidden characters or not', () => {
+    const MIB = 1024 * 1024;
+    const time = (run: () => void) => {
+      const started = performance.now();
+      run();
+      return performance.now() - started;
+    };
+    expect(time(() => expect(stripHidden('\u200B'.repeat(MIB), 'strict')).toBe(''))).toBeLessThan(750);
+    expect(time(() => expect(stripHidden('a\u200B'.repeat(MIB / 2), 'strict')).toHaveLength(MIB / 2))).toBeLessThan(750);
+    expect(time(() => expect(stripHidden('x'.repeat(MIB), 'strict')).toHaveLength(MIB))).toBeLessThan(250);
   });
 });

@@ -1,4 +1,4 @@
-import { useId, useMemo, useState, type ReactNode } from 'react';
+import { useId, useMemo, type ReactNode } from 'react';
 import { ChevronDown, ChevronRight, CircleAlert } from 'lucide-react';
 import { clsx } from 'clsx';
 import { usePaged } from '../../hooks/usePaged';
@@ -17,8 +17,18 @@ import { ClampedText } from './ClampedText';
 import { CollapsibleCode } from './CollapsibleCode';
 import { HiddenText } from './HiddenText';
 import { RENDER_LIMITS } from './limits';
+import { usePersistentToggle } from './nodeUiState';
+import { Section } from './NodeUiScope';
+import { matchesLabel, useHiddenMatches, useMatchCount } from './searchHighlight';
 import { ShowMore } from './ShowMore';
 import { BADGE_DANGER, PANE_LABEL } from './styles';
+
+/** What a tool result (or the output drawn like one) holds that a search can match. */
+const resultTexts = (result: ToolResultsItem): string | readonly string[] => (result.kind === 'tool_result' ? [toolTitle(result.tool), result.text] : result.text);
+
+/** What a block of the stimulus holds that a search can match. */
+const blockTexts = (block: StimulusBlock): string | readonly string[] =>
+  block.kind === 'tool_results' ? block.results.flatMap(resultTexts) : block.kind === 'none' ? '' : block.text;
 
 /** The line a group of tool results folds behind. */
 function SummaryToggle({
@@ -26,12 +36,15 @@ function SummaryToggle({
   controls,
   onToggle,
   hasError = false,
+  matches = 0,
   children,
 }: {
   open: boolean;
   controls: string;
   onToggle: () => void;
   hasError?: boolean;
+  /** While the timeline is searched: how many matches the folded results hold, said while they are folded. */
+  matches?: number;
   children: ReactNode;
 }) {
   return (
@@ -50,7 +63,10 @@ function SummaryToggle({
       ) : (
         <ChevronRight size={12} className="mt-0.5 shrink-0" aria-hidden="true" />
       )}
-      <span className="min-w-0 break-words">{children}</span>
+      <span className="min-w-0 break-words">
+        {children}
+        {!open && matches > 0 && matchesLabel(matches)}
+      </span>
       {hasError && <CircleAlert size={12} className="mt-0.5 shrink-0 text-danger" aria-hidden="true" />}
     </button>
   );
@@ -98,32 +114,35 @@ function OutputItem({ text }: { text: string }) {
  * the caller says to start it open. It draws a page of results at a time.
  */
 function ToolResultsGroup({ results, defaultOpen }: { results: ToolResultsItem[]; defaultOpen: boolean }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const [open, setOpen] = usePersistentToggle('open', defaultOpen);
   const id = useId();
   const summary = useMemo(() => toolResultsSummary(results), [results]);
   const hasError = useMemo(() => results.some((result) => result.kind === 'tool_result' && result.isError), [results]);
-  const { visible, remaining, showMore } = usePaged(results.length, RENDER_LIMITS.toolResultsPerGroup);
+  const { visible, remaining, showMore } = usePaged(results.length, RENDER_LIMITS.toolResultsPerGroup, 'results');
+  // What the folded results hold that the search matches: their names and their output.
+  const texts = useMemo(() => results.flatMap(resultTexts), [results]);
+  const matches = useMatchCount(texts, !open);
+  const hiddenMatches = useHiddenMatches(results, visible, resultTexts);
 
   return (
     <div className="min-w-0">
-      <SummaryToggle open={open} controls={id} onToggle={() => setOpen((value) => !value)} hasError={hasError}>
-        <HiddenText text={summary} mode="strict" />
+      <SummaryToggle open={open} controls={id} onToggle={() => setOpen((value) => !value)} hasError={hasError} matches={matches}>
+        <HiddenText text={summary} mode="strict" marks={false} />
       </SummaryToggle>
       {open && (
         <div id={id} className="mt-2 space-y-2">
-          {results.slice(0, visible).map((result, index) =>
-            result.kind === 'tool_result' ? (
-              <ToolResultItem key={index} result={result} />
-            ) : (
-              <OutputItem key={index} text={result.text} />
-            ),
-          )}
+          {results.slice(0, visible).map((result, index) => (
+            <Section key={index} name={`result-${index}`}>
+              {result.kind === 'tool_result' ? <ToolResultItem result={result} /> : <OutputItem text={result.text} />}
+            </Section>
+          ))}
           <ShowMore
             remaining={remaining}
             page={RENDER_LIMITS.toolResultsPerGroup}
             one="tool result"
             many="tool results"
             onShow={showMore}
+            matches={hiddenMatches}
           />
         </div>
       )}
@@ -140,18 +159,21 @@ const UNDIVIDED_NOTE =
  * only "Tool results": the names in the markers are exactly what is in doubt.
  */
 function UndividedStimulus({ text, defaultOpen }: { text: string; defaultOpen: boolean }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const [open, setOpen] = usePersistentToggle('open', defaultOpen);
   const id = useId();
+  const matches = useMatchCount(text, !open);
   return (
     <div className="min-w-0">
-      <SummaryToggle open={open} controls={id} onToggle={() => setOpen((value) => !value)}>
+      <SummaryToggle open={open} controls={id} onToggle={() => setOpen((value) => !value)} matches={matches}>
         Tool results
       </SummaryToggle>
       <p className="mt-2 text-xs italic text-muted">{UNDIVIDED_NOTE}</p>
       {open && (
         <div id={id} className="mt-2">
           <OutputBox>
-            <CollapsibleCode text={text} wrap maxLines={10} label="Tool output" />
+            <Section name="text">
+              <CollapsibleCode text={text} wrap maxLines={10} label="Tool output" />
+            </Section>
           </OutputBox>
         </div>
       )}
@@ -207,7 +229,8 @@ export function StimulusPane({ segments, origin, author, promptIsEmbedded, undiv
   const human = author === 'human';
   const startOpen = author !== 'system';
   const blocks = useMemo(() => groupStimulus(segments), [segments]);
-  const { visible, remaining, showMore } = usePaged(blocks.length, RENDER_LIMITS.stimulusBlocks);
+  const { visible, remaining, showMore } = usePaged(blocks.length, RENDER_LIMITS.stimulusBlocks, 'blocks');
+  const hiddenMatches = useHiddenMatches(blocks, visible, blockTexts);
 
   if (undividedText !== null) {
     return (
@@ -230,6 +253,28 @@ export function StimulusPane({ segments, origin, author, promptIsEmbedded, undiv
   // unless it has to explain that the human's message is inside one of them.
   const labelled = promptIsEmbedded || blocks.some((block) => block.kind !== 'tool_results');
 
+  const drawBlock = (block: StimulusBlock): ReactNode => {
+    switch (block.kind) {
+      case 'prompt':
+        return human ? (
+          <ClampedText text={block.text} lines={4} className="font-serif text-sm leading-relaxed text-ink" />
+        ) : (
+          <OutputBox>
+            <CollapsibleCode text={block.text} wrap maxLines={10} label="Unmarked text" />
+          </OutputBox>
+        );
+      case 'meta':
+      case 'compaction': {
+        const label = BLOCK_LABEL[block.kind] ?? null;
+        return <NoteBlock label={label === origin ? null : label} text={block.text} />;
+      }
+      case 'tool_results':
+        return <ToolResultsGroup results={block.results} defaultOpen={startOpen} />;
+      case 'none':
+        return null;
+    }
+  };
+
   return (
     <div className="rr-thought min-w-0 rounded-[1.25rem] p-4">
       {labelled && <div className={clsx(PANE_LABEL, 'text-action')}>{origin}</div>}
@@ -239,33 +284,12 @@ export function StimulusPane({ segments, origin, author, promptIsEmbedded, undiv
         </p>
       )}
       <div className={clsx('space-y-3', labelled && 'mt-2')}>
-        {blocks.slice(0, visible).map((block, index) => {
-          switch (block.kind) {
-            case 'prompt':
-              return human ? (
-                <ClampedText
-                  key={index}
-                  text={block.text}
-                  lines={4}
-                  className="font-serif text-sm leading-relaxed text-ink"
-                />
-              ) : (
-                <OutputBox key={index}>
-                  <CollapsibleCode text={block.text} wrap maxLines={10} label="Unmarked text" />
-                </OutputBox>
-              );
-            case 'meta':
-            case 'compaction': {
-              const label = BLOCK_LABEL[block.kind] ?? null;
-              return <NoteBlock key={index} label={label === origin ? null : label} text={block.text} />;
-            }
-            case 'tool_results':
-              return <ToolResultsGroup key={index} results={block.results} defaultOpen={startOpen} />;
-            case 'none':
-              return null;
-          }
-        })}
-        <ShowMore remaining={remaining} page={RENDER_LIMITS.stimulusBlocks} one="part" many="parts" onShow={showMore} />
+        {blocks.slice(0, visible).map((block, index) => (
+          <Section key={index} name={`block-${index}`}>
+            {drawBlock(block)}
+          </Section>
+        ))}
+        <ShowMore remaining={remaining} page={RENDER_LIMITS.stimulusBlocks} one="part" many="parts" onShow={showMore} matches={hiddenMatches} />
       </div>
     </div>
   );

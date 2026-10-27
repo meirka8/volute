@@ -12,10 +12,16 @@ import {
 import { clsx } from 'clsx';
 import { formatTimestamp } from '../../lib/formatTimestamp';
 import { hiddenAsText } from '../../lib/hiddenChars';
+import { toolTitle } from '../../lib/toolCalls';
+import { actionLineText, getActionLines, getObservation, getThought, hasContent, showsReasoning, type ActionLine } from '../../lib/triadNode';
 import { nodeLayout, type ParentToolCall } from '../../lib/transcriptNode';
 import type { InteractionNode } from '../../types/cvc';
 import { CardHeader, type CardSelection } from './CardHeader';
 import { HiddenCharsNotice, HiddenCharsScope, HiddenText } from './HiddenText';
+import { usePersistentToggle } from './nodeUiState';
+import { NodeUiScope } from './NodeUiScope';
+import { matchesLabel, useIsSearching, useMatchCount } from './searchHighlight';
+import { MarkBudgetScope, SearchNotes } from './SearchNotes';
 import { TranscriptNodeBody } from './TranscriptNodeBody';
 
 interface TimelineNodeProps {
@@ -36,6 +42,11 @@ interface TimelineNodeProps {
    * are, so assistive technology can say "3 of 10,000" and not "3 of 12".
    */
   listPosition?: { position: number; size: number };
+  /**
+   * The step the search is on (the one "n of m" counts, which next and previous move between). It is
+   * outlined. That is not selection: nothing else about the card changes.
+   */
+  isCurrent?: boolean;
 }
 
 function getAuthorIcon(author: InteractionNode['author']) {
@@ -69,60 +80,32 @@ function getAuthorLabel(author: InteractionNode['author']) {
 }
 
 /**
- * Check if text has meaningful content (not just whitespace, newlines, quotes).
+ * One line of the Action pane. The parts of it the capture recorded are searched and marked, each as the kind of
+ * text it is (the name of a tool, a file), and the Reviewer's own words are not. Without a search the line is drawn
+ * as one piece of text, exactly as it always was.
  */
-function hasContent(text: string | null | undefined): boolean {
-  if (!text) return false;
-  const cleaned = text.replace(/[\s\n\r\t"'`]/g, '');
-  return cleaned.length > 0;
-}
-
-function getThoughtText(interaction: InteractionNode): string {
-  if (hasContent(interaction.user_prompt)) {
-    return interaction.user_prompt!;
-  }
-
-  if (!hasContent(interaction.model_cot) && hasContent(interaction.model_response)) {
-    return interaction.model_response!;
-  }
-
-  if (hasContent(interaction.model_cot)) {
-    return 'No primary prompt was recorded for this AI step.';
-  }
-
-  return 'No explicit thought was recorded for this step.';
-}
-
-function getActionLines(interaction: InteractionNode): string[] {
-  if (interaction.tool_executions.length > 0) {
-    return interaction.tool_executions.map((tool) => {
-      const args = tool.arguments?.trim();
-      return args ? `${tool.tool_name} ${args}` : tool.tool_name;
-    });
-  }
-
-  if (interaction.artifact_links.length > 0) {
-    return interaction.artifact_links.map(
-      (link) =>
-        `${link.link_type === 'temporal' ? 'low-confidence temporal link' : link.link_type} ${link.git_commit_hash.substring(0, 7)}`,
+function ActionLineText({ line }: { line: ActionLine }) {
+  const searching = useIsSearching();
+  if (line.kind === 'none') return <HiddenText text={line.text} mode="strict" marks={false} />;
+  if (!searching) return <HiddenText text={actionLineText(line)} mode="strict" />;
+  if (line.kind === 'link') {
+    return (
+      <>
+        <HiddenText text={line.word} mode="strict" marks={false} /> <HiddenText text={line.hash} mode="strict" scope="commit" full={line.full} />
+      </>
     );
   }
-
-  return ['No recorded tool execution.'];
-}
-
-function getObservationText(interaction: InteractionNode): string {
-  if (hasContent(interaction.model_response)) {
-    return interaction.model_response!;
-  }
-
-  if (interaction.tool_executions.length > 0) {
-    return interaction.tool_executions
-      .map((tool) => `${tool.status === 'success' ? 'pass' : 'fail'} ${tool.tool_name}`)
-      .join('\n');
-  }
-
-  return 'No recorded observation.';
+  return (
+    <>
+      <HiddenText text={line.name} mode="strict" scope="tool" full={toolTitle(line.name)} />
+      {line.args !== '' && (
+        <>
+          {' '}
+          <HiddenText text={line.args} mode="strict" scope="path" />
+        </>
+      )}
+    </>
+  );
 }
 
 function getSignal(interaction: InteractionNode) {
@@ -168,20 +151,24 @@ function confidence(link: InteractionNode['artifact_links'][number]) {
  * doing so exactly as before (see TimelineNode.triad.test.tsx).
  */
 function TriadNodeBody({ interaction, selection }: { interaction: InteractionNode; selection: CardSelection }) {
-  const [isReasoningExpanded, setIsReasoningExpanded] = useState(false);
-  const [isThoughtExpanded, setIsThoughtExpanded] = useState(false);
-  const [isObservationExpanded, setIsObservationExpanded] = useState(false);
+  const [isReasoningExpanded, setIsReasoningExpanded] = usePersistentToggle('why', false);
+  const [isThoughtExpanded, setIsThoughtExpanded] = usePersistentToggle('thought', false);
+  const [isObservationExpanded, setIsObservationExpanded] = usePersistentToggle('observation', false);
   const [thoughtElement, setThoughtElement] = useState<HTMLParagraphElement | null>(null);
   const [observationElement, setObservationElement] = useState<HTMLParagraphElement | null>(null);
   const [isThoughtTruncated, setIsThoughtTruncated] = useState(false);
   const [isObservationTruncated, setIsObservationTruncated] = useState(false);
 
   const hasReasoning = hasContent(interaction.model_cot);
-  const showWhyButton = interaction.author === 'agent' && hasReasoning;
-  const thoughtText = getThoughtText(interaction);
-  const observationText = getObservationText(interaction);
+  const showWhyButton = showsReasoning(interaction);
+  const { text: thoughtText, recorded: thoughtRecorded } = getThought(interaction);
+  const { text: observationText, recorded: observationRecorded } = getObservation(interaction);
   const actionLines = getActionLines(interaction);
   const signal = getSignal(interaction);
+  // While the timeline is searched: what each fold that is shut holds, said on its control.
+  const thoughtMatches = useMatchCount(thoughtText, thoughtRecorded && !isThoughtExpanded && isThoughtTruncated);
+  const observationMatches = useMatchCount(observationText, observationRecorded && !isObservationExpanded && isObservationTruncated);
+  const reasoningMatches = useMatchCount(interaction.model_cot ?? '', showWhyButton && !isReasoningExpanded);
 
   const thoughtRef = useCallback((node: HTMLParagraphElement | null) => {
     setThoughtElement(node);
@@ -243,10 +230,11 @@ function TriadNodeBody({ interaction, selection }: { interaction: InteractionNod
           </>
         }
         time={formatTimestamp(interaction.timestamp)}
-        model={interaction.model_name ? <HiddenText text={interaction.model_name} mode="strict" /> : null}
+        model={interaction.model_name ? <HiddenText text={interaction.model_name} mode="strict" marks={false} /> : null}
       />
 
       <HiddenCharsNotice />
+      <SearchNotes interaction={interaction} />
 
       <div className="space-y-3">
         <div className="rr-thought rounded-[1.25rem] p-4">
@@ -258,7 +246,7 @@ function TriadNodeBody({ interaction, selection }: { interaction: InteractionNod
               !isThoughtExpanded && 'line-clamp-4'
             )}
           >
-            <HiddenText text={thoughtText} mode="prose" />
+            <HiddenText text={thoughtText} mode="prose" marks={thoughtRecorded} />
           </p>
           {(isThoughtTruncated || isThoughtExpanded) && (
             <button
@@ -268,7 +256,7 @@ function TriadNodeBody({ interaction, selection }: { interaction: InteractionNod
               }}
               className="mt-2 text-xs text-action transition-colors hover:opacity-80"
             >
-              {isThoughtExpanded ? 'Show less' : 'Show more'}
+              {isThoughtExpanded ? 'Show less' : `Show more${matchesLabel(thoughtMatches)}`}
             </button>
           )}
         </div>
@@ -277,8 +265,8 @@ function TriadNodeBody({ interaction, selection }: { interaction: InteractionNod
           <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-action">Action</div>
           <div className="mt-2 space-y-2">
             {actionLines.map((line, index) => (
-              <div key={`${index}-${line}`} className="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink">
-                <HiddenText text={line} mode="strict" />
+              <div key={`${index}-${actionLineText(line)}`} className="rounded-2xl bg-canvas/75 px-3 py-2 font-mono text-xs text-ink">
+                <ActionLineText line={line} />
               </div>
             ))}
           </div>
@@ -297,6 +285,7 @@ function TriadNodeBody({ interaction, selection }: { interaction: InteractionNod
               >
                 {isReasoningExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
                 <span>Why?</span>
+                {!isReasoningExpanded && reasoningMatches > 0 && <span className="text-muted">{matchesLabel(reasoningMatches)}</span>}
               </button>
             )}
           </div>
@@ -307,7 +296,7 @@ function TriadNodeBody({ interaction, selection }: { interaction: InteractionNod
               !isObservationExpanded && 'line-clamp-4'
             )}
           >
-            <HiddenText text={observationText} mode="strict" />
+            <HiddenText text={observationText} mode="strict" marks={observationRecorded} />
           </p>
           {(isObservationTruncated || isObservationExpanded) && (
             <button
@@ -317,7 +306,7 @@ function TriadNodeBody({ interaction, selection }: { interaction: InteractionNod
               }}
               className="mt-2 text-xs text-action transition-colors hover:opacity-80"
             >
-              {isObservationExpanded ? 'Show less' : 'Show more'}
+              {isObservationExpanded ? 'Show less' : `Show more${matchesLabel(observationMatches)}`}
             </button>
           )}
 
@@ -374,7 +363,7 @@ function ArtifactLinkChips({ links }: { links: InteractionNode['artifact_links']
           >
             <GitCommit size={10} />
             <span className="font-mono">
-              <HiddenText text={link.git_commit_hash.substring(0, 7)} mode="strict" />
+              <HiddenText text={link.git_commit_hash.substring(0, 7)} mode="strict" scope="commit" full={link.git_commit_hash} />
             </span>
             <span className="text-muted/80">
               ({confidenceInfo.label})
@@ -419,6 +408,7 @@ export function TimelineNode({
   parentToolNames = null,
   enter = false,
   listPosition,
+  isCurrent = false,
 }: TimelineNodeProps) {
   const baseId = useId();
   const selection: CardSelection = { pressed: isSelected, onSelect, speakerId: `${baseId}-speaker`, timeId: `${baseId}-time` };
@@ -427,9 +417,11 @@ export function TimelineNode({
       aria-labelledby={`${selection.speakerId} ${selection.timeId}`}
       aria-posinset={listPosition?.position}
       aria-setsize={listPosition?.size}
+      aria-current={isCurrent ? 'true' : undefined}
       className={clsx(
         'mx-3 my-3 cursor-pointer rounded-[1.5rem] border p-4 transition-colors',
         enter && 'rr-card-enter',
+        isCurrent && 'rr-current-match',
         isSelected
           ? 'rr-selected-card border-action bg-action/10'
           : 'border-line bg-surface/55 hover:border-action/35 hover:bg-canvas/70'
@@ -439,15 +431,19 @@ export function TimelineNode({
         onSelect?.();
       }}
     >
-      <HiddenCharsScope>
-        {nodeLayout(interaction) === 'transcript' ? (
-          <TranscriptNodeBody interaction={interaction} parentToolNames={parentToolNames} selection={selection}>
-            <ArtifactLinkChips links={interaction.artifact_links} />
-          </TranscriptNodeBody>
-        ) : (
-          <TriadNodeBody interaction={interaction} selection={selection} />
-        )}
-      </HiddenCharsScope>
+      <NodeUiScope nodeId={interaction.id}>
+        <HiddenCharsScope>
+          <MarkBudgetScope>
+            {nodeLayout(interaction) === 'transcript' ? (
+              <TranscriptNodeBody interaction={interaction} parentToolNames={parentToolNames} selection={selection}>
+                <ArtifactLinkChips links={interaction.artifact_links} />
+              </TranscriptNodeBody>
+            ) : (
+              <TriadNodeBody interaction={interaction} selection={selection} />
+            )}
+          </MarkBudgetScope>
+        </HiddenCharsScope>
+      </NodeUiScope>
     </li>
   );
 }

@@ -5,6 +5,8 @@ import type { HiddenMode } from '../../lib/hiddenChars';
 import { displayText, exceedsLines } from '../../lib/textLines';
 import { ExpandToggle } from './ExpandToggle';
 import { HiddenText } from './HiddenText';
+import { usePersistentToggle } from './nodeUiState';
+import { useMatchCount } from './searchHighlight';
 
 // Literal class names, so Tailwind's scanner finds them.
 const CLAMP_CLASS = {
@@ -36,13 +38,14 @@ interface ClampedTextProps {
  * measuring, which also keeps the control available where layout is not computed.
  */
 export function ClampedText({ text, lines = 4, mode = 'prose', className }: ClampedTextProps) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = usePersistentToggle('expanded', false);
   const [element, setElement] = useState<HTMLElement | null>(null);
   const shown = useMemo(() => displayText(text), [text]);
   const measuredClamp = useIsClamped(element, expanded, shown);
   const id = useId();
 
   const canExpand = measuredClamp || exceedsLines(shown, lines);
+  const matches = useMatchCount(shown, canExpand && !expanded);
   return (
     <div className="min-w-0">
       <p
@@ -58,6 +61,7 @@ export function ClampedText({ text, lines = 4, mode = 'prose', className }: Clam
           onToggle={() => setExpanded((value) => !value)}
           collapsedLabel="Show more"
           controls={id}
+          matches={matches}
         />
       )}
     </div>

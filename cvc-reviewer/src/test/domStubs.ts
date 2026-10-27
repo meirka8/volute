@@ -1,4 +1,5 @@
 import { vi } from 'vitest';
+import { restoreLayoutStubs } from './layoutStubs';
 
 /**
  * Minimal `ResizeObserver` stand-in. jsdom does not implement it, and the
@@ -28,6 +29,7 @@ export function installDomStubs(): void {
 }
 
 export function restoreDomStubs(): void {
+  restoreLayoutStubs();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 }
