@@ -11,6 +11,12 @@ if (-not [Uri]::TryCreate($ReleaseBaseUrl, [UriKind]::Absolute, [ref]$BaseUri) -
 if (-not [string]::IsNullOrEmpty($BaseUri.UserInfo) -or -not [string]::IsNullOrEmpty($BaseUri.Query) -or -not [string]::IsNullOrEmpty($BaseUri.Fragment)) { throw "CVC_RELEASE_BASE_URL must not contain credentials, a query, or a fragment." }
 if (-not [IO.Path]::IsPathRooted($InstallDir) -or $InstallDir -match '[\x00-\x1f;*?]') { throw "CVC_INSTALL_DIR must be a safe absolute filesystem path." }
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
+# The release archive also carries LICENSE and THIRD-PARTY-NOTICES.md. They are
+# installed into a share directory beside the install directory:
+# %USERPROFILE%\.cvc\bin gives %USERPROFILE%\.cvc\share\cvc, and a custom
+# <prefix>\bin gives <prefix>\share\cvc.
+$SharePrefix = [IO.Path]::GetFullPath((Join-Path $InstallDir '..'))
+$ShareDir = Join-Path (Join-Path $SharePrefix 'share') 'cvc'
 if ($ReleaseVersion -ne "latest" -and $ReleaseVersion -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
     throw "CVC_RELEASE_VERSION must be exactly v<semver> (without build metadata), or unset."
 }
@@ -18,6 +24,7 @@ if ($ReleaseVersion -ne "latest" -and $ReleaseVersion -notmatch '^v(0|[1-9]\d*)\
 $MaxArchiveBytes = 256MB
 $MaxChecksumBytes = 1MB
 $MaxBinaryBytes = 128MB
+$MaxNoticeBytes = 16MB
 
 function Test-AllowedRedirect([Uri]$Initial, [Uri]$Target) {
     if ($Target.Scheme -ne 'https' -or -not [string]::IsNullOrEmpty($Target.UserInfo)) { return $false }
@@ -88,6 +95,43 @@ function Expand-SafeBinary([string]$Archive, [string]$Member, [string]$Destinati
     } finally { $Zip.Dispose() }
 }
 
+# Like Expand-SafeBinary, for the optional license and third-party notices:
+# $true once the archive's one entry named $Member (not empty, at most
+# $MaximumBytes) has been written to $Destination, a new file. $false, with no
+# file left at $Destination, when the archive has no such entry or it cannot be
+# extracted within those limits. It does not throw for either: a release that
+# predates the notices is installed without them.
+function Expand-OptionalNotice([string]$Archive, [string]$Member, [string]$Destination, [long]$MaximumBytes) {
+    $Staged = $false
+    $Created = $false
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $Zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+        try {
+            $Entries = @($Zip.Entries | Where-Object { $_.FullName -ceq $Member })
+            if ($Entries.Count -eq 1 -and $Entries[0].Length -gt 0 -and $Entries[0].Length -le $MaximumBytes) {
+                $InputStream = $Entries[0].Open()
+                $OutputStream = New-Object IO.FileStream($Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                $Created = $true
+                try {
+                    $Buffer = New-Object byte[] 65536
+                    [long]$Total = 0
+                    while (($Read = $InputStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+                        $Total += $Read
+                        if ($Total -gt $MaximumBytes) { throw "Expanded notice is unexpectedly large: $Member" }
+                        $OutputStream.Write($Buffer, 0, $Read)
+                    }
+                    $OutputStream.Flush($true)
+                    $Staged = $Total -gt 0
+                }
+                finally { $OutputStream.Dispose(); $InputStream.Dispose() }
+            }
+        } finally { $Zip.Dispose() }
+    } catch { $Staged = $false }
+    if ((-not $Staged) -and $Created) { Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue }
+    return $Staged
+}
+
 # 'absent', 'file' (a regular file), or 'other' (a directory or any reparse
 # point, which are never replaced or deleted).
 function Get-CvcPathKind([string]$Path) {
@@ -155,6 +199,49 @@ function Publish-CvcBinaries([string]$InstallDir, [string[]]$MoveOrder, [hashtab
     }
 }
 
+# Installs the staged notices (a hashtable of file name to a staged file) into
+# $ShareDir. The checks come first and are all or nothing: an unsafe directory or
+# an unsafe existing target stops it before anything is replaced. Each file is
+# copied into $ShareDir under a temporary name (so the final move stays on one
+# volume) and then replaces the installed one, so a re-run leaves exactly one
+# copy of each file. The notices are documentation, so this never throws: on any
+# problem it warns and returns $false, and the install carries on without them.
+function Publish-CvcNotices([string]$ShareDir, [hashtable]$Staged) {
+    $Temporary = @{}
+    try {
+        if (Test-Path -LiteralPath $ShareDir) {
+            $ShareItem = Get-Item -LiteralPath $ShareDir -Force
+            if (-not $ShareItem.PSIsContainer -or ($ShareItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "not a safe directory: $ShareDir" }
+        } else { New-Item -ItemType Directory -Path $ShareDir | Out-Null }
+        foreach ($Name in @($Staged.Keys)) {
+            $Target = Join-Path $ShareDir $Name
+            if ((Get-CvcPathKind $Target) -eq 'other') { throw "refusing unsafe existing target: $Target" }
+        }
+        foreach ($Name in @($Staged.Keys)) {
+            $Copy = Join-Path $ShareDir ('.cvc-' + $Name + '.' + [Guid]::NewGuid())
+            $Temporary[$Name] = $Copy
+            [IO.File]::Copy($Staged[$Name], $Copy, $false)
+        }
+        foreach ($Name in @($Staged.Keys)) {
+            $Target = Join-Path $ShareDir $Name
+            # The third argument is the backup file name, and "none" must be a real null
+            # string: PowerShell turns $null into "" for a .NET string parameter, and
+            # File.Replace rejects "" ("The path is not of a legal form").
+            if ((Get-CvcPathKind $Target) -eq 'file') { [IO.File]::Replace($Temporary[$Name], $Target, [NullString]::Value) }
+            else { [IO.File]::Move($Temporary[$Name], $Target) }
+            $Temporary.Remove($Name)
+        }
+        return $true
+    }
+    catch {
+        Write-Warning "The license and third-party notices were not installed: $($_.Exception.Message)"
+        return $false
+    }
+    finally {
+        foreach ($Copy in @($Temporary.Values)) { Remove-Item -LiteralPath $Copy -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 # Returns 'add' or 'skip'. Read-Host throws in a -NonInteractive host and
 # misbehaves when stdin is redirected (CI, automation), so an unattended session
 # skips PATH configuration instead of failing a successful install. Answering
@@ -189,6 +276,13 @@ $Binaries = @("cvc.exe", "cvc-mcp.exe", "cvc-lsp.exe")
 # without the lock, so a new cvc must imply its siblings are already new.
 $MoveOrder = @("cvc-lsp.exe", "cvc-mcp.exe", "cvc.exe")
 $Prepared = @{}
+# Optional: an older release archive may lack them, and a problem installing
+# them never stops the binaries from being installed.
+$NoticeFiles = @("LICENSE", "THIRD-PARTY-NOTICES.md")
+$NoticesStaged = @{}
+$NoticesAbsent = @()
+$NoticesInstalled = @()
+$NoticesFailed = @()
 $InstallLock = $null
 $InstallLockPath = $null
 $InstallLockAcquired = $false
@@ -206,6 +300,13 @@ try {
     if ($Expected -cne $Actual) { throw "Checksum verification failed for $AssetName." }
 
     foreach ($Binary in $Binaries) { Expand-SafeBinary $ArchivePath $Binary (Join-Path $StageDir $Binary) }
+    # LICENSE and THIRD-PARTY-NOTICES.md come out of the archive the same way,
+    # but they are optional: an older release that lacks them is installed without.
+    foreach ($Notice in $NoticeFiles) {
+        $NoticePath = Join-Path $StageDir $Notice
+        if (Expand-OptionalNotice $ArchivePath $Notice $NoticePath $MaxNoticeBytes) { $NoticesStaged[$Notice] = $NoticePath }
+        else { $NoticesAbsent += $Notice }
+    }
     if (Test-Path -LiteralPath $InstallDir) {
         $InstallItem = Get-Item -LiteralPath $InstallDir -Force
         if (-not $InstallItem.PSIsContainer -or ($InstallItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Refusing unsafe installation directory: $InstallDir" }
@@ -214,10 +315,27 @@ try {
     try { $InstallLock = New-Object IO.FileStream($InstallLockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $InstallLockAcquired = $true }
     catch { throw "Another installation is active (or a stale lock exists): $InstallLockPath" }
 
+    # Every binary target is checked here, before the notices are installed and
+    # before anything is staged, as install.sh does: an install refused for an
+    # unsafe target has changed no notice. Publish-CvcBinaries checks again
+    # right before it replaces anything.
+    foreach ($Binary in $Binaries) {
+        $Target = Join-Path $InstallDir $Binary
+        if ((Get-CvcPathKind $Target) -eq 'other') { throw "Refusing unsafe existing target: $Target" }
+    }
     foreach ($Binary in $Binaries) {
         $Temporary = Join-Path $InstallDir (".cvc-" + $Binary + "." + [Guid]::NewGuid())
         [IO.File]::Copy((Join-Path $StageDir $Binary), $Temporary, $false)
         $Prepared[$Binary] = $Temporary
+    }
+    # The notices go in under the same lock, after every binary target has been
+    # checked and staged and before the first one is replaced, so a refused
+    # install has changed no notice either. They cannot stop the binaries: a
+    # problem is warned about (see Publish-CvcNotices) and reported in the summary.
+    if ($NoticesStaged.Count -gt 0) {
+        $NoticesAttempted = @($NoticeFiles | Where-Object { $NoticesStaged.ContainsKey($_) })
+        if (Publish-CvcNotices -ShareDir $ShareDir -Staged $NoticesStaged) { $NoticesInstalled = $NoticesAttempted }
+        else { $NoticesFailed = $NoticesAttempted }
     }
     # Refuses unsafe targets before replacing anything, then renames running
     # images aside instead of overwriting them.
@@ -234,6 +352,12 @@ Write-Host "`nSuccess! CVC installed to $InstallDir"
 Write-Host "  cvc.exe       - CLI interface"
 Write-Host "  cvc-mcp.exe   - MCP server for coding agents"
 Write-Host "  cvc-lsp.exe   - Language server for the VSCode extension`n"
+if ($NoticesInstalled.Count -gt 0) {
+    Write-Host "License and third-party notices installed to $ShareDir"
+    Write-Host "  $($NoticesInstalled -join ', ')`n"
+}
+if ($NoticesAbsent.Count -gt 0) { Write-Host "Not included in this release archive, so not installed: $($NoticesAbsent -join ', ')`n" }
+if ($NoticesFailed.Count -gt 0) { Write-Host "Not installed (see the warning above): $($NoticesFailed -join ', ')`n" }
 if ((Read-CvcPathConsent "Would you like to add CVC to your User PATH? [Y/n]") -eq 'add') {
     $UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
     if ($null -eq $UserPath) { $UserPath = '' }

@@ -344,7 +344,10 @@ The release contains the binary archives, four VSIX assets, `LICENSE`,
 Every native archive, VSIX, and npm launcher tarball contains
 `THIRD-PARTY-NOTICES.md`. The launcher stages an exact temporary copy during
 `npm pack`/`npm publish` and removes it afterward; its package test verifies the
-tarball entry and cleanup. `uninstall.sh` and
+tarball entry and cleanup. Every native archive also contains `LICENSE`, and
+`install.sh` and `install.ps1` copy both files into a `share/cvc` directory beside
+the install directory (`~/.cvc/share/cvc` by default) and print where; an archive
+that lacks them is still installed, with a note. `uninstall.sh` and
 `uninstall.ps1` are not
 released until they have been separately hardened. The workflow stages release-only
 copies of the installers with their default `CVC_RELEASE_VERSION` set to the exact
@@ -375,7 +378,9 @@ After all jobs complete, verify:
 
 - GitHub Release assets include `LICENSE`, `THIRD-PARTY-NOTICES.md`, `install.sh`, `install.ps1`, and
   `SHA256SUMS.txt`; verify each downloaded installer script and archive against that
-  checksum file, then perform the applicable installer smoke test.
+  checksum file, then perform the applicable installer smoke test. The installer's
+  summary must name the `share/cvc` directory it put `LICENSE` and
+  `THIRD-PARTY-NOTICES.md` in, and both files must be there.
 - Verify GitHub build provenance for every downloaded release asset (including
   `LICENSE`, the two installer scripts, and `SHA256SUMS.txt`) with:
 

@@ -253,7 +253,7 @@ Everything else the push changes is named on the same line rather than counted i
 
 A push with no new interactions says so, as in `Publishing 3 commit link(s) and 1 tombstone(s) to 'origin' (no new shared interactions; 42 shared in total).`, and its challenge ends in `0`. A push that changes only the ref's format or index says `a format/index update of refs/cvc/main` instead. When nothing differs from the destination, `push` prints `No new shared interactions to publish to 'origin' (42 shared in total).` and asks for no challenge. Hooks and an acknowledged auto-push print the result line (`Published 21 new shared interaction(s) to 'origin' (42 shared in total).`) without a challenge.
 
-Reconcile ambiguous transport results before changing publication choices:
+A destination that declines the ref update, through a protected ref, a server hook, or a race lost after the advertisement, fails the push with the server's reason, publishes nothing, and leaves the affected rows in the unknown state until a reconciliation confirms what the destination holds. Reconcile ambiguous transport results before changing publication choices:
 
 ```bash
 cvc privacy reconcile --remote origin
@@ -324,6 +324,8 @@ In the share phrase, `<count>` and `<token>` pin the exact set of thoughts the s
 **Words.** The view counts thoughts. A thought is one recorded step; for Claude Code, one assistant response. `cvc share` calls the same unit a "turn" and `cvc push` calls it an "interaction", so a count can read differently on the screen, in a phrase, and in a command's output.
 
 **Scripts and automation.** Use `cvc conversations --plain` in scripts and in any tool that drives `cvc` through a pseudo-terminal, which looks like a terminal and would otherwise get the view. The view adds no consent path of its own: each phrase is still typed at the prompt, as with the commands.
+
+**In VS Code.** The extension's **Volute: Share with Remote in Terminal** command opens this view for you. On Linux and macOS, when `cvc --version` of the `cvc` the extension runs (`volute.cvcCliPath`, then `~/.cvc/bin`, then `PATH`) reports 0.7.1 or later, the command runs `cvc conversations` in a VS Code terminal and asks for nothing first: you choose the conversation and the remote in the view, and each share, unshare and publish still ends in the typed phrase of the matching command, which neither the view nor the extension answers for you. The view needs a terminal panel of at least 60 columns by 12 rows; in a smaller one the plain listing appears with a line saying why, so enlarge the panel and run the command again. On Windows, where the view only browses, and with a `cvc` older than 0.7.1 or one whose version cannot be read, the command keeps its earlier flow: it asks for a conversation id and a remote name in two input boxes and runs `cvc share <conversation-id> --remote <name>` in a terminal. The extension reads the version each time the command runs, so updating `cvc` in place needs no window reload; after installing `cvc` somewhere else, run **Volute: Check Setup** so the extension finds it.
 
 ## Suppress, redact, and local rewrite plans
 
