@@ -315,15 +315,23 @@ try {
     try { $InstallLock = New-Object IO.FileStream($InstallLockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $InstallLockAcquired = $true }
     catch { throw "Another installation is active (or a stale lock exists): $InstallLockPath" }
 
+    # Every binary target is checked here, before the notices are installed and
+    # before anything is staged, as install.sh does: an install refused for an
+    # unsafe target has changed no notice. Publish-CvcBinaries checks again
+    # right before it replaces anything.
+    foreach ($Binary in $Binaries) {
+        $Target = Join-Path $InstallDir $Binary
+        if ((Get-CvcPathKind $Target) -eq 'other') { throw "Refusing unsafe existing target: $Target" }
+    }
     foreach ($Binary in $Binaries) {
         $Temporary = Join-Path $InstallDir (".cvc-" + $Binary + "." + [Guid]::NewGuid())
         [IO.File]::Copy((Join-Path $StageDir $Binary), $Temporary, $false)
         $Prepared[$Binary] = $Temporary
     }
-    # The notices go in under the same lock, after every binary has been staged
-    # and before the first one is replaced, so a refused install has changed no
-    # notice either. They cannot stop the binaries: a problem is warned about (see
-    # Publish-CvcNotices) and reported in the summary.
+    # The notices go in under the same lock, after every binary target has been
+    # checked and staged and before the first one is replaced, so a refused
+    # install has changed no notice either. They cannot stop the binaries: a
+    # problem is warned about (see Publish-CvcNotices) and reported in the summary.
     if ($NoticesStaged.Count -gt 0) {
         $NoticesAttempted = @($NoticeFiles | Where-Object { $NoticesStaged.ContainsKey($_) })
         if (Publish-CvcNotices -ShareDir $ShareDir -Staged $NoticesStaged) { $NoticesInstalled = $NoticesAttempted }

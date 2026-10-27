@@ -173,6 +173,17 @@ try {
     $NoticeCalls = @($Ast.FindAll({ param($Node) ($Node -is [System.Management.Automation.Language.CommandAst]) -and ($Node.GetCommandName() -eq 'Publish-CvcNotices') }, $true))
     $BinaryCalls = @($Ast.FindAll({ param($Node) ($Node -is [System.Management.Automation.Language.CommandAst]) -and ($Node.GetCommandName() -eq 'Publish-CvcBinaries') }, $true))
     Assert-Test (($NoticeCalls.Count -eq 1) -and ($BinaryCalls.Count -eq 1) -and ($NoticeCalls[0].Extent.StartOffset -lt $BinaryCalls[0].Extent.StartOffset)) 'install.ps1 installs the notices once, before it replaces the binaries'
+    # And every binary target is refused before the notices are installed, as
+    # install.sh does: the refusal must happen in the script body (Publish-CvcBinaries
+    # has its own check, but that runs after the notices), ahead of the notices call.
+    $BodyRefusals = @($Ast.FindAll({ param($Node)
+        ($Node -is [System.Management.Automation.Language.ThrowStatementAst]) -and ($Node.Extent.Text -match 'Refusing unsafe existing target')
+    }, $true) | Where-Object {
+        $Parent = $_.Parent
+        while ($null -ne $Parent -and -not ($Parent -is [System.Management.Automation.Language.FunctionDefinitionAst])) { $Parent = $Parent.Parent }
+        $null -eq $Parent
+    })
+    Assert-Test (($BodyRefusals.Count -ge 1) -and ($NoticeCalls.Count -eq 1) -and ($BodyRefusals[0].Extent.StartOffset -lt $NoticeCalls[0].Extent.StartOffset)) 'install.ps1 refuses an unsafe binary target before it installs the notices'
 
     Write-Host 'first install into an empty directory'
     $Dir = New-CaseDir 'fresh'
