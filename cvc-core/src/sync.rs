@@ -44,6 +44,12 @@ pub enum SyncError {
         "the remote CVC ref for '{0}' changed while publishing; nothing was published. Run the command again."
     )]
     BaselineMoved(String),
+    /// The destination answered the push with a per-reference rejection (a
+    /// protected ref, a pre-receive or update hook, or a lost race after the
+    /// advertisement). libgit2 reports that through the `push_update_reference`
+    /// callback and still returns success from the push, so it is surfaced here.
+    #[error("the destination rejected the update of {reference}: {reason}; nothing was published")]
+    Rejected { reference: String, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
@@ -518,9 +524,13 @@ fn prune_event_closure(
     outer.write().map_err(Into::into)
 }
 
-/// Immutable range payloads carry no interaction identity. Redaction follows
-/// event ownership/closure and removes a range only when no surviving event
-/// references it.
+/// Immutable range payloads carry no interaction identity, so the only tie
+/// between a range and an interaction is a derivation event that references it.
+/// Suppression follows that tie: it removes a range when an event it removes
+/// referenced the range and no surviving event still does. A range that no
+/// event of the tree references is not about a suppressed interaction, so it
+/// stays: it may be evidence another clone published ahead of its events, and a
+/// projection must keep what independent writers added.
 fn prune_range_sources(
     repo: &Repository,
     root: &Tree<'_>,
@@ -530,14 +540,20 @@ fn prune_range_sources(
         return Ok(None);
     };
     let mut bytes = 0;
-    let surviving = retain_event_closure(
-        collect_derivation_events(repo, root, &mut bytes, MAX_SYNC_TOTAL_BYTES)?,
-        suppressed,
-        &HashSet::new(),
-    );
-    let referenced: HashSet<_> = surviving
+    let events = collect_derivation_events(repo, root, &mut bytes, MAX_SYNC_TOTAL_BYTES)?;
+    let referenced_before: HashSet<String> = events
+        .iter()
+        .filter_map(|event| event.range_id.clone())
+        .collect();
+    let surviving = retain_event_closure(events, suppressed, &HashSet::new());
+    let referenced_after: HashSet<&str> = surviving
         .iter()
         .filter_map(|event| event.range_id.as_deref())
+        .collect();
+    let orphaned: HashSet<&str> = referenced_before
+        .iter()
+        .map(String::as_str)
+        .filter(|range_id| !referenced_after.contains(range_id))
         .collect();
     let mut outer = repo.treebuilder(Some(&ranges))?;
     for shard in ranges.iter() {
@@ -547,7 +563,7 @@ fn prune_range_sources(
         for entry in subtree.iter() {
             let range: RangeEvidence =
                 serde_json::from_slice(repo.find_blob(entry.id())?.content())?;
-            if !referenced.contains(range.range_id.as_str()) {
+            if orphaned.contains(range.range_id.as_str()) {
                 builder.remove(entry.name().unwrap_or_default())?;
             }
         }
@@ -1464,8 +1480,9 @@ fn push_ids_to_ref(
             )?),
         };
         add_sync_bytes(&mut emitted_bytes, bytes.len(), MAX_SYNC_TOTAL_BYTES)?;
-        // `prune_range_sources` drops every range no surviving baseline event
-        // references, so a range the projection re-adds may be unchanged.
+        // `prune_range_sources` drops a range once every baseline event that
+        // referenced it is gone, so a range the projection re-adds (a local
+        // event still references it) may be unchanged.
         if insert_blob_counting_new(b, &file, repo.blob(&bytes)?)?
             && !baseline_holds(repo, baseline_root_tree.as_ref(), "ranges", shard, &file)
         {
@@ -2986,17 +3003,54 @@ pub fn push_temp_ref(
         return Err(SyncError::Ref("invalid temporary ref".into()));
     }
     let mut remote = repo.remote_anonymous(&destination.effective_url)?;
+    // A server can accept the connection and still decline the ref update
+    // (`ng <ref> <reason>` in the smart protocol). libgit2 delivers that
+    // through this callback and returns success from the push itself, so the
+    // rejection is recorded here and turned into the error the caller sees.
+    let rejection: std::cell::RefCell<Option<(String, String)>> = std::cell::RefCell::new(None);
     let mut callbacks = git2::RemoteCallbacks::new();
     callbacks.credentials(|_url, username_from_url, _allowed_types| {
         git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
     });
+    callbacks.push_update_reference(|reference, status| {
+        record_reference_update(&rejection, reference, status)
+    });
     let mut options = git2::PushOptions::new();
     options.remote_callbacks(callbacks);
-    remote.push(
+    let pushed = remote.push(
         &[&format!("{temporary_ref}:refs/cvc/main")],
         Some(&mut options),
-    )?;
+    );
+    drop(options);
+    if let Some((reference, reason)) = rejection.into_inner() {
+        return Err(SyncError::Rejected { reference, reason });
+    }
+    pushed?;
     Ok(())
+}
+
+/// The `push_update_reference` rule: a `None` status is an accepted update; a
+/// `Some` status is the server's rejection, remembered for the caller and
+/// returned as an error so libgit2 stops treating the push as a success.
+fn record_reference_update(
+    rejection: &std::cell::RefCell<Option<(String, String)>>,
+    reference: &str,
+    status: Option<&str>,
+) -> std::result::Result<(), git2::Error> {
+    match status {
+        None => Ok(()),
+        Some(reason) => {
+            let reason = if reason.trim().is_empty() {
+                "rejected by the destination".to_owned()
+            } else {
+                reason.trim().to_owned()
+            };
+            if rejection.borrow().is_none() {
+                *rejection.borrow_mut() = Some((reference.to_owned(), reason.clone()));
+            }
+            Err(git2::Error::from_str(&format!("{reference}: {reason}")))
+        }
+    }
 }
 
 /// Remove an untransported projection candidate. Candidates are local staging
@@ -3117,6 +3171,55 @@ mod derivation_graph_tests {
             &legacy,
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod push_rejection_tests {
+    use super::*;
+
+    /// Public issue 124. libgit2's local transport cannot produce a server-side
+    /// `ng` status (it applies ref updates itself and errors outright, which
+    /// the non-fast-forward test in tests/test_sync.rs covers), so the mapping
+    /// the smart-protocol path relies on is pinned here.
+    #[test]
+    fn an_accepted_update_has_no_status_and_passes() {
+        let rejection = std::cell::RefCell::new(None);
+        assert!(record_reference_update(&rejection, "refs/cvc/main", None).is_ok());
+        assert!(rejection.into_inner().is_none());
+    }
+
+    #[test]
+    fn a_rejected_update_is_remembered_and_stops_the_push() {
+        let rejection = std::cell::RefCell::new(None);
+        let outcome = record_reference_update(
+            &rejection,
+            "refs/cvc/main",
+            Some("pre-receive hook declined"),
+        );
+        assert!(outcome.is_err());
+        assert_eq!(
+            rejection.into_inner(),
+            Some((
+                "refs/cvc/main".to_owned(),
+                "pre-receive hook declined".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn an_empty_rejection_reason_still_rejects_and_only_the_first_is_kept() {
+        let rejection = std::cell::RefCell::new(None);
+        assert!(record_reference_update(&rejection, "refs/cvc/main", Some("  ")).is_err());
+        assert!(record_reference_update(&rejection, "refs/cvc/other", Some("later")).is_err());
+        let (reference, reason) = rejection.into_inner().unwrap();
+        assert_eq!(reference, "refs/cvc/main");
+        assert_eq!(reason, "rejected by the destination");
+        let error = SyncError::Rejected { reference, reason };
+        assert_eq!(
+            error.to_string(),
+            "the destination rejected the update of refs/cvc/main: rejected by the destination; nothing was published"
+        );
     }
 }
 

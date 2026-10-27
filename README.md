@@ -35,7 +35,7 @@ Alternatively, download the archive for your platform directly from [GitHub Rele
 | macOS ARM64 | `cvc-aarch64-apple-darwin.tar.gz` |
 | Windows x86-64 | `cvc-x86_64-pc-windows-msvc.zip` |
 
-Linux ARM64 is not currently released. The repository's `install.sh`, `install.ps1`, and npm launcher support the same platform matrix and reject unsupported platforms before downloading an asset.
+Linux ARM64 is not currently released. The repository's `install.sh`, `install.ps1`, and npm launcher support the same platform matrix and reject unsupported platforms before downloading an asset. The `install.sh` and `install.ps1` scripts also copy the `LICENSE` and `THIRD-PARTY-NOTICES.md` that each archive carries into a `share/cvc` directory beside the install directory (`~/.cvc/share/cvc` by default, `%USERPROFILE%\.cvc\share\cvc` on Windows), print where they put them, and still install an older archive that lacks them.
 
 Extract the archive and put `cvc` (or `cvc.exe`) on `PATH`. Each published binary archive contains `cvc`, `cvc-mcp`, and `cvc-lsp`. Verify the archive against the `SHA256SUMS.txt` asset attached to the same release before extracting it. Then initialize CVC from a Git working tree:
 
