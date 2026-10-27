@@ -1,6 +1,7 @@
-import { useId, useMemo, useState } from 'react';
+import { useId, useMemo } from 'react';
 import { clsx } from 'clsx';
 import type { HiddenMode } from '../../lib/hiddenChars';
+import type { QueryScope } from '../../lib/timelineSearch';
 import {
   cutAtCodePoint,
   exceedsCharBudget,
@@ -10,6 +11,8 @@ import {
 } from '../../lib/textLines';
 import { ExpandToggle } from './ExpandToggle';
 import { HiddenText } from './HiddenText';
+import { usePersistentToggle } from './nodeUiState';
+import { useMatchCount } from './searchHighlight';
 
 /** A count as the controls say it: "8,192 lines". */
 const count = (value: number) => value.toLocaleString('en-US');
@@ -34,6 +37,8 @@ interface CollapsibleCodeProps {
    * Either way they are drawn as visible tokens, never raw (see `HiddenText`).
    */
   mode?: HiddenMode;
+  /** The one field the text is (a file's name, say), when it is one; which the search marks for a term with a prefix. */
+  scope?: QueryScope;
   className?: string;
 }
 
@@ -56,9 +61,10 @@ export function CollapsibleCode({
   wrap = false,
   label = 'Text',
   mode = 'strict',
+  scope,
   className,
 }: CollapsibleCodeProps) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = usePersistentToggle('expanded', false);
   const id = useId();
   const lines = useMemo(() => splitDisplayLines(text), [text]);
   const full = useMemo(() => lines.join('\n'), [lines]);
@@ -73,6 +79,7 @@ export function CollapsibleCode({
     const head = cutByLines ? lines.slice(0, maxLines).join('\n') : full;
     return wrap ? cutAtCodePoint(head, WRAPPED_CHAR_BUDGET) : head;
   }, [collapsible, expanded, full, lines, cutByLines, maxLines, wrap]);
+  const matches = useMatchCount(full, collapsible && !expanded, scope);
 
   return (
     <div className={clsx('min-w-0', className)}>
@@ -86,7 +93,7 @@ export function CollapsibleCode({
           wrap ? 'whitespace-pre-wrap break-words' : 'overflow-x-auto whitespace-pre',
         )}
       >
-        <HiddenText text={shown} mode={mode} />
+        <HiddenText text={shown} mode={mode} scope={scope} />
       </pre>
       {collapsible && (
         <ExpandToggle
@@ -94,6 +101,7 @@ export function CollapsibleCode({
           onToggle={() => setExpanded((value) => !value)}
           collapsedLabel={cutByLines ? `Show all ${count(lines.length)} lines` : `Show all ${count(full.length)} characters`}
           controls={id}
+          matches={matches}
         />
       )}
     </div>

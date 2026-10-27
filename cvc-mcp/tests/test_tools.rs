@@ -526,7 +526,7 @@ async fn test_sync_history_pulls_from_remote() {
     let res = call_tool(args, state.clone()).await.unwrap();
     let text = res["content"][0]["text"].as_str().unwrap();
     assert!(
-        text.contains("Pulled 1 new interaction"),
+        text.contains("Pulled 1 new thought"),
         "unexpected sync_history response: {text}"
     );
 

@@ -611,9 +611,13 @@ function rawBody(shown: Shown): ToolCallBody {
   return body;
 }
 
-export function describeToolCall(
-  exec: Pick<ToolExecution, 'tool_name' | 'arguments'>,
-): ToolCallView {
+/** A view, and the arguments it was made from when they were a JSON object. */
+interface Described {
+  view: ToolCallView;
+  args: Record<string, unknown> | null;
+}
+
+function describe(exec: Pick<ToolExecution, 'tool_name' | 'arguments'>): Described {
   const tool = typeof exec?.tool_name === 'string' ? exec.tool_name : '';
   const title = toolTitle(tool);
   const recorded: unknown = exec?.arguments;
@@ -626,23 +630,176 @@ export function describeToolCall(
       compact === null
         ? { text: '', omitted: 0, unrenderable: true }
         : clip(compact === undefined ? String(recorded) : compact);
-    return { ...rawBody(shown), tool, title, extras: [] };
+    return { view: { ...rawBody(shown), tool, title, extras: [] }, args: null };
   }
 
   const parsed = parseToolArguments(recorded);
-  if (parsed.kind === 'truncated') return { kind: 'truncated', bytes: parsed.bytes, tool, title, extras: [] };
+  if (parsed.kind === 'truncated') return { view: { kind: 'truncated', bytes: parsed.bytes, tool, title, extras: [] }, args: null };
   if (parsed.kind === 'raw') {
     // A tool_use without an input is recorded as the JSON text `null`.
     const text = parsed.text.trim();
-    if (text === '' || text === 'null') return { kind: 'none', tool, title, extras: [] };
-    return { ...rawBody(clip(parsed.text)), tool, title, extras: [] };
+    if (text === '' || text === 'null') return { view: { kind: 'none', tool, title, extras: [] }, args: null };
+    return { view: { ...rawBody(clip(parsed.text)), tool, title, extras: [] }, args: null };
   }
 
-  const describe = findDescriber(tool);
-  if (describe) {
+  const describer = findDescriber(tool);
+  if (describer) {
     const reader = createReader(parsed.value);
-    const body = describe(reader);
-    if (body) return { ...body, tool, title, extras: reader.rest() };
+    const body = describer(reader);
+    if (body) return { view: { ...body, tool, title, extras: reader.rest() }, args: parsed.value };
   }
-  return { kind: 'fields', fields: toFields(parsed.value), tool, title, extras: [] };
+  return { view: { kind: 'fields', fields: toFields(parsed.value), tool, title, extras: [] }, args: parsed.value };
+}
+
+export function describeToolCall(
+  exec: Pick<ToolExecution, 'tool_name' | 'arguments'>,
+): ToolCallView {
+  return describe(exec).view;
+}
+
+// ---------------------------------------------------------------------------
+// What a call draws, for the search (issue #118)
+// ---------------------------------------------------------------------------
+
+/** The arguments that name a file: what a card shows as a path, and what the search reads as one. */
+export const PATH_ARGUMENTS = ['file_path', 'path', 'notebook_path'] as const;
+
+/** Chips made only of the Reviewer's words: they say that an option was on, and hold nothing the capture recorded. */
+const FIXED_CHIPS: ReadonlySet<string> = new Set(['runs in background', 'replace all occurrences', 'ignore case', 'line numbers', 'multiline']);
+
+/** The words a chip starts with when the rest of it is a recorded value, by their first character (most chips are none of them). */
+const VALUE_CHIP_LABELS: ReadonlyMap<number, readonly string[]> = (() => {
+  const labels = ['timeout ', 'cell ', 'type ', 'mode ', 'lines ', 'line ', 'from line ', 'pages ', 'in ', 'glob ', 'output ', '-A ', '-B ', '-C ', 'head_limit ', 'subagent '];
+  const byFirst = new Map<number, string[]>();
+  for (const label of labels) byFirst.set(label.charCodeAt(0), [...(byFirst.get(label.charCodeAt(0)) ?? []), label]);
+  return byFirst;
+})();
+
+export interface ChipParts {
+  /** The Reviewer's words, with the space after them. */
+  readonly label: string;
+  /** What the capture recorded (as the chip writes it: a duration is "120s"). */
+  readonly value: string;
+  /** `path` when the value is a file. */
+  readonly scope?: 'path';
+}
+
+/**
+ * A chip taken apart into the Reviewer's words and the recorded value after them, or null for a chip that is
+ * the Reviewer's words alone. The search marks the value and never the words.
+ */
+export function splitChip(chip: string): ChipParts | null {
+  if (typeof chip !== 'string' || chip === '' || FIXED_CHIPS.has(chip)) return null;
+  const labels = VALUE_CHIP_LABELS.get(chip.charCodeAt(0));
+  if (labels === undefined) return null;
+  for (const label of labels) {
+    if (chip.startsWith(label)) return { label, value: chip.slice(label.length), ...(label === 'in ' ? { scope: 'path' as const } : {}) };
+  }
+  return null;
+}
+
+/** A piece of text a card draws for a call, and what it can be searched as. */
+export interface DrawnPiece {
+  readonly text: string;
+  /** The one field the text is: the name of the tool, or a file. Absent for any other text. */
+  readonly scope?: 'path' | 'tool';
+  /** Drawn one line at a time, each on its own (the rows of a diff), so that a phrase does not run from one line to the next. */
+  readonly lines?: true;
+}
+
+/** How much of a call is read for the search, whatever it holds. */
+export interface PieceLimits {
+  /** Pieces left to read, and characters left to read; both are spent as pieces are taken. */
+  strings: number;
+  chars: number;
+}
+
+export const MAX_DRAWN_STRINGS = 20_000;
+export const MAX_DRAWN_CHARS = 4 * 1024 * 1024;
+
+/**
+ * Everything a card draws for one call that comes from the capture, as text to search: the name it is shown
+ * under, the command or the paths or the texts of an edit, the values of the options (never the Reviewer's
+ * words for them), the rows of a checklist, and the value of every other argument as the card writes it.
+ * The names of the arguments are not in it: a card draws them as labels, and the search leaves them out
+ * (`tool:` finds a call by its name).
+ *
+ * `limits` is spent as pieces are taken, so a caller reading many calls shares one budget: a call read
+ * after it is spent gives only its name.
+ */
+/** Adds a piece of text to `out`, if there is any and the budget has not run out; the budget is spent as it goes. */
+function takePiece(out: DrawnPiece[], budget: PieceLimits, text: string | undefined, scope?: 'path', lines?: true): void {
+  if (typeof text !== 'string' || text === '' || budget.strings <= 0 || budget.chars <= 0) return;
+  budget.strings--;
+  budget.chars -= text.length;
+  out.push(scope === undefined && lines === undefined ? { text } : { text, ...(scope === undefined ? {} : { scope }), ...(lines === undefined ? {} : { lines }) });
+}
+
+/** The values of the chips that hold one, as pieces (the Reviewer's words in them are left out). */
+function takeChipValues(out: DrawnPiece[], budget: PieceLimits, chips: readonly string[]): void {
+  for (const chip of chips) {
+    const parts = splitChip(chip);
+    if (parts !== null) takePiece(out, budget, parts.value, parts.scope);
+  }
+}
+
+/** The value of a row (never its name); a value that is a file, by the name of the argument and the type of the value, is a path. */
+function takeFieldValue(out: DrawnPiece[], budget: PieceLimits, args: Record<string, unknown> | null, field: ToolField): void {
+  if (field.unrenderable) return;
+  const isPath = args !== null && (PATH_ARGUMENTS as readonly string[]).includes(field.key) && typeof args[field.key] === 'string';
+  takePiece(out, budget, field.value, isPath ? 'path' : undefined);
+}
+
+export function toolCallPieces(exec: Pick<ToolExecution, 'tool_name' | 'arguments'> | null | undefined, limits?: PieceLimits): DrawnPiece[] {
+  const budget = limits ?? { strings: MAX_DRAWN_STRINGS, chars: MAX_DRAWN_CHARS };
+  const { view, args } = describe(exec ?? { tool_name: '', arguments: '' });
+  const pieces: DrawnPiece[] = [{ text: view.title, scope: 'tool' }];
+  switch (view.kind) {
+    case 'command':
+      takePiece(pieces, budget, view.caption ?? undefined);
+      takePiece(pieces, budget, view.command);
+      takeChipValues(pieces, budget, view.chips);
+      break;
+    case 'edit':
+      takePiece(pieces, budget, view.filePath, 'path');
+      takeChipValues(pieces, budget, view.chips);
+      for (const edit of view.edits) {
+        takeChipValues(pieces, budget, edit.chips);
+        takePiece(pieces, budget, edit.oldText, undefined, true);
+        takePiece(pieces, budget, edit.newText, undefined, true);
+      }
+      break;
+    case 'file_content':
+      takePiece(pieces, budget, view.filePath, 'path');
+      takeChipValues(pieces, budget, view.chips);
+      takePiece(pieces, budget, view.content);
+      break;
+    case 'lookup':
+      takePiece(pieces, budget, view.value, view.label === 'file' ? 'path' : undefined);
+      takePiece(pieces, budget, view.detail ?? undefined);
+      takeChipValues(pieces, budget, view.chips);
+      break;
+    case 'delegation':
+      takePiece(pieces, budget, view.caption ?? undefined);
+      takeChipValues(pieces, budget, view.chips);
+      takePiece(pieces, budget, view.prompt);
+      break;
+    case 'todos':
+      for (const todo of view.todos) {
+        takePiece(pieces, budget, todo.content);
+        takePiece(pieces, budget, todo.activeForm);
+      }
+      break;
+    case 'fields':
+      for (const field of view.fields) takeFieldValue(pieces, budget, args, field);
+      break;
+    case 'raw':
+      if (!view.unrenderable) takePiece(pieces, budget, view.text);
+      break;
+    case 'truncated':
+    case 'none':
+      break;
+  }
+  for (const field of view.extras) takeFieldValue(pieces, budget, args, field);
+  return pieces;
 }

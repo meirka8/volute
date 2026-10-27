@@ -139,7 +139,7 @@ pub async fn run(requested: Option<&str>, limit: Option<usize>, plain: bool) -> 
         RepositoryLayout::discover(&current_dir).context("Failed to discover Git repository")?;
     layout.worktree_root()?;
     if !layout.cvc_dir().exists() {
-        println!("CVC is not initialized in this repository. Run 'cvc init' to setup.");
+        println!("CVC is not initialized in this repository. Run 'cvc init' to set up.");
         return Ok(());
     }
     let store = CvcStore::open_initialized(layout.db_path())?;

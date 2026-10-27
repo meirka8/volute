@@ -1729,7 +1729,6 @@ mod tests {
             "Share covers     27 thoughts: 21 already shared, 6 new",
             "Auto-push        off",
             "A thought is one recorded step (for Claude Code, one assistant response).",
-            "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\".",
             "Scrubbing can miss secrets. Published thoughts cannot be recalled.",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in\n{text}");
@@ -1919,7 +1918,7 @@ mod tests {
             "Share, unshare, publish and authorize each wait for their typed phrase; no key does any of them by itself.",
             "Two standing choices act later without a new phrase: +future shares new thoughts as they are captured, and auto-push (set with cvc privacy set-auto-push, never from this view) publishes shared thoughts at every git push to that remote.",
             "Scrubbing and .thoughtignore can miss secrets; they are not a guarantee.",
-            "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\".",
+            "A thought is one recorded step (for Claude Code, one assistant response).",
         ] {
             assert!(page_shows(&mut model, expected), "never on screen: {expected:?}");
         }
@@ -1934,7 +1933,7 @@ mod tests {
         }
         model.handle_key(key(KeyCode::End));
         let text = dump(&rendered(&model));
-        assert!(text.contains("\"interactions\""), "{text}");
+        assert!(text.contains("response)."), "{text}");
 
         // On a tall terminal the whole page is in view at once.
         model.set_size(100, 90);
@@ -1944,7 +1943,7 @@ mod tests {
             "private --s--> shared (in this clone) --p--> published (on the remote)",
             "? unconfirmed · not shared here:",
             "no key does any of them by itself.",
-            "\"interactions\".",
+            "A thought is one recorded step (for Claude Code, one assistant response).",
         ] {
             assert!(words.contains(expected), "missing {expected:?} in\n{words}");
         }

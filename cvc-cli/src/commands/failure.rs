@@ -69,6 +69,35 @@ impl fmt::Display for SharingConsentMissing {
 
 impl std::error::Error for SharingConsentMissing {}
 
+/// `cvc unshare` found, before it asked for its phrase, that the store would
+/// refuse the unshare: some thought of the conversation is published, pending
+/// or of unknown state at the destination. No phrase was asked and nothing
+/// changed.
+///
+/// `Display` is the reason, in the words the interactive view gives for the same
+/// check (`tui::words::unshare_refusal`, which names `cvc privacy reconcile`
+/// when the cause is an unfinished publish). It is the store's own refusal made
+/// early, and classifies as that refusal does ([`FlowFailure::UnshareBlocked`]);
+/// the store's refusal after the phrase stays the authority.
+#[derive(Debug)]
+pub(crate) struct UnshareRefused {
+    reason: String,
+}
+
+impl UnshareRefused {
+    pub(crate) fn new(reason: String) -> Self {
+        Self { reason }
+    }
+}
+
+impl fmt::Display for UnshareRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for UnshareRefused {}
+
 /// A publication stopped after its push began, so the local records do not say
 /// what the destination holds of it. Either the transport failed in a way that
 /// does not say whether the destination received the objects (the thoughts the
@@ -139,11 +168,11 @@ impl Error for BundledPublishFailed {
 }
 
 /// What `cvc-core` says when a share's snapshot no longer matches the
-/// conversation (a turn was captured while the challenge was open). Nothing was
+/// conversation (a thought was captured while the challenge was open). Nothing was
 /// shared.
 const CONVERSATION_CHANGED: &str = "conversation changed during authorization; retry";
 
-/// What `cvc-core` says when an unshare is refused because some turn is
+/// What `cvc-core` says when an unshare is refused because some thought is
 /// pending, published or of unknown state at the destination. Nothing changed.
 const UNSHARE_BLOCKED: &str = "cannot unshare pending, published, or unknown content";
 
@@ -183,8 +212,9 @@ pub(crate) enum FlowFailure {
     /// The conversation changed while the challenge was open, so the snapshot
     /// the phrase counted is stale. Nothing was shared; try again.
     ConversationChanged,
-    /// Unsharing was refused: some turn is already (or may be) published at the
-    /// destination. Nothing changed.
+    /// Unsharing was refused: some thought is already (or may be) published at
+    /// the destination. Nothing changed. Either the store refused it, after the
+    /// phrase, or [`UnshareRefused`] did, before any phrase was asked.
     UnshareBlocked,
     /// Publishing needs the destination's sharing consent and there is none.
     ConsentMissing,
@@ -229,6 +259,9 @@ pub(crate) fn classify_failure(error: &anyhow::Error) -> FlowFailure {
     }
     if error.downcast_ref::<SharingConsentMissing>().is_some() {
         return FlowFailure::ConsentMissing;
+    }
+    if error.downcast_ref::<UnshareRefused>().is_some() {
+        return FlowFailure::UnshareBlocked;
     }
     if let Some(DbError::Migration(message)) = error.downcast_ref::<DbError>() {
         match message.as_str() {
@@ -443,6 +476,55 @@ mod tests {
         );
         let wrapped = anyhow::Error::from(error).context("unshare failed");
         assert_eq!(classify_failure(&wrapped), FlowFailure::UnshareBlocked);
+
+        // The same refusal, made by `unshare_conversation` before any phrase is
+        // asked, classifies the same and says why in the view's words. Nothing
+        // here is a terminal, so a phrase that was asked would have failed on
+        // that instead, and would not classify as a refusal.
+        use cvc_core::privacy::remote_destination;
+        let directory = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(directory.path()).unwrap();
+        repo.remote("origin", "https://example.invalid/r.git")
+            .unwrap();
+        let destination = remote_destination(&repo, "origin").unwrap();
+        let store = CvcStore::open(directory.path().join("index.db")).unwrap();
+        let shared = |conversation: &str, state: PublicationState| {
+            let id = capture(&store, conversation);
+            let snapshot = store.share_snapshot(conversation).unwrap();
+            store
+                .share_exact_snapshot(
+                    conversation,
+                    &destination.fingerprint,
+                    &snapshot,
+                    FutureSharePolicy::Private,
+                )
+                .unwrap();
+            store
+                .mark_publication(&[id], &destination.fingerprint, state)
+                .unwrap();
+        };
+        shared("published", PublicationState::Published);
+        shared("unfinished", PublicationState::Pending);
+        for (conversation, said) in [
+            (
+                "published",
+                "Cannot unshare: 1 thought is already published to 'origin', and published thoughts cannot be recalled.",
+            ),
+            (
+                "unfinished",
+                "Cannot unshare yet: an earlier publish to 'origin' did not finish cleanly. Run: cvc privacy reconcile --remote origin",
+            ),
+        ] {
+            let error = crate::commands::sync::unshare_conversation(
+                &repo,
+                &store,
+                &destination,
+                conversation,
+            )
+            .expect_err("the store would refuse this unshare");
+            assert_eq!(classify_failure(&error), FlowFailure::UnshareBlocked);
+            assert_eq!(format!("{error:#}"), said);
+        }
     }
 
     /// An error with a source of its own, as a transport's errors have.
