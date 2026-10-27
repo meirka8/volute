@@ -82,6 +82,35 @@ function serialize(manifest, raw) {
 }
 
 /**
+ * Whether `source`, an entry found under `sourceDir` at any depth, is staged: the
+ * `filter` of the copy in `stagePackage`.
+ *
+ * The exclusions that depend on the top-level name alone are decided first, from
+ * the name, without touching the file system. The source directory is not quiet
+ * while it is staged: an `npm pack` run in it puts a tarball there and, through
+ * prepack, the generated notices, and removes both again, while `cpSync` lists a
+ * directory before it calls the filter on each entry. Looking at an entry that is
+ * left out anyway would only give it a chance to vanish in between.
+ *
+ * Any other entry is refused if it is a symbolic link. One that vanished since it
+ * was listed (ENOENT, and only that error) was never part of the package and is
+ * skipped; every other error is thrown.
+ */
+export function shouldStage(source, sourceDir) {
+  const top = relative(sourceDir, source).split(sep)[0];
+  if (NOT_COPIED.has(top) || README_NAME.test(top) || top.endsWith('.tgz')) return false;
+  let stat;
+  try {
+    stat = lstatSync(source);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+  if (stat.isSymbolicLink()) throw new Error(`Refusing to stage a symbolic link: ${source}`);
+  return true;
+}
+
+/**
  * Stages `name` and returns { root, dir, manifest }: `dir` is the package
  * directory, `root` the stage root to remove afterwards. Options: `version`
  * (stamped into the staged manifest), `out` (an absent or empty directory to use
@@ -113,14 +142,7 @@ export function stagePackage(name, { version, out, sourceDir = SOURCE_DIR } = {}
   mkdirSync(dir, { recursive: true });
 
   copyFileSync(join(repoRoot, 'THIRD-PARTY-NOTICES.md'), join(root, 'THIRD-PARTY-NOTICES.md'));
-  cpSync(sourceDir, dir, {
-    recursive: true,
-    filter: source => {
-      if (lstatSync(source).isSymbolicLink()) throw new Error(`Refusing to stage a symbolic link: ${source}`);
-      const top = relative(sourceDir, source).split(sep)[0];
-      return !(NOT_COPIED.has(top) || README_NAME.test(top) || top.endsWith('.tgz'));
-    },
-  });
+  cpSync(sourceDir, dir, { recursive: true, filter: source => shouldStage(source, sourceDir) });
   copyFileSync(join(sourceDir, entry.readme), join(dir, 'README.md'));
 
   const staged = {
