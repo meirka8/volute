@@ -146,7 +146,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
                     policy,
                     capture_worktree,
                 )) {
-                    eprintln!("CVC Warning: Failed to save interaction: {}", e);
+                    eprintln!("CVC Warning: Failed to save thought: {}", e);
                 }
             }
             Err(e) => {

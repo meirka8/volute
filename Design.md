@@ -586,7 +586,7 @@ Scans maintain a cursor per worktree and symbolic branch. Newly discovered candi
 
 - **The Need:** A user may want to commit the code publicly but keep the conversation private (e.g., "Explain this basic concept to me").
     
-- **Implemented:** Interactions are private by default. Sharing records an exact current conversation snapshot for one remote; `--future` separately opts future turns into sharing for that remote. Consent is a separate, destination-fingerprinted acknowledgement, and auto-push is off until separately acknowledged.
+- **Implemented:** Interactions are private by default. Sharing records an exact current conversation snapshot for one remote; `--future` separately opts future thoughts into sharing for that remote. Consent is a separate, destination-fingerprinted acknowledgement, and auto-push is off until separately acknowledged.
     
 
 ### 13.5 Large Context Blobs

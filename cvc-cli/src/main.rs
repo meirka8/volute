@@ -22,7 +22,7 @@ enum Commands {
     Init,
     /// Show the state of CVC
     Status,
-    /// Push CVC interactions to the remote
+    /// Push CVC thoughts to the remote
     Push {
         #[arg(long)]
         remote: Option<String>,
@@ -30,7 +30,7 @@ enum Commands {
         #[arg(long)]
         manual: bool,
     },
-    /// Pull CVC interactions from the remote
+    /// Pull CVC thoughts from the remote
     Pull,
     /// Inspect or change local privacy acknowledgements
     Privacy {
@@ -122,12 +122,12 @@ enum Commands {
         #[command(subcommand)]
         command: HookCommands,
     },
-    /// Run a command and capture the interaction
+    /// Run a command and capture it as a thought
     Run {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// View the interaction log
+    /// View the thought log
     Log,
 }
 

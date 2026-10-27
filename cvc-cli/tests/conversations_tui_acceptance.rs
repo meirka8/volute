@@ -193,7 +193,7 @@ fn a_session_and_its_subagent_are_shared_and_published_with_three_phrases_and_on
     for said in [
         "-- cvc: publish",
         "Published thoughts cannot be recalled, and scrubbing can miss secrets.",
-        &format!("Publishing {waiting} new shared interaction(s) to 'origin'."),
+        &format!("Publishing {waiting} new shared thought(s) to 'origin'."),
     ] {
         assert!(main_screen.contains(said), "{said:?} in:\n{main_screen}");
     }
@@ -817,7 +817,7 @@ fn an_imported_conversation_is_read_only_in_the_view() {
     let reader = another_clone_of(&author);
     reader.consent_to_sharing();
     let pulled = reader.cvc_ok(&["pull"]);
-    assert!(pulled.contains("Pulled 1 interaction(s)"), "{pulled}");
+    assert!(pulled.contains("Pulled 1 thought(s)"), "{pulled}");
     let imported = format!("remote:{}:{id}", fingerprint(&reader, "origin"));
     assert_eq!(
         listed_state(&reader, &imported),
