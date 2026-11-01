@@ -1963,7 +1963,8 @@ pub(crate) struct Capture {
     pub(crate) capture_worktree: Option<String>,
 }
 macro_rules! capture_type {
-    ($name:ident, $source:expr) => {
+    ($(#[$meta:meta])* $name:ident, $source:expr) => {
+        $(#[$meta])*
         pub struct $name(Capture);
         impl $name {
             pub fn new(
@@ -1990,7 +1991,14 @@ macro_rules! capture_type {
         }
     };
 }
-capture_type!(McpCapture, CaptureSource::Mcp);
+capture_type!(
+    /// A thought received through the MCP server. Constructing this type is how
+    /// a front states that channel; the store then records the thought private
+    /// and never extends its conversation's future sharing to it, whichever
+    /// conversation the client named.
+    McpCapture,
+    CaptureSource::Mcp
+);
 capture_type!(CliRunCapture, CaptureSource::CliRun);
 capture_type!(LspPassiveCapture, CaptureSource::VscodePassive);
 capture_type!(LspExplicitCapture, CaptureSource::VscodeExplicit);

@@ -6,10 +6,12 @@ use cvc_core::models::{
 };
 use cvc_core::privacy::{
     acknowledge_sharing, has_unterminated_private_key_block, privacy_status, scrub, scrub_json,
-    validate_sanitized_json, CliRunCapture, McpCapture, PreparedPolicy,
+    validate_sanitized_json, CliRunCapture, LspExplicitCapture, LspPassiveCapture, McpCapture,
+    PreparedPolicy,
 };
 use cvc_core::sync;
 use git2::Repository;
+use std::collections::HashSet;
 use tempfile::tempdir;
 
 /// "No remote baseline": pins a tracking ref that does not exist, so the
@@ -2085,6 +2087,210 @@ fn share_snapshot_race_rejects_new_turn_without_sharing_it() {
         .projection_interaction_ids("remote")
         .unwrap()
         .is_empty());
+}
+
+/// The front a fixture thought is recorded through.
+#[derive(Clone, Copy, Debug)]
+enum Channel {
+    /// `commit_thought` on the MCP server.
+    Mcp,
+    /// The VS Code chat-session watcher, through the LSP's turn batches.
+    EditorWatcher,
+    /// The LSP's explicit turn notifications.
+    EditorTurn,
+}
+
+/// Records one thought into `conversation_id` the way `channel`'s front does,
+/// and returns its id.
+fn record(store: &CvcStore, channel: Channel, conversation_id: &str) -> InteractionId {
+    let id = InteractionId::new();
+    let mut thought = interaction(id.clone(), conversation_id);
+    let conversation = Conversation {
+        id: conversation_id.into(),
+        title: conversation_id.into(),
+        created_at: Utc::now(),
+    };
+    let policy = PreparedPolicy::built_ins_only();
+    let worktree = "0".repeat(64);
+    match channel {
+        Channel::Mcp => {
+            store
+                .capture_mcp(McpCapture::new(
+                    conversation,
+                    thought,
+                    vec![],
+                    vec![],
+                    policy,
+                    worktree,
+                ))
+                .unwrap();
+        }
+        Channel::EditorWatcher => {
+            // The watcher records a chat request as one batch keyed by it.
+            let request = format!("request-{id}");
+            thought.source_request_id = Some(request.clone());
+            store
+                .replace_lsp_passive_capture_batch(
+                    &request,
+                    vec![LspPassiveCapture::new(
+                        conversation,
+                        thought,
+                        vec![],
+                        vec![],
+                        policy,
+                        worktree,
+                    )],
+                )
+                .unwrap();
+        }
+        Channel::EditorTurn => {
+            store
+                .capture_lsp_explicit(LspExplicitCapture::new(
+                    conversation,
+                    thought,
+                    vec![],
+                    vec![],
+                    policy,
+                    worktree,
+                ))
+                .unwrap();
+        }
+    }
+    id
+}
+
+/// The interactions a publication candidate for `destination` would add to a
+/// destination that holds nothing yet, read from the candidate itself rather
+/// than from the share records.
+fn publishable(repo: &Repository, store: &CvcStore, destination: &str) -> HashSet<InteractionId> {
+    match sync::push_projection_to_ref(repo, store, &no_baseline(repo), destination).unwrap() {
+        sync::ProjectionResult::Candidate {
+            candidate,
+            publication,
+            ..
+        } => {
+            drop(candidate);
+            publication.new_ids.into_iter().collect()
+        }
+        sync::ProjectionResult::NoChanges { .. } => HashSet::new(),
+    }
+}
+
+fn shared_for(store: &CvcStore, destination: &str) -> HashSet<InteractionId> {
+    store
+        .projection_interaction_ids(destination)
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
+#[test]
+fn a_thought_recorded_through_mcp_stays_private_in_a_conversation_whose_future_is_shared() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let store = CvcStore::open(dir.path().join("index.db")).unwrap();
+    let destination = "7".repeat(64);
+    let other = "8".repeat(64);
+
+    // An editor session whose future thoughts the user shares for two
+    // destinations, the way `cvc share <id> --future` records it.
+    let first = record(&store, Channel::EditorWatcher, "editor-session");
+    let snapshot = store.share_snapshot("editor-session").unwrap();
+    for remote in [&destination, &other] {
+        store
+            .share_exact_snapshot(
+                "editor-session",
+                remote,
+                &snapshot,
+                FutureSharePolicy::Shared,
+            )
+            .unwrap();
+    }
+
+    // An MCP client names that conversation. Its thought is recorded there, and
+    // private for every destination.
+    let through_mcp = record(&store, Channel::Mcp, "editor-session");
+    assert_eq!(
+        store
+            .conversation_interaction_count("editor-session")
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store
+            .conversation_mcp_capture_count("editor-session")
+            .unwrap(),
+        1
+    );
+    // The editor's later captures still join the future sharing.
+    let watched = record(&store, Channel::EditorWatcher, "editor-session");
+    let turn = record(&store, Channel::EditorTurn, "editor-session");
+    let passive: HashSet<_> = [first, watched, turn].into_iter().collect();
+    for remote in [&destination, &other] {
+        assert_eq!(shared_for(&store, remote), passive, "{remote}");
+        assert_eq!(publishable(&repo, &store, remote), passive, "{remote}");
+    }
+    let summary = store
+        .conversation_details("editor-session", Some(&destination))
+        .unwrap()
+        .unwrap()
+        .summary;
+    assert_eq!((summary.thoughts, summary.shared_count), (4, 3));
+    assert_eq!(summary.share_future, Some(true));
+
+    // Only an explicit share of the conversation covers the MCP thought, and
+    // only for the destination it names.
+    let snapshot = store.share_snapshot("editor-session").unwrap();
+    store
+        .share_exact_snapshot(
+            "editor-session",
+            &destination,
+            &snapshot,
+            FutureSharePolicy::Shared,
+        )
+        .unwrap();
+    assert!(shared_for(&store, &destination).contains(&through_mcp));
+    assert!(publishable(&repo, &store, &destination).contains(&through_mcp));
+    assert!(!shared_for(&store, &other).contains(&through_mcp));
+}
+
+#[test]
+fn a_conversation_created_by_an_mcp_thought_is_private_despite_future_sharing_recorded_for_it() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let store = CvcStore::open(dir.path().join("index.db")).unwrap();
+    let destination = "7".repeat(64);
+
+    // Future sharing recorded for ids that hold nothing yet, the way
+    // `cvc share <id> --future` records it before anything was captured there.
+    for id in ["named-by-a-client", "watched-later"] {
+        store
+            .share_exact_snapshot(id, &destination, &[], FutureSharePolicy::Shared)
+            .unwrap();
+        assert!(store.get_conversation(id).unwrap().is_none(), "{id}");
+    }
+
+    // The MCP thought creates its conversation and is private there.
+    let through_mcp = record(&store, Channel::Mcp, "named-by-a-client");
+    assert!(store
+        .get_conversation("named-by-a-client")
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get_interaction(&through_mcp)
+        .unwrap()
+        .is_some_and(|thought| thought.conversation_id == "named-by-a-client"));
+    // A passive capture creating its conversation joins the recorded future
+    // sharing, as it always has.
+    let watched = record(&store, Channel::EditorWatcher, "watched-later");
+    let expected: HashSet<_> = [watched].into_iter().collect();
+    assert_eq!(shared_for(&store, &destination), expected);
+    assert_eq!(publishable(&repo, &store, &destination), expected);
+
+    // An MCP thought in a brand-new conversation nobody shared is private too.
+    let fresh = record(&store, Channel::Mcp, "never-shared");
+    assert!(!shared_for(&store, &destination).contains(&fresh));
+    assert!(!shared_for(&store, &destination).contains(&through_mcp));
 }
 
 fn shown(raw: &str) -> Option<String> {

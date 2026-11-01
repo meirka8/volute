@@ -403,3 +403,120 @@ fn cross_repository_reinitialize_is_rejected_without_creating_a_store() {
     let second_layout = cvc_core::repository::RepositoryLayout::discover(&second.root).unwrap();
     assert!(!second_layout.cvc_dir().exists());
 }
+
+/// Waits for the server's log line that ends one capture: `saved` on success,
+/// `failure` otherwise.
+fn wait_for_capture(rx: &mpsc::Receiver<Value>, saved: &str, failure: &str) {
+    let completion = wait_for(rx, Duration::from_secs(5), |m| {
+        m.get("method") == Some(&json!("window/logMessage"))
+            && m["params"]["message"]
+                .as_str()
+                .is_some_and(|s| s.contains(saved) || s.contains(failure))
+    });
+    let message = completion["params"]["message"].as_str().unwrap();
+    assert!(message.contains(saved), "{message}");
+}
+
+#[test]
+fn future_sharing_still_extends_to_the_editor_watcher_and_turn_notifications() {
+    let repo = test_repo("future");
+    let mut child = ChildGuard(lsp_command(&repo, &repo.root).spawn().unwrap());
+    let mut stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Some(msg) = read_message(&mut reader) {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+    send(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "capabilities":{}, "rootUri": Url::from_directory_path(&repo.root).unwrap(), "processId":null
+        }}),
+    );
+    let initialized = wait_for(&rx, Duration::from_secs(5), |m| {
+        m.get("id") == Some(&json!(1))
+    });
+    assert!(initialized.get("result").is_some(), "{initialized:?}");
+    send(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+    );
+    // The watcher records only after the capture acknowledgement, which the
+    // CLI's typed challenge would record.
+    cvc_core::privacy::acknowledge_capture(&git2::Repository::open(&repo.root).unwrap()).unwrap();
+
+    let mut capture_both = |round: u32| {
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"$/cvc/turn/batch","params":{
+                "sourceRequestId": format!("request-{round}"),
+                "sessionId": "copilot-session",
+                "model": "test",
+                "interactions": [{
+                    "author": "human",
+                    "userPrompt": format!("watched prompt {round}"),
+                    "response": format!("watched response {round}")
+                }]
+            }}),
+        );
+        wait_for_capture(&rx, "Batch saved", "Failed to save batch");
+        let turn = format!("turn-{round}");
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"$/cvc/turn/start","params":{
+                "id": turn, "prompt": format!("explicit prompt {round}"), "author": "human"
+            }}),
+        );
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"$/cvc/turn/end","params":{
+                "id": turn, "response": format!("explicit response {round}"), "model": "test"
+            }}),
+        );
+        wait_for_capture(&rx, "Interaction saved to DB", "Failed to save interaction");
+    };
+
+    // Both editor conversations are shared with their future thoughts, as
+    // `cvc share <id> --future` records it, after a first thought in each.
+    capture_both(1);
+    let layout = cvc_core::repository::RepositoryLayout::discover(&repo.root).unwrap();
+    let destination = "7".repeat(64);
+    {
+        let store = cvc_core::db::CvcStore::open(layout.db_path()).unwrap();
+        for conversation in ["copilot-session", "default-session"] {
+            let snapshot = store.share_snapshot(conversation).unwrap();
+            assert_eq!(snapshot.len(), 1, "{conversation}");
+            store
+                .share_exact_snapshot(
+                    conversation,
+                    &destination,
+                    &snapshot,
+                    cvc_core::models::FutureSharePolicy::Shared,
+                )
+                .unwrap();
+        }
+    }
+
+    // The editor's later thoughts join the share as they are captured.
+    capture_both(2);
+    let store = cvc_core::db::CvcStore::open(layout.db_path()).unwrap();
+    let mut captured = std::collections::HashSet::new();
+    for conversation in ["copilot-session", "default-session"] {
+        let thoughts = store
+            .get_recent_interactions_for_conversation(conversation, 10)
+            .unwrap();
+        assert_eq!(thoughts.len(), 2, "{conversation}");
+        captured.extend(thoughts.into_iter().map(|thought| thought.id));
+    }
+    let shared: std::collections::HashSet<_> = store
+        .projection_interaction_ids(&destination)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(shared, captured);
+}

@@ -22,6 +22,12 @@ use std::{
 
 const MAX_REDACTION_PLAN_BYTES: u64 = 64 * 1024;
 
+/// Printed before the `I SHARE` phrase when future sharing is asked for a
+/// conversation that already holds thoughts recorded through MCP. The share
+/// covers those, but the store records every later MCP thought private, so
+/// future sharing does not extend to them.
+const MCP_THOUGHTS_STAY_PRIVATE: &str = "Future sharing does not extend to thoughts recorded through MCP: later ones stay private until this conversation is shared again.";
+
 fn remote(repo: &Repository, requested: Option<&str>) -> Result<String> {
     if let Some(name) = requested {
         return Ok(name.to_owned());
@@ -281,7 +287,9 @@ pub async fn share(
 /// conversation and destination are known, with `--future` as
 /// `FutureSharePolicy::Shared` and `--push` as `publish_after`.
 ///
-/// It prints the conversation summary, then requires the typed
+/// It prints the conversation summary (and, when future sharing is asked for a
+/// conversation holding thoughts recorded through MCP, that future sharing does
+/// not extend to later ones), then requires the typed
 /// `I SHARE <id> <fingerprint> <count> <token>` challenge for the exact
 /// snapshot it just read, and only then records the share. The challenge goes
 /// through `typed_acknowledgement`, so it needs an interactive terminal and a
@@ -315,6 +323,9 @@ pub(crate) fn share_conversation(
         .find(|summary| summary.id == id)
     {
         println!("{}", share_summary(&destination.name, &summary));
+    }
+    if future == FutureSharePolicy::Shared && store.conversation_mcp_capture_count(id)? > 0 {
+        println!("{MCP_THOUGHTS_STAY_PRIVATE}");
     }
     let ids = store.share_snapshot(id)?;
     let closure = ids.iter().map(|x| x.as_str()).collect::<String>();

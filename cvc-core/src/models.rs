@@ -624,6 +624,65 @@ pub(crate) enum CaptureSource {
     Legacy,
 }
 
+impl CaptureSource {
+    /// Whether a capture from this source joins its conversation's future
+    /// sharing: the destinations for which `cvc share --future` (or the future
+    /// choice of the conversations view) recorded that the conversation's later
+    /// thoughts are shared as they are captured.
+    ///
+    /// Future sharing exists for the passive channels, and they take part: the
+    /// editor's chat-session watcher and its turn notifications, and Claude Code
+    /// transcript ingestion. Each records into the conversation of the session it
+    /// observed. `cvc run` and pulls keep taking part as well; a run always
+    /// starts a conversation of its own, and a pull records into a conversation
+    /// namespaced by the destination it came from.
+    ///
+    /// An MCP client names the conversation a thought goes into, and in practice
+    /// the model behind the client chooses that name. A thought recorded through
+    /// MCP is therefore stored private whatever the named conversation's future
+    /// sharing, and only an explicit share of the conversation covers it.
+    /// `Legacy`, the default, takes part in nothing, so a capture whose source is
+    /// not known is never shared by a conversation's policy either.
+    ///
+    /// There is deliberately no catch-all arm: a new source does not compile
+    /// until it is decided here.
+    pub(crate) fn inherits_future_sharing(self) -> bool {
+        match self {
+            CaptureSource::VscodePassive
+            | CaptureSource::VscodeExplicit
+            | CaptureSource::ClaudeCode
+            | CaptureSource::CliRun
+            | CaptureSource::SyncImport => true,
+            CaptureSource::Mcp | CaptureSource::Legacy => false,
+        }
+    }
+
+    /// Whether a capture from this source renames its conversation when the
+    /// conversation already exists. Every source titles a conversation it
+    /// creates; this decides only what happens to one that is already there.
+    ///
+    /// The channels that observe a session keep its title current, Claude Code
+    /// ingestion above all: a session is titled from its first prompt until its
+    /// own title appears. The editor, `cvc run` and pulls set theirs as before.
+    /// An MCP client names the conversation a thought goes into, so a thought
+    /// recorded through MCP leaves an existing conversation's title exactly as
+    /// it was, empty or not: that title is what `cvc conversations` lists and
+    /// what the summary before the `I SHARE` phrase shows. `Legacy`, a source
+    /// that is not known, renames nothing either.
+    ///
+    /// No catch-all arm, for the same reason as `inherits_future_sharing`.
+    pub(crate) fn refreshes_conversation_title(self) -> bool {
+        match self {
+            CaptureSource::VscodePassive
+            | CaptureSource::VscodeExplicit
+            | CaptureSource::ClaudeCode
+            | CaptureSource::CliRun
+            | CaptureSource::SyncImport => true,
+            CaptureSource::Mcp | CaptureSource::Legacy => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Author {
