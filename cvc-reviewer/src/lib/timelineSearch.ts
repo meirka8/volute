@@ -21,9 +21,10 @@
  * - `text`: the stimulus (the prompt, the context, the compaction summary, the tool results with
  *   the names they are shown under), the reasoning, the response and the arguments of the tool
  *   calls, as the layout of the step draws them. The markers of the wire (`[tool_result Bash]`,
- *   `[meta]`), the placeholders the Reviewer writes when nothing was recorded, the names of
- *   arguments, the words of the options ("runs in background") and reasoning a card has no place
- *   for are not in it. The pieces are joined by NUL, which the fold leaves out of every one of
+ *   `[meta]`, and the version 2 markers with their boundary tokens), the notes the capture leaves
+ *   where it cut or could not keep something (`[cvc: withheld ...]`, `[cvc: truncated ...]`), the
+ *   placeholders the Reviewer writes when nothing was recorded, the names of arguments, the words
+ *   of the options ("runs in background") and reasoning a card has no place for are not in it. The pieces are joined by NUL, which the fold leaves out of every one of
  *   them, so a phrase never matches across two of them.
  * - `tools`: each call's recorded name and the name the cards show (`toolTitle`).
  * - `paths`: the files the step touched, from its context items and from the files its calls name, with `/` for
@@ -50,18 +51,20 @@ import type { ArtifactLinkData, InteractionNode } from '../types/cvc';
 import { fold, isWhiteSpaceCode, withSlashes } from './searchFold';
 import { StringTable } from './stringTable';
 import { cutAtCodePoint } from './textLines';
-import { toolCallPieces, toolTitle, type DrawnPiece } from './toolCalls';
+import { splitOmitted, toolCallPieces, toolTitle, type DrawnPiece } from './toolCalls';
 import { getActionLines, getObservation, getThought, showsReasoning } from './triadNode';
 import {
   groupStimulus,
   hasText,
+  isWithheldResponse,
   nodeLayout,
   parentToolNamesByNode,
-  parseStimulus,
-  stimulusOrigin,
-  toolResultsMatchParent,
+  readStimulus,
+  viewStimulus,
+  withheldFieldBytes,
   type ParentToolCall,
   type StimulusBlock,
+  type StimulusView,
 } from './transcriptNode';
 
 // ---------------------------------------------------------------------------
@@ -403,6 +406,36 @@ function stimulusTexts(block: StimulusBlock, into: string[]): void {
   }
 }
 
+/**
+ * The texts of a stimulus as `StimulusPane` draws them, by the view it draws (`viewStimulus`). The notes the
+ * capture left where it cut a part or could not keep it are drawn in the Reviewer's own words, and the
+ * markers and boundary tokens of the wire are not drawn at all: none of them is a text to find.
+ */
+function stimulusViewTexts(view: StimulusView, into: string[]): void {
+  switch (view.kind) {
+    case 'segments':
+      for (const block of groupStimulus(view.segments)) stimulusTexts(block, into);
+      break;
+    case 'undivided':
+    case 'unverified':
+      // Drawn as one block of text, markers and all.
+      into.push(view.text);
+      break;
+    case 'verified':
+      for (const block of view.blocks) {
+        if (block.kind === 'tool_results') {
+          for (const result of block.results) {
+            into.push(toolTitle(result.tool));
+            for (const piece of result.content) if (piece.kind === 'text') into.push(piece.text);
+          }
+        } else {
+          for (const piece of block.content) if (piece.kind === 'text') into.push(piece.text);
+        }
+      }
+      break;
+  }
+}
+
 /** The lines of a text that is drawn a line at a time (the rows of a diff), less the empty ones. */
 function linesOf(text: string): string[] {
   const lines = text.includes('\r') ? text.split('\r\n').join('\n').split('\r').join('\n').split('\n') : text.split('\n');
@@ -442,18 +475,18 @@ function readStep(node: InteractionNode, parentTools: readonly ParentToolCall[] 
   const transcript = nodeLayout(node) === 'transcript';
 
   if (transcript) {
-    const segments = parseStimulus(node.user_prompt, { interruptionBoundary: node.author === 'human' });
-    const origin = stimulusOrigin(node, segments);
+    // The stimulus is read as the card reads it: by its verified markers, as one block when they carry tokens that
+    // do not verify, and by the version 1 heuristics only when there are no tokens at all (and then, a stimulus whose
+    // tool results are not those of the step before is drawn as one block of text, markers and all).
+    const read = readStimulus({ id: node.id, author: node.author, user_prompt: node.user_prompt });
+    const { view, origin } = viewStimulus(node, read, parentTools);
     parts.origin = origin === 'Prompt' ? 'prompt' : origin === 'Tool results' ? 'tool-results' : 'other';
-    // A stimulus whose tool results are not those of the step before is drawn as one block of text, markers and all.
-    const undivided = parentTools !== null && !toolResultsMatchParent(segments, parentTools);
-    if (undivided) {
-      if (typeof node.user_prompt === 'string') parts.texts.push(node.user_prompt);
-    } else {
-      for (const block of groupStimulus(segments)) stimulusTexts(block, parts.texts);
+    stimulusViewTexts(view, parts.texts);
+    // Text the capture could not scrub is not recorded, and the card says so in its own words instead of drawing it.
+    if (hasText(node.model_cot) && withheldFieldBytes(node.model_cot) === null) parts.texts.push(node.model_cot);
+    if (hasText(node.model_response) && !isWithheldResponse(node) && withheldFieldBytes(node.model_response) === null) {
+      parts.texts.push(node.model_response);
     }
-    if (hasText(node.model_cot)) parts.texts.push(node.model_cot);
-    if (hasText(node.model_response)) parts.texts.push(node.model_response);
   } else {
     const thought = getThought(node);
     if (thought.recorded) parts.texts.push(thought.text);
@@ -465,7 +498,9 @@ function readStep(node: InteractionNode, parentTools: readonly ParentToolCall[] 
   }
 
   if (Array.isArray(node.tool_executions)) {
-    for (const exec of node.tool_executions) {
+    // The capture's record that it left calls out is not a call the model made, and the transcript layout draws no card for it.
+    const calls = transcript ? splitOmitted(node.tool_executions).calls : node.tool_executions;
+    for (const exec of calls) {
       const name = typeof exec?.tool_name === 'string' ? exec.tool_name : '';
       const title = toolTitle(name);
       if (name !== '') parts.toolNames.push(name);
@@ -914,13 +949,30 @@ export function conversationHint(node: InteractionNode): string | null {
   const prompt = typeof node.user_prompt === 'string' ? node.user_prompt : '';
   if (prompt === '') return null;
   if (nodeLayout(node) !== 'transcript') return firstLine(prompt);
-  const segments = parseStimulus(prompt, { interruptionBoundary: node.author === 'human' });
-  for (const kind of ['prompt', 'meta'] as const) {
-    for (const segment of segments) {
-      if (segment.kind === kind && segment.text.trim() !== '') return firstLine(segment.text);
-    }
+  const read = readStimulus({ id: node.id, author: node.author, user_prompt: prompt });
+  switch (read.kind) {
+    case 'legacy':
+      for (const kind of ['prompt', 'meta'] as const) {
+        for (const segment of read.segments) {
+          if (segment.kind === kind && segment.text.trim() !== '') return firstLine(segment.text);
+        }
+      }
+      return null;
+    case 'verified':
+      // What the capture marked: a person's words, else the task an agent delegated, else the context it started with.
+      for (const kind of ['prompt', 'task', 'meta'] as const) {
+        for (const part of read.parts) {
+          if (part.kind !== kind) continue;
+          for (const piece of part.content) {
+            if (piece.kind === 'text' && piece.text.trim() !== '') return firstLine(piece.text);
+          }
+        }
+      }
+      return null;
+    case 'unverified':
+      // Its markers did not verify: nothing in it says which words are a person's, and the markers are not words.
+      return null;
   }
-  return null;
 }
 
 interface ConversationDraft {

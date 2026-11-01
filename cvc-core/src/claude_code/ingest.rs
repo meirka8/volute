@@ -4,13 +4,15 @@
 //! closed responses in that window, skips the ones already recorded (by their
 //! deterministic ids), and commits the new captures together with the advanced
 //! cursor in one transaction. A run that fails changes nothing.
+use super::fields;
 use super::links;
 use super::session_lock::{SessionLock, SESSION_LOCK_WAIT};
 use super::transcript::{self, ParsedLine, PlanInput, TranscriptError, HARNESS};
-use crate::db::{CvcStore, DbError, HarnessCursorUpdate};
+use crate::db::{CvcStore, DbError, HarnessCursorUpdate, HARNESS_REASONS_SHOWN};
 use crate::models::{Conversation, Interaction, InteractionId};
 use crate::privacy::{self, ClaudeCodeCapture, PreparedPolicy};
 use crate::repository::{RepositoryLayout, RepositoryLayoutError};
+use crate::stimulus;
 use chrono::Utc;
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
@@ -88,6 +90,25 @@ pub struct IngestReport {
     pub unrecorded_blocks: usize,
     /// The distinct block types behind `unrecorded_blocks`, sorted.
     pub unrecorded_block_types: Vec<String>,
+    /// Of `inserted`, the responses recorded as a stand-in because their capture
+    /// could not be scrubbed within the limits: the stand-in keeps the stimulus,
+    /// says its response was withheld, and holds no tool calls or context items.
+    /// Without it, one such response would keep the cursor from moving past it.
+    pub withheld: usize,
+    /// Responses that could not be recorded at all, not even as a stand-in
+    /// (a conversation id or a title the capture boundary refuses). They are
+    /// skipped so that the responses after them are recorded.
+    pub lost: usize,
+    /// Why responses were withheld or lost: the limit that was hit, each once,
+    /// never any of the text.
+    pub withheld_reasons: Vec<String>,
+    /// Tool calls a response made beyond the 255 it records, in the responses
+    /// this run newly saw. A response that left calls or context items out ends
+    /// with a `cvc-omitted` record that says how many.
+    pub omitted_tool_calls: usize,
+    /// Context items (worktree paths a call read or edited) a response left out:
+    /// past the 256 it records, or a path that could not be scrubbed.
+    pub omitted_context_items: usize,
 }
 
 /// One transcript file to ingest: the file, the session id every entry must
@@ -187,7 +208,7 @@ pub fn ingest_waiting(
     // each in `<session>/subagents/agent-<id>.jsonl` beside the main file. Each
     // becomes its own conversation, keyed off the parent session so it never
     // collides with the parent or another agent.
-    for subagent in discover_subagents(transcript_path)? {
+    for subagent in discover_subagents(transcript_path, policy)? {
         let conversation_id = format!("{session}:{}", subagent.agent_stem);
         if !privacy::is_safe_identifier(&conversation_id) {
             continue;
@@ -215,6 +236,17 @@ pub fn ingest_waiting(
             }
         }
         report.unrecorded_block_types.sort();
+        report.withheld += target_report.withheld;
+        report.lost += target_report.lost;
+        for reason in target_report.withheld_reasons {
+            if report.withheld_reasons.len() < HARNESS_REASONS_SHOWN
+                && !report.withheld_reasons.contains(&reason)
+            {
+                report.withheld_reasons.push(reason);
+            }
+        }
+        report.omitted_tool_calls += target_report.omitted_tool_calls;
+        report.omitted_context_items += target_report.omitted_context_items;
     }
 
     Ok(report)
@@ -272,6 +304,7 @@ fn ingest_target(
             worktree_root: &worktree_root,
             path_aliases: &path_aliases,
             final_mode: mode == IngestMode::Final,
+            subagent: target.include_sidechain,
         },
     );
 
@@ -279,14 +312,22 @@ fn ingest_target(
     let title = target
         .title_override
         .clone()
-        .or_else(|| plan.title.clone())
+        .or_else(|| {
+            plan.title
+                .as_deref()
+                .and_then(|title| fields::captured_title(title, policy))
+        })
         .or_else(|| {
             existing
                 .as_ref()
                 .map(|conversation| conversation.title.clone())
                 .filter(|title| !title.trim().is_empty())
         })
-        .or_else(|| plan.first_human_prompt.as_deref().and_then(derive_title))
+        .or_else(|| {
+            plan.first_human_prompt
+                .as_deref()
+                .and_then(|prompt| derive_title(prompt, policy))
+        })
         .unwrap_or_else(|| DEFAULT_TITLE.to_owned());
     let created_at = existing
         .as_ref()
@@ -304,6 +345,8 @@ fn ingest_target(
     let mut already_present = 0usize;
     let mut unrecorded_blocks = 0usize;
     let mut unrecorded_block_types: BTreeSet<String> = BTreeSet::new();
+    let mut omitted_tool_calls = 0usize;
+    let mut omitted_context_items = 0usize;
     let mut commit_bearing: Vec<links::CommitBearingResponse> = Vec::new();
     for planned in plan.interactions {
         if !planned.commit_candidates.is_empty() {
@@ -319,6 +362,9 @@ fn ingest_target(
         }
         unrecorded_blocks += planned.unrecorded_blocks.len();
         unrecorded_block_types.extend(planned.unrecorded_blocks.iter().cloned());
+        // Scrubbed part by part with this capture's policy, then bounded and
+        // marked: see `crate::stimulus`.
+        let user_prompt = planned.user_prompt(policy);
         // A parent outside this batch and outside the store (suppressed, or
         // never recorded) breaks the chain rather than failing the batch.
         let parent_id = match planned.parent_id {
@@ -327,24 +373,47 @@ fn ingest_target(
             }
             _ => None,
         };
+        // The model's text, its reasoning and the tool arguments are scrubbed
+        // in full here, with the capture's policy, and only then bounded; one
+        // the scrubber cannot process is recorded as a note instead of failing
+        // the batch and holding the cursor back: see `fields`.
+        let model_cot = planned
+            .model_cot
+            .map(|text| fields::captured_text(text, policy));
+        let model_response = planned
+            .model_response
+            .map(|text| fields::captured_text(text, policy));
+        // The same for the paths and the calls, which are also capped at what the
+        // capture boundary takes (a response with more would otherwise keep the
+        // cursor from moving): see `fields`.
+        let (context_items, left_out_context_items) =
+            fields::captured_context_items(planned.context_items, policy);
+        let (tool_executions, left_out_tool_calls) = fields::captured_tool_executions(
+            planned.tool_executions,
+            left_out_context_items,
+            &planned.id,
+            policy,
+        );
+        omitted_tool_calls += left_out_tool_calls;
+        omitted_context_items += left_out_context_items;
         let interaction = Interaction {
             id: planned.id.clone(),
             conversation_id: target.conversation_id.to_owned(),
             parent_id,
             timestamp: planned.timestamp,
             author: planned.author,
-            user_prompt: planned.user_prompt,
+            user_prompt,
             model_name: planned.model_name,
-            model_cot: planned.model_cot,
-            model_response: planned.model_response,
+            model_cot,
+            model_response,
             source_request_id: Some(planned.response_key),
         };
         batch_ids.insert(planned.id);
         captures.push(ClaudeCodeCapture::new(
             conversation.clone(),
             interaction,
-            planned.context_items,
-            planned.tool_executions,
+            context_items,
+            tool_executions,
             policy.clone(),
             capture_worktree.clone(),
         ));
@@ -390,6 +459,11 @@ fn ingest_target(
         subagent_linked: 0,
         unrecorded_blocks,
         unrecorded_block_types: unrecorded_block_types.into_iter().collect(),
+        withheld: outcome.withheld,
+        lost: outcome.lost,
+        withheld_reasons: outcome.reasons,
+        omitted_tool_calls,
+        omitted_context_items,
     })
 }
 
@@ -404,7 +478,10 @@ struct Subagent {
 
 /// Finds `<session>/subagents/agent-*.jsonl` beside `<session>.jsonl`. A missing
 /// directory yields nothing; symlinks and non-files are ignored.
-fn discover_subagents(transcript_path: &Path) -> Result<Vec<Subagent>, IngestError> {
+fn discover_subagents(
+    transcript_path: &Path,
+    policy: &PreparedPolicy,
+) -> Result<Vec<Subagent>, IngestError> {
     let directory = transcript_path.with_extension("").join("subagents");
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -429,7 +506,7 @@ fn discover_subagents(transcript_path: &Path) -> Result<Vec<Subagent>, IngestErr
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             continue;
         }
-        let title = subagent_title(&path.with_extension("meta.json"));
+        let title = subagent_title(&path.with_extension("meta.json"), policy);
         subagents.push(Subagent {
             path: path.clone(),
             agent_stem: stem.to_owned(),
@@ -442,7 +519,7 @@ fn discover_subagents(transcript_path: &Path) -> Result<Vec<Subagent>, IngestErr
 }
 
 /// A short title from a subagent's `.meta.json` (`agentType`: `description`).
-fn subagent_title(meta_path: &Path) -> Option<String> {
+fn subagent_title(meta_path: &Path, policy: &PreparedPolicy) -> Option<String> {
     let text = fs::read_to_string(meta_path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let agent_type = value.get("agentType").and_then(|v| v.as_str());
@@ -453,7 +530,7 @@ fn subagent_title(meta_path: &Path) -> Option<String> {
         (None, Some(desc)) if !desc.trim().is_empty() => desc.to_owned(),
         _ => return None,
     };
-    Some(derive_title(&combined).unwrap_or(combined))
+    derive_title(&combined, policy)
 }
 
 /// The stored cursor is trusted only when it still lands on a line boundary
@@ -499,15 +576,16 @@ fn path_aliases(lines: &[ParsedLine], worktree_root: &Path) -> Vec<(PathBuf, Pat
     aliases
 }
 
-fn derive_title(prompt: &str) -> Option<String> {
+/// A title from the first non-blank line of `prompt`. The line is scrubbed in
+/// full before it is cut, so a secret is redacted whole rather than cut in
+/// half; a line that cannot be scrubbed yields no title.
+fn derive_title(prompt: &str, policy: &PreparedPolicy) -> Option<String> {
     let line = prompt.lines().find(|line| !line.trim().is_empty())?.trim();
+    let line = policy.scrub(line).ok()?;
     if line.len() <= MAX_DERIVED_TITLE_BYTES {
-        return Some(line.to_owned());
+        return Some(line);
     }
-    let mut end = MAX_DERIVED_TITLE_BYTES;
-    while end > 0 && !line.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = stimulus::head_len(&line, MAX_DERIVED_TITLE_BYTES);
     Some(format!("{}…", &line[..end]))
 }
 
@@ -668,6 +746,7 @@ mod tests {
                 worktree_root: root,
                 path_aliases: &[],
                 final_mode: true,
+                subagent: false,
             },
         );
         plan.interactions[0].id.clone()

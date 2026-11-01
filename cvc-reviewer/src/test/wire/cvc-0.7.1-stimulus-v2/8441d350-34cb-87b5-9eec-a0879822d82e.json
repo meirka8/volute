@@ -1,0 +1,114 @@
+{
+  "interaction": {
+    "id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+    "conversation_id": "5e0d6a42-7b1c-4d3e-9a8f-1c2b3d4e5f60",
+    "parent_id": "c727978d-df55-8fa3-98c1-02b7698dda1c",
+    "timestamp": "2026-10-10T12:56:00Z",
+    "author": "human",
+    "user_prompt": "[meta ~cvc-eb176785d512a6bc] <system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nFixture instructions (inert).\n</system-reminder>\n\n[prompt ~cvc-eb176785d512a6bc] Thanks. Now read the twelve modules",
+    "model_name": "claude-fixture-edge",
+    "model_cot": null,
+    "model_response": "Reading the twelve modules.",
+    "source_request_id": "req_E12"
+  },
+  "context_items": [],
+  "tool_executions": [
+    {
+      "id": 15,
+      "interaction_id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/src/mod0.rs\"}",
+      "status": "success"
+    },
+    {
+      "id": 16,
+      "interaction_id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/src/mod1.rs\"}",
+      "status": "success"
+    },
+    {
+      "id": 17,
+      "interaction_id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/src/mod2.rs\"}",
+      "status": "success"
+    },
+    {
+      "id": 18,
+      "interaction_id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/src/mod3.rs\"}",
+      "status": "success"
+    },
+    {
+      "id": 19,
+      "interaction_id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/src/mod4.rs\"}",
+      "status": "success"
+    },
+    {
+      "id": 20,
+      "interaction_id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/src/mod5.rs\"}",
+      "status": "success"
+    },
+    {
+      "id": 21,
+      "interaction_id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/src/mod6.rs\"}",
+      "status": "success"
+    },
+    {
+      "id": 22,
+      "interaction_id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/src/mod7.rs\"}",
+      "status": "success"
+    },
+    {
+      "id": 23,
+      "interaction_id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/src/mod8.rs\"}",
+      "status": "success"
+    },
+    {
+      "id": 24,
+      "interaction_id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/src/mod9.rs\"}",
+      "status": "success"
+    },
+    {
+      "id": 25,
+      "interaction_id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/src/mod10.rs\"}",
+      "status": "success"
+    },
+    {
+      "id": 26,
+      "interaction_id": "8441d350-34cb-87b5-9eec-a0879822d82e",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/src/mod11.rs\"}",
+      "status": "success"
+    }
+  ],
+  "artifact_links": []
+}

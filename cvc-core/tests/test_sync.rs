@@ -4014,3 +4014,648 @@ fn a_failed_transport_leaves_baseline_held_rows_published_and_marks_only_new_one
     assert_eq!(rows.len(), 2);
     Ok(())
 }
+
+// ---- a node already published that the privacy check now refuses ------------------------
+
+const FETCHED_BASELINE: &str = "refs/remotes/fixture/cvc/main";
+
+fn published_item(text: &str) -> Interaction {
+    Interaction {
+        id: InteractionId::new(),
+        conversation_id: "published".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: text.into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    }
+}
+
+/// Publishes the item, then rewrites its node in the published tree the way an
+/// earlier version could have written it, and makes the result the fetched
+/// baseline of the remote called `fixture`.
+fn fetch_baseline_with_edited_node(
+    repo: &Repository,
+    store: &CvcStore,
+    id: &InteractionId,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> anyhow::Result<()> {
+    project_fixture_to_ref(repo, store, "refs/cvc/published")?;
+    let commit = repo
+        .find_reference("refs/cvc/published")?
+        .peel_to_commit()?;
+    let tree = commit.tree()?;
+    let id_text = id.to_string();
+    let shard = &id_text[..2];
+    let file = format!("{id_text}.json");
+    let blob = repo.find_blob(
+        tree.get_path(std::path::Path::new(&format!("nodes/{shard}/{file}")))?
+            .id(),
+    )?;
+    let mut value: serde_json::Value = serde_json::from_slice(blob.content())?;
+    edit(&mut value);
+    let edited = repo.blob(&serde_json::to_vec_pretty(&value)?)?;
+    let nodes = tree
+        .get_name("nodes")
+        .expect("nodes")
+        .to_object(repo)?
+        .peel_to_tree()?;
+    let shard_tree = nodes
+        .get_name(shard)
+        .expect("shard")
+        .to_object(repo)?
+        .peel_to_tree()?;
+    let mut shard_builder = repo.treebuilder(Some(&shard_tree))?;
+    shard_builder.insert(&file, edited, FileMode::Blob.into())?;
+    let mut nodes_builder = repo.treebuilder(Some(&nodes))?;
+    nodes_builder.insert(shard, shard_builder.write()?, FileMode::Tree.into())?;
+    let mut root = repo.treebuilder(Some(&tree))?;
+    root.insert("nodes", nodes_builder.write()?, FileMode::Tree.into())?;
+    let rewritten = repo.find_tree(root.write()?)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    repo.commit(
+        Some(FETCHED_BASELINE),
+        &signature,
+        &signature,
+        "a node as an earlier version wrote it",
+        &rewritten,
+        &[&commit],
+    )?;
+    Ok(())
+}
+
+fn push_error(repo: &Repository, store: &CvcStore) -> String {
+    match sync::push_projection_to_ref(
+        repo,
+        store,
+        &pinned(repo, FETCHED_BASELINE),
+        TEST_DESTINATION,
+    ) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("the push was expected to stop at the published node"),
+    }
+}
+
+#[test]
+fn a_published_node_with_an_unterminated_key_header_stops_the_push_and_says_how_to_go_on(
+) -> anyhow::Result<()> {
+    let header = "output\n-----BEGIN RSA PRIVATE KEY-----\nMIIEfakeFAKEfake0123456789";
+    // The key text before a lone END line is the same case from the other side.
+    let footer =
+        "MIIEfakeFAKEfake0123456789\nQ2VudCB0aGUgZW5k==\n-----END RSA PRIVATE KEY-----\nok";
+    for (place, text) in [
+        ("prompt", header),
+        ("response", header),
+        ("tool arguments", header),
+        ("end line", footer),
+    ] {
+        let temp = TempDir::new()?;
+        let repo = Repository::init(temp.path())?;
+        let store = CvcStore::open(temp.path().join("source.db"))?;
+        let item = published_item("an ordinary prompt");
+        store.create_interaction(&item)?;
+        let id = item.id.to_string();
+        fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| match place {
+            "prompt" => node["interaction"]["user_prompt"] = text.into(),
+            "response" | "end line" => node["interaction"]["model_response"] = text.into(),
+            _ => {
+                node["tool_executions"] = serde_json::json!([{
+                    "id": 1, "interaction_id": id, "tool_protocol": "native",
+                    "tool_name": "Write", "status": "success",
+                    "arguments": serde_json::json!({"content": text}).to_string(),
+                }]);
+            }
+        })?;
+
+        let message = push_error(&repo, &store);
+        assert!(message.contains(&id), "{place}: {message}");
+        assert!(
+            message.contains("already-published text holds an unterminated private-key block"),
+            "{place}: {message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "`cvc redact {id} --remote fixture --rewrite-plan redaction-plan.json`"
+            )),
+            "{place}: {message}"
+        );
+        assert!(
+            message.contains("`cvc push --manual --remote fixture`"),
+            "{place}: {message}"
+        );
+        assert!(message.contains("rotate it first"), "{place}: {message}");
+        assert!(
+            message.contains("also removes the node from this machine's database"),
+            "{place}: {message}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn suppressing_the_node_for_the_destination_is_what_lets_the_push_go_on() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("an ordinary prompt");
+    let other = Interaction {
+        user_prompt: "another turn, also published".into(),
+        ..published_item("unused")
+    };
+    store.create_interaction(&item)?;
+    store.create_interaction(&other)?;
+    let id = item.id.to_string();
+    fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
+        node["interaction"]["user_prompt"] =
+            "-----BEGIN PRIVATE KEY-----\nMIIEfakeFAKEfake0123456789".into();
+    })?;
+    assert!(push_error(&repo, &store).contains(&id));
+
+    // What `cvc redact <id> --remote fixture` records, then the next push.
+    store.authorize_and_tombstone_remote(
+        &item.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::UserRequested,
+    )?;
+    let sync::ProjectionResult::Candidate { oid, .. } = sync::push_projection_to_ref(
+        &repo,
+        &store,
+        &pinned(&repo, FETCHED_BASELINE),
+        TEST_DESTINATION,
+    )?
+    else {
+        panic!("the tombstone is something to publish")
+    };
+    let tree = repo.find_commit(oid)?.tree()?;
+    let at = |dir: &str, who: &str| {
+        tree.get_path(std::path::Path::new(&format!(
+            "{dir}/{}/{who}.json",
+            &who[..2]
+        )))
+        .is_ok()
+    };
+    assert!(!at("nodes", &id), "the suppressed node left the tree");
+    assert!(at("tombstones", &id), "its tombstone is published");
+    assert!(
+        at("nodes", &other.id.to_string()),
+        "the other node is still there"
+    );
+    Ok(())
+}
+
+#[test]
+fn any_published_node_that_fails_the_check_is_named_with_its_own_reason() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("an ordinary prompt");
+    store.create_interaction(&item)?;
+    fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
+        node["interaction"]["model_response"] = "key AKIAABCDEFGHIJKLMNOP here".into();
+    })?;
+    let message = push_error(&repo, &store);
+    assert!(message.contains(&item.id.to_string()), "{message}");
+    assert!(
+        message.contains("no longer passes the privacy check"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("unterminated private-key block"),
+        "{message}"
+    );
+    assert!(message.contains("cvc redact"), "{message}");
+    Ok(())
+}
+
+#[test]
+fn a_clean_published_node_does_not_stop_a_push() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("an ordinary prompt");
+    store.create_interaction(&item)?;
+    // A key block that has its END line is redacted whole, not unterminated, and
+    // text that only mentions the words is not a header.
+    fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
+        node["interaction"]["user_prompt"] = "see the PRIVATE KEY section of the BEGIN docs".into();
+    })?;
+    assert!(sync::push_projection_to_ref(
+        &repo,
+        &store,
+        &pinned(&repo, FETCHED_BASELINE),
+        TEST_DESTINATION
+    )
+    .is_ok());
+    Ok(())
+}
+
+#[test]
+fn a_published_node_that_only_mentions_a_key_header_does_not_stop_a_push() -> anyhow::Result<()> {
+    for (place, text) in [
+        (
+            "prompt",
+            "A key file must start with -----BEGIN RSA PRIVATE KEY----- and end with its END line.",
+        ),
+        (
+            "response",
+            "Header:\n-----BEGIN PRIVATE KEY-----\nThe next line is ordinary text, not a key.",
+        ),
+        ("tool arguments", "-----END PRIVATE KEY-----"),
+    ] {
+        let temp = TempDir::new()?;
+        let repo = Repository::init(temp.path())?;
+        let store = CvcStore::open(temp.path().join("source.db"))?;
+        let item = published_item("an ordinary prompt");
+        store.create_interaction(&item)?;
+        let id = item.id.to_string();
+        fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| match place {
+            "prompt" => node["interaction"]["user_prompt"] = text.into(),
+            "response" => node["interaction"]["model_response"] = text.into(),
+            _ => {
+                node["tool_executions"] = serde_json::json!([{
+                    "id": 1, "interaction_id": id, "tool_protocol": "native",
+                    "tool_name": "Write", "status": "success",
+                    "arguments": serde_json::json!({"content": text}).to_string(),
+                }]);
+            }
+        })?;
+        assert!(
+            sync::push_projection_to_ref(
+                &repo,
+                &store,
+                &pinned(&repo, FETCHED_BASELINE),
+                TEST_DESTINATION
+            )
+            .is_ok(),
+            "{place}: prose that mentions a header must not stop the push"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_secret_in_a_marker_name_of_a_remote_node_is_refused_on_push_and_rewritten_on_import(
+) -> anyhow::Result<()> {
+    use cvc_core::stimulus::{self, Reading, StimulusPart};
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("an ordinary prompt");
+    store.create_interaction(&item)?;
+    let id = item.id.to_string();
+    // A node as a hostile remote could write it: a stimulus that verifies, with
+    // a token where a tool's name goes. Names are not covered by the boundary.
+    let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    let crafted = stimulus::render(
+        &item.id,
+        &[
+            StimulusPart::tool_result(Some(secret), false, "output"),
+            StimulusPart::prompt("then a person"),
+        ],
+        &|text| Ok(text.to_owned()),
+    );
+    assert!(crafted.contains(&format!("[tool_result {secret} ")));
+    fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
+        node["interaction"]["user_prompt"] = crafted.clone().into();
+    })?;
+
+    // Pushing on top of it stops: the node no longer passes the privacy check.
+    let message = push_error(&repo, &store);
+    assert!(message.contains(&id), "{message}");
+    assert!(
+        message.contains("no longer passes the privacy check"),
+        "{message}"
+    );
+
+    // Pulling it rewrites the name before the first write, and what is stored
+    // is still the verified stimulus.
+    let imported = CvcStore::open(temp.path().join("imported.db"))?;
+    sync::pull_from_ref(&repo, &imported, FETCHED_BASELINE)?;
+    let stored = imported
+        .get_interaction(&item.id)?
+        .expect("the node was imported")
+        .user_prompt;
+    assert!(!stored.contains("ghp_"), "{stored}");
+    assert!(stored.contains("[tool_result redacted-tool "), "{stored}");
+    assert!(matches!(
+        stimulus::read(&item.id, &stored),
+        Reading::Verified(_)
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_context_range_an_earlier_version_stored_with_a_negative_line_is_published_without_it(
+) -> anyhow::Result<()> {
+    // A Read with huge numbers wrapped around in a release build and stored a negative
+    // end line; a remote refuses such an item, so a push of its conversation failed
+    // every time. The item is published, without a range.
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("a thought that read three ranges");
+    let range = |path: &str, start: Option<i32>, end: Option<i32>| ContextItem {
+        id: None,
+        interaction_id: item.id.clone(),
+        file_path: path.into(),
+        git_blob_sha: None,
+        dirty_patch: None,
+        start_line: start,
+        end_line: end,
+    };
+    store.capture_mcp(McpCapture::new(
+        Conversation {
+            id: item.conversation_id.clone(),
+            title: "fixture".into(),
+            created_at: item.timestamp,
+        },
+        item.clone(),
+        vec![
+            range("src/wrapped.rs", Some(5), Some(-3)),
+            range("src/negative_start.rs", Some(-1), Some(9)),
+            range("src/fine.rs", Some(3), Some(8)),
+        ],
+        Vec::new(),
+        PreparedPolicy::built_ins_only(),
+        "0".repeat(64),
+    ))?;
+    store.share_conversation_for_remote(
+        &item.conversation_id,
+        TEST_DESTINATION,
+        FutureSharePolicy::Private,
+    )?;
+    let sync::ProjectionResult::Candidate { oid, candidate, .. } =
+        sync::push_projection_to_ref(&repo, &store, &pinned(&repo, ""), TEST_DESTINATION)?
+    else {
+        panic!("the thought is something to publish")
+    };
+    drop(candidate);
+    let id = item.id.to_string();
+    let tree = repo.find_commit(oid)?.tree()?;
+    let entry = tree.get_path(std::path::Path::new(&format!(
+        "nodes/{}/{id}.json",
+        &id[..2]
+    )))?;
+    let node: serde_json::Value = serde_json::from_slice(repo.find_blob(entry.id())?.content())?;
+    let ranges: std::collections::BTreeMap<String, (serde_json::Value, serde_json::Value)> = node
+        ["context_items"]
+        .as_array()
+        .expect("context items")
+        .iter()
+        .map(|item| {
+            (
+                item["file_path"].as_str().unwrap().to_owned(),
+                (item["start_line"].clone(), item["end_line"].clone()),
+            )
+        })
+        .collect();
+    assert_eq!(ranges.len(), 3);
+    assert_eq!(
+        ranges["src/wrapped.rs"],
+        (serde_json::Value::Null, serde_json::Value::Null)
+    );
+    assert_eq!(
+        ranges["src/negative_start.rs"],
+        (serde_json::Value::Null, serde_json::Value::Null)
+    );
+    assert_eq!(ranges["src/fine.rs"], (3.into(), 8.into()));
+    // The stored rows are not touched: the repair is made on what is published.
+    let stored = store.get_context_items(&item.id)?;
+    assert!(stored.iter().any(|row| row.end_line == Some(-3)));
+    Ok(())
+}
+
+// ---- hostile names in a remote tree --------------------------------------------------------
+
+const HOSTILE_REF: &str = "refs/cvc/hostile";
+
+/// A ref whose tree holds `<namespace>/<shard>/<file>`, as a hostile remote could
+/// publish it. The events and ranges namespaces come with FORMAT 5 and the empty
+/// sibling tree that format requires, so a name is all that is wrong with them.
+fn hostile_ref(
+    repo: &Repository,
+    namespace: &str,
+    shard: &str,
+    file: &str,
+    body: &[u8],
+) -> anyhow::Result<()> {
+    let mut shard_tree = repo.treebuilder(None)?;
+    shard_tree.insert(file, repo.blob(body)?, FileMode::Blob.into())?;
+    let mut outer = repo.treebuilder(None)?;
+    outer.insert(shard, shard_tree.write()?, FileMode::Tree.into())?;
+    let mut root = repo.treebuilder(None)?;
+    root.insert(namespace, outer.write()?, FileMode::Tree.into())?;
+    if namespace != "tombstones" {
+        let empty = repo.treebuilder(None)?.write()?;
+        let sibling = if namespace == "events" {
+            "ranges"
+        } else {
+            "events"
+        };
+        root.insert(sibling, empty, FileMode::Tree.into())?;
+        root.insert("FORMAT", repo.blob(b"5\n")?, FileMode::Blob.into())?;
+    }
+    let tree = repo.find_tree(root.write()?)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    repo.commit(
+        Some(HOSTILE_REF),
+        &signature,
+        &signature,
+        "hostile names",
+        &tree,
+        &[],
+    )?;
+    Ok(())
+}
+
+/// What pulling that ref does: an `Err` with its message, `Ok` for a tree that is
+/// accepted, and a failure of the test for a panic.
+fn pull_hostile(
+    namespace: &str,
+    shard: &str,
+    file: &str,
+    body: &[u8],
+) -> anyhow::Result<Result<(), String>> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("pulled.db"))?;
+    hostile_ref(&repo, namespace, shard, file, body)?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sync::pull_from_ref(&repo, &store, HOSTILE_REF)
+    }));
+    match outcome {
+        Ok(result) => Ok(result.map_err(|error| error.to_string())),
+        Err(_) => panic!("pulling {namespace}/{shard}/{file:?} panicked"),
+    }
+}
+
+#[test]
+fn a_remote_tombstone_name_that_is_not_a_canonical_id_is_an_error_never_a_panic(
+) -> anyhow::Result<()> {
+    let id = InteractionId::new().to_string();
+    let body = serde_json::to_vec(&Tombstone::new(
+        id.parse()?,
+        TombstoneReasonCode::Security,
+        None,
+    ))?;
+    let other_shard = if id.starts_with("00") { "01" } else { "00" };
+    let simple = id.replace('-', "");
+    let cases: Vec<(&str, String, String, &str)> = vec![
+        (
+            "a one-byte stem",
+            "ab".into(),
+            "a.json".into(),
+            "invalid tombstone filename",
+        ),
+        (
+            "an empty stem",
+            "ab".into(),
+            ".json".into(),
+            "invalid tombstone filename",
+        ),
+        (
+            "a multibyte character across byte 2",
+            "ab".into(),
+            "aé.json".into(),
+            "invalid tombstone filename",
+        ),
+        (
+            "a multibyte stem as long as an id",
+            "c3".into(),
+            format!("{}.json", "é".repeat(18)),
+            "invalid tombstone filename",
+        ),
+        (
+            "an uppercase id",
+            id[..2].to_uppercase(),
+            format!("{}.json", id.to_uppercase()),
+            "invalid tombstone filename",
+        ),
+        (
+            "an id without hyphens",
+            id[..2].into(),
+            format!("{simple}.json"),
+            "invalid tombstone filename",
+        ),
+        (
+            "a name that is not an id",
+            "ab".into(),
+            "ab-not-an-interaction-id.json".into(),
+            "invalid tombstone filename",
+        ),
+        (
+            "a name without .json",
+            id[..2].into(),
+            id.clone(),
+            "invalid tombstone filename",
+        ),
+        (
+            "an id in the wrong shard",
+            other_shard.into(),
+            format!("{id}.json"),
+            "tombstone shard mismatch",
+        ),
+    ];
+    for (case, shard, file, message) in cases {
+        let result = pull_hostile("tombstones", &shard, &file, &body)?;
+        let error = result.expect_err(case);
+        assert!(error.contains(message), "{case}: {error}");
+    }
+    // A valid tree is still accepted.
+    assert_eq!(
+        pull_hostile("tombstones", &id[..2], &format!("{id}.json"), &body)?,
+        Ok(())
+    );
+    Ok(())
+}
+
+#[test]
+fn a_remote_event_or_range_name_that_is_not_a_digest_is_an_error_never_a_panic(
+) -> anyhow::Result<()> {
+    for (namespace, lower_only, invalid, mismatch) in [
+        (
+            "events",
+            false,
+            "invalid event filename",
+            "event path mismatch",
+        ),
+        (
+            "ranges",
+            true,
+            "invalid range filename",
+            "range path mismatch",
+        ),
+    ] {
+        let digest = "a".repeat(64);
+        let mut cases: Vec<(&str, String, String, &str)> = vec![
+            ("a one-byte stem", "aa".into(), "a.json".into(), invalid),
+            ("an empty stem", "aa".into(), ".json".into(), invalid),
+            (
+                "a multibyte character across byte 2",
+                "aa".into(),
+                "aé.json".into(),
+                invalid,
+            ),
+            (
+                "a multibyte stem as long as a digest",
+                "c3".into(),
+                format!("{}.json", "é".repeat(32)),
+                invalid,
+            ),
+            (
+                "a stem of the right length that is not hex",
+                "aa".into(),
+                format!("{}.json", "g".repeat(64)),
+                invalid,
+            ),
+            (
+                "a digest in the wrong shard",
+                "bb".into(),
+                format!("{digest}.json"),
+                mismatch,
+            ),
+        ];
+        if lower_only {
+            cases.push((
+                "an uppercase stem",
+                "aa".into(),
+                format!("{}.json", "A".repeat(64)),
+                invalid,
+            ));
+            cases.push((
+                "an uppercase shard",
+                "AA".into(),
+                format!("{digest}.json"),
+                "invalid range shard",
+            ));
+        }
+        for (case, shard, file, message) in cases {
+            let result = pull_hostile(namespace, &shard, &file, b"{}")?;
+            let error = result.expect_err(case);
+            assert!(error.contains(message), "{namespace}, {case}: {error}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_local_event_with_a_malformed_id_is_an_error_at_projection() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let db_path = temp.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let item = published_item("an ordinary prompt");
+    store.create_interaction(&item)?;
+    let mut event = derivation(&item.id, 'a', Vec::new());
+    event.event_id = "a".into();
+    insert_event_fixture(&db_path, &event)?;
+    trust_and_authorize_event(&db_path, &event)?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sync::push_projection_to_ref(&repo, &store, &pinned(&repo, ""), TEST_DESTINATION).is_err()
+    }));
+    assert_eq!(outcome.ok(), Some(true), "projecting a malformed event id");
+    Ok(())
+}

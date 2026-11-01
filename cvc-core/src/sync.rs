@@ -38,6 +38,22 @@ pub enum SyncError {
     Serde(#[from] serde_json::Error),
     #[error("Reference error: {0}")]
     Ref(String),
+    /// A node already in the destination's published history no longer passes
+    /// the privacy check. Published bytes are immutable, so the destination
+    /// can only be extended once the node is suppressed for it.
+    #[error(
+        "published node {id} cannot be re-verified: {reason}. If it held a real credential, \
+         rotate it first. To continue, suppress the node for this destination with \
+         `cvc redact {id} --remote {remote} --rewrite-plan redaction-plan.json` (this also \
+         removes the node from this machine's database), then run \
+         `cvc push --manual --remote {remote}`. The old bytes stay in the destination's Git \
+         history."
+    )]
+    PublishedNode {
+        id: String,
+        remote: String,
+        reason: String,
+    },
     /// The tracking ref moved between the import that was recorded as the
     /// projection baseline and the projection itself. Nothing was written.
     #[error(
@@ -331,8 +347,22 @@ pub fn validate_ref_name(ref_name: &str) -> bool {
 /// First two hex characters of an interaction ID, used as its `nodes/` shard.
 /// Mirrors `.git/objects`' own fan-out scheme so individual tree listings stay small
 /// as history grows, instead of one giant flat directory.
-fn shard_prefix(id: &str) -> &str {
-    &id[0..2]
+///
+/// Names that come out of a remote tree are validated before they get here, but
+/// this never panics whatever it is given: a name shorter than two bytes, or one
+/// whose second byte falls inside a multibyte character, is an error.
+fn shard_prefix(id: &str) -> Result<&str> {
+    id.get(0..2)
+        .ok_or_else(|| SyncError::Ref("identifier is too short to shard".into()))
+}
+
+/// `name` when it is an interaction id in canonical form: lowercase and hyphenated,
+/// as the rest of the sync paths require of the ids in a remote tree.
+fn canonical_interaction_id(name: &str) -> Option<&str> {
+    name.parse::<crate::models::InteractionId>()
+        .ok()
+        .filter(|id| id.as_str() == name)
+        .map(|_| name)
 }
 
 /// Resolves `name` as a child tree of `parent` (if `parent` is set and has such a
@@ -381,7 +411,7 @@ fn remove_tombstoned_projection_paths(
         let mut nb = repo.treebuilder(Some(&nodes))?;
         let mut changed = false;
         for id in ids {
-            let p = shard_prefix(id);
+            let p = shard_prefix(id)?;
             if let Some(sub) = child_tree(repo, Some(&nodes), p) {
                 let mut sb = repo.treebuilder(Some(&sub))?;
                 if sb.remove(format!("{id}.json")).is_ok() {
@@ -640,7 +670,7 @@ pub fn build_hard_redaction_plan<'repo>(
     }
     let id = target.as_str();
     let file = format!("{id}.json");
-    let shard = shard_prefix(&id);
+    let shard = shard_prefix(&id)?;
     let tombstones = child_tree(repo, Some(&tree), "tombstones");
     let tombstone_oid = child_tree(repo, tombstones.as_ref(), shard)
         .and_then(|s| s.get_name(&file).map(|e| e.id()))
@@ -842,7 +872,7 @@ pub fn apply_hard_redaction_locally(repo: &Repository, plan: &RedactionPlan) -> 
     let tree = commit.tree()?;
     let id = plan.target_id.as_str();
     let file = format!("{id}.json");
-    let shard = shard_prefix(&id);
+    let shard = shard_prefix(&id)?;
     if tree.get_name(&file).is_some()
         || child_tree(repo, Some(&tree), "nodes")
             .and_then(|nodes| child_tree(repo, Some(&nodes), shard))
@@ -916,7 +946,7 @@ fn validate_redaction_replacement(repo: &Repository, plan: &RedactionPlan) -> Re
     }
     let id = plan.target_id.as_str();
     let file = format!("{id}.json");
-    let shard = shard_prefix(&id);
+    let shard = shard_prefix(&id)?;
     let tombstone_oid = child_tree(
         repo,
         child_tree(repo, Some(&tree), "tombstones").as_ref(),
@@ -1126,6 +1156,8 @@ fn push_ids_to_ref(
         .map(|tree| repo.find_tree(tree.id()))
         .transpose()?;
 
+    // The remote the destination is, as an error can tell a person to type it.
+    let remote_name = baseline.remote.as_str();
     let mut emitted_bytes = 0usize;
     // Everything below that adds a new entry to the outbound tree is counted
     // here at the insertion site, so the summary cannot disagree with the tree.
@@ -1184,12 +1216,12 @@ fn push_ids_to_ref(
         projected_nodes.insert(id.as_str());
         let legacy_filename = format!("{}.json", id.as_str());
         if let Some(entry) = root_builder.get(&legacy_filename)? {
-            verify_existing_node(repo, entry.id(), &id.as_str())?;
+            verify_existing_node(repo, entry.id(), &id.as_str(), remote_name)?;
             continue; // already synced under the pre-v2 flat layout; leave it alone
         }
 
         let id_str = id.as_str();
-        let prefix = shard_prefix(&id_str);
+        let prefix = shard_prefix(&id_str)?;
         let already_sharded = child_tree(repo, existing_nodes_tree.as_ref(), prefix)
             .map(|sub| sub.get_name(&legacy_filename).is_some())
             .unwrap_or(false);
@@ -1197,7 +1229,7 @@ fn push_ids_to_ref(
             let entry = child_tree(repo, existing_nodes_tree.as_ref(), prefix)
                 .and_then(|tree| tree.get_name(&legacy_filename).map(|entry| entry.id()))
                 .ok_or_else(|| SyncError::Ref("missing immutable node".into()))?;
-            verify_existing_node(repo, entry, &id.as_str())?;
+            verify_existing_node(repo, entry, &id.as_str(), remote_name)?;
             continue;
         }
 
@@ -1250,7 +1282,7 @@ fn push_ids_to_ref(
         validate_tombstone(tombstone)?;
         let id = tombstone.interaction_id.to_string();
         let file = format!("{id}.json");
-        let prefix = shard_prefix(&id);
+        let prefix = shard_prefix(&id)?;
         let prior = child_tree(repo, existing_tombstones.as_ref(), prefix)
             .and_then(|x| x.get_name(&file).map(|e| e.id()));
         if let Some(oid) = prior {
@@ -1418,7 +1450,7 @@ fn push_ids_to_ref(
         {
             return Err(SyncError::Ref("invalid local derivation event".into()));
         }
-        let shard = &event.event_id[..2];
+        let shard = shard_prefix(&event.event_id)?;
         let file = format!("{}.json", event.event_id);
         let exists = child_tree(repo, existing_events_tree.as_ref(), shard)
             .and_then(|t| t.get_name(&file).map(|e| e.id()));
@@ -1460,7 +1492,7 @@ fn push_ids_to_ref(
         if !range.verify_id() {
             return Err(SyncError::Ref("invalid local range".into()));
         }
-        let shard = &range.range_id[..2];
+        let shard = shard_prefix(&range.range_id)?;
         let file = format!("{}.json", range.range_id);
         let bytes = serde_json::to_vec(&range)?;
         if let Some(oid) = child_tree(repo, existing_ranges_tree.as_ref(), shard)
@@ -1609,13 +1641,17 @@ fn baseline_holds(
 }
 
 /// Whether `tree` holds the node of interaction `id`, in either the legacy flat
-/// layout or the sharded `nodes/` layout.
-fn holds_node(repo: &Repository, tree: &Tree, id: &str) -> bool {
+/// layout or the sharded `nodes/` layout. An id that cannot be sharded is an error,
+/// never a panic, as everywhere an id is sliced.
+fn holds_node(repo: &Repository, tree: &Tree, id: &str) -> Result<bool> {
     let file = format!("{id}.json");
-    tree.get_name(&file).is_some()
-        || child_tree(repo, Some(tree), "nodes")
-            .and_then(|nodes| child_tree(repo, Some(&nodes), shard_prefix(id)))
-            .is_some_and(|shard| shard.get_name(&file).is_some())
+    if tree.get_name(&file).is_some() {
+        return Ok(true);
+    }
+    let shard = shard_prefix(id)?;
+    Ok(child_tree(repo, Some(tree), "nodes")
+        .and_then(|nodes| child_tree(repo, Some(&nodes), shard))
+        .is_some_and(|shard| shard.get_name(&file).is_some()))
 }
 
 /// What tombstone pruning took out of the baseline: `(interactions, records)`.
@@ -1633,7 +1669,7 @@ fn count_pruned_baseline_entries(
     let baseline_links = child_tree(repo, Some(baseline), "links");
     let projected_links = child_tree(repo, Some(projected), "links");
     for id in tombstoned {
-        if holds_node(repo, baseline, id) && !holds_node(repo, projected, id) {
+        if holds_node(repo, baseline, id)? && !holds_node(repo, projected, id)? {
             interactions += 1;
         }
         let held = baseline_links
@@ -1867,28 +1903,55 @@ fn validate_closed_derivation_graph(
             }
         }
     }
+    // A depth-first walk down the sources of each event, with a stack of its own:
+    // the length of a chain of derivations is whatever a remote published, up to
+    // the limit on events, and a call for each would overflow the stack.
     fn visit<'a>(
-        id: &'a str,
+        start: &'a str,
         by_id: &HashMap<&'a str, &'a DerivationEvent>,
         visiting: &mut HashSet<&'a str>,
         visited: &mut HashSet<&'a str>,
     ) -> Result<()> {
-        if visited.contains(id) {
+        if visited.contains(start) {
             return Ok(());
         }
-        if !visiting.insert(id) {
+        // Each frame is an event being walked and the next of its sources to look at.
+        let mut stack: Vec<(&'a str, usize)> = Vec::new();
+        if !visiting.insert(start) {
             return Err(SyncError::Ref("cyclic derivation graph".into()));
         }
-        let event = by_id
-            .get(id)
-            .ok_or_else(|| SyncError::Ref("missing derivation event".into()))?;
-        for source in &event.source_event_ids {
-            if is_event_source(source) {
-                visit(source, by_id, visiting, visited)?;
+        stack.push((start, 0));
+        while let Some((id, next)) = stack.last().copied() {
+            let event = by_id
+                .get(id)
+                .ok_or_else(|| SyncError::Ref("missing derivation event".into()))?;
+            let mut descend = None;
+            let mut at = next;
+            while at < event.source_event_ids.len() {
+                let source = event.source_event_ids[at].as_str();
+                at += 1;
+                if is_event_source(source) && !visited.contains(source) {
+                    descend = Some(source);
+                    break;
+                }
+            }
+            if let Some(frame) = stack.last_mut() {
+                frame.1 = at;
+            }
+            match descend {
+                Some(source) => {
+                    if !visiting.insert(source) {
+                        return Err(SyncError::Ref("cyclic derivation graph".into()));
+                    }
+                    stack.push((source, 0));
+                }
+                None => {
+                    visiting.remove(id);
+                    visited.insert(id);
+                    stack.pop();
+                }
             }
         }
-        visiting.remove(id);
-        visited.insert(id);
         Ok(())
     }
     let mut visiting = HashSet::new();
@@ -2412,7 +2475,7 @@ fn collect_ranges(
                             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
                 })
                 .ok_or_else(|| SyncError::Ref("invalid range filename".into()))?;
-            if &id[..2] != name || entry.kind() != Some(ObjectType::Blob) {
+            if shard_prefix(id)? != name || entry.kind() != Some(ObjectType::Blob) {
                 return Err(SyncError::Ref("range path mismatch".into()));
             }
             let blob = repo.find_blob(entry.id())?;
@@ -2465,7 +2528,7 @@ fn collect_derivation_events(
                 .strip_suffix(".json")
                 .filter(|x| x.len() == 64 && x.bytes().all(|b| b.is_ascii_hexdigit()))
                 .ok_or_else(|| SyncError::Ref("invalid event filename".into()))?;
-            if &id[..2] != name || entry.kind() != Some(ObjectType::Blob) {
+            if shard_prefix(id)? != name || entry.kind() != Some(ObjectType::Blob) {
                 return Err(SyncError::Ref("event path mismatch".into()));
             }
             let blob = repo.find_blob(entry.id())?;
@@ -2573,10 +2636,13 @@ fn collect_tombstones(
             if entry.kind() != Some(ObjectType::Blob) {
                 return Err(SyncError::Ref("invalid tombstone entry type".into()));
             }
+            // The name comes from the remote tree: it must be a canonical
+            // interaction id before anything slices it.
             let id = name
                 .strip_suffix(".json")
+                .and_then(canonical_interaction_id)
                 .ok_or_else(|| SyncError::Ref("invalid tombstone filename".into()))?;
-            if shard_prefix(id) != shard_name {
+            if shard_prefix(id)? != shard_name {
                 return Err(SyncError::Ref("tombstone shard mismatch".into()));
             }
             let blob = repo.find_blob(entry.id())?;
@@ -2809,13 +2875,53 @@ fn add_sync_bytes(total: &mut usize, amount: usize, max_total_bytes: usize) -> R
     Ok(())
 }
 
-fn verify_existing_node(repo: &Repository, oid: git2::Oid, expected_id: &str) -> Result<()> {
+/// Re-checks a node already published to the destination against the current
+/// privacy check. The bytes cannot be changed, so a node that fails stops the
+/// push; the error says which node, why, and how to go on.
+fn verify_existing_node(
+    repo: &Repository,
+    oid: git2::Oid,
+    expected_id: &str,
+    remote: &str,
+) -> Result<()> {
     let blob = repo.find_blob(oid)?;
     let node: SyncNode = serde_json::from_slice(blob.content())?;
     if node.interaction.id.to_string() != expected_id {
         return Err(SyncError::Ref("immutable node filename/id mismatch".into()));
     }
-    validate_final_node_bytes(blob.content())
+    validate_final_node_bytes(blob.content()).map_err(|error| SyncError::PublishedNode {
+        id: expected_id.to_owned(),
+        remote: remote.to_owned(),
+        reason: published_node_problem(blob.content(), &error),
+    })
+}
+
+/// Why a published node fails: key material next to a private-key header or END
+/// line that has no partner, or else the check's own message.
+fn published_node_problem(bytes: &[u8], error: &SyncError) -> String {
+    fn holds_unterminated_block(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(text) => {
+                crate::privacy::has_unterminated_private_key_block(text)
+            }
+            serde_json::Value::Array(items) => items.iter().any(holds_unterminated_block),
+            serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+                crate::privacy::has_unterminated_private_key_block(key)
+                    || holds_unterminated_block(value)
+            }),
+            _ => false,
+        }
+    }
+    let unterminated = serde_json::from_slice::<serde_json::Value>(bytes)
+        .is_ok_and(|value| holds_unterminated_block(&value));
+    if unterminated {
+        "its already-published text holds an unterminated private-key block (key material next \
+         to a \"-----BEGIN ... PRIVATE KEY-----\" or \"-----END ... PRIVATE KEY-----\" line \
+         whose partner line is missing), which the privacy check now redacts"
+            .to_owned()
+    } else {
+        format!("it no longer passes the privacy check ({error})")
+    }
 }
 
 /// This is intentionally after serialization: it verifies the precise bytes
@@ -2832,7 +2938,26 @@ fn validate_final_node_bytes(bytes: &[u8]) -> Result<()> {
         crate::privacy::validate_sanitized_json(&tool.arguments)
             .map_err(|e| SyncError::Ref(format!("unsafe final tool arguments: {e}")))?;
     }
-    inspect_final_strings(bytes)
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+    // A harness stimulus was scrubbed part by part, so it is checked that way:
+    // scrubbing it as one string could touch the markers between its parts.
+    // Every other string, and an unverified stimulus, is checked whole.
+    if let Some(prompt) = value.pointer_mut("/interaction/user_prompt") {
+        if let serde_json::Value::String(text) = prompt.take() {
+            let scrubbed = crate::stimulus::scrub_stimulus(
+                &node.interaction.id,
+                &text,
+                &crate::privacy::scrub,
+            )
+            .map_err(|e| SyncError::Ref(format!("final string invalid: {e}")))?;
+            if scrubbed != text {
+                return Err(SyncError::Ref(
+                    "unredacted secret in final Git bytes".into(),
+                ));
+            }
+        }
+    }
+    inspect_value(&value)
 }
 
 fn validate_final_link_bytes(bytes: &[u8]) -> Result<()> {
@@ -2859,36 +2984,38 @@ fn validate_final_link_bytes(bytes: &[u8]) -> Result<()> {
 }
 
 fn inspect_final_strings(bytes: &[u8]) -> Result<()> {
-    fn visit(value: &serde_json::Value) -> Result<()> {
-        match value {
-            serde_json::Value::String(text) => {
-                // scrub is marker-aware.  Thus an unchanged value is either
-                // clean or a valid CVC marker, while a changed one is a leak.
-                if crate::privacy::scrub(text)
-                    .map_err(|e| SyncError::Ref(format!("final string invalid: {e}")))?
-                    != *text
-                {
-                    return Err(SyncError::Ref(
-                        "unredacted secret in final Git bytes".into(),
-                    ));
-                }
+    inspect_value(&serde_json::from_slice(bytes)?)
+}
+
+/// Every string in `value`, keys included, must already be clean.
+fn inspect_value(value: &serde_json::Value) -> Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            // scrub is marker-aware.  Thus an unchanged value is either
+            // clean or a valid CVC marker, while a changed one is a leak.
+            if crate::privacy::scrub(text)
+                .map_err(|e| SyncError::Ref(format!("final string invalid: {e}")))?
+                != *text
+            {
+                return Err(SyncError::Ref(
+                    "unredacted secret in final Git bytes".into(),
+                ));
             }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    visit(value)?;
-                }
-            }
-            serde_json::Value::Object(values) => {
-                for (key, value) in values {
-                    visit(&serde_json::Value::String(key.clone()))?;
-                    visit(value)?;
-                }
-            }
-            _ => {}
         }
-        Ok(())
+        serde_json::Value::Array(values) => {
+            for value in values {
+                inspect_value(value)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                inspect_value(&serde_json::Value::String(key.clone()))?;
+                inspect_value(value)?;
+            }
+        }
+        _ => {}
     }
-    visit(&serde_json::from_slice(bytes)?)
+    Ok(())
 }
 
 /// Fetch using the already snapshotted effective destination.  The named remote is
@@ -3066,6 +3193,15 @@ pub fn cleanup_projection_ref(repo: &Repository, temporary_ref: &str) -> Result<
     Ok(())
 }
 
+/// Puts the node `id` into `sorted_nodes` after the chain of its ancestors that
+/// are in this batch, nearest to the root first.
+///
+/// The ancestors are collected by walking up the parent links, and put in order
+/// afterwards, rather than by a call for each: the depth is the length of a
+/// session, which a remote chooses, and a call for each of thousands of
+/// responses overflows the stack of the thread this runs on (a runtime worker
+/// has 2 MiB, a Windows main thread 1 MiB). The order of the output, and the
+/// error for a cycle, are the ones the recursive walk gave.
 fn topo_visit(
     id: &str,
     node_map: &mut std::collections::HashMap<String, SyncNode>,
@@ -3076,40 +3212,41 @@ fn topo_visit(
     if visited.contains(id) {
         return Ok(());
     }
-    if visiting.contains(id) {
-        return Err(SyncError::Ref(format!(
-            "Cycle detected in interaction dependencies: {}",
-            id
-        )));
-    }
-
-    visiting.insert(id.to_string());
-
-    // Process dependencies (parent)
-    if let Some(node) = node_map.get(id) {
-        if let Some(parent_id) = &node.interaction.parent_id {
-            // parent_id is InteractionId. We need string string.
-            let p_id = parent_id.to_string();
-            // If parent is in our batch, visit it first.
-            // If it's not in the batch, we assume it's in DB or missing (which will fail FK).
-            if node_map.contains_key(&p_id) {
-                topo_visit(&p_id, node_map, sorted_nodes, visited, visiting)?;
-            }
+    // `id`, then its parent if that is in the batch and not sorted yet, then its
+    // parent's parent, and so on: the node that is to come last is first.
+    let mut chain: Vec<String> = Vec::new();
+    let mut current = id.to_owned();
+    loop {
+        if visiting.contains(&current) {
+            return Err(SyncError::Ref(format!(
+                "Cycle detected in interaction dependencies: {}",
+                current
+            )));
+        }
+        visiting.insert(current.clone());
+        // If the parent is not in our batch, we assume it is in the DB or
+        // missing (which will fail the foreign key).
+        let parent = node_map
+            .get(&current)
+            .and_then(|node| node.interaction.parent_id.as_ref())
+            .map(|parent| parent.to_string())
+            .filter(|parent| !visited.contains(parent) && node_map.contains_key(parent));
+        chain.push(current);
+        match parent {
+            Some(parent) => current = parent,
+            None => break,
         }
     }
-
-    visiting.remove(id);
-    visited.insert(id.to_string());
-
-    // Move from map to sorted list
-    // Note: This removes from map, so if multiple nodes depend on A,
-    // the second time we check A it won't be in map.
-    // BUT we check `visited` first. If A is visited, we return Ok.
-    // So we don't need A in map anymore.
-    if let Some(node) = node_map.remove(id) {
-        sorted_nodes.push(node);
+    // The root-most ancestor first, `id` last.
+    while let Some(next) = chain.pop() {
+        visiting.remove(&next);
+        visited.insert(next.clone());
+        // Moving the node out of the map is what the later nodes that name it
+        // as their parent find: they check `visited` first.
+        if let Some(node) = node_map.remove(&next) {
+            sorted_nodes.push(node);
+        }
     }
-
     Ok(())
 }
 
@@ -3171,6 +3308,355 @@ mod derivation_graph_tests {
             &legacy,
         )
         .is_err());
+    }
+
+    // ---- walks over chains a remote chooses ------------------------------------------
+    //
+    // The depth of a walk over parents or over derivation sources is the length of a
+    // session or of a chain of events, which a remote publishes. These run on a
+    // thread with a one-mebibyte stack (a Windows main thread has that much, a
+    // runtime worker twice it): a recursive walk overflows it, which aborts the
+    // process, so a test that finishes is the proof that the walk does not recurse.
+
+    fn on_a_small_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .name("one-mebibyte-stack".into())
+            .stack_size(1024 * 1024)
+            .spawn(work)
+            .expect("a thread with a small stack")
+            .join()
+            .expect("the walk finished")
+    }
+
+    fn sync_node(id: &InteractionId, parent: Option<&InteractionId>) -> SyncNode {
+        SyncNode {
+            interaction: crate::models::Interaction {
+                id: id.clone(),
+                conversation_id: "conversation".into(),
+                parent_id: parent.cloned(),
+                timestamp: chrono::Utc::now(),
+                author: crate::models::Author::Human,
+                user_prompt: String::new(),
+                model_name: None,
+                model_cot: None,
+                model_response: None,
+                source_request_id: None,
+            },
+            context_items: Vec::new(),
+            tool_executions: Vec::new(),
+            artifact_links: Vec::new(),
+        }
+    }
+
+    /// What `topo_visit` was before it stopped recursing, for comparison.
+    fn recursive_topo_visit(
+        id: &str,
+        node_map: &mut HashMap<String, SyncNode>,
+        sorted_nodes: &mut Vec<SyncNode>,
+        visited: &mut HashSet<String>,
+        visiting: &mut HashSet<String>,
+    ) -> Result<()> {
+        if visited.contains(id) {
+            return Ok(());
+        }
+        if visiting.contains(id) {
+            return Err(SyncError::Ref(format!(
+                "Cycle detected in interaction dependencies: {}",
+                id
+            )));
+        }
+        visiting.insert(id.to_string());
+        if let Some(node) = node_map.get(id) {
+            if let Some(parent_id) = &node.interaction.parent_id {
+                let p_id = parent_id.to_string();
+                if node_map.contains_key(&p_id) {
+                    recursive_topo_visit(&p_id, node_map, sorted_nodes, visited, visiting)?;
+                }
+            }
+        }
+        visiting.remove(id);
+        visited.insert(id.to_string());
+        if let Some(node) = node_map.remove(id) {
+            sorted_nodes.push(node);
+        }
+        Ok(())
+    }
+
+    /// A walk over the parents of a batch.
+    type Walk = fn(
+        &str,
+        &mut HashMap<String, SyncNode>,
+        &mut Vec<SyncNode>,
+        &mut HashSet<String>,
+        &mut HashSet<String>,
+    ) -> Result<()>;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) % bound as u64) as usize
+        }
+    }
+
+    #[test]
+    fn a_chain_of_ten_thousand_responses_is_ordered_parents_first_on_a_one_mebibyte_stack() {
+        let (ordered, ids) = on_a_small_stack(|| {
+            let ids: Vec<InteractionId> = (0..10_000).map(|_| InteractionId::new()).collect();
+            let mut node_map: HashMap<String, SyncNode> = HashMap::new();
+            for (at, id) in ids.iter().enumerate() {
+                let parent = at.checked_sub(1).map(|before| &ids[before]);
+                node_map.insert(id.to_string(), sync_node(id, parent));
+            }
+            let mut sorted = Vec::new();
+            let (mut visited, mut visiting) = (HashSet::new(), HashSet::new());
+            // From the newest response, so that the whole chain is one walk.
+            topo_visit(
+                &ids[9_999].to_string(),
+                &mut node_map,
+                &mut sorted,
+                &mut visited,
+                &mut visiting,
+            )
+            .expect("a chain is not a cycle");
+            assert!(node_map.is_empty() && visiting.is_empty());
+            (
+                sorted
+                    .iter()
+                    .map(|node| node.interaction.id.clone())
+                    .collect::<Vec<_>>(),
+                ids,
+            )
+        });
+        assert_eq!(ordered, ids);
+    }
+
+    #[test]
+    fn the_order_and_the_error_of_the_walk_are_those_of_the_recursive_one() {
+        let mut random = Lcg(0x70b0);
+        for case in 0..3_000 {
+            let count = random.below(40) + 1;
+            let ids: Vec<InteractionId> = (0..count).map(|_| InteractionId::new()).collect();
+            let outsider = InteractionId::new();
+            // Parents anywhere in the batch (so cycles and self-parents happen),
+            // outside it, or none.
+            let parents: Vec<Option<usize>> = (0..count)
+                .map(|_| match random.below(4) {
+                    0 => None,
+                    1 => Some(count),
+                    _ => Some(random.below(count)),
+                })
+                .collect();
+            let build = || {
+                let mut node_map: HashMap<String, SyncNode> = HashMap::new();
+                for (at, id) in ids.iter().enumerate() {
+                    let parent = parents[at].map(|p| if p == count { &outsider } else { &ids[p] });
+                    node_map.insert(id.to_string(), sync_node(id, parent));
+                }
+                node_map
+            };
+            let mut starts: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+            for at in (1..starts.len()).rev() {
+                starts.swap(at, random.below(at + 1));
+            }
+            let run = |walk: Walk| {
+                let mut node_map = build();
+                let mut sorted = Vec::new();
+                let (mut visited, mut visiting) = (HashSet::new(), HashSet::new());
+                for start in &starts {
+                    if let Err(error) = walk(
+                        start,
+                        &mut node_map,
+                        &mut sorted,
+                        &mut visited,
+                        &mut visiting,
+                    ) {
+                        return Err(error.to_string());
+                    }
+                }
+                Ok(sorted
+                    .iter()
+                    .map(|node| node.interaction.id.to_string())
+                    .collect::<Vec<_>>())
+            };
+            assert_eq!(run(topo_visit), run(recursive_topo_visit), "case {case}");
+        }
+    }
+
+    #[test]
+    fn a_cycle_of_parents_is_an_error_that_names_the_node_the_walk_came_back_to() {
+        let (a, b, c) = (
+            InteractionId::new(),
+            InteractionId::new(),
+            InteractionId::new(),
+        );
+        let mut node_map: HashMap<String, SyncNode> = HashMap::new();
+        node_map.insert(a.to_string(), sync_node(&a, Some(&c)));
+        node_map.insert(b.to_string(), sync_node(&b, Some(&a)));
+        node_map.insert(c.to_string(), sync_node(&c, Some(&b)));
+        let mut sorted = Vec::new();
+        let (mut visited, mut visiting) = (HashSet::new(), HashSet::new());
+        let error = topo_visit(
+            &a.to_string(),
+            &mut node_map,
+            &mut sorted,
+            &mut visited,
+            &mut visiting,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                SyncError::Ref(message)
+                    if *message == format!("Cycle detected in interaction dependencies: {a}")
+            ),
+            "{error}"
+        );
+        assert!(sorted.is_empty());
+        // A node that is its own parent is a cycle of one.
+        let mut node_map: HashMap<String, SyncNode> = HashMap::new();
+        node_map.insert(a.to_string(), sync_node(&a, Some(&a)));
+        assert!(topo_visit(
+            &a.to_string(),
+            &mut node_map,
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            &mut HashSet::new()
+        )
+        .is_err());
+    }
+
+    fn event_chain_id(n: usize) -> String {
+        format!("{n:064x}")
+    }
+
+    #[test]
+    fn a_chain_of_twenty_thousand_derivation_events_is_checked_on_a_one_mebibyte_stack() {
+        let first = "11111111-1111-4111-8111-111111111111";
+        let verdict = on_a_small_stack(move || {
+            // The most events a pull takes, each derived from the one before it.
+            let mut events = vec![event(
+                &event_chain_id(1),
+                first,
+                vec![format!("legacy:{first}:{}", "d".repeat(40))],
+            )];
+            for n in 2..=MAX_SYNC_DERIVATION_EVENTS {
+                events.push(event(
+                    &event_chain_id(n),
+                    first,
+                    vec![event_chain_id(n - 1)],
+                ));
+            }
+            let legacy = HashSet::from([(first.to_owned(), "d".repeat(40))]);
+            let ok = validate_closed_derivation_graph(&events, &legacy).is_ok();
+            // The same chain closed into a ring is a cycle.
+            events[0].source_event_ids = vec![event_chain_id(MAX_SYNC_DERIVATION_EVENTS)];
+            let ring = validate_closed_derivation_graph(&events, &legacy).is_err();
+            (ok, ring)
+        });
+        assert_eq!(verdict, (true, true));
+    }
+
+    #[test]
+    fn derivation_graphs_are_accepted_exactly_when_they_have_no_cycle() {
+        let first = "11111111-1111-4111-8111-111111111111";
+        let legacy_source = format!("legacy:{first}:{}", "d".repeat(40));
+        let legacy = HashSet::from([(first.to_owned(), "d".repeat(40))]);
+        let mut random = Lcg(0xde71);
+        for case in 0..3_000 {
+            let count = random.below(12) + 1;
+            // Each event derives from some events and, when it has none, from the legacy one.
+            let sources: Vec<Vec<usize>> = (0..count)
+                .map(|_| (0..random.below(3)).map(|_| random.below(count)).collect())
+                .collect();
+            let events: Vec<DerivationEvent> = (0..count)
+                .map(|at| {
+                    let mut list: Vec<String> =
+                        sources[at].iter().map(|s| event_chain_id(s + 1)).collect();
+                    list.sort();
+                    list.dedup();
+                    if list.is_empty() || random.below(2) == 0 {
+                        list.push(legacy_source.clone());
+                    }
+                    event(&event_chain_id(at + 1), first, list)
+                })
+                .collect();
+            // An independent check: repeatedly remove an event nothing waits on.
+            let mut remaining: Vec<bool> = vec![true; count];
+            let mut progress = true;
+            while progress {
+                progress = false;
+                for at in 0..count {
+                    if remaining[at] && sources[at].iter().all(|s| !remaining[*s]) {
+                        remaining[at] = false;
+                        progress = true;
+                    }
+                }
+            }
+            let acyclic = remaining.iter().all(|left| !left);
+            assert_eq!(
+                validate_closed_derivation_graph(&events, &legacy).is_ok(),
+                acyclic,
+                "case {case}: {sources:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shard_prefix_is_an_error_and_never_a_panic_for_names_it_cannot_slice() {
+        assert_eq!(shard_prefix("ab").unwrap(), "ab");
+        assert_eq!(
+            shard_prefix("3c2b1a09-8f7e-8d6c-9b5a-4f3e2d1c0b9a").unwrap(),
+            "3c"
+        );
+        // Two bytes that are one whole character slice fine.
+        assert_eq!(shard_prefix("é").unwrap(), "é");
+        for name in ["", "a", "aé", "日本", "a日"] {
+            assert!(shard_prefix(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn looking_a_node_up_by_an_id_that_cannot_be_sharded_is_an_error_and_never_a_panic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let empty = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        // A canonical id names no node in an empty tree.
+        let id = "3c2b1a09-8f7e-8d6c-9b5a-4f3e2d1c0b9a";
+        assert!(!holds_node(&repo, &empty, id).unwrap());
+        for name in ["", "a", "aé", "日本", "a日"] {
+            assert!(holds_node(&repo, &empty, name).is_err(), "{name:?}");
+        }
+        // What pruning removed is counted for tombstones, which are ids too: one that
+        // cannot be sharded stops the count with an error.
+        let tombstoned = HashSet::from(["aé".to_owned()]);
+        assert!(count_pruned_baseline_entries(&repo, &empty, &empty, &tombstoned).is_err());
+    }
+
+    #[test]
+    fn only_a_canonical_interaction_id_is_accepted_as_a_name() {
+        let id = "3c2b1a09-8f7e-8d6c-9b5a-4f3e2d1c0b9a";
+        assert_eq!(canonical_interaction_id(id), Some(id));
+        for name in [
+            "",
+            "a",
+            "aé",
+            &id.to_uppercase(),
+            &id.replace('-', ""),
+            &format!("{{{id}}}"),
+            &format!("urn:uuid:{id}"),
+            &format!(" {id}"),
+            &format!("{id}\n"),
+            &"é".repeat(18),
+            &format!("{id}.json"),
+        ] {
+            assert_eq!(canonical_interaction_id(name), None, "{name:?}");
+        }
     }
 }
 

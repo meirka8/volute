@@ -78,7 +78,42 @@ pub async fn claude_code(
             report.unrecorded_block_types.join(", ")
         );
     }
+    for line in left_out_lines(&report) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// What the capture boundary could not keep, as lines to print, so that a
+/// response recorded as a stand-in, or left out, is never silent. None of the
+/// text of such a response is in them, only the limit that was hit.
+fn left_out_lines(report: &IngestReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    if report.withheld > 0 || report.lost > 0 {
+        let mut parts = Vec::new();
+        if report.withheld > 0 {
+            parts.push(format!(
+                "{} recorded as a stand-in that says its response was withheld",
+                report.withheld
+            ));
+        }
+        if report.lost > 0 {
+            parts.push(format!("{} not recorded at all", report.lost));
+        }
+        lines.push(format!(
+            "  could not scrub {} response(s) within the limits: {} ({})",
+            report.withheld + report.lost,
+            parts.join(", "),
+            report.withheld_reasons.join("; ")
+        ));
+    }
+    if report.omitted_tool_calls > 0 || report.omitted_context_items > 0 {
+        lines.push(format!(
+            "  left out of the responses recorded now: {} tool call(s) beyond the 255 a response records, {} context item(s) (a path that cannot be scrubbed, or beyond the 256 a response records); each such response ends with a cvc-omitted record that says so",
+            report.omitted_tool_calls, report.omitted_context_items
+        ));
+    }
+    lines
 }
 
 /// Hook mode reads Claude Code's JSON payload from stdin and writes nothing to
@@ -506,5 +541,61 @@ mod tests {
         assert!(!session_is_busy(&anyhow::Error::new(
             IngestError::UnknownSession
         )));
+    }
+
+    fn report() -> IngestReport {
+        IngestReport {
+            session_id: "s".into(),
+            inserted: 3,
+            already_present: 0,
+            pending_responses: 0,
+            linked_from_commits: 0,
+            cursor: 10,
+            transcript_len: 10,
+            subagent_sessions: 0,
+            subagent_inserted: 0,
+            subagent_linked: 0,
+            unrecorded_blocks: 0,
+            unrecorded_block_types: Vec::new(),
+            withheld: 0,
+            lost: 0,
+            withheld_reasons: Vec::new(),
+            omitted_tool_calls: 0,
+            omitted_context_items: 0,
+        }
+    }
+
+    #[test]
+    fn a_clean_ingest_prints_nothing_about_what_was_left_out() {
+        assert!(left_out_lines(&report()).is_empty());
+    }
+
+    #[test]
+    fn withheld_lost_and_omitted_responses_are_said_with_their_reasons_and_no_text() {
+        let lines = left_out_lines(&IngestReport {
+            withheld: 2,
+            lost: 1,
+            withheld_reasons: vec![
+                "capture collection exceeds limit".into(),
+                "too many secret matches".into(),
+            ],
+            omitted_tool_calls: 45,
+            omitted_context_items: 44,
+            ..report()
+        });
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            "  could not scrub 3 response(s) within the limits: 2 recorded as a stand-in that says its response was withheld, 1 not recorded at all (capture collection exceeds limit; too many secret matches)"
+        );
+        assert!(lines[1].contains("45 tool call(s)"), "{lines:?}");
+        assert!(lines[1].contains("44 context item(s)"), "{lines:?}");
+        assert!(lines[1].contains("cvc-omitted"), "{lines:?}");
+        // Only counts and limits: never any text of a response.
+        let only_omitted = left_out_lines(&IngestReport {
+            omitted_context_items: 1,
+            ..report()
+        });
+        assert_eq!(only_omitted.len(), 1);
     }
 }
