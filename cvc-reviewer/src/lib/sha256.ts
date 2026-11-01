@@ -8,7 +8,7 @@
  * it there would mean a state machine per card (a flash of the unverified reading, cancellation,
  * double effects), or checking every node of a pull request before the first one is drawn, and it
  * exists only in a secure context. The token is a consistency check over public values, not a
- * signature, so nothing here defends against a timing attack and nothing secret is hashed; what
+ * signature, so nothing here needs constant-time behaviour and nothing secret is hashed; what
  * matters is that the digest is right, and the tests pin that against the NIST vectors, the
  * producer's own vectors and the platform's implementation on random input.
  *
