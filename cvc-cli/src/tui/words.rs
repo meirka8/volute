@@ -1264,8 +1264,9 @@ pub fn already_authorized_status(remote: &str) -> String {
 }
 
 /// The notice after a flow that stopped. `remote` is the name of the remote the
-/// flow was for. Nothing here shows an error's own text except `Other`, which
-/// is cut to its first line and sanitized.
+/// flow was for. Nothing here shows an error's own text except `Other`,
+/// `OutcomeUnknown` and `DestinationMismatch`, each cut to its first line and
+/// sanitized.
 pub fn failure_status(kind: FlowKind, failure: &FlowFailure, remote: &str) -> String {
     match (failure, kind) {
         (FlowFailure::NotConfirmed, kind) => not_done(kind, "the typed phrase did not match", remote),
@@ -1301,6 +1302,15 @@ pub fn failure_status(kind: FlowKind, failure: &FlowFailure, remote: &str) -> St
             format!(
                 "{} (error: {})",
                 publish_unfinished(remote),
+                text::sanitize(text::first_line(text))
+            )
+        }
+        // Refused before any connection was opened, so it is known that nothing
+        // was sent; the refusal's own text says so and what to change.
+        (FlowFailure::DestinationMismatch(text), kind) => {
+            format!(
+                "{}: {}",
+                kind.failed(),
                 text::sanitize(text::first_line(text))
             )
         }
@@ -3084,6 +3094,20 @@ mod tests {
         for kind in [FlowKind::Share, FlowKind::Unshare, FlowKind::Authorize] {
             assert!(failure_status(kind, &unknown, "origin").contains("the remote may hold some"));
         }
+    }
+
+    #[test]
+    fn a_publish_refused_before_it_connected_says_what_its_refusal_says_and_no_more() {
+        let refusal = FlowFailure::DestinationMismatch(
+            "remote 'origin' now resolves to a different destination than the one consented to; nothing was sent.\nsecond line\u{1b}[2J".to_owned(),
+        );
+        let said = failure_status(FlowKind::Publish, &refusal, "origin");
+        assert_eq!(
+            said,
+            "Publish failed: remote 'origin' now resolves to a different destination than the one consented to; nothing was sent."
+        );
+        // It is known that nothing was sent, so it is not worded as unfinished.
+        assert!(!said.contains("may hold some"), "{said}");
     }
 
     #[test]

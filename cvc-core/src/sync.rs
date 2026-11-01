@@ -66,6 +66,33 @@ pub enum SyncError {
     /// callback and still returns success from the push, so it is surfaced here.
     #[error("the destination rejected the update of {reference}: {reason}; nothing was published")]
     Rejected { reference: String, reason: String },
+    /// git's URL rewriting rules (`url.<base>.insteadOf`, and
+    /// `url.<base>.pushInsteadOf` for the push URL), applied once more at
+    /// transport time, would send this operation somewhere other than the
+    /// consented URL. Refused before connecting: nothing was sent. Each location
+    /// is shown as [`crate::privacy::display_location`] shows it, or as a fixed
+    /// placeholder when that shows nothing; never as the raw URL.
+    #[error("git URL rewriting rules would send '{consented}' to '{actual}' at transport time; nothing was sent. Consent is bound to the destination it was given for: remove the chained url.<base>.insteadOf or pushInsteadOf rule, or acknowledge the remote again once it resolves to one URL.")]
+    DestinationRewritten { consented: String, actual: String },
+    /// The named remote no longer resolves to the destination this operation
+    /// was bound to (its URL or a rewrite rule changed in the meantime, or it
+    /// can no longer be resolved at all). Refused before connecting: nothing
+    /// was sent.
+    #[error("remote '{remote}' now resolves to a different destination than the one consented to; nothing was sent. Check `cvc privacy status --remote {remote}` and acknowledge the new destination if that is intended.")]
+    DestinationChanged { remote: String },
+}
+
+impl SyncError {
+    /// Whether the operation was refused before any connection to the
+    /// destination was opened, so that nothing was sent. True only for the
+    /// destination-binding refusals; any other error is treated as one that
+    /// may have come from a transport that had already started.
+    pub fn refused_before_transport(&self) -> bool {
+        matches!(
+            self,
+            Self::DestinationRewritten { .. } | Self::DestinationChanged { .. }
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
@@ -3053,7 +3080,8 @@ pub fn fetch_destination(
     if let Ok(mut stale) = repo.find_reference(&remote_tracking_ref) {
         stale.delete()?;
     }
-    let mut remote = repo.remote_anonymous(&destination.effective_url)?;
+    verify_destination_current(repo, destination)?;
+    let mut remote = consented_remote(repo, destination)?;
     let mut list_callbacks = git2::RemoteCallbacks::new();
     list_callbacks.credentials(|_url, username_from_url, _allowed_types| {
         git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
@@ -3129,7 +3157,8 @@ pub fn push_temp_ref(
     if !validate_ref_name(temporary_ref) {
         return Err(SyncError::Ref("invalid temporary ref".into()));
     }
-    let mut remote = repo.remote_anonymous(&destination.effective_url)?;
+    verify_destination_current(repo, destination)?;
+    let mut remote = consented_remote(repo, destination)?;
     // A server can accept the connection and still decline the ref update
     // (`ng <ref> <reason>` in the smart protocol). libgit2 delivers that
     // through this callback and returns success from the push itself, so the
@@ -3153,6 +3182,79 @@ pub fn push_temp_ref(
         return Err(SyncError::Rejected { reference, reason });
     }
     pushed?;
+    Ok(())
+}
+
+/// Opens the transport remote for a consented destination and checks that it
+/// still points at the consented URL.
+///
+/// `RemoteDestination::effective_url` is the named remote's push URL after
+/// git's single pass of `url.<base>.insteadOf` rewriting, which is what the
+/// fingerprint, and so the user's typed consent, binds. libgit2 applies those
+/// rules again when an anonymous remote is created from that URL, and reports
+/// the result through the remote's `url` (and `pushurl` for `pushInsteadOf`),
+/// so a chained rule shows up here as a URL that differs from the consented
+/// one. That is refused before any connection is made, whichever direction
+/// the operation uses.
+///
+/// The URLs are compared as bytes: `url()` and `pushurl()` return `None` for
+/// a URL that is not UTF-8, and a rewrite to such a URL must not pass unseen.
+fn consented_remote<'r>(
+    repo: &'r Repository,
+    destination: &crate::privacy::RemoteDestination,
+) -> Result<git2::Remote<'r>> {
+    let remote = repo.remote_anonymous(&destination.effective_url)?;
+    let consented = destination.effective_url.as_bytes();
+    let transport_urls = [Some(remote.url_bytes()), remote.pushurl_bytes()];
+    for actual in transport_urls.into_iter().flatten() {
+        if actual != consented {
+            return Err(SyncError::DestinationRewritten {
+                consented: shown_location(consented),
+                actual: shown_location(actual),
+            });
+        }
+    }
+    Ok(remote)
+}
+
+/// Stands in, in an error, for a location [`crate::privacy::display_location`]
+/// will not show.
+const LOCATION_NOT_SHOWN: &str = "(location not shown)";
+
+/// A URL as an error may show it: its display form, or [`LOCATION_NOT_SHOWN`]
+/// when it has none. Never the URL itself, which may embed credentials.
+fn shown_location(url: &[u8]) -> String {
+    std::str::from_utf8(url)
+        .ok()
+        .and_then(crate::privacy::display_location)
+        .unwrap_or_else(|| LOCATION_NOT_SHOWN.to_owned())
+}
+
+/// Refuses transport when the named remote no longer resolves to the
+/// destination this operation was bound to: its URL or a rewrite rule changed
+/// after the destination was resolved, for instance while a consent prompt
+/// was open. A remote that no longer exists is not a change of destination:
+/// the bound URL is still the consented one. A remote that still exists but
+/// cannot be resolved is: it cannot be shown to still be that destination.
+pub fn verify_destination_current(
+    repo: &Repository,
+    destination: &crate::privacy::RemoteDestination,
+) -> Result<()> {
+    let changed = || SyncError::DestinationChanged {
+        remote: destination.name.clone(),
+    };
+    match repo.find_remote(&destination.name) {
+        Ok(_) => {}
+        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(()),
+        Err(_) => return Err(changed()),
+    }
+    // Its error is not passed on: `PrivacyError::Policy` prints as a
+    // `.thoughtignore` problem, which this is not.
+    let current =
+        crate::privacy::remote_destination(repo, &destination.name).map_err(|_| changed())?;
+    if current.fingerprint != destination.fingerprint {
+        return Err(changed());
+    }
     Ok(())
 }
 

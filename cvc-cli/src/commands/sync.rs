@@ -758,12 +758,19 @@ fn push_destination(
 /// Records what a finished push means for the thoughts it carried, which were
 /// marked `pending` before it began. From here on every error is a
 /// [`PublicationOutcomeUnknown`]: the push has been attempted, so nothing the
-/// local records can still say settles what the destination holds.
+/// local records can still say settles what the destination holds. The one
+/// exception is a push refused before it connected.
 ///
 /// - The push went through: they become `published`, and so do the tombstones it
 ///   carried. If recording that fails the destination holds them, but the rows
 ///   stay `pending` (or the tombstones unrecorded) until a reconciliation or the
 ///   next push settles it.
+/// - The push was refused before any connection was opened (the remote no
+///   longer resolves to the destination this publish was bound to): nothing was
+///   sent, so the destination still holds the baseline fetched under this
+///   operation's lock, which these are not part of. Their `pending` marks are
+///   dropped, as a reconciliation would drop them, and the refusal is an
+///   ordinary error.
 /// - The push failed: that is ambiguous, so they become `unknown` and the error
 ///   is the transport's. Do not make content mutable until a later reconciliation
 ///   proves the destination did not receive it. If marking them fails too, that
@@ -783,6 +790,10 @@ fn settle_push(
                 .mark_remote_tombstones_published(fingerprint)
                 .map_err(PublicationOutcomeUnknown::new)?;
             Ok(())
+        }
+        Err(error) if error.refused_before_transport() => {
+            store.clear_uncertain_publications(new_ids, fingerprint)?;
+            Err(error.into())
         }
         Err(error) => {
             store
@@ -1387,6 +1398,23 @@ mod settle_tests {
                 .collect()
         }
 
+        /// Like [`Self::states`], with `None` for a thought that has no row.
+        fn rows(&self) -> Vec<Option<String>> {
+            let connection = Connection::open(&self.path).unwrap();
+            self.ids
+                .iter()
+                .map(|id| {
+                    connection
+                        .query_row(
+                            "SELECT state FROM publications WHERE interaction_id = ?1 AND remote_fingerprint = ?2",
+                            params![id.as_str(), FINGERPRINT],
+                            |row| row.get(0),
+                        )
+                        .ok()
+                })
+                .collect()
+        }
+
         /// Makes recording a publication state fail, as a database that went
         /// read-only or full would.
         fn refuse_publication_updates(&self) {
@@ -1425,6 +1453,35 @@ mod settle_tests {
         );
         // Typing it changed nothing a command prints.
         assert_eq!(format!("{error:#}"), "Reference error: transport boom");
+    }
+
+    #[test]
+    fn a_push_refused_before_it_connected_drops_the_pending_marks_and_is_an_ordinary_failure() {
+        for refusal in [
+            SyncError::DestinationChanged {
+                remote: "origin".into(),
+            },
+            SyncError::DestinationRewritten {
+                consented: "host.example/o/r.git".into(),
+                actual: "other.example/o/r.git".into(),
+            },
+        ] {
+            let begun = Begun::new();
+            // One was published there before: that is never undone.
+            begun
+                .store
+                .mark_publication(&begun.ids[..1], FINGERPRINT, PublicationState::Published)
+                .unwrap();
+            let printed = refusal.to_string();
+            let error = begun.settle(Err(refusal)).unwrap_err();
+            // Nothing was sent, so nothing is left uncertain or marked unknown.
+            assert_eq!(begun.rows(), [Some("published".to_owned()), None]);
+            assert_eq!(
+                classify_failure(&error),
+                FlowFailure::DestinationMismatch(printed.clone())
+            );
+            assert_eq!(format!("{error:#}"), printed);
+        }
     }
 
     #[test]

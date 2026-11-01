@@ -58,8 +58,10 @@ pub struct PrivacyStatus {
 }
 
 /// An immutable description of the destination selected for one operation.  Do not
-/// re-read the git config after this is created: `pushurl` is deliberately allowed
-/// to differ from the fetch URL.
+/// re-read the git config to replace any of it after this is created: `pushurl` is
+/// deliberately allowed to differ from the fetch URL. Transport re-reads the config
+/// only to confirm that the remote still resolves to this destination, and refuses
+/// to connect otherwise (`sync::verify_destination_current`).
 ///
 /// `effective_url` may embed credentials. `Debug` therefore leaves it out, and
 /// anything shown to a person uses [`display_location`] instead.

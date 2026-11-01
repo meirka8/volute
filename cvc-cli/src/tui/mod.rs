@@ -389,10 +389,14 @@ fn run_flow(ctx: &Context, screen: &mut Screen, model: &mut Model, flow: Flow) -
         Ok(report) => report,
         Err(error) => {
             let failure = classify_failure(&error);
-            if let FlowFailure::Other(reason) | FlowFailure::OutcomeUnknown(reason) = &failure {
+            if let FlowFailure::Other(reason)
+            | FlowFailure::OutcomeUnknown(reason)
+            | FlowFailure::DestinationMismatch(reason) = &failure
+            {
                 // Not one of the expected refusals: show it whole, on the main
                 // screen, and wait, so it can be read before the list returns.
-                print_failure(kind, reason, &dest);
+                let nothing_sent = matches!(failure, FlowFailure::DestinationMismatch(_));
+                print_failure(kind, reason, &dest, nothing_sent);
                 wait_for_enter();
             }
             Report::Failed { kind, failure }
@@ -424,7 +428,7 @@ fn publishing_settings_match(listed: &RemoteOverview, now: &privacy::PrivacyStat
 }
 
 /// Prints an unexpected failure on the main screen, every line sanitized.
-fn print_failure(kind: FlowKind, reason: &str, dest: &Destination) {
+fn print_failure(kind: FlowKind, reason: &str, dest: &Destination, nothing_sent: bool) {
     let mut lines = reason.lines();
     println!(
         "cvc: {} failed: {}",
@@ -434,7 +438,7 @@ fn print_failure(kind: FlowKind, reason: &str, dest: &Destination) {
     for line in lines {
         println!("  {}", text::sanitize(line));
     }
-    if kind == FlowKind::Publish {
+    if kind == FlowKind::Publish && !nothing_sent {
         // The push may have started before the error.
         println!("{}", words::publish_unfinished(&dest.name));
     }

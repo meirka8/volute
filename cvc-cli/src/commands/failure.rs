@@ -12,6 +12,7 @@
 
 use cvc_core::db::DbError;
 use cvc_core::privacy::PrivacyError;
+use cvc_core::sync::SyncError;
 use std::error::Error;
 use std::fmt;
 
@@ -223,6 +224,11 @@ pub(crate) enum FlowFailure {
     /// it. The text is the failure's plain message. `cvc privacy reconcile`
     /// settles it. See [`PublicationOutcomeUnknown`].
     OutcomeUnknown(String),
+    /// Refused before any connection to the destination was opened: the remote
+    /// no longer resolves to the destination the flow was bound to (see
+    /// [`SyncError::refused_before_transport`]). Nothing was sent. The text is
+    /// the refusal's plain message, which says why and what to change.
+    DestinationMismatch(String),
     /// `cvc share --push`: the share was recorded and the publication that
     /// followed it in the same command did not complete, for the reason inside.
     /// The share stands whatever the reason is; a reason that would mean
@@ -240,13 +246,19 @@ pub(crate) enum FlowFailure {
 /// The order matters. A bundled publication's failure is looked for first: the
 /// share before it is recorded, so what failed inside is classified as what
 /// happened to the publication, not to the flow. Then an unsettled publication,
-/// and only then the typed refusals.
+/// then a refusal before transport, and only then the typed refusals.
 pub(crate) fn classify_failure(error: &anyhow::Error) -> FlowFailure {
     if let Some(bundled) = error.downcast_ref::<BundledPublishFailed>() {
         return FlowFailure::SharedButNotPublished(Box::new(classify_failure(&bundled.cause)));
     }
     if error.downcast_ref::<PublicationOutcomeUnknown>().is_some() {
         return FlowFailure::OutcomeUnknown(plain_message(error));
+    }
+    if error
+        .downcast_ref::<SyncError>()
+        .is_some_and(SyncError::refused_before_transport)
+    {
+        return FlowFailure::DestinationMismatch(plain_message(error));
     }
     if let Some(not_confirmed) = error.downcast_ref::<ChallengeNotConfirmed>() {
         return match not_confirmed {
@@ -397,6 +409,33 @@ mod tests {
             classify_failure(&BundledPublishFailed::wrap(said_why)),
             FlowFailure::SharedButNotPublished(Box::new(FlowFailure::InputKeptArriving))
         );
+    }
+
+    #[test]
+    fn a_refusal_before_transport_keeps_its_text_and_classifies_as_a_destination_mismatch() {
+        let refusal = cvc_core::sync::SyncError::DestinationChanged {
+            remote: "origin".into(),
+        };
+        let text = refusal.to_string();
+        assert!(text.contains("nothing was sent"), "{text}");
+        assert_eq!(
+            classify(refusal),
+            FlowFailure::DestinationMismatch(text.clone())
+        );
+        // Through added context too, with the chain as the commands print it.
+        let wrapped = anyhow::Error::from(cvc_core::sync::SyncError::DestinationChanged {
+            remote: "origin".into(),
+        })
+        .context("publishing to 'origin'");
+        assert_eq!(
+            classify_failure(&wrapped),
+            FlowFailure::DestinationMismatch(format!("publishing to 'origin': {text}"))
+        );
+        // Any other sync error is not one: it may come from a started transport.
+        assert!(matches!(
+            classify(cvc_core::sync::SyncError::Ref("transport boom".into())),
+            FlowFailure::Other(_)
+        ));
     }
 
     #[test]
