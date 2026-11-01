@@ -42,7 +42,9 @@ pub enum PrivacyError {
     Remote(String),
     /// The repository-local consent state (`privacy.json`, its directory and its
     /// locks) cannot be read, written or locked, or it holds no consent where
-    /// one is required.
+    /// one is required, or the capture acknowledgement cannot be recorded
+    /// because the current user cannot be identified or the acknowledgement
+    /// cannot be bound to this checkout.
     #[error("{0}")]
     ConsentState(String),
     /// A value offered for capture, import or publication was refused: it is
@@ -874,13 +876,13 @@ pub fn acknowledge_capture(repo: &git2::Repository) -> Result<()> {
 }
 fn acknowledge_capture_as(repo: &git2::Repository, user: Option<&str>) -> Result<()> {
     let user = user.ok_or_else(|| {
-        PrivacyError::Policy(
+        PrivacyError::ConsentState(
             "the current user cannot be identified, so capture cannot be acknowledged for them"
                 .into(),
         )
     })?;
     let binding = capture_binding_for(repo, user).ok_or_else(|| {
-        PrivacyError::Policy(
+        PrivacyError::ConsentState(
             "the capture acknowledgement cannot be bound to this checkout and user".into(),
         )
     })?;
@@ -2819,7 +2821,17 @@ mod tests {
         let path = privacy_path(&repo).unwrap();
         let before = std::fs::read(&path).unwrap();
         for user in [None, Some(""), Some("10\n01")] {
-            assert!(acknowledge_capture_as(&repo, user).is_err(), "{user:?}");
+            // A problem with the consent state, which reads as one: it is not a
+            // `.thoughtignore` problem and must not say so.
+            let refused = acknowledge_capture_as(&repo, user).unwrap_err();
+            assert!(
+                matches!(refused, PrivacyError::ConsentState(_)),
+                "{user:?}: {refused:?}"
+            );
+            assert!(
+                !refused.to_string().contains("thoughtignore"),
+                "{user:?}: {refused}"
+            );
         }
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
