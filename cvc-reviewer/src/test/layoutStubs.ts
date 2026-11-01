@@ -1,5 +1,3 @@
-import { vi } from 'vitest';
-
 /**
  * A page layout for jsdom, which has none: every element is zero tall and the
  * viewport is zero high. The windowed timeline measures cards and the scrolling
@@ -7,8 +5,7 @@ import { vi } from 'vitest';
  *
  * A card is identified by the step number in its text ("Step 17"), which is how
  * the tests name their steps; a card without one is asked about as step -1. Call it
- * before rendering; pair it with `restoreDomStubs` (it uses spies, which
- * `vi.restoreAllMocks` undoes).
+ * before rendering; pair it with `restoreDomStubs`, which puts back what it replaced.
  */
 
 /**
@@ -36,24 +33,52 @@ export interface PageLayout {
   measured: Set<number>;
 }
 
+/**
+ * What `stubPageLayout` replaced, to put back. (It does not use `vi.spyOn`: a spy keeps the element and the result of every
+ * call it is given, and a test that draws a few hundred cards asks about each of them many times; one run of the random walks
+ * ran a worker out of memory that way. A plain replacement keeps nothing.)
+ */
+const restorers: Array<() => void> = [];
+
+function replace(target: object, key: string, descriptor: PropertyDescriptor): void {
+  const original = Object.getOwnPropertyDescriptor(target, key);
+  Object.defineProperty(target, key, { configurable: true, ...descriptor });
+  restorers.push(() => {
+    if (original === undefined) delete (target as Record<string, unknown>)[key];
+    else Object.defineProperty(target, key, original);
+  });
+}
+
+/** Puts back what `stubPageLayout` replaced. `restoreDomStubs` calls it. */
+export function restoreLayoutStubs(): void {
+  while (restorers.length > 0) restorers.pop()!();
+}
+
 export function stubPageLayout(layout: Partial<PageLayout> & Pick<PageLayout, 'heightOf'>): PageLayout {
   const page: PageLayout = { viewport: 800, width: 480, measured: new Set(), ...layout };
 
-  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
-    let height = 0;
-    // The cards are the children of the list element, which the timeline gives the class `flow-root`.
-    if (this.matches('.flow-root > *')) {
-      const step = stepOf(this);
-      height = page.heightOf(step ?? -1, this);
-      if (step !== null) page.measured.add(step);
-    }
-    return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: height, width: 0, height, toJSON: () => ({}) } as DOMRect;
+  replace(HTMLElement.prototype, 'getBoundingClientRect', {
+    writable: true,
+    value: function (this: HTMLElement) {
+      let height = 0;
+      // The cards are the children of the list element, which the timeline gives the class `flow-root`.
+      if (this.matches('.flow-root > *')) {
+        const step = stepOf(this);
+        height = page.heightOf(step ?? -1, this);
+        if (step !== null) page.measured.add(step);
+      }
+      return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: height, width: 0, height, toJSON: () => ({}) } as DOMRect;
+    },
   });
-  vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(function (this: Element) {
-    return this.classList.contains('overflow-y-auto') ? page.viewport : 0;
+  replace(Element.prototype, 'clientHeight', {
+    get(this: Element) {
+      return this.classList.contains('overflow-y-auto') ? page.viewport : 0;
+    },
   });
-  vi.spyOn(Element.prototype, 'clientWidth', 'get').mockImplementation(function (this: Element) {
-    return this.classList.contains('overflow-y-auto') ? page.width : 0;
+  replace(Element.prototype, 'clientWidth', {
+    get(this: Element) {
+      return this.classList.contains('overflow-y-auto') ? page.width : 0;
+    },
   });
   return page;
 }

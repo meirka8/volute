@@ -1,0 +1,17 @@
+{
+  "interaction": {
+    "id": "267710d5-0ae8-80c5-884a-2b1f0a1e185b",
+    "conversation_id": "5e0d6a42-7b1c-4d3e-9a8f-1c2b3d4e5f60",
+    "parent_id": "a5eb6e77-a1d9-85d4-93d0-fe978a93e042",
+    "timestamp": "2026-10-10T12:05:00Z",
+    "author": "system",
+    "user_prompt": "[tool_result Bash ~cvc-9f4f7df66c916491] CVC: Linked 0 thought(s) to commit ed3791688a0b.\ned37916 edge commit",
+    "model_name": "claude-fixture-edge",
+    "model_cot": null,
+    "model_response": "Committed.",
+    "source_request_id": "req_E5"
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": []
+}

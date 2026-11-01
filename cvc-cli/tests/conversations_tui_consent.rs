@@ -8,6 +8,9 @@
 //!    with future thoughts, an unshare, a publish and an authorization: an
 //!    empty line, a wrong phrase and Esc in the bar record nothing, Esc asks no
 //!    phrase at all, and the right phrase records exactly what the bar offered.
+//!    The phrase of a share says whether it covers future thoughts, and a
+//!    phrase that can be worked out in advance is answered only with the nonce
+//!    of its own prompt.
 //! 6. Type-ahead and paste cannot take the place of a key or of a phrase.
 //!
 //! What a flow records is read around the view: the plain listing, `cvc
@@ -16,7 +19,7 @@
 mod common;
 mod tui_support;
 
-use common::{challenges, PtySession};
+use common::{challenges, with_another_nonce, without_nonce, PtySession};
 use std::time::Duration;
 use tui_support::*;
 
@@ -88,10 +91,21 @@ fn a_share_is_recorded_only_by_its_phrase() {
     view.wait_for("Not shared: the typed phrase did not match. Nothing was changed.");
     nothing_recorded();
 
+    // The phrase of a share that covers future thoughts as well: `f` was not
+    // pressed, so it is not the phrase of this share.
+    open_bar(&mut view, 's', "not yet shared");
+    view.press(Key::Enter);
+    view.answer_with(4, |phrase| {
+        phrase.replacen("I SHARE ", "I SHARE FUTURE ", 1)
+    });
+    view.wait_for("Not shared: the typed phrase did not match. Nothing was changed.");
+    nothing_recorded();
+
     // The right phrase records the snapshot, and later thoughts stay private.
     open_bar(&mut view, 's', "not yet shared");
     view.press(Key::Enter);
-    view.type_phrase(4);
+    let right = view.type_phrase(5);
+    assert!(!right.contains("FUTURE"), "{right}");
     view.wait_for("1 thought marked shared for remote 'origin'; future thoughts are private.");
     assert_eq!(
         share_record(&fixture, &id, &origin),
@@ -105,8 +119,8 @@ fn a_share_is_recorded_only_by_its_phrase() {
     view.is_at_the_list();
     assert!(view.quit().success());
     assert_terminal_restored(&view.session);
-    // Four phrases were asked for four attempts; nothing was published.
-    assert_eq!(challenges(&view.session.output()).len(), 4);
+    // Five phrases were asked for five attempts; nothing was published.
+    assert_eq!(challenges(&view.session.output()).len(), 5);
     assert_eq!(published_conversations(&fixture.remote), None);
 }
 
@@ -126,11 +140,15 @@ fn a_share_with_future_thoughts_is_recorded_only_by_f_and_its_phrase() {
     cancel_the_bar(&mut view, "f: also future thoughts");
     nothing_recorded();
 
-    // `f` leads to the phrase, and an empty line records nothing.
+    // `f` leads to the phrase, which says FUTURE, and an empty line records
+    // nothing.
     open_bar(&mut view, 's', "f: also future thoughts");
     view.key('f');
     let asked = view.answer_with(1, |_| String::new());
-    assert!(asked.starts_with(&format!("I SHARE {id} {origin} 1 ")));
+    assert!(
+        asked.starts_with(&format!("I SHARE FUTURE {id} {origin} 1 ")),
+        "{asked}"
+    );
     view.wait_for("Not shared: the typed phrase did not match. Nothing was changed.");
     nothing_recorded();
 
@@ -141,10 +159,20 @@ fn a_share_with_future_thoughts_is_recorded_only_by_f_and_its_phrase() {
     view.wait_for("Not shared: the typed phrase did not match. Nothing was changed.");
     nothing_recorded();
 
+    // And so does the phrase of a snapshot share: without FUTURE it does not
+    // grant the thoughts still to come.
+    open_bar(&mut view, 's', "f: also future thoughts");
+    view.key('f');
+    view.answer_with(3, |phrase| {
+        phrase.replacen("I SHARE FUTURE ", "I SHARE ", 1)
+    });
+    view.wait_for("Not shared: the typed phrase did not match. Nothing was changed.");
+    nothing_recorded();
+
     // The right phrase after `f` records the snapshot and the future together.
     open_bar(&mut view, 's', "f: also future thoughts");
     view.key('f');
-    view.type_phrase(3);
+    view.type_phrase(4);
     view.wait_for("1 thought marked shared for remote 'origin'; future thoughts are shared too.");
     assert_eq!(
         share_record(&fixture, &id, &origin),
@@ -157,7 +185,7 @@ fn a_share_with_future_thoughts_is_recorded_only_by_f_and_its_phrase() {
     assert!(view.flat().contains("◐ shared · 1 waiting +future"));
     assert!(view.quit().success());
     assert_terminal_restored(&view.session);
-    assert_eq!(challenges(&view.session.output()).len(), 3);
+    assert_eq!(challenges(&view.session.output()).len(), 4);
     assert_eq!(published_conversations(&fixture.remote), None);
 }
 
@@ -175,7 +203,7 @@ fn future_thoughts_are_added_to_a_snapshot_share_only_by_f_and_its_phrase() {
     // Enter in the bar shares what is there and nothing later.
     open_bar(&mut view, 's', "not yet shared");
     view.press(Key::Enter);
-    view.type_phrase(1);
+    let snapshot_phrase = view.type_phrase(1);
     view.wait_for("1 thought marked shared for remote 'origin'; future thoughts are private.");
     assert_eq!(share_record(&fixture, &id, &origin), snapshot_only);
 
@@ -188,9 +216,14 @@ fn future_thoughts_are_added_to_a_snapshot_share_only_by_f_and_its_phrase() {
     assert_eq!(view.prompts_so_far(), 1);
     assert!(!view.flat().contains("Not shared"));
 
-    // `f` and a wrong phrase leave the future as it was.
+    // `f` and the phrase that shared the snapshot leave the future as it was:
+    // the phrase `f` asks for says FUTURE.
     view.key('f');
-    view.answer_with(2, |_| "not the phrase".to_owned());
+    let future_phrase = view.answer_with(2, |_| snapshot_phrase.clone());
+    assert_eq!(
+        future_phrase,
+        snapshot_phrase.replacen("I SHARE ", "I SHARE FUTURE ", 1)
+    );
     view.wait_for("Not shared: the typed phrase did not match. Nothing was changed.");
     assert_eq!(share_record(&fixture, &id, &origin), snapshot_only);
 
@@ -243,11 +276,13 @@ fn an_unshare_is_recorded_only_by_its_phrase() {
     cancel_the_bar(&mut view, question);
     still_shared();
 
-    // An empty line.
+    // An empty line. The phrase is one that can be worked out in advance, so
+    // its prompt adds a nonce.
     open_bar(&mut view, 'u', question);
     view.press(Key::Enter);
     let asked = view.answer_with(1, |_| String::new());
-    assert_eq!(asked, format!("I UNSHARE {id} {origin}"));
+    let phrase = format!("I UNSHARE {id} {origin}");
+    assert_eq!(without_nonce(&asked), phrase);
     view.wait_for("Not unshared: the typed phrase did not match. Nothing was changed.");
     still_shared();
 
@@ -258,10 +293,32 @@ fn an_unshare_is_recorded_only_by_its_phrase() {
     view.wait_for("Not unshared: the typed phrase did not match. Nothing was changed.");
     still_shared();
 
+    // The phrase without the nonce: all that could be known before the prompt.
+    open_bar(&mut view, 'u', question);
+    view.press(Key::Enter);
+    view.answer_with(3, |_| phrase.clone());
+    view.wait_for("Not unshared: the typed phrase did not match. Nothing was changed.");
+    still_shared();
+
+    // The whole phrase the first prompt asked: its nonce was for that prompt.
+    // (Should this one draw the same nonce, one chance in 2^25, another wrong
+    // nonce is typed instead.)
+    open_bar(&mut view, 'u', question);
+    view.press(Key::Enter);
+    view.answer_with(4, |now| {
+        if now == asked {
+            with_another_nonce(now)
+        } else {
+            asked.clone()
+        }
+    });
+    view.wait_for("Not unshared: the typed phrase did not match. Nothing was changed.");
+    still_shared();
+
     // The right phrase makes it private again.
     open_bar(&mut view, 'u', question);
     view.press(Key::Enter);
-    view.type_phrase(3);
+    view.type_phrase(5);
     view.wait_for("1 thought made private again for remote 'origin'.");
     assert_eq!(
         share_record(&fixture, &id, &origin),
@@ -361,6 +418,7 @@ fn an_authorization_is_recorded_only_by_its_phrase() {
     let fixture = common::Fixture::new();
     let id = captured_conversation(&fixture);
     let origin = fingerprint(&fixture, "origin");
+    // The phrase without the nonce its prompt adds.
     let phrase = format!("I AUTHORIZE SHARING {origin}");
     let not_authorized = || {
         assert!(!is_authorized(&fixture, "origin"));
@@ -381,7 +439,7 @@ fn an_authorization_is_recorded_only_by_its_phrase() {
     open_bar(&mut view, 's', offer);
     view.press(Key::Enter);
     let asked = view.answer_with(1, |_| String::new());
-    assert_eq!(asked, phrase);
+    assert_eq!(without_nonce(&asked), phrase);
     view.wait_for("Not authorized: the typed phrase did not match.");
     not_authorized();
 
@@ -392,11 +450,19 @@ fn an_authorization_is_recorded_only_by_its_phrase() {
     view.wait_for("Not authorized: the typed phrase did not match.");
     not_authorized();
 
+    // The phrase without its nonce, which anyone who knows the push URL can
+    // work out.
+    open_bar(&mut view, 's', offer);
+    view.press(Key::Enter);
+    view.answer_with(3, |_| phrase.clone());
+    view.wait_for("Not authorized: the typed phrase did not match.");
+    not_authorized();
+
     // The right phrase authorizes publishing to this exact destination, and
     // does not turn auto-push on.
     open_bar(&mut view, 's', offer);
     view.press(Key::Enter);
-    view.type_phrase(3);
+    view.type_phrase(4);
     view.wait_for("Publishing to 'origin' is now authorized. Auto-push stays off.");
     assert!(is_authorized(&fixture, "origin"));
     assert!(!auto_push_is_on(&fixture, "origin"));
@@ -404,7 +470,7 @@ fn an_authorization_is_recorded_only_by_its_phrase() {
 
     // It authorizes and stops there: nothing is shared, nothing is asked next.
     view.wait_quietly(Duration::from_millis(700));
-    assert_eq!(view.prompts_so_far(), 3);
+    assert_eq!(view.prompts_so_far(), 4);
     assert!(!view.flat().contains("not yet shared"));
     assert_eq!(share_record(&fixture, &id, &origin), ShareRecord::default());
     assert_eq!(listed_state(&fixture, &id), "[private]");
@@ -490,7 +556,7 @@ fn an_unshare_does_not_need_authorization_but_a_publish_still_does() {
     );
     view.press(Key::Enter);
     let asked = view.type_phrase(1);
-    assert_eq!(asked, format!("I UNSHARE {id} {origin}"));
+    assert_eq!(without_nonce(&asked), format!("I UNSHARE {id} {origin}"));
     view.wait_for("1 thought made private again for remote 'origin'.");
     assert_eq!(listed_state(&fixture, &id), "[private]");
     assert!(!is_authorized(&fixture, "origin"));
@@ -571,11 +637,13 @@ fn a_share_phrase_typed_in_the_same_write_as_the_keys_does_not_answer_the_prompt
 fn an_authorization_phrase_typed_in_the_same_write_as_the_keys_does_not_answer_the_prompt() {
     let fixture = common::Fixture::new();
     captured_conversation(&fixture);
+    // All of the phrase that can be known before the prompt: its prompt adds a
+    // nonce, so this could not answer it even if it were not thrown away.
     let phrase = format!("I AUTHORIZE SHARING {}", fingerprint(&fixture, "origin"));
     let mut view = View::open(&fixture);
 
     view.session.write(format!("s\r{phrase}\n").as_bytes());
-    assert_eq!(view.prompt(1), phrase);
+    assert_eq!(without_nonce(&view.prompt(1)), phrase);
     view.wait_quietly(Duration::from_millis(800));
     assert!(waits_at_the_prompt(&view), "{}", describe(&view.session));
     assert!(!is_authorized(&fixture, "origin"));
@@ -585,11 +653,12 @@ fn an_authorization_phrase_typed_in_the_same_write_as_the_keys_does_not_answer_t
     view.is_at_the_list();
     assert!(!is_authorized(&fixture, "origin"));
 
-    // Control: typed after the prompt it authorizes.
+    // Control: the phrase its prompt shows, typed after the prompt, authorizes.
     open_bar(&mut view, 's', "is not authorized in this clone yet.");
     view.press(Key::Enter);
-    assert_eq!(view.prompt(2), phrase);
-    view.type_back(&phrase);
+    let asked = view.prompt(2);
+    assert_eq!(without_nonce(&asked), phrase);
+    view.type_back(&asked);
     view.wait_for("Publishing to 'origin' is now authorized.");
     assert!(is_authorized(&fixture, "origin"));
     assert!(view.quit().success());
@@ -865,7 +934,10 @@ fn a_remote_url_with_credentials_is_never_shown_or_echoed() {
         .contains("Publishing to 'origin' (example.invalid/org/repo.git)"));
     view.press(Key::Enter);
     let phrase = view.type_phrase(1);
-    assert_eq!(phrase, format!("I AUTHORIZE SHARING {origin}"));
+    assert_eq!(
+        without_nonce(&phrase),
+        format!("I AUTHORIZE SHARING {origin}")
+    );
     view.wait_for("Publishing to 'origin' is now authorized.");
 
     // Sharing, the picker and the details say the same.
@@ -954,7 +1026,7 @@ fn a_publish_reports_what_is_new_against_the_total_and_asks_nothing_when_nothing
     assert!(asked.ends_with(" 1"), "{asked}");
     let summary = flat(&view.session.screen());
     assert!(
-        summary.contains("Publishing 1 new shared interaction(s) to 'origin' (2 shared in total)."),
+        summary.contains("Publishing 1 new shared thought(s) to 'origin' (2 shared in total)."),
         "{summary}"
     );
     view.type_back(&asked);

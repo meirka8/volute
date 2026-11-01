@@ -66,6 +66,9 @@
     --diff-code-selected-background-color: rgba(230, 219, 212, 0.7);
     --diff-code-selected-text-color: #5a4a41;
     --diff-omit-gutter-line-color: #b00020;
+    --mark-bg: rgba(249, 168, 37, 0.45);
+    --mark-line: rgba(140, 84, 0, 0.9);
+    --current-match: #5a4a41;
     line-height: 1.5;
     font-weight: 400;
     font-synthesis: none;
@@ -127,6 +130,9 @@
     --diff-code-selected-background-color: rgba(45, 45, 42, 0.82);
     --diff-code-selected-text-color: #e0e0db;
     --diff-omit-gutter-line-color: #e57373;
+    --mark-bg: rgba(255, 213, 79, 0.26);
+    --mark-line: rgba(255, 213, 79, 0.7);
+    --current-match: #e0e0db;
 }
 
 * {
@@ -205,6 +211,27 @@ body,
 
 .rr-selected-card {
     box-shadow: var(--selected-card-shadow);
+}
+
+/*
+ * Search (issue #118). What the search matches is marked where it is: a tint, a hairline round it (amber against a
+ * beige page differs little in lightness, so the line carries the contrast: at least 3:1 against every background a
+ * card has, in both themes), and the text colour of the page whatever the text around it is (muted text on the amber
+ * would be too faint to read; the text on the mark is at least 4.5:1). The step the search is on is outlined. That is
+ * not the selection, which is a blue border and a tint. Windows high-contrast mode replaces the colours of a mark with
+ * the system's own for marked text.
+ */
+mark.rr-mark {
+    background-color: var(--mark-bg);
+    box-shadow: 0 0 0 1px var(--mark-line);
+    color: var(--color-ink);
+    border-radius: 3px;
+    padding: 0 1px;
+}
+
+.rr-current-match {
+    outline: 2px solid var(--current-match);
+    outline-offset: 3px;
 }
 
 /* A card whose step is new to the timeline fades in and slides a little. */

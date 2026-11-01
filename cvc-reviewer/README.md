@@ -90,23 +90,48 @@ Nodes shaped like Claude Code transcript steps are laid out as stimulus (what it
 to) → reasoning (when the model exposed it) → response → tool calls. The stimulus is usually
 a prompt or the previous step's tool results, so a tool's result appears on the **next**
 step. Tool results are folded to a one-line summary only on steps that tool output started;
-on steps a person started they stay open, as the two can be hard to tell apart. Edit and Write
-cards show what the call asked for, not necessarily the change that reached the PR.
+on steps a person took part in they stay open (in an older capture the two can be hard to tell
+apart). Edit and Write cards show what the call asked for, not necessarily the change that
+reached the PR.
 
-Tool results are marked in the text itself, so a fetched web page can imitate the markers.
-Each result must match a call of the previous step by tool name and by whether it failed, or
-the stimulus is shown undivided, with a note; if that step is not in the timeline, it is
-divided by its markers, unchecked. A result claiming a server-side call never matches: the
-model provider runs those calls and delivers their results inside the assistant's own
-message, so the capture never writes a tool result for them. A `[meta]` or
+**Newer captures mark every part of the stimulus verifiably.** A person's words, a subagent's
+task, context the harness injected, a compaction summary and each tool result all start with a
+boundary token that tool output cannot have contained when it was written, and the Reviewer
+trusts a marker only when its token checks out against the step's own id. So a person's words
+are drawn as prose and are never something a tool printed; a subagent's task is labelled
+**Task** and described as an instruction from the agent that delegated the work, since nobody
+types into a subagent; tool results, context and compaction summaries are drawn as before; and
+a note says where the capture cut a part (**… N bytes truncated**), could not scrub it
+(**Withheld: this part could not be scrubbed**) or left parts out (**N more parts not
+recorded**). The token itself is never shown. Tool output that imitates markers stays output.
+The check against the previous step's calls (below) does not undo this division: it puts a note
+on a result that none of that step's calls accounts for, and on that result only. The token is
+a consistency check, not a signature. It is computed from public values, so it exposes tool
+output that imitates the structure, and text changed after it was captured, and it does not say
+who wrote the text. It does not cover the name or the error flag in a marker.
+
+A stimulus that carries such tokens but does not verify (changed after it was captured,
+damaged, or written for another step) is shown undivided, under **Unverified stimulus**: one
+block of monospace text with the note **Shown undivided: this step's markers could not be
+verified.**, folded the way tool results are. It is never drawn as a prompt, and never split by
+the older rules below.
+
+**Older captures** (before the boundary token) mark tool results in the text itself, so a
+fetched web page can imitate the markers. They are read by the rules in the rest of this
+section, which are unchanged. Each result must match a call of the previous step by tool name
+and by whether it failed, or the stimulus is shown undivided, with a note; if that step is not
+in the timeline, it is divided by its markers, unchecked. A result claiming a server-side call
+never matches: the model provider runs those calls and delivers their results inside the
+assistant's own message, so the capture never writes a tool result for them. A `[meta]` or
 `[compaction summary]` part after tool results is drawn inside them as plain output, marker
 and all, not as **Context** or **Compaction summary**. No check catches every imitation,
 because the markers are plain text.
 
-In a step a person started, only the last `[Request interrupted by user…]` line starts a
-prompt, and only if no tool result follows it; otherwise the text stays together, and the
-step says when it cannot tell where the prompt starts. Elsewhere that line and plain text
-(**Unmarked text**) are monospace, never a prompt.
+In an older capture of a step a person started, only the last `[Request interrupted by user…]`
+line starts a prompt, and only if no tool result follows it; otherwise the text stays
+together, and the step says when it cannot tell where the prompt starts. Elsewhere that line
+and plain text (**Unmarked text**) are monospace, never a prompt. (In a newer capture the line
+is part of the person's text.)
 
 The Reviewer infers this layout from the shape of the node, because the synced record does
 not say which tool captured it. It is a display choice, not a provenance or trust signal.
@@ -126,4 +151,143 @@ content the capture does not record does (`[image]`).
 Where the capture hit a limit, the step says so:
 **Arguments not recorded: N bytes exceeded the capture limit** replaces tool arguments too
 large to keep, and `…[cvc: truncated N bytes]` marks where text was cut. Privacy redactions
-appear as `[CVC_REDACTED:v1:<kind>:<id>]`.
+appear as `[CVC_REDACTED:v1:<kind>:<id>]`, and can replace part of a longer text, such as a
+key block inside numbered output, so line numbers can skip.
+
+A field the capture could not scrub is not recorded, and the step says so in words:
+**Arguments withheld: N bytes could not be scrubbed.** on the call, and **Withheld: N bytes
+could not be scrubbed.** for a response or its reasoning. A step records at most 255 tool
+calls and 256 context items. When it left some out, the capture ends the calls with a record of
+its own, and the Tool calls end with a note such as **45 more tool calls and 44 context items
+were not recorded**. That record is not a call the model made, so it is no card and is not
+counted as a call or a failure; only the exact record counts (the `cvc` protocol, the name
+`cvc-omitted`, its fixed arguments, as the last entry), so anything that merely resembles it is
+drawn as the ordinary call it is. The results of the calls it stands for are not held against
+the previous step. A response the capture could not store at all is recorded as a stand-in: its
+stimulus, no model name, no reasoning, no tool calls, and a note in place of the response,
+which the step words as **This response was withheld: it could not be scrubbed within the
+capture limits.**
+
+## Searching and filtering the timeline
+
+The box at the top of the timeline narrows the steps as you type, and the filters under it narrow them by who
+or what a step was. Neither fetches anything: they work on the steps already loaded, through an index built the
+first time the box or the filters are used (a timeline nobody searches pays nothing for it).
+
+**What is searched: what a card draws.** The index holds the text a step's card shows, and nothing else, so a step
+the search leaves always has something on its card that says why. For a step in the stimulus / reasoning / response
+layout that is the prompt, a subagent's task, injected context, compaction summary and tool results of the stimulus (with the
+names the results are shown under), the reasoning, the response, and for each tool call the *values* it recorded as the card
+shows them: a command and its description, the lines of an edit's diff, the content of a write, a pattern, a URL, the
+rows of a checklist, the value of every other argument (numbers included: a field that holds `42` is found by "42"), and
+the value of an option where the card writes one ("timeout 120s", "glob *.ts"). For a step in the Thought / Action /
+Observation layout it is the prompt, the line the Action pane writes for each call (the name of the tool and the
+arguments as they were recorded, JSON and all), the response, and the reasoning of an AI agent, which is behind "Why?";
+a human's reasoning there is on no card and is not searched.
+
+What is **not** searched: the markers of the wire (`[tool_result Bash]`, `[meta]`, `[no stimulus recorded]`, and the
+markers with their boundary tokens of a verified stimulus), the notes the capture leaves where it cut a part or could not
+keep it (`…[cvc: truncated N bytes …]`, `[cvc: withheld …]`, and the `[cvc: withheld N bytes that could not be scrubbed]` that
+stands in for a field), which a card words in its own way, the Reviewer's own words (labels, badges, placeholders such as "No recorded observation", "runs in background", "ignore
+case", "replace all occurrences"), the model name, and the *names* of a tool call's arguments (`command`, `file_path`:
+use `tool:` to find a call by what it is called). The names of the tools called, the files a step touched (the
+`file_path`, `path` and `notebook_path` of its calls, and its context items) and the hashes of the commits it is linked
+to are searched too. A file a step names only in its context items matches even though no card draws it: the card says
+so ("Matched in: context file paths, which this card does not show"). The *tool* and *commit* fields are shown in
+part (the name a card gives a tool is shorter than the name that was recorded, a commit chip shows seven characters of the
+hash): a term that is in the part that is not shown marks the whole of what is.
+
+**How text is compared.** Both the text and the terms are folded the same way, so what is found is what is marked:
+case in full (`ß` is "ss", the final sigma is a sigma, a Turkish capital `İ` is an `i` and a dot above), compatibility forms
+per character (full-width letters and ligatures are their letters; a precomposed `é` is the same as an `e` and the accent
+after it, and "cafe" finds both), every white-space character as a space (a no-break space in a phrase is a space), and every
+hidden or bidirectional character left out, so that an invisible character can not hide a match: `pass<ZWSP>word` is found
+by "password". The hidden characters are those of Unicode's Default_Ignorable_Code_Point property (and the C0 and C1
+controls and the interlinear annotation characters); a card draws them as visible `⟨U+…⟩` tokens, and a match that runs
+across one is marked on either side of its token. **Look-alike letters are not folded**: a Cyrillic `а` is not a Latin
+`a`, and a search for one does not find the other.
+
+**The query.** Terms are separated by white space; `"retry limit"` is one term. `path:`, `tool:` and `commit:` before a
+term (in any case) look in that field only: `path:src/net`, `tool:bash`, `commit:a1b2c3d`, or with a quoted value,
+`path:"my dir/a.ts"`. Any other `word:` is plain text (`http://example.com` is searched as it is). A prefix with nothing
+after it yet, an empty pair of quotes, and a phrase of nothing but spaces are ignored while you type them. Nothing is read
+as a regular expression: `.*` and `(a+)+$` are text. No more than 16 different terms are used ("Only the first 16 terms are
+used" says so when there are more), and a term is cut at 512 characters.
+
+**Marks.** What matches is marked in place in `<mark>` elements that hold only text, on every piece of wire text a card
+draws, at most 100 marks to a block of text and at most 500 on a card (the card says "Only the first 500 matches on this
+card are marked" when it stops: the step still matches, and the folds still count every match they hold). The Reviewer's
+own words are never marked, and neither are the names of arguments. A term with a prefix marks only the text of its
+field (`tool:` the names of the calls, `path:` file paths, `commit:` hashes). Folded text is never opened for you: a fold
+that holds matches says how many, on its control ("Tool results · Bash · 3 matches", "Show all 40 lines · 2 matches", "Why? · 1
+match"). The count on a "Show more", "Show all N lines" or diff toggle is of the whole block, matches already in view
+included. A control that draws the next page of a long list says how many matches the items not drawn yet hold ("Show 10
+more tool calls (53 not shown) · 1 match"). A diff draws a line at a time, so a phrase that runs from one line of it to the
+next is not a match there.
+
+**Next and previous.** The count (a live region) reads "3 of 12 · 12 of 300 steps" while there is a query and "12 of 300
+steps" when only filters narrow the list: whenever anything narrows the list, the bar says how many of the steps it
+shows. Enter in the box goes to the next match, Shift+Enter to the previous, wrapping round; the arrow buttons do the
+same, and the step is scrolled into view if it is not and outlined. The outline is not the selection: selecting a step is
+unchanged. Escape clears the box, and in an empty box leaves it. `/` anywhere on the page that does not use the key (not while
+typing in a box, text area, select or editable region, and not with a modifier) comes to the box.
+
+**Filters.** The "Filters" disclosure holds one group of check boxes for each kind; within a group a step needs *any* of the
+values ticked, and it needs one of each group that has a value ticked. Each value that is on is also a chip that removes it.
+
+- *Conversation*: named from its id alone, never from what its steps look like. "Subagent `<id>`" for
+  `<session>:agent-<id>`, with the session it belongs to as a note ("of session `<id>`"); "Session `<id>`" for every other
+  conversation (a Claude Code session, the MCP server, the editor, `cvc run`). Each shows the number of steps and the first
+  line of what its earliest step was asked. Conversation titles are not part of the synced record, so there are none to show;
+  ids are cut to their first characters, and no more than it takes to tell two apart (a note cuts its session's id as the
+  session's own name does). Ids that are the same as far as a name looks (it never looks past 64 characters) are told apart by
+  a number, "(2)".
+- *Stimulus origin*: Prompt (a person's), Tool results, and Other (MCP, VS Code and `cvc run` steps, a subagent's task,
+  compaction, context, a stimulus whose markers could not be verified).
+- *Tool*: the names the cards show (`github · create_issue`, `web_search (server-side)`).
+- *Link type*: generated, temporal, verified, and publisher-asserted (any link that carries a derivation event), the same
+  split as the commit chips on a card. Only the kinds that are present are offered.
+- *Commit*: the pull request's commits, newest first, with the first line of the message when GitHub's commit list gave it
+  (no extra request), and how many steps are linked to each. A step linked to the commit stays linked to it whatever else is
+  filtered: a filter chooses steps, it never changes them.
+- *Touches the open file*: steps whose files include the file open in the diff pane, by path ending (the steps record where
+  the file was on the machine that wrote them, and the pull request names it from the repository root, so a root-level
+  `index.ts` also finds steps that touched `src/index.ts`). It follows the open file as you switch files, and another pull
+  request opens at its own first file, never at one of the last pull request's.
+
+**The list.** Steps that do not match are removed from the list, which is still windowed if it is long, and the steps that
+match keep their order. What you opened in a card (a fold, "Show more", "Show all N lines", a page of a long list, "Why?")
+is kept with the step, so it is still open when the card comes back, from a search or from being scrolled out of the
+window. When a search or filter begins the list opens at the top; when the last one is cleared, the list opens where you
+were in it. Clearing from the empty state ("Clear search and filters") puts the keyboard in the box.
+
+**The address keeps the filters after the `#`, and never the search text.** The filters are kept in the fragment of the
+address so that a reload, or a step back to the page, finds them again: `#conv=…&origin=…&tool=…&link=…&commit=…&file=…`, one
+`conv`, `origin`, `tool`, `link` or `commit` for each value and a `file` path (for "touches the open file" it is the file
+that is open; a path from a link stays that file). The fragment is never sent to a server, and the page sends no referrer.
+They are written at once, replacing the history entry (a choice of a filter is not a history entry), and only while the page
+is still the one the timeline was drawn on; the path, the parameters of the query string that are not ours (`?tab=files`) and
+any other parameter of the fragment are left as they were. A value that is not one its parameter holds (an unknown origin, an
+id with a space, a hash that is not hexadecimal) is ignored, and every value is shown as text, with hidden characters made
+visible; a value too long for the address, or that reading it would change, is left out of it and never written cut short.
+Back restores a page's filters, not what was typed in its box.
+
+What you typed is not in the address: a search is often a word from a log, a name or a secret, and the address goes to the
+history, to the screen and to whoever the page is shared with. **"Copy link"** (the button beside the filters) is how a
+view is shared: it copies the address with the filters *and* the search text, as `q=` in the fragment. Before it puts a text
+that looks like a secret (a private key, a token with a known prefix, a JWT, a password assignment, or a long run of mixed-case
+letters and digits that is not a hash: a commit hash, a SHA-256 and a UUID are not taken for one) into a link it asks, in a
+line you can reach with the keyboard, whether to copy without the search text (the default) or anyway. That is a nudge and
+not a guarantee: a secret that does not look like one passes (a short password does). Where the browser does not let the
+page write to the clipboard, the link is shown in a field, selected, to copy from; "Link copied" is announced in the count's
+live region.
+
+A link that brings a search or filters (a fragment with `q=` or any of the parameters above, opened in a new tab, in this
+one, or pasted into its address bar) is applied, the search text leaves the address at once, and a line under the bar says
+"This view was opened from a link with a search and filters applied" with a **Clear** button, until you change the search or
+the filters: a crafted link can not narrow the timeline without your seeing it. None of these names (`q`, `conv`, `origin`,
+`tool`, `link`, `commit`, `file`) is read from the query string, the old `?q=` included. The page takes them out of it when it
+opens, so that a leftover one, from a link made before the filters moved to the fragment, is not kept in the address and the
+history, and "Copy link" leaves them out of the query string of the link and keeps every other parameter as it was: a query
+string is what a server is sent. Whoever opens a copied link keeps its search text in their own browser history, which a page
+can not prevent.

@@ -1,7 +1,9 @@
 use chrono::Utc;
 use cvc_core::db::CvcStore;
-use cvc_core::models::{Author, CommitSha, Conversation, Interaction, InteractionId};
-use cvc_core::privacy::{McpCapture, PreparedPolicy};
+use cvc_core::models::{
+    Author, CommitSha, Conversation, FutureSharePolicy, Interaction, InteractionId,
+};
+use cvc_core::privacy::{LspPassiveCapture, McpCapture, PreparedPolicy};
 use cvc_mcp::server::{start_session, AppState};
 use cvc_mcp::tools::{call_tool, list_tools};
 use git2::Repository;
@@ -102,6 +104,273 @@ async fn test_list_tools() {
     assert!(tools_array.iter().any(|t| t["name"] == "read_history"));
     assert!(tools_array.iter().any(|t| t["name"] == "get_context"));
     assert!(tools_array.iter().any(|t| t["name"] == "setup_cvc"));
+}
+
+/// What `commit_thought` states about the privacy of what it records.
+const THOUGHTS_STAY_PRIVATE: &str =
+    "Thoughts recorded through MCP stay private until shared with `cvc share`.";
+
+#[tokio::test]
+async fn test_commit_thought_describes_its_thoughts_as_private_without_changing_its_input_schema() {
+    let tools = list_tools();
+    let commit_thought = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "commit_thought")
+        .unwrap();
+    let description = commit_thought["description"].as_str().unwrap();
+    assert!(description.contains(THOUGHTS_STAY_PRIVATE), "{description}");
+
+    let schema = &commit_thought["inputSchema"];
+    let mut properties: Vec<&str> = schema["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    properties.sort_unstable();
+    assert_eq!(
+        properties,
+        [
+            "context_summary",
+            "conversation_id",
+            "cwd",
+            "parent_id",
+            "reasoning",
+            "response",
+            "task"
+        ]
+    );
+    assert_eq!(schema["required"], json!(["task", "reasoning"]));
+    for property in schema["properties"].as_object().unwrap().values() {
+        assert_eq!(property["type"], "string", "{property}");
+    }
+
+    let conversation_id = schema["properties"]["conversation_id"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !conversation_id.contains("Created if it doesn't already exist"),
+        "{conversation_id}"
+    );
+    assert!(
+        conversation_id.contains("A conversation that does not exist yet is created."),
+        "{conversation_id}"
+    );
+    assert!(
+        conversation_id.contains("the thought is recorded private"),
+        "{conversation_id}"
+    );
+    assert!(
+        conversation_id.contains(THOUGHTS_STAY_PRIVATE),
+        "{conversation_id}"
+    );
+}
+
+/// The id `commit_thought` reports, read from the first content block the way
+/// clients read it, after checking the second block states the privacy.
+fn recorded_id(result: &serde_json::Value) -> InteractionId {
+    let content = result["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "{result}");
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[1]["text"], THOUGHTS_STAY_PRIVATE);
+    content[0]["text"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("Thought recorded. ID: ")
+        .unwrap_or_else(|| panic!("unexpected result: {result}"))
+        .parse()
+        .unwrap()
+}
+
+/// Records one editor-session thought the way the VS Code watcher does.
+fn record_watched(store: &CvcStore, conversation_id: &str, request: &str) -> InteractionId {
+    record_watched_titled(store, conversation_id, "Copilot Chat Session", request)
+}
+
+/// [`record_watched`] with the conversation title the watcher hands over.
+fn record_watched_titled(
+    store: &CvcStore,
+    conversation_id: &str,
+    title: &str,
+    request: &str,
+) -> InteractionId {
+    let id = InteractionId::new();
+    store
+        .replace_lsp_passive_capture_batch(
+            request,
+            vec![LspPassiveCapture::new(
+                Conversation {
+                    id: conversation_id.into(),
+                    title: title.into(),
+                    created_at: Utc::now(),
+                },
+                Interaction {
+                    id: id.clone(),
+                    conversation_id: conversation_id.into(),
+                    parent_id: None,
+                    timestamp: Utc::now(),
+                    author: Author::Human,
+                    user_prompt: "watched prompt".into(),
+                    model_name: None,
+                    model_cot: None,
+                    model_response: Some("watched response".into()),
+                    source_request_id: Some(request.into()),
+                },
+                Vec::new(),
+                Vec::new(),
+                PreparedPolicy::built_ins_only(),
+                "0".repeat(64),
+            )],
+        )
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn test_commit_thought_into_a_conversation_whose_future_is_shared_is_recorded_private() {
+    let (dir, state) = make_state();
+    start_session(&state, "test-client").unwrap();
+    let destination = "7".repeat(64);
+    let store = fixture_store(dir.path());
+
+    // An editor session whose future thoughts the user shared, the way
+    // `cvc share <id> --future` records it.
+    let watched = record_watched(&store, "editor-session", "request-1");
+    let snapshot = store.share_snapshot("editor-session").unwrap();
+    store
+        .share_exact_snapshot(
+            "editor-session",
+            &destination,
+            &snapshot,
+            FutureSharePolicy::Shared,
+        )
+        .unwrap();
+
+    // The client names that conversation: the thought is recorded there, and
+    // the result says it is private.
+    let result = call_tool(commit_thought_in("editor-session"), state.clone())
+        .await
+        .unwrap();
+    let through_mcp = recorded_id(&result);
+    let thought = store.get_interaction(&through_mcp).unwrap().unwrap();
+    assert_eq!(thought.conversation_id, "editor-session");
+    assert_eq!(
+        store.projection_interaction_ids(&destination).unwrap(),
+        vec![watched.clone()]
+    );
+
+    // The conversation's future sharing still applies to the editor's thoughts.
+    let later = record_watched(&store, "editor-session", "request-2");
+    let shared: std::collections::HashSet<_> = store
+        .projection_interaction_ids(&destination)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(shared, [watched, later].into_iter().collect());
+    assert!(!shared.contains(&through_mcp));
+}
+
+#[tokio::test]
+async fn test_commit_thought_creating_a_conversation_is_recorded_private_despite_future_sharing_recorded_for_it(
+) {
+    let (dir, state) = make_state();
+    start_session(&state, "test-client").unwrap();
+    let destination = "7".repeat(64);
+    let store = fixture_store(dir.path());
+    // Future sharing recorded before anything was captured under the id, as
+    // `cvc share named-by-the-client --future` records it.
+    store
+        .share_exact_snapshot(
+            "named-by-the-client",
+            &destination,
+            &[],
+            FutureSharePolicy::Shared,
+        )
+        .unwrap();
+    assert!(store
+        .get_conversation("named-by-the-client")
+        .unwrap()
+        .is_none());
+
+    let named = recorded_id(
+        &call_tool(commit_thought_in("named-by-the-client"), state.clone())
+            .await
+            .unwrap(),
+    );
+    assert!(store
+        .get_conversation("named-by-the-client")
+        .unwrap()
+        .is_some());
+    // The server's own per-process conversation is private as well.
+    let default_session = recorded_id(
+        &call_tool(
+            json!({
+                "name": "commit_thought",
+                "arguments": { "reasoning": "Thinking process", "task": "User query" }
+            }),
+            state.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    for id in [&named, &default_session] {
+        assert!(store.get_interaction(id).unwrap().is_some());
+    }
+    assert!(store
+        .projection_interaction_ids(&destination)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn test_commit_thought_leaves_the_title_of_an_existing_conversation_as_it_was() {
+    let (dir, state) = make_state();
+    start_session(&state, "test-client").unwrap();
+    let store = fixture_store(dir.path());
+    let title = |id: &str| store.get_conversation(id).unwrap().unwrap().title;
+
+    // Two editor sessions, one with a title and one with an empty title. The
+    // title is what `cvc conversations` lists and what the summary before the
+    // `I SHARE` phrase shows.
+    record_watched_titled(&store, "titled-session", "Refactor the parser", "request-1");
+    record_watched_titled(&store, "untitled-session", "", "request-2");
+    for (conversation, before) in [
+        ("titled-session", "Refactor the parser"),
+        ("untitled-session", ""),
+    ] {
+        assert_eq!(title(conversation), before);
+        recorded_id(
+            &call_tool(commit_thought_in(conversation), state.clone())
+                .await
+                .unwrap(),
+        );
+        // The thought is recorded there, and the title is exactly as it was.
+        assert_eq!(
+            store.conversation_mcp_capture_count(conversation).unwrap(),
+            1,
+            "{conversation}"
+        );
+        assert_eq!(title(conversation), before, "{conversation}");
+    }
+
+    // A thought that creates its conversation gives it the usual title.
+    recorded_id(
+        &call_tool(commit_thought_in("brand-new"), state.clone())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(title("brand-new"), "Session brand-new");
+
+    // The watcher still renames its own session.
+    record_watched_titled(
+        &store,
+        "titled-session",
+        "Parser refactor, part two",
+        "request-3",
+    );
+    assert_eq!(title("titled-session"), "Parser refactor, part two");
 }
 
 #[tokio::test]
@@ -526,7 +795,7 @@ async fn test_sync_history_pulls_from_remote() {
     let res = call_tool(args, state.clone()).await.unwrap();
     let text = res["content"][0]["text"].as_str().unwrap();
     assert!(
-        text.contains("Pulled 1 new interaction"),
+        text.contains("Pulled 1 new thought"),
         "unexpected sync_history response: {text}"
     );
 

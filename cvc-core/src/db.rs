@@ -453,19 +453,66 @@ pub struct HarnessCursorUpdate<'a> {
     pub byte_offset: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HarnessBatchOutcome {
+    /// Captures stored, stand-ins included.
     pub inserted: usize,
     /// Captures skipped because their id is locally tombstoned or was recorded
     /// concurrently.
     pub suppressed: usize,
+    /// Of `inserted`, the stand-ins: responses whose capture could not be
+    /// prepared (a field the scrubber cannot process, a collection over its
+    /// limit) and that are stored as a note instead, so that they do not keep
+    /// the responses after them from being recorded.
+    pub withheld: usize,
+    /// Captures that could not be prepared and whose stand-in could not be
+    /// either: skipped, so that the batch and its cursor can go on.
+    pub lost: usize,
+    /// Why captures were withheld or lost, each reason once, in the order met,
+    /// at most [`HARNESS_REASONS_SHOWN`] of them.
+    pub reasons: Vec<String>,
 }
+
+/// How many distinct reasons a [`HarnessBatchOutcome`] lists.
+pub const HARNESS_REASONS_SHOWN: usize = 8;
 
 /// "Shared for the destination `?1`": an interaction share for that
 /// fingerprint or for the `'*'` wildcard. This is the sharing test
 /// `projection_interaction_ids` applies, without its publication-state filter.
 /// No destination (`NULL`) shares nothing, wildcard included.
 const SHARED_FOR_DESTINATION: &str = "(?1 IS NOT NULL AND EXISTS (SELECT 1 FROM interaction_shares s WHERE s.interaction_id = i.id AND s.remote_fingerprint IN (?1, '*')))";
+
+/// Whether any row is kept under the destination fingerprint `?1`, in any of
+/// the places [`ADOPT_DESTINATION_ROWS`] moves rows between fingerprints.
+const DESTINATION_ROWS_EXIST: &str = "SELECT EXISTS(SELECT 1 FROM conversation_shares WHERE remote_fingerprint = ?1)
+    OR EXISTS(SELECT 1 FROM interaction_shares WHERE remote_fingerprint = ?1)
+    OR EXISTS(SELECT 1 FROM publications WHERE remote_fingerprint = ?1)
+    OR EXISTS(SELECT 1 FROM tombstones WHERE scope_kind = 'remote' AND remote_fingerprint = ?1)
+    OR EXISTS(SELECT 1 FROM derivation_authorizations WHERE remote_fingerprint = ?1)
+    OR EXISTS(SELECT 1 FROM range_authorizations WHERE remote_fingerprint = ?1)
+    OR EXISTS(SELECT 1 FROM derivation_observations WHERE origin = 'remote_sync' AND (source_fingerprint = ?1 OR source_key = ?1))
+    OR EXISTS(SELECT 1 FROM range_observations WHERE origin = 'remote_sync' AND (source_key = ?1 OR source_remote = ?1))";
+
+/// Moves every row kept under the destination fingerprint `?1` to `?2`. The
+/// observations a pull recorded (`remote_sync`) carry the fingerprint in their
+/// key column too. Run only when nothing is kept under `?2` yet, so that no
+/// primary key can collide.
+const ADOPT_DESTINATION_ROWS: [&str; 8] = [
+    "UPDATE conversation_shares SET remote_fingerprint = ?2 WHERE remote_fingerprint = ?1",
+    "UPDATE interaction_shares SET remote_fingerprint = ?2 WHERE remote_fingerprint = ?1",
+    "UPDATE publications SET remote_fingerprint = ?2 WHERE remote_fingerprint = ?1",
+    "UPDATE tombstones SET remote_fingerprint = ?2 WHERE scope_kind = 'remote' AND remote_fingerprint = ?1",
+    "UPDATE derivation_authorizations SET remote_fingerprint = ?2 WHERE remote_fingerprint = ?1",
+    "UPDATE range_authorizations SET remote_fingerprint = ?2 WHERE remote_fingerprint = ?1",
+    "UPDATE derivation_observations SET
+         source_fingerprint = CASE WHEN source_fingerprint = ?1 THEN ?2 ELSE source_fingerprint END,
+         source_key = CASE WHEN source_key = ?1 THEN ?2 ELSE source_key END
+     WHERE origin = 'remote_sync' AND (source_fingerprint = ?1 OR source_key = ?1)",
+    "UPDATE range_observations SET
+         source_key = CASE WHEN source_key = ?1 THEN ?2 ELSE source_key END,
+         source_remote = CASE WHEN source_remote = ?1 THEN ?2 ELSE source_remote END
+     WHERE origin = 'remote_sync' AND (source_key = ?1 OR source_remote = ?1)",
+];
 
 /// The summary query up to its `tail` (`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`).
 /// `?1` is the destination fingerprint, or `NULL` for none. Every reader of
@@ -901,6 +948,17 @@ impl CvcStore {
             |r| r.get::<_, i64>(0),
         )? as usize)
     }
+    /// How many of the conversation's interactions were recorded through MCP
+    /// (`capture_source = 'mcp'`). Future sharing never extends to a thought
+    /// recorded through MCP, so a front that records future sharing for the
+    /// conversation can say that later ones will stay private.
+    pub fn conversation_mcp_capture_count(&self, conversation_id: &str) -> Result<usize> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM interactions WHERE conversation_id=?1 AND capture_source='mcp'",
+            params![conversation_id],
+            |r| r.get::<_, i64>(0),
+        )? as usize)
+    }
 
     // --- Interactions ---
 
@@ -946,7 +1004,7 @@ impl CvcStore {
             let id = Self::insert_capture(&tx, capture)?;
             // Publication observed on one remote is not local sharing intent.  Keep
             // imported turns private until the user explicitly shares their
-            // conversation; `pull_from_ref_for_remote` separately records the
+            // conversation; the pull separately records the
             // remote-specific publication proof.
             tx.execute("UPDATE interactions SET visibility='private', capture_source='sync_import', scrubber_version=1 WHERE id=?1", params![id.to_string()])?;
         }
@@ -1066,6 +1124,9 @@ impl CvcStore {
         }
     }
 
+    /// Records a thought received through the MCP server. It is stored private
+    /// and never joins its conversation's future sharing, whichever conversation
+    /// the client named; only an explicit share of that conversation covers it.
     pub fn capture_mcp(&self, capture: crate::privacy::McpCapture) -> Result<InteractionId> {
         self.capture(capture.into_capture())
     }
@@ -1184,40 +1245,82 @@ impl CvcStore {
     }
 
     /// Claude Code transcript ingest: every capture is prepared before SQLite
-    /// is touched, then the new captures and the advanced cursor commit in one
-    /// immediate transaction. Ids are deterministic per response, so a capture
-    /// that already exists or is locally tombstoned is skipped, never replaced:
-    /// replacing would drop the commit links an earlier ingest has earned.
+    /// is touched (one that cannot be is stored as a stand-in, see
+    /// [`HarnessBatchOutcome::withheld`]), then the new captures and the advanced
+    /// cursor commit in one immediate transaction. Ids are deterministic per
+    /// response, so a capture that already exists or is locally tombstoned is
+    /// skipped, never replaced: replacing would drop the commit links an earlier
+    /// ingest has earned.
     pub fn capture_claude_code_batch(
         &self,
         captures: Vec<crate::privacy::ClaudeCodeCapture>,
         cursor: HarnessCursorUpdate<'_>,
     ) -> Result<HarnessBatchOutcome> {
-        let prepared: Vec<Capture> = captures
-            .into_iter()
-            .map(|capture| privacy::prepare(capture.into_capture()))
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|e| DbError::Migration(e.to_string()))?;
+        // A capture that cannot be prepared is stored as a stand-in, or skipped
+        // when not even that works; it never fails the batch, because the
+        // cursor only moves when the batch is stored.
+        let mut prepared: Vec<(Capture, bool)> = Vec::with_capacity(captures.len());
+        let mut lost: Vec<(InteractionId, Option<InteractionId>)> = Vec::new();
+        let mut reasons: Vec<String> = Vec::new();
+        let mut note = |reason: String| {
+            if reasons.len() < HARNESS_REASONS_SHOWN && !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        };
+        for capture in captures {
+            match privacy::prepare_harness(capture.into_capture()) {
+                privacy::HarnessCapture::Prepared(capture) => prepared.push((capture, false)),
+                privacy::HarnessCapture::Withheld { stand_in, reason } => {
+                    note(reason);
+                    prepared.push((stand_in, true));
+                }
+                privacy::HarnessCapture::Lost {
+                    id,
+                    parent_id,
+                    reason,
+                } => {
+                    note(reason);
+                    lost.push((id, parent_id));
+                }
+            }
+        }
         let byte_offset = i64::try_from(cursor.byte_offset)
             .map_err(|_| DbError::Migration("harness cursor offset overflows".into()))?;
-        let outcome = self.with_immediate_write_retry(|tx| {
+        let mut outcome = self.with_immediate_write_retry(|tx| {
             let mut outcome = HarnessBatchOutcome::default();
-            for capture in &prepared {
+            // What this batch did not store, and what each of those was a child
+            // of: a capture whose parent is one of them is a child of that
+            // parent instead, so the chain skips over what is missing. A parent
+            // that is stored nowhere would fail the batch on the foreign key, so
+            // the chain breaks there instead.
+            let mut skipped: std::collections::HashMap<&InteractionId, Option<&InteractionId>> = lost
+                .iter()
+                .map(|(id, parent)| (id, parent.as_ref()))
+                .collect();
+            for (capture, withheld) in &prepared {
                 let id = &capture.interaction.id;
-                let exists = tx
-                    .query_row(
-                        "SELECT 1 FROM interactions WHERE id=?1",
-                        params![id.as_str()],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some();
+                let exists = Self::interaction_exists_tx(tx, id)?;
                 if exists || Self::is_tombstoned_tx(tx, id)? {
                     outcome.suppressed += 1;
+                    if !exists {
+                        skipped.insert(id, capture.interaction.parent_id.as_ref());
+                    }
                     continue;
                 }
-                Self::insert_capture(tx, capture)?;
+                let mut parent = capture.interaction.parent_id.as_ref();
+                for _ in 0..=skipped.len() {
+                    match parent.and_then(|parent| skipped.get(parent)) {
+                        Some(next) => parent = *next,
+                        None => break,
+                    }
+                }
+                let parent = match parent {
+                    Some(parent) if Self::interaction_exists_tx(tx, parent)? => Some(parent),
+                    _ => None,
+                };
+                Self::insert_capture_with_parent(tx, capture, parent)?;
                 outcome.inserted += 1;
+                outcome.withheld += usize::from(*withheld);
             }
             tx.execute(
                 "INSERT INTO harness_ingest_cursors(harness,session_id,transcript_path,byte_offset,updated_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(harness,session_id) DO UPDATE SET transcript_path=excluded.transcript_path, byte_offset=excluded.byte_offset, updated_at=excluded.updated_at",
@@ -1231,6 +1334,8 @@ impl CvcStore {
             )?;
             Ok(outcome)
         })?;
+        outcome.lost = lost.len();
+        outcome.reasons = reasons;
         self.ensure_wal_visible()?;
         Ok(outcome)
     }
@@ -1268,11 +1373,40 @@ impl CvcStore {
     }
 
     fn insert_capture(tx: &Transaction<'_>, capture: &Capture) -> Result<InteractionId> {
+        Self::insert_capture_with_parent(tx, capture, capture.interaction.parent_id.as_ref())
+    }
+
+    fn interaction_exists_tx(tx: &Transaction<'_>, id: &InteractionId) -> Result<bool> {
+        Ok(tx
+            .query_row(
+                "SELECT 1 FROM interactions WHERE id=?1",
+                params![id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Inserts `capture` as a child of `parent` rather than of the parent it
+    /// names, for a batch whose chain had to skip a capture it did not store.
+    fn insert_capture_with_parent(
+        tx: &Transaction<'_>,
+        capture: &Capture,
+        parent: Option<&InteractionId>,
+    ) -> Result<InteractionId> {
         if Self::is_tombstoned_tx(tx, &capture.interaction.id)? {
             return Err(DbError::Migration("interaction is tombstoned".into()));
         }
+        // Every source titles a conversation it creates. Only a source that may
+        // rename an existing one (`CaptureSource::refreshes_conversation_title`)
+        // overwrites its title; an MCP thought leaves it exactly as it was.
+        let conversation_sql = if capture.source.refreshes_conversation_title() {
+            "INSERT INTO conversations (id,title,created_at) VALUES (?1,?2,?3) ON CONFLICT(id) DO UPDATE SET title=excluded.title"
+        } else {
+            "INSERT INTO conversations (id,title,created_at) VALUES (?1,?2,?3) ON CONFLICT(id) DO NOTHING"
+        };
         tx.execute(
-            "INSERT INTO conversations (id,title,created_at) VALUES (?1,?2,?3) ON CONFLICT(id) DO UPDATE SET title=excluded.title",
+            conversation_sql,
             params![
                 capture.conversation.id,
                 capture.conversation.title,
@@ -1280,7 +1414,7 @@ impl CvcStore {
             ],
         )?;
         let i = &capture.interaction;
-        let parent = i.parent_id.as_ref().map(InteractionId::as_str);
+        let parent = parent.map(InteractionId::as_str);
         let author = serde_json::to_string(&i.author)
             .unwrap_or_default()
             .replace('"', "");
@@ -1289,7 +1423,13 @@ impl CvcStore {
             .replace('"', "");
         let visibility = "private";
         tx.execute("INSERT INTO interactions (id,conversation_id,parent_id,timestamp,author,user_prompt,model_name,model_cot,model_response,source_request_id,visibility,capture_source,scrubber_version,capture_worktree) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13)", params![i.id.to_string(),i.conversation_id,parent,i.timestamp.timestamp(),author,i.user_prompt,i.model_name,i.model_cot,i.model_response,i.source_request_id,visibility,source,capture.capture_worktree])?;
-        tx.execute("INSERT OR IGNORE INTO interaction_shares(interaction_id,remote_fingerprint) SELECT ?1,remote_fingerprint FROM conversation_shares WHERE conversation_id=?2 AND share_future=1", params![i.id.to_string(), i.conversation_id])?;
+        // The conversation's future sharing extends only to captures whose
+        // trusted source takes part in it (`CaptureSource::inherits_future_sharing`).
+        // Every other capture, an MCP thought above all, is stored private and is
+        // shared only when an explicit share names its conversation again.
+        if capture.source.inherits_future_sharing() {
+            tx.execute("INSERT OR IGNORE INTO interaction_shares(interaction_id,remote_fingerprint) SELECT ?1,remote_fingerprint FROM conversation_shares WHERE conversation_id=?2 AND share_future=1", params![i.id.to_string(), i.conversation_id])?;
+        }
         for x in &capture.context_items {
             tx.execute("INSERT INTO context_items (interaction_id,file_path,git_blob_sha,dirty_patch,start_line,end_line) VALUES (?1,?2,?3,?4,?5,?6)",params![i.id.to_string(),x.file_path,x.git_blob_sha,x.dirty_patch,x.start_line,x.end_line])?;
         }
@@ -2867,6 +3007,59 @@ impl CvcStore {
         Ok(())
     }
 
+    /// Whether this store keeps rows under the destination fingerprint `legacy`
+    /// and none under `fingerprint`, so that
+    /// [`adopt_destination_fingerprint`](Self::adopt_destination_fingerprint)
+    /// would move them. Read-only.
+    pub(crate) fn destination_rows_pending_adoption(
+        &self,
+        legacy: &str,
+        fingerprint: &str,
+    ) -> Result<bool> {
+        Self::destination_rows_await_adoption(&self.conn, legacy, fingerprint)
+    }
+
+    fn destination_rows_await_adoption(
+        conn: &Connection,
+        legacy: &str,
+        fingerprint: &str,
+    ) -> Result<bool> {
+        let holds = |value: &str| -> Result<bool> {
+            Ok(conn.query_row(DESTINATION_ROWS_EXIST, params![value], |row| row.get(0))?)
+        };
+        Ok(holds(legacy)? && !holds(fingerprint)?)
+    }
+
+    /// Moves every row this store keeps under the destination fingerprint
+    /// `legacy` to `fingerprint`, in one transaction, when there is at least one
+    /// and none is kept under `fingerprint` yet: rows already kept under
+    /// `fingerprint` win, and nothing is merged into them. Returns whether rows
+    /// were moved.
+    ///
+    /// The rows are those of every table that records a destination: shares
+    /// (`conversation_shares`, `interaction_shares`), publication state
+    /// (`publications`), remote tombstones, derivation and range
+    /// authorizations, and what a pull observed at the destination
+    /// (`derivation_observations` and `range_observations` of origin
+    /// `remote_sync`, which key those rows by the fingerprint). The
+    /// `remote:<fingerprint>:` namespace of conversation ids imported by a pull
+    /// is not touched.
+    pub(crate) fn adopt_destination_fingerprint(
+        &self,
+        legacy: &str,
+        fingerprint: &str,
+    ) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if !Self::destination_rows_await_adoption(&tx, legacy, fingerprint)? {
+            return Ok(false);
+        }
+        for statement in ADOPT_DESTINATION_ROWS {
+            tx.execute(statement, params![legacy, fingerprint])?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn get_context_items(&self, interaction_id: &InteractionId) -> Result<Vec<ContextItem>> {
         let mut stmt = self.conn.prepare("SELECT id, interaction_id, file_path, git_blob_sha, dirty_patch, start_line, end_line FROM context_items WHERE interaction_id = ?1")?;
 
@@ -3104,8 +3297,132 @@ impl CvcStore {
 #[cfg(test)]
 mod trusted_api_tests {
     use super::*;
-    use crate::models::Evidence;
+    use crate::models::{CaptureSource, Evidence};
     use crate::privacy::{McpCapture, PreparedPolicy};
+
+    /// One thought from `source` into `conversation_id`, carrying `title` for
+    /// its conversation, as the source's front would hand it to the store.
+    fn fixture_capture(
+        source: CaptureSource,
+        conversation_id: &str,
+        title: &str,
+    ) -> (InteractionId, Capture) {
+        let id = InteractionId::new();
+        let capture = Capture {
+            conversation: Conversation {
+                id: conversation_id.into(),
+                title: title.into(),
+                created_at: Utc::now(),
+            },
+            interaction: Interaction {
+                id: id.clone(),
+                conversation_id: conversation_id.into(),
+                parent_id: None,
+                timestamp: Utc::now(),
+                author: Author::Agent,
+                user_prompt: format!("{source:?}"),
+                model_name: None,
+                model_cot: None,
+                model_response: None,
+                source_request_id: None,
+            },
+            context_items: Vec::new(),
+            tool_executions: Vec::new(),
+            source,
+            policy: PreparedPolicy::built_ins_only(),
+            capture_worktree: Some("0".repeat(64)),
+        };
+        (id, capture)
+    }
+
+    /// Every source titles a conversation it creates. Only the sources that
+    /// observe a session rename one that already exists; a thought recorded
+    /// through MCP and a capture whose source is not known leave its title
+    /// exactly as it was, an empty one included.
+    #[test]
+    fn only_the_sources_that_observe_a_session_rename_an_existing_conversation(
+    ) -> anyhow::Result<()> {
+        let store = CvcStore::open(":memory:")?;
+        let title_of = |conversation: &str| -> anyhow::Result<String> {
+            Ok(store
+                .get_conversation(conversation)?
+                .ok_or_else(|| anyhow::anyhow!("no conversation {conversation}"))?
+                .title)
+        };
+        for (source, renames) in [
+            (CaptureSource::Mcp, false),
+            (CaptureSource::Legacy, false),
+            (CaptureSource::VscodePassive, true),
+            (CaptureSource::VscodeExplicit, true),
+            (CaptureSource::ClaudeCode, true),
+            (CaptureSource::CliRun, true),
+            (CaptureSource::SyncImport, true),
+        ] {
+            assert_eq!(source.refreshes_conversation_title(), renames, "{source:?}");
+            let conversation = format!("{source:?}");
+            store.capture(fixture_capture(source, &conversation, "created as").1)?;
+            assert_eq!(title_of(&conversation)?, "created as", "{source:?}");
+            for existing in ["created as", ""] {
+                store.conn.execute(
+                    "UPDATE conversations SET title=?2 WHERE id=?1",
+                    params![conversation, existing],
+                )?;
+                store.capture(fixture_capture(source, &conversation, "named again").1)?;
+                let expected = if renames { "named again" } else { existing };
+                assert_eq!(
+                    title_of(&conversation)?,
+                    expected,
+                    "{source:?} {existing:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The one write boundary decides, for every trusted source, whether a
+    /// capture joins its conversation's future sharing. A thought recorded
+    /// through MCP and a capture whose source is not known (`Legacy`, the
+    /// default, which no public constructor produces) are stored private; the
+    /// other sources join the destinations whose future sharing is on, and only
+    /// those.
+    #[test]
+    fn future_sharing_extends_only_to_the_sources_that_take_part_in_it() -> anyhow::Result<()> {
+        let store = CvcStore::open(":memory:")?;
+        let future_shared = "7".repeat(64);
+        let future_private = "8".repeat(64);
+        // Recorded before anything is in the conversation, as `cvc share
+        // policy --future` would record it.
+        store.share_exact_snapshot("policy", &future_shared, &[], FutureSharePolicy::Shared)?;
+        store.share_exact_snapshot("policy", &future_private, &[], FutureSharePolicy::Private)?;
+        assert_eq!(CaptureSource::default(), CaptureSource::Legacy);
+        for (source, inherits) in [
+            (CaptureSource::Mcp, false),
+            (CaptureSource::Legacy, false),
+            (CaptureSource::VscodePassive, true),
+            (CaptureSource::VscodeExplicit, true),
+            (CaptureSource::ClaudeCode, true),
+            (CaptureSource::CliRun, true),
+            (CaptureSource::SyncImport, true),
+        ] {
+            assert_eq!(source.inherits_future_sharing(), inherits, "{source:?}");
+            let (id, capture) = fixture_capture(source, "policy", "policy");
+            store.capture(capture)?;
+            let shares: Vec<String> = store
+                .conn
+                .prepare(
+                    "SELECT remote_fingerprint FROM interaction_shares WHERE interaction_id=?1",
+                )?
+                .query_map(params![id.as_str()], |row| row.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            let expected = if inherits {
+                vec![future_shared.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(shares, expected, "{source:?}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn squash_queue_capacity_is_classified_as_retryable() {

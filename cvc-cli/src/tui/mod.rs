@@ -40,6 +40,11 @@ mod tree;
 mod view;
 mod words;
 
+/// Why an unshare would be refused, in the view's words. The one thing the
+/// commands take from `words`: `cvc unshare` refuses with it, and asks no phrase,
+/// for an unshare the store would refuse (`commands::sync::unshare_conversation`).
+pub(crate) use words::unshare_refusal;
+
 use std::io::{self, Write};
 
 use anyhow::Result;
@@ -118,8 +123,9 @@ pub(crate) fn run(start: Start<'_>) -> Result<Launch> {
     let data = load(&ctx, remotes, remote.as_deref())?;
     if data.summaries.iter().all(|summary| summary.thoughts == 0) {
         // Nothing to list: say so on the main screen, with the one next step.
-        let capture_acknowledged = privacy::capture_acknowledged(start.repo).unwrap_or(false);
-        for line in words::empty_state(capture_acknowledged, start.harness_installed) {
+        // State that cannot be read counts as never acknowledged.
+        let capture = privacy::capture_acknowledgement(start.repo).unwrap_or_default();
+        for line in words::empty_state(capture, start.harness_installed) {
             println!("{line}");
         }
         return Ok(Launch::Finished);
@@ -375,19 +381,22 @@ fn run_flow(ctx: &Context, screen: &mut Screen, model: &mut Model, flow: Flow) -
         Flow::Publish => {
             sync::publish_manually(ctx.repo, ctx.store, &destination).map(Report::Published)
         }
-        Flow::Authorize => {
-            sync::acknowledge_sharing_for(ctx.repo, &destination).map(|()| Report::Authorized)
-        }
+        Flow::Authorize => sync::acknowledge_sharing_for(ctx.repo, ctx.store, &destination)
+            .map(|()| Report::Authorized),
     };
 
     let report = match outcome {
         Ok(report) => report,
         Err(error) => {
             let failure = classify_failure(&error);
-            if let FlowFailure::Other(reason) | FlowFailure::OutcomeUnknown(reason) = &failure {
+            if let FlowFailure::Other(reason)
+            | FlowFailure::OutcomeUnknown(reason)
+            | FlowFailure::DestinationMismatch(reason) = &failure
+            {
                 // Not one of the expected refusals: show it whole, on the main
                 // screen, and wait, so it can be read before the list returns.
-                print_failure(kind, reason, &dest);
+                let nothing_sent = matches!(failure, FlowFailure::DestinationMismatch(_));
+                print_failure(kind, reason, &dest, nothing_sent);
                 wait_for_enter();
             }
             Report::Failed { kind, failure }
@@ -419,7 +428,7 @@ fn publishing_settings_match(listed: &RemoteOverview, now: &privacy::PrivacyStat
 }
 
 /// Prints an unexpected failure on the main screen, every line sanitized.
-fn print_failure(kind: FlowKind, reason: &str, dest: &Destination) {
+fn print_failure(kind: FlowKind, reason: &str, dest: &Destination, nothing_sent: bool) {
     let mut lines = reason.lines();
     println!(
         "cvc: {} failed: {}",
@@ -429,7 +438,7 @@ fn print_failure(kind: FlowKind, reason: &str, dest: &Destination) {
     for line in lines {
         println!("  {}", text::sanitize(line));
     }
-    if kind == FlowKind::Publish {
+    if kind == FlowKind::Publish && !nothing_sent {
         // The push may have started before the error.
         println!("{}", words::publish_unfinished(&dest.name));
     }
@@ -480,6 +489,7 @@ mod tests {
     fn now(sharing_consented: bool, auto_push: bool) -> privacy::PrivacyStatus {
         privacy::PrivacyStatus {
             capture_acknowledged: true,
+            capture_acknowledgement: privacy::CaptureAcknowledgement::Acknowledged,
             sharing_consented,
             auto_push,
             remote_fingerprint: "f".repeat(64),

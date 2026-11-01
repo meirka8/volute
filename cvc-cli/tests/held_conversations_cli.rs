@@ -154,7 +154,7 @@ fn a_pulled_conversation_is_offered_by_the_share_picker_for_the_remote_it_came_f
     // ... another clone, which has a second remote of its own, pulls it.
     let reader = another_clone_of(&author);
     let pulled = reader.cvc_ok(&["pull"]);
-    assert!(pulled.contains("Pulled 1 interaction(s)"), "{pulled}");
+    assert!(pulled.contains("Pulled 1 thought(s)"), "{pulled}");
     add_a_second_remote(&reader);
     let imported = format!("remote:{}:{id}", fingerprint(&reader, "origin"));
     assert_eq!(

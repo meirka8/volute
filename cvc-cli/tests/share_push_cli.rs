@@ -33,7 +33,7 @@ fn share_push_with_auto_push_acknowledged_publishes_after_the_share_challenge_al
     assert_eq!(challenges(&output), vec![share], "{output}");
     assert!(!output.contains("I PUBLISH"), "{output}");
     assert!(
-        output.contains("Published 1 new shared interaction(s) to 'origin'."),
+        output.contains("Published 1 new shared thought(s) to 'origin'."),
         "{output}"
     );
     let remote = git2::Repository::open_bare(&fixture.remote).unwrap();

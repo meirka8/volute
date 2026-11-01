@@ -11,6 +11,12 @@
  * a lookup table per code unit: no regular expression, so no backtracking, and the
  * cost is linear in the length of the text whatever it holds.
  *
+ * The class follows Unicode's Default_Ignorable_Code_Point property: every code point
+ * that property lists is in it (the unassigned ones among them too, which no font
+ * draws and a later version of Unicode may give a meaning), together with the C0 and
+ * C1 controls and the interlinear annotation characters. The tests walk the whole
+ * code space against that property, so a new member of it is caught.
+ *
  * Two levels of strictness, because some of these characters have honest uses:
  *
  * - `strict`, for code-like text (commands, paths, diffs, tool output, names):
@@ -54,11 +60,11 @@ const BASELINE_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0x180b, 0x180f], // Mongolian variation selectors and vowel separator
   [0x200b, 0x200f], // zero-width space, joiners, direction marks
   [0x202a, 0x202e], // bidirectional embeddings and overrides
-  [0x2060, 0x2064], // word joiner and invisible operators
-  [0x2066, 0x206f], // bidirectional isolates and the deprecated format controls
+  [0x2060, 0x206f], // word joiner, invisible operators, the unassigned U+2065, isolates and the deprecated format controls
   [0x3164, 0x3164], // Hangul filler
   [0xfeff, 0xfeff], // zero-width no-break space (byte order mark)
   [0xffa0, 0xffa0], // halfwidth Hangul filler
+  [0xfff0, 0xfff8], // unassigned code points of the Specials block that the property lists
   [0xfff9, 0xfffb], // interlinear annotation
 ];
 
@@ -67,15 +73,34 @@ const PROSE_EXCEPTIONS: ReadonlyArray<readonly [number, number]> = [[0x200c, 0x2
 const STRICT_EXTRAS: ReadonlyArray<readonly [number, number]> = [[0xfe00, 0xfe0f]];
 
 /**
- * The tag characters U+E0000-U+E007F and the variation selectors U+E0100-U+E01EF are
- * outside the Basic Multilingual Plane: UTF-16 writes each as the high surrogate
- * 0xDB40 followed by one low surrogate in these ranges.
+ * The members of the class outside the Basic Multilingual Plane, which UTF-16 writes as a high
+ * surrogate followed by a low one:
+ *
+ * - U+E0000-U+E0FFF (the tag characters, the variation selectors supplement and the code points
+ *   between and after them): the high surrogates 0xDB40-0xDB43 with any low surrogate;
+ * - U+1D173-U+1D17A (musical symbols that mark beams, ties, slurs and phrases): 0xD834 with
+ *   0xDD73-0xDD7A;
+ * - U+1BCA0-U+1BCA3 (shorthand format controls): 0xD82F with 0xDCA0-0xDCA3.
  */
-const SUPPLEMENTARY_HIGH = 0xdb40;
-const TAG_LOW = [0xdc00, 0xdc7f] as const;
-const VARIATION_LOW = [0xdd00, 0xddef] as const;
-/** U+E0000 is the code point of the pair (0xDB40, 0xDC00). */
-const SUPPLEMENTARY_BASE = 0xe0000;
+const TAGS_HIGH = [0xdb40, 0xdb43] as const;
+const MUSICAL_HIGH = 0xd834;
+const MUSICAL_LOW = [0xdd73, 0xdd7a] as const;
+const SHORTHAND_HIGH = 0xd82f;
+const SHORTHAND_LOW = [0xdca0, 0xdca3] as const;
+
+/** Whether a high surrogate and the code unit after it are a member of the class. */
+function pairIsHidden(high: number, low: number): boolean {
+  if (!(low >= 0xdc00 && low <= 0xdfff)) return false; // NaN past the end of the text, which no comparison accepts
+  if (high >= TAGS_HIGH[0] && high <= TAGS_HIGH[1]) return true;
+  if (high === MUSICAL_HIGH) return low >= MUSICAL_LOW[0] && low <= MUSICAL_LOW[1];
+  if (high === SHORTHAND_HIGH) return low >= SHORTHAND_LOW[0] && low <= SHORTHAND_LOW[1];
+  return false;
+}
+
+/** The code point a surrogate pair stands for. */
+function pairCodePoint(high: number, low: number): number {
+  return 0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00);
+}
 
 function fill(table: Uint8Array, ranges: ReadonlyArray<readonly [number, number]>, value: 0 | 1) {
   for (const [low, high] of ranges) table.fill(value, low, high + 1);
@@ -93,16 +118,31 @@ const TABLES: Record<HiddenMode, Uint8Array> = { strict: STRICT_TABLE, prose: PR
 
 /**
  * How many UTF-16 code units the hidden character at `index` takes: 0 when the
- * character there is not hidden, 1 for the Basic Multilingual Plane, 2 for a
- * tag character or variation selector written as a surrogate pair.
+ * character there is not hidden, 1 for the Basic Multilingual Plane, 2 for a member
+ * of the class written as a surrogate pair.
  */
 function hiddenUnitsAt(text: string, index: number, table: Uint8Array): 0 | 1 | 2 {
   const unit = text.charCodeAt(index);
-  if (unit === SUPPLEMENTARY_HIGH) {
-    const low = text.charCodeAt(index + 1); // NaN past the end, which no comparison accepts
-    return (low >= TAG_LOW[0] && low <= TAG_LOW[1]) || (low >= VARIATION_LOW[0] && low <= VARIATION_LOW[1]) ? 2 : 0;
-  }
+  if (unit >= 0xd800 && unit <= 0xdbff) return pairIsHidden(unit, text.charCodeAt(index + 1)) ? 2 : 0;
   return table[unit] === 1 ? 1 : 0;
+}
+
+/**
+ * How many UTF-16 code units the member of the strict class at `index` takes (0 when there is none
+ * there): for code that has to read text the way the cards draw it, which is the strict class.
+ */
+export function strictHiddenUnitsAt(text: string, index: number): 0 | 1 | 2 {
+  return hiddenUnitsAt(text, index, STRICT_TABLE);
+}
+
+/** Whether a code point is in the class at this level (the strict one unless said otherwise). */
+export function isHiddenCodePoint(codePoint: number, mode: HiddenMode = 'strict'): boolean {
+  if (codePoint < 0x10000) return TABLES[mode][codePoint] === 1;
+  return (
+    (codePoint >= 0xe0000 && codePoint <= 0xe0fff) ||
+    (codePoint >= 0x1d173 && codePoint <= 0x1d17a) ||
+    (codePoint >= 0x1bca0 && codePoint <= 0x1bca3)
+  );
 }
 
 /** Whether `text` holds any hidden character of this level. Stops at the first one. */
@@ -114,6 +154,42 @@ export function hasHiddenChars(text: string, mode: HiddenMode): boolean {
     if (hiddenUnitsAt(text, index, table) !== 0) return true;
   }
   return false;
+}
+
+/**
+ * `text` with every character of the class left out, in one pass: for matching, where a
+ * character that draws nothing must not be able to hide a match (`pass<ZWSP>word` reads as
+ * "password" to whoever searches for it, and is drawn as ⟨U+200B⟩ between two halves).
+ * Tab, line feed and carriage return are not in the class and stay.
+ *
+ * Returns `text` itself when there is nothing to leave out, so the common case allocates
+ * nothing. Like the rest of this module it is one pass with a lookup table: no regular
+ * expression, and linear whatever the text holds.
+ */
+export function stripHidden(text: string, mode: HiddenMode = 'strict'): string {
+  const table = TABLES[mode];
+  const length = text.length;
+  let kept: string[] | null = null;
+  let runStart = 0;
+  for (let index = 0; index < length; ) {
+    const unit = text.charCodeAt(index);
+    if (unit >= 0x20 && unit < 0x7f) {
+      index++;
+      continue;
+    }
+    const units = hiddenUnitsAt(text, index, table);
+    if (units === 0) {
+      index++;
+      continue;
+    }
+    kept ??= [];
+    if (index > runStart) kept.push(text.slice(runStart, index));
+    index += units;
+    runStart = index;
+  }
+  if (kept === null) return text;
+  if (runStart < length) kept.push(text.slice(runStart));
+  return kept.join('');
 }
 
 /**
@@ -159,7 +235,7 @@ export function splitHidden(
     } else {
       if (index > runStart) segments.push({ kind: 'text', text: text.slice(runStart, index) });
       if (tokens < maxTokens) {
-        const codePoint = units === 2 ? SUPPLEMENTARY_BASE + (text.charCodeAt(index + 1) - TAG_LOW[0]) : unit;
+        const codePoint = units === 2 ? pairCodePoint(unit, text.charCodeAt(index + 1)) : unit;
         segments.push({ kind: 'hidden', codePoint });
         tokens++;
       } else {
@@ -264,7 +340,22 @@ const NAMES: Readonly<Record<number, string>> = {
   0xfffb: 'INTERLINEAR ANNOTATION TERMINATOR',
   0xe0001: 'LANGUAGE TAG',
   0xe007f: 'CANCEL TAG',
+  0x1bca0: 'SHORTHAND FORMAT LETTER OVERLAP',
+  0x1bca1: 'SHORTHAND FORMAT CONTINUING OVERLAP',
+  0x1bca2: 'SHORTHAND FORMAT DOWN STEP',
+  0x1bca3: 'SHORTHAND FORMAT UP STEP',
+  0x1d173: 'MUSICAL SYMBOL BEGIN BEAM',
+  0x1d174: 'MUSICAL SYMBOL END BEAM',
+  0x1d175: 'MUSICAL SYMBOL BEGIN TIE',
+  0x1d176: 'MUSICAL SYMBOL END TIE',
+  0x1d177: 'MUSICAL SYMBOL BEGIN SLUR',
+  0x1d178: 'MUSICAL SYMBOL END SLUR',
+  0x1d179: 'MUSICAL SYMBOL BEGIN PHRASE',
+  0x1d17a: 'MUSICAL SYMBOL END PHRASE',
 };
+
+/** U+E0000, where the tag characters begin. */
+const TAGS_BASE = 0xe0000;
 
 /**
  * What a hidden character is called: Unicode's name where there is a short one,
@@ -280,9 +371,12 @@ export function hiddenCharName(codePoint: number): string {
   if (codePoint >= 0xfe00 && codePoint <= 0xfe0f) return `VARIATION SELECTOR-${codePoint - 0xfe00 + 1}`;
   if (codePoint >= 0xe0100 && codePoint <= 0xe01ef) return `VARIATION SELECTOR-${codePoint - 0xe0100 + 17}`;
   if (codePoint >= 0xe0020 && codePoint <= 0xe007e) {
-    return `TAG CHARACTER FOR ${JSON.stringify(String.fromCharCode(codePoint - SUPPLEMENTARY_BASE))}`;
+    return `TAG CHARACTER FOR ${JSON.stringify(String.fromCharCode(codePoint - TAGS_BASE))}`;
   }
-  if (codePoint >= SUPPLEMENTARY_BASE && codePoint <= 0xe007f) return 'TAG CHARACTER';
+  if (codePoint >= TAGS_BASE && codePoint <= 0xe007f) return 'TAG CHARACTER';
+  // The members that have no character of their own yet: the property lists them so that a later
+  // version of Unicode can give them one without changing what a reader sees of the text.
+  if (isHiddenCodePoint(codePoint)) return 'UNASSIGNED DEFAULT-IGNORABLE CODE POINT';
   return 'HIDDEN CHARACTER';
 }
 

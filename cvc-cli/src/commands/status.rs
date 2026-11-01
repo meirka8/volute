@@ -11,7 +11,7 @@ pub async fn run() -> Result<()> {
     let cvc_dir = layout.cvc_dir();
 
     if !cvc_dir.exists() {
-        println!("CVC is not initialized in this repository. Run 'cvc init' to setup.");
+        println!("CVC is not initialized in this repository. Run 'cvc init' to set up.");
         return Ok(());
     }
 
@@ -23,8 +23,8 @@ pub async fn run() -> Result<()> {
 
     println!("CVC Status for {}", worktree_root.display());
     println!("----------------------------------------");
-    println!("Total Interactions:      {}", all_ids.len());
-    println!("Floating Interactions (Unlinked): {}", floating.len());
+    println!("Total Thoughts:      {}", all_ids.len());
+    println!("Floating Thoughts (Unlinked): {}", floating.len());
 
     // Future improvement: Check divergence with refs/cvc/main
 

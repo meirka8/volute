@@ -25,7 +25,7 @@
 mod common;
 mod tui_support;
 
-use common::{challenges, Fixture, PtySession};
+use common::{challenges, without_nonce, Fixture, PtySession};
 use std::collections::BTreeMap;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -193,7 +193,7 @@ fn a_session_and_its_subagent_are_shared_and_published_with_three_phrases_and_on
     for said in [
         "-- cvc: publish",
         "Published thoughts cannot be recalled, and scrubbing can miss secrets.",
-        &format!("Publishing {waiting} new shared interaction(s) to 'origin'."),
+        &format!("Publishing {waiting} new shared thought(s) to 'origin'."),
     ] {
         assert!(main_screen.contains(said), "{said:?} in:\n{main_screen}");
     }
@@ -681,7 +681,10 @@ fn a_remote_without_consent_offers_authorization_and_cannot_share_or_publish() {
     view.wait_for(offer);
     view.press(Key::Enter);
     let asked = view.answer_with(1, |_| "not the phrase".to_owned());
-    assert_eq!(asked, format!("I AUTHORIZE SHARING {second}"));
+    assert_eq!(
+        without_nonce(&asked),
+        format!("I AUTHORIZE SHARING {second}")
+    );
     view.wait_for("Not authorized: the typed phrase did not match.");
     assert!(!is_authorized(&fixture, "second"));
     assert!(is_authorized(&fixture, "origin"));
@@ -692,7 +695,10 @@ fn a_remote_without_consent_offers_authorization_and_cannot_share_or_publish() {
     view.wait_for(offer);
     view.press(Key::Enter);
     let asked = view.type_phrase(2);
-    assert_eq!(asked, format!("I AUTHORIZE SHARING {second}"));
+    assert_eq!(
+        without_nonce(&asked),
+        format!("I AUTHORIZE SHARING {second}")
+    );
     view.wait_for("Publishing to 'second' is now authorized. Auto-push stays off.");
     assert!(is_authorized(&fixture, "second"));
     assert!(!auto_push_is_on(&fixture, "second"));
@@ -817,7 +823,7 @@ fn an_imported_conversation_is_read_only_in_the_view() {
     let reader = another_clone_of(&author);
     reader.consent_to_sharing();
     let pulled = reader.cvc_ok(&["pull"]);
-    assert!(pulled.contains("Pulled 1 interaction(s)"), "{pulled}");
+    assert!(pulled.contains("Pulled 1 thought(s)"), "{pulled}");
     let imported = format!("remote:{}:{id}", fingerprint(&reader, "origin"));
     assert_eq!(
         listed_state(&reader, &imported),

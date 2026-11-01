@@ -2,8 +2,8 @@
 //! the wording can be reviewed and tested without a terminal.
 //!
 //! The vocabulary is fixed: the view says "thought" (with real plurals), never
-//! "turn" or "interaction"; those words belong to the CLI's own output, which
-//! the view only ever shows on the suspended main screen. There are no
+//! "turn" or "interaction", and the CLI's own output, which the view shows on
+//! the suspended main screen, says "thought(s)" as well. There are no
 //! contractions, sentences end with a period, header labels are lowercase and
 //! a remote's name is in single quotes inside a sentence and bare after
 //! `remote:`. Times are UTC. Every string built from the store or from Git goes
@@ -12,6 +12,7 @@
 use chrono::{TimeZone, Utc};
 use cvc_core::db::{ConversationDetails, ConversationSummary, UnshareCheck};
 use cvc_core::models::FutureSharePolicy;
+use cvc_core::privacy::CaptureAcknowledgement;
 
 use super::text::{self, Glyphs};
 use crate::commands::conversations::RemoteOverview;
@@ -643,7 +644,8 @@ pub fn nothing_to_unshare(remote: &str) -> String {
 }
 
 /// Why `cvc unshare` would be refused for this conversation, or `None` when it
-/// would go ahead.
+/// would go ahead. The unshare bar shows it, and `cvc unshare` itself fails with
+/// it, before asking for a phrase.
 pub fn unshare_refusal(check: &UnshareCheck, remote: &str) -> Option<String> {
     if check.published > 0 {
         Some(format!(
@@ -1263,8 +1265,9 @@ pub fn already_authorized_status(remote: &str) -> String {
 }
 
 /// The notice after a flow that stopped. `remote` is the name of the remote the
-/// flow was for. Nothing here shows an error's own text except `Other`, which
-/// is cut to its first line and sanitized.
+/// flow was for. Nothing here shows an error's own text except `Other`,
+/// `OutcomeUnknown` and `DestinationMismatch`, each cut to its first line and
+/// sanitized.
 pub fn failure_status(kind: FlowKind, failure: &FlowFailure, remote: &str) -> String {
     match (failure, kind) {
         (FlowFailure::NotConfirmed, kind) => not_done(kind, "the typed phrase did not match", remote),
@@ -1300,6 +1303,15 @@ pub fn failure_status(kind: FlowKind, failure: &FlowFailure, remote: &str) -> St
             format!(
                 "{} (error: {})",
                 publish_unfinished(remote),
+                text::sanitize(text::first_line(text))
+            )
+        }
+        // Refused before any connection was opened, so it is known that nothing
+        // was sent; the refusal's own text says so and what to change.
+        (FlowFailure::DestinationMismatch(text), kind) => {
+            format!(
+                "{}: {}",
+                kind.failed(),
                 text::sanitize(text::first_line(text))
             )
         }
@@ -1407,7 +1419,6 @@ pub fn banner(
             lines.push(format!(
                 "Effect   Sends the shared thoughts to {remote}, where anyone who can read it can read them. Published thoughts cannot be recalled, and scrubbing can miss secrets."
             ));
-            lines.push("Note     The summary below counts thoughts as \"interactions\".".to_owned());
         }
         FlowKind::Authorize => lines.push(format!(
             "Effect   Allows publishing to {remote} at this exact push URL; you are asked again if the URL changes. CVC checks only the URL, not who owns the repository or who can read it. Publishes nothing and does not turn on auto-push."
@@ -1739,10 +1750,6 @@ pub fn details_page(input: &DetailsInput, g: &Glyphs) -> Vec<Page> {
         "A thought is one recorded step (for Claude Code, one assistant response).".to_owned(),
     ));
     page.push(Page::Text(
-        "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\"."
-            .to_owned(),
-    ));
-    page.push(Page::Text(
         "Scrubbing can miss secrets. Published thoughts cannot be recalled.".to_owned(),
     ));
     page
@@ -1917,10 +1924,6 @@ pub fn help_page(g: &Glyphs) -> Vec<Page> {
         Page::Text(
             "A thought is one recorded step (for Claude Code, one assistant response).".to_owned(),
         ),
-        Page::Text(
-            "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\"."
-                .to_owned(),
-        ),
     ]
 }
 
@@ -1989,27 +1992,35 @@ pub fn remote_rows(
 /// Claude Code sessions, since the user-scoped plugin leaves nothing in the
 /// checkout to tell it from not recording at all. The plugin takes two
 /// commands in Claude Code (the marketplace has to be added before `cvc@volute`
-/// can be installed), so they are given one to a line, ready to paste. Every
-/// line fits an 80-column terminal.
-pub fn empty_state(capture_acknowledged: bool, harness_installed: bool) -> &'static [&'static str] {
-    if !capture_acknowledged {
-        &[
+/// can be installed), so they are given one to a line, ready to paste. With
+/// capture off because the acknowledgement on record was given for another
+/// checkout or user (a copied repository, or an older cvc), one more line says
+/// so. Every line fits an 80-column terminal.
+pub fn empty_state(
+    capture: CaptureAcknowledgement,
+    harness_installed: bool,
+) -> &'static [&'static str] {
+    match capture {
+        CaptureAcknowledgement::NotAcknowledged => &[
             "No conversations captured yet.",
             "Passive capture is off. Turn it on with: cvc privacy acknowledge-capture",
-        ]
-    } else if !harness_installed {
-        &[
+        ],
+        CaptureAcknowledgement::OtherCheckoutOrUser => &[
+            "No conversations captured yet.",
+            "Passive capture is off. Turn it on with: cvc privacy acknowledge-capture",
+            "It was acknowledged for another checkout or user, or by an older cvc.",
+        ],
+        CaptureAcknowledgement::Acknowledged if !harness_installed => &[
             "No conversations captured yet.",
             "To record Claude Code sessions, run these in Claude Code:",
             "  /plugin marketplace add meirka8/volute",
             "  /plugin install cvc@volute",
             "or, for this checkout only, run in a shell: cvc harness install claude-code",
-        ]
-    } else {
-        &[
+        ],
+        CaptureAcknowledgement::Acknowledged => &[
             "No conversations captured yet.",
             "Conversations appear here after a session has been captured.",
-        ]
+        ],
     }
 }
 
@@ -3095,6 +3106,20 @@ mod tests {
     }
 
     #[test]
+    fn a_publish_refused_before_it_connected_says_what_its_refusal_says_and_no_more() {
+        let refusal = FlowFailure::DestinationMismatch(
+            "remote 'origin' now resolves to a different destination than the one consented to; nothing was sent.\nsecond line\u{1b}[2J".to_owned(),
+        );
+        let said = failure_status(FlowKind::Publish, &refusal, "origin");
+        assert_eq!(
+            said,
+            "Publish failed: remote 'origin' now resolves to a different destination than the one consented to; nothing was sent."
+        );
+        // It is known that nothing was sent, so it is not worded as unfinished.
+        assert!(!said.contains("may hold some"), "{said}");
+    }
+
+    #[test]
     fn a_share_whose_publication_stopped_never_reads_as_nothing_recorded() {
         let bundled = |inner| FlowFailure::SharedButNotPublished(Box::new(inner));
         for (inner, ending) in [
@@ -3205,11 +3230,11 @@ mod tests {
             publish[2],
             "Effect   Sends the shared thoughts to 'origin', where anyone who can read it can read them. Published thoughts cannot be recalled, and scrubbing can miss secrets."
         );
-        assert_eq!(
-            publish[3],
-            "Note     The summary below counts thoughts as \"interactions\"."
-        );
+        // The summary the command prints below counts thoughts too, so the
+        // banner has no note about another name for them.
+        assert_eq!(publish[3], "         An empty line and Enter cancels.");
         assert_eq!(publish.last().unwrap(), "Checking 'origin' first…");
+        assert!(!publish.join("\n").contains("interaction"));
         // Only a publish says the thoughts cannot be recalled.
         for kind in [FlowKind::Share, FlowKind::Unshare, FlowKind::Authorize] {
             let text = banner(kind, &dest(), None, &U).join("\n");
@@ -3709,7 +3734,6 @@ mod tests {
             "Unconfirmed: 3 thoughts from a publish that did not finish cleanly",
             "Auto-push: off",
             "A thought is one recorded step (for Claude Code, one assistant response).",
-            "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\".",
             "Scrubbing can miss secrets. Published thoughts cannot be recalled.",
         ] {
             assert!(
@@ -3905,7 +3929,7 @@ mod tests {
             "Two standing choices act later without a new phrase: +future shares new thoughts as they are captured, and auto-push (set with cvc privacy set-auto-push, never from this view) publishes shared thoughts at every git push to that remote.",
             "Scrubbing and .thoughtignore can miss secrets; they are not a guarantee.",
             "Counts in the header are this clone's view; publish re-checks the remote first.",
-            "cvc share counts thoughts as \"turns\"; cvc push counts them as \"interactions\".",
+            "A thought is one recorded step (for Claude Code, one assistant response).",
         ] {
             assert!(text.contains(expected), "missing {expected:?}");
         }
@@ -3954,17 +3978,30 @@ mod tests {
 
     #[test]
     fn the_empty_state_gives_one_hint() {
-        assert_eq!(
-            empty_state(false, false),
-            [
-                "No conversations captured yet.",
-                "Passive capture is off. Turn it on with: cvc privacy acknowledge-capture"
-            ]
-        );
+        use CaptureAcknowledgement::{Acknowledged, NotAcknowledged, OtherCheckoutOrUser};
+        for installed in [false, true] {
+            assert_eq!(
+                empty_state(NotAcknowledged, installed),
+                [
+                    "No conversations captured yet.",
+                    "Passive capture is off. Turn it on with: cvc privacy acknowledge-capture"
+                ]
+            );
+            // An acknowledgement that does not count here (a copied repository,
+            // an older cvc): the same hint, and one line saying why.
+            assert_eq!(
+                empty_state(OtherCheckoutOrUser, installed),
+                [
+                    "No conversations captured yet.",
+                    "Passive capture is off. Turn it on with: cvc privacy acknowledge-capture",
+                    "It was acknowledged for another checkout or user, or by an older cvc.",
+                ]
+            );
+        }
         // Capture on, no checkout harness: both routes, the plugin's two
         // commands one to a line.
         assert_eq!(
-            empty_state(true, false),
+            empty_state(Acknowledged, false),
             [
                 "No conversations captured yet.",
                 "To record Claude Code sessions, run these in Claude Code:",
@@ -3974,7 +4011,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            empty_state(true, true),
+            empty_state(Acknowledged, true),
             [
                 "No conversations captured yet.",
                 "Conversations appear here after a session has been captured."
@@ -3984,14 +4021,17 @@ mod tests {
 
     #[test]
     fn every_empty_state_line_fits_an_80_column_terminal() {
-        for (acknowledged, installed) in [(false, false), (true, false), (true, true)] {
-            for line in empty_state(acknowledged, installed) {
-                assert!(
-                    line.chars().count() <= 80,
-                    "{} columns: {line}",
-                    line.chars().count()
-                );
-                assert_eq!(*line, line.trim_end());
+        use CaptureAcknowledgement::{Acknowledged, NotAcknowledged, OtherCheckoutOrUser};
+        for capture in [NotAcknowledged, OtherCheckoutOrUser, Acknowledged] {
+            for installed in [false, true] {
+                for line in empty_state(capture, installed) {
+                    assert!(
+                        line.chars().count() <= 80,
+                        "{} columns: {line}",
+                        line.chars().count()
+                    );
+                    assert_eq!(*line, line.trim_end());
+                }
             }
         }
     }

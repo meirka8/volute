@@ -52,6 +52,9 @@ const SAME_HEIGHT = 0.05;
 
 const EMPTY_WINDOW: TimelineWindow = { start: 0, end: 0, before: 0, after: 0, total: 0 };
 
+/** A list no one is ever given: what the controller holds when it has to lay the next one out afresh. */
+const NO_IDS: readonly string[] = [];
+
 /** Everything mounted, no space: the window of a list that is not windowed. */
 const wholeList = (count: number): TimelineWindow => ({ start: 0, end: count, before: 0, after: 0, total: 0 });
 
@@ -70,10 +73,13 @@ function outerHeight(element: Element): number {
 }
 
 /** The place in the list to hold still, by the id of the card, so it survives the list changing. */
-interface HeldPlace {
+export interface HeldPlace {
   id: string;
   within: number;
 }
+
+/** How tall a part of a card has to be on the page for it to count as in view (see `scrollToIndex`). */
+const MIN_VISIBLE = 160;
 
 export class WindowedListController {
   private readonly listeners = new Set<() => void>();
@@ -96,6 +102,10 @@ export class WindowedListController {
   private viewportHeight = guessViewportHeight();
   private width = -1;
   private held: HeldPlace | null = null;
+  /** Set by `holdPlaceForNextList`: the place the next list is to open at, whatever the reader was looking at. */
+  private nextPlace: HeldPlace | null = null;
+  /** The list just laid out opens at a place it was told to, which the page has not been scrolled to yet. */
+  private placed = false;
 
   private current: TimelineWindow = EMPTY_WINDOW;
   /** The cards mounted as of the last commit: `list.children[k]` is card `start + k`. */
@@ -139,7 +149,13 @@ export class WindowedListController {
     this.width = scroller.clientWidth;
     // The window is brought up to date by `afterCommit`, which runs next and has measured the cards by then:
     // doing it here as well could take a card out of the page only for it to be put back a moment later.
-    this.readScroll();
+    if (this.placed) {
+      // The list was laid out to open at a place the page has not been scrolled to yet: that place is the truth, not where the page is.
+      this.knownScrollTop = scroller.scrollTop;
+      this.viewportHeight = scroller.clientHeight || guessViewportHeight();
+    } else {
+      this.readScroll();
+    }
     return () => this.detach();
   }
 
@@ -167,6 +183,54 @@ export class WindowedListController {
     this.measureMounted();
     this.restorePlace();
     this.refresh();
+  }
+
+  // ----- moving the reader, for code that is not a scroll ---------------------------------
+
+  /** The card at the top of the viewport and how far into it; null at the very top. */
+  captureAnchor(): HeldPlace | null {
+    this.syncHeld();
+    return this.held === null ? null : { ...this.held };
+  }
+
+  /**
+   * The next list to be laid out opens with `place` at the top of the viewport (if it holds that card). The list
+   * is laid out again whatever it is: the one that comes next can be the very list that was on the page before a
+   * search narrowed it (it was never laid out while the search was on, if the search left few enough steps).
+   */
+  holdPlaceForNextList(place: HeldPlace | null): void {
+    this.nextPlace = place;
+    this.ids = NO_IDS;
+  }
+
+  /** Takes in a scroll position that was set by code, which the browser reports a frame later. */
+  noteScrolled(): void {
+    this.readScroll();
+    this.refresh();
+  }
+
+  /**
+   * Scrolls card `index` to the top of the viewport, unless it is in view already (its top is, and
+   * enough of it). The place of a card nobody has measured is an estimate; once it is on the page
+   * the measuring corrects it, and the card stays where it was put (see `restorePlace`).
+   */
+  scrollToIndex(index: number): void {
+    const scroller = this.scroller;
+    if (scroller === null || !(index >= 0 && index < this.ids.length)) return;
+    this.syncHeld();
+    const top = this.offsets[index];
+    const height = this.offsets[index + 1] - top;
+    const view = scroller.scrollTop;
+    if (top >= view && top + Math.min(height, MIN_VISIBLE) <= view + this.viewportHeight) return;
+    // Whole pixels: the browser rounds the position to the pixel.
+    scroller.scrollTop = Math.round(top);
+    this.noteScrolled();
+  }
+
+  /** Called by the hook after every commit: whatever the page was told to open at, it has by now. */
+  settled(): void {
+    this.nextPlace = null;
+    this.placed = false;
   }
 
   // ----- events ----------------------------------------------------------------
@@ -230,6 +294,12 @@ export class WindowedListController {
     for (let index = 0; index < ids.length; index++) this.sizes[index] = this.measured.get(ids[index]) ?? this.estimate;
     this.offsets = offsetsOf(this.sizes);
 
+    // A list that replaces this one on purpose (the filters were cleared) opens where it is told to.
+    if (this.nextPlace !== null) {
+      this.held = this.nextPlace;
+      this.nextPlace = null;
+      this.placed = true;
+    }
     // Steps arriving above the reader push what they are reading down: keep the same card in view.
     const place = this.held;
     const index = place === null ? undefined : this.indexById.get(place.id);
@@ -358,6 +428,25 @@ export class WindowedListController {
   }
 }
 
+/** Where the reader was in the whole list: for coming back to it after the list was narrowed and then widened again. */
+export interface ScrollMemory {
+  /** The card at the top of the viewport and how far into it. Null at the very top, and for a list that is not windowed. */
+  readonly anchor: HeldPlace | null;
+  /** The scroll position, which is what a list that is not windowed comes back to. */
+  readonly scrollTop: number;
+}
+
+/** What code that moves the reader (search, for one) can ask of the list. */
+export interface ListControls {
+  /** Brings card `index` (a place in the list the hook was given) into view, at the top unless it is there already. */
+  scrollToIndex(index: number): void;
+  scrollToTop(): void;
+  /** Where the reader is now; null when the list is not on the page. */
+  capture(): ScrollMemory | null;
+  /** Opens the list that comes next at `memory`. A null memory (the list was not on the page) does nothing. */
+  restore(memory: ScrollMemory | null): void;
+}
+
 /** What `useWindowedList` returns. */
 export interface WindowedList {
   /** The cards to mount, and the space for the others. The whole list when it is short. */
@@ -368,6 +457,7 @@ export interface WindowedList {
   scrollerRef: RefObject<HTMLDivElement | null>;
   /** Goes on the element that holds the mounted cards, as their only children. */
   listRef: RefObject<HTMLOListElement | null>;
+  controls: ListControls;
 }
 
 /**
@@ -396,5 +486,59 @@ export function useWindowedList(ids: readonly string[]): WindowedList {
     if (windowed) controller.afterCommit(ids, win);
   }, [controller, windowed, ids, win]);
 
-  return { win, windowed, scrollerRef, listRef };
+  // Where a list that replaces this one is to open, for the case that the controller does not do it: a list that is not windowed.
+  const reopenAt = useRef<ScrollMemory | null>(null);
+  const latest = useRef({ windowed, ids });
+  useLayoutEffect(() => {
+    latest.current = { windowed, ids };
+    const memory = reopenAt.current;
+    reopenAt.current = null;
+    const scroller = scrollerRef.current;
+    if (memory !== null && scroller !== null && (!windowed || memory.anchor === null)) {
+      scroller.scrollTop = memory.scrollTop;
+      // The page reports a scroll a frame later; the window is told now, so the right cards are drawn before the paint.
+      if (windowed) controller.noteScrolled();
+    }
+    controller.settled();
+  });
+
+  const controls = useMemo<ListControls>(
+    () => ({
+      scrollToIndex(index) {
+        const scroller = scrollerRef.current;
+        if (scroller === null) return;
+        if (latest.current.windowed) {
+          controller.scrollToIndex(index);
+          return;
+        }
+        // Everything is on the page: ask the page where the card is.
+        const card = listRef.current?.children[index];
+        if (!card) return;
+        const area = scroller.getBoundingClientRect();
+        const box = card.getBoundingClientRect();
+        const top = box.top - area.top;
+        if (top >= 0 && top + Math.min(box.height, MIN_VISIBLE) <= scroller.clientHeight) return;
+        scroller.scrollTop = Math.max(0, Math.round(scroller.scrollTop + top));
+      },
+      scrollToTop() {
+        const scroller = scrollerRef.current;
+        if (scroller === null) return;
+        scroller.scrollTop = 0;
+        if (latest.current.windowed) controller.noteScrolled();
+      },
+      capture() {
+        const scroller = scrollerRef.current;
+        if (scroller === null) return null;
+        return { anchor: latest.current.windowed ? controller.captureAnchor() : null, scrollTop: scroller.scrollTop };
+      },
+      restore(memory) {
+        if (memory === null) return;
+        controller.holdPlaceForNextList(memory.anchor);
+        reopenAt.current = memory;
+      },
+    }),
+    [controller],
+  );
+
+  return { win, windowed, scrollerRef, listRef, controls };
 }

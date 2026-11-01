@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useAuth } from "../auth/AuthContext";
 import { createGithubClient, type GithubClient } from "../api/github";
-import { CommitRanger } from "../lib/CommitRanger";
+import { CommitRanger, type PRCommit } from "../lib/CommitRanger";
 import { InteractionMapper } from "../lib/InteractionMapper";
 import { purgeCognitiveCache } from "../lib/cognitiveCache";
 import { EMPTY_TREE_SHA, eventLink, fetchFormat5Evidence, readBoundedJson, type DerivationEvent } from "../lib/format5";
@@ -34,6 +34,11 @@ const FORMAT5_MAX_STRING_BYTES = 1024 * 1024;
 
 export interface PRInteractionsResult {
   interactions: InteractionNode[];
+  /**
+   * The pull request's commits, oldest first, with the first line of each message when GitHub's commit list
+   * gave it: for the timeline's commit filter. Absent when there is no CVC history, and nothing was looked up.
+   */
+  commits?: PRCommit[];
   /** True when we hit the legacy fallback's cap -- the result may be incomplete. */
   truncated: boolean;
   /** False when refs/cvc/main doesn't exist at all yet (no CVC history, not an error). */
@@ -447,10 +452,11 @@ async function fetchLegacyCapped(
   owner: string,
   repo: string,
   treeSha: string,
-  commitShas: string[],
+  commits: PRCommit[],
   token: string,
   tombstoned: Set<string>,
 ): Promise<PRInteractionsResult> {
+  const commitShas = commits.map((commit) => commit.sha);
   const { data: treeData } = await client.octokit.rest.git.getTree({
     owner,
     repo,
@@ -480,6 +486,7 @@ async function fetchLegacyCapped(
   const mapper = new InteractionMapper(allInteractions);
   return {
     interactions: mapper.getInteractionsForRange(commitShas),
+    commits,
     truncated,
     hasHistory: true,
   };
@@ -520,7 +527,8 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
       }
 
       const ranger = new CommitRanger(client);
-      const commitShas = await ranger.getCommitShas(owner, repo, prNumber);
+      const commits = await ranger.getCommits(owner, repo, prNumber);
+      const commitShas = commits.map((commit) => commit.sha);
 
        const { data: rootTree } = await client.octokit.rest.git.getTree({
         owner,
@@ -613,7 +621,7 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
           owner,
           repo,
            cvcMainSha,
-           commitShas,
+           commits,
            token,
            tombstonedIds,
          );
@@ -722,6 +730,7 @@ export function usePRInteractions(owner: string, repo: string, prNumber: number)
             ...(eventRecordsByInteraction.get(interaction.id) ?? []),
           ]),
         ),
+        commits,
         truncated: false,
         hasHistory: true,
       };

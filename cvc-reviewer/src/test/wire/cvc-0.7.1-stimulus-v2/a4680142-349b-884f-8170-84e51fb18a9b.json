@@ -1,0 +1,17 @@
+{
+  "interaction": {
+    "id": "a4680142-349b-884f-8170-84e51fb18a9b",
+    "conversation_id": "5e0d6a42-7b1c-4d3e-9a8f-1c2b3d4e5f60",
+    "parent_id": "0f18d1f8-42e5-8506-a1fe-de2e53044f08",
+    "timestamp": "2026-10-10T13:00:10Z",
+    "author": "system",
+    "user_prompt": "[compaction summary ~cvc-fcfb593481243dd1]\nThis session is being continued from a previous conversation. Summary: twelve modules were read and a deploy log was inspected.",
+    "model_name": "claude-fixture-edge",
+    "model_cot": null,
+    "model_response": "Continuing after the compaction.",
+    "source_request_id": "req_E14"
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": []
+}

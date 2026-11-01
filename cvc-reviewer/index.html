@@ -5,6 +5,9 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/volute-icon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- The address of a page can hold a search in its fragment (see the README), and no page of this app needs to tell
+         another site where a link came from. Nothing here is served by this origin that wants a referrer. -->
+    <meta name="referrer" content="no-referrer" />
     <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; connect-src 'self' https://api.github.com http://localhost:3000 %VITE_PLATFORM_API_URL%; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; style-src-elem 'self' 'unsafe-inline' https://fonts.googleapis.com; style-src-attr 'unsafe-inline'; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: https://avatars.githubusercontent.com;" />
     <title>Volute CVC Reviewer</title>

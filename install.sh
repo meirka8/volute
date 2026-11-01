@@ -24,6 +24,11 @@ case "$INSTALL_DIR" in
   /*) ;;
   *) echo "CVC_INSTALL_DIR must be an absolute path" >&2; exit 1 ;;
 esac
+# The release archive also carries LICENSE and THIRD-PARTY-NOTICES.md. They are
+# installed into a share directory beside the install directory: ~/.cvc/bin
+# gives ~/.cvc/share/cvc, and a custom <prefix>/bin gives <prefix>/share/cvc.
+SHARE_PARENT=$(dirname "$INSTALL_DIR")
+SHARE_DIR="${SHARE_PARENT%/}/share/cvc"
 # Release tags are `v` plus SemVer, with an optional prerelease and no build
 # metadata. This is deliberately the same tag shape used by the release gate;
 # accepting arbitrary paths here would turn a version override into a URL
@@ -49,8 +54,82 @@ check_redirect_target() {
   return 1
 }
 
+# LICENSE and THIRD-PARTY-NOTICES.md are documentation, so nothing about them may
+# keep the verified binaries from being installed: a problem is reported on
+# stderr and the install goes on without them.
+notices_warn() {
+  echo "Warning: the license and third-party notices were not installed: $1" >&2
+}
+
+# Streams one optional member of the release archive into $STAGE the way the
+# binaries are streamed below: into an installer-created regular file, so links
+# and traversal entries in the archive are never materialized. It succeeds only
+# for a non-empty regular file under a far tighter `ulimit -f` bound than the
+# binaries get (16 MiB, or 32 MiB in shells that count 1024-byte blocks; the
+# notices are far smaller) and otherwise leaves nothing behind. Releases that
+# predate the notices fail here and are installed without them.
+stage_notice() {
+  if (ulimit -f 32768; tar -xOzf "$ARCHIVE" -- "$1") > "$STAGE/$1" 2>/dev/null \
+    && [ -s "$STAGE/$1" ] && [ -f "$STAGE/$1" ] && [ ! -L "$STAGE/$1" ]; then
+    return 0
+  fi
+  rm -f "$STAGE/$1"
+  return 1
+}
+
+# Installs the notices staged by stage_notice into $SHARE_DIR. The checks come
+# first and are all or nothing: an unsafe directory or an unsafe existing target
+# stops it before anything is replaced. The files are copied into a private
+# directory inside $SHARE_DIR and renamed into place, as the binaries are, so a
+# re-run replaces the one copy of each file in place and never leaves a second
+# one. On any problem it warns and returns non-zero; the caller carries on.
+publish_notices() {
+  if [ -L "$SHARE_DIR" ]; then
+    notices_warn "refusing symlink directory: $SHARE_DIR"
+    return 1
+  fi
+  if ! mkdir -p "$SHARE_DIR"; then
+    notices_warn "cannot create the directory $SHARE_DIR"
+    return 1
+  fi
+  if [ ! -d "$SHARE_DIR" ] || [ -L "$SHARE_DIR" ]; then
+    notices_warn "not a safe directory: $SHARE_DIR"
+    return 1
+  fi
+  for notice in LICENSE THIRD-PARTY-NOTICES.md; do
+    [ -f "$STAGE/$notice" ] || continue
+    notice_target="$SHARE_DIR/$notice"
+    if [ -e "$notice_target" ] && { [ ! -f "$notice_target" ] || [ -L "$notice_target" ]; }; then
+      notices_warn "refusing unsafe existing target: $notice_target"
+      return 1
+    fi
+  done
+  if ! NOTICE_STAGE=$(mktemp -d "$SHARE_DIR/.cvc-install.XXXXXX"); then
+    notices_warn "cannot create a staging directory in $SHARE_DIR"
+    return 1
+  fi
+  for notice in LICENSE THIRD-PARTY-NOTICES.md; do
+    [ -f "$STAGE/$notice" ] || continue
+    if ! cp "$STAGE/$notice" "$NOTICE_STAGE/$notice" || ! chmod 0644 "$NOTICE_STAGE/$notice"; then
+      notices_warn "cannot copy $notice into $SHARE_DIR"
+      return 1
+    fi
+  done
+  for notice in LICENSE THIRD-PARTY-NOTICES.md; do
+    [ -f "$NOTICE_STAGE/$notice" ] || continue
+    if ! mv -f "$NOTICE_STAGE/$notice" "$SHARE_DIR/$notice"; then
+      notices_warn "cannot replace $SHARE_DIR/$notice"
+      return 1
+    fi
+  done
+  rmdir "$NOTICE_STAGE" 2>/dev/null || rm -rf "$NOTICE_STAGE"
+  NOTICE_STAGE=
+  return 0
+}
+
 cleanup() {
   [ -n "${PUBLISH_STAGE:-}" ] && rm -rf "$PUBLISH_STAGE"
+  [ -n "${NOTICE_STAGE:-}" ] && rm -rf "$NOTICE_STAGE"
   [ -n "${LOCK_DIR:-}" ] && rmdir "$LOCK_DIR" 2>/dev/null || true
   [ -n "${TMP_DIR:-}" ] && rm -rf "$TMP_DIR"
 }
@@ -113,6 +192,14 @@ for binary in cvc cvc-mcp cvc-lsp; do
   (ulimit -f 262144; tar -xOzf "$ARCHIVE" -- "$binary") > "$STAGE/$binary" || { echo "Failed to extract safe binary: $binary" >&2; exit 1; }
   [ -s "$STAGE/$binary" ] && [ -f "$STAGE/$binary" ] && [ ! -L "$STAGE/$binary" ] || { echo "Release archive is missing safe binary: $binary" >&2; exit 1; }
 done
+# LICENSE and THIRD-PARTY-NOTICES.md come out of the archive the same way, but
+# they are optional: an older release that lacks them is installed without.
+NOTICES_STAGED=""
+NOTICES_ABSENT=""
+for notice in LICENSE THIRD-PARTY-NOTICES.md; do
+  if stage_notice "$notice"; then NOTICES_STAGED="${NOTICES_STAGED:+$NOTICES_STAGED, }$notice"
+  else NOTICES_ABSENT="${NOTICES_ABSENT:+$NOTICES_ABSENT, }$notice"; fi
+done
 
 [ ! -L "$INSTALL_DIR" ] || { echo "Refusing symlink installation directory: $INSTALL_DIR" >&2; exit 1; }
 mkdir -p "$INSTALL_DIR"
@@ -127,6 +214,20 @@ for binary in cvc cvc-mcp cvc-lsp; do
   cp "$STAGE/$binary" "$PUBLISH_STAGE/$binary"
   chmod 0755 "$PUBLISH_STAGE/$binary"
 done
+# The notices go in under the same lock, after every binary target has been
+# checked and staged and before the first binary is replaced, so a refused
+# install has changed no notice either. They cannot stop the binaries: a problem
+# is warned about (see publish_notices) and reported in the summary.
+NOTICES_INSTALLED=""
+NOTICES_FAILED=""
+if [ -n "$NOTICES_STAGED" ]; then
+  if publish_notices; then
+    NOTICES_INSTALLED=$NOTICES_STAGED
+  else
+    NOTICES_FAILED=$NOTICES_STAGED
+    if [ -n "${NOTICE_STAGE:-}" ]; then rm -rf "$NOTICE_STAGE"; NOTICE_STAGE=; fi
+  fi
+fi
 # cvc moves into place LAST: the npm launcher probes `cvc --version` without
 # the lock, so a new cvc must imply its siblings are already new.
 for binary in cvc-lsp cvc-mcp cvc; do
@@ -145,6 +246,19 @@ echo "  cvc       — CLI interface"
 echo "  cvc-mcp   — MCP server for coding agents"
 echo "  cvc-lsp   — Language server for the VSCode extension"
 echo ""
+if [ -n "$NOTICES_INSTALLED" ]; then
+  echo "License and third-party notices installed to $SHARE_DIR"
+  echo "  $NOTICES_INSTALLED"
+  echo ""
+fi
+if [ -n "$NOTICES_ABSENT" ]; then
+  echo "Not included in this release archive, so not installed: $NOTICES_ABSENT"
+  echo ""
+fi
+if [ -n "$NOTICES_FAILED" ]; then
+  echo "Not installed (see the warning above): $NOTICES_FAILED"
+  echo ""
+fi
 echo "Please manually add $INSTALL_DIR to your PATH:"
 echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
 echo ""

@@ -55,7 +55,7 @@ fn pull_rejects_non_utf8_sync_paths() -> anyhow::Result<()> {
         &[],
     )?;
     let store = CvcStore::open(temp.path().join("index.db"))?;
-    assert!(sync::pull_from_ref(&repo, &store, "refs/cvc/non-utf8").is_err());
+    assert!(sync::pull_from_ref(&repo, &store, "refs/cvc/non-utf8", TEST_DESTINATION).is_err());
     Ok(())
 }
 
@@ -392,7 +392,13 @@ fn format5_always_emits_and_requires_empty_reserved_trees() -> anyhow::Result<()
         &[],
     )?;
     let imported = CvcStore::open(temp.path().join("imported.db"))?;
-    assert!(sync::pull_from_ref(&repo, &imported, "refs/cvc/missing-v5-namespace").is_err());
+    assert!(sync::pull_from_ref(
+        &repo,
+        &imported,
+        "refs/cvc/missing-v5-namespace",
+        TEST_DESTINATION
+    )
+    .is_err());
     Ok(())
 }
 
@@ -509,7 +515,13 @@ fn pull_rejects_dangling_event_before_tombstone_pruning_with_duplicate_legacy_en
         &[],
     )?;
     let imported = CvcStore::open(temp.path().join("imported.db"))?;
-    assert!(sync::pull_from_ref(&repo, &imported, "refs/cvc/pre-prune-malformed").is_err());
+    assert!(sync::pull_from_ref(
+        &repo,
+        &imported,
+        "refs/cvc/pre-prune-malformed",
+        TEST_DESTINATION
+    )
+    .is_err());
     assert!(imported.get_all_interaction_ids()?.is_empty());
     Ok(())
 }
@@ -634,7 +646,8 @@ fn format5_rejects_malformed_ranges_and_by_commit_shapes_or_targets() -> anyhow:
     ] {
         let store = CvcStore::open(temp.path().join(format!("{name}.db")))?;
         assert!(
-            sync::pull_from_ref(&repo, &store, &format!("refs/cvc/{name}")).is_err(),
+            sync::pull_from_ref(&repo, &store, &format!("refs/cvc/{name}"), TEST_DESTINATION)
+                .is_err(),
             "accepted {name}"
         );
     }
@@ -772,7 +785,7 @@ fn post_node_link_records_reach_fresh_and_existing_pulls() -> anyhow::Result<()>
     project_fixture_to_ref(&repo, &source, ref_name)?;
 
     let existing = CvcStore::open(temp_dir.path().join("existing.db"))?;
-    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    sync::pull_from_ref(&repo, &existing, ref_name, TEST_DESTINATION)?;
     assert!(existing.get_artifact_links(&interaction.id)?.is_empty());
 
     let sha = CommitSha::new("a".repeat(40));
@@ -785,8 +798,8 @@ fn post_node_link_records_reach_fresh_and_existing_pulls() -> anyhow::Result<()>
     project_fixture_to_ref(&repo, &source, ref_name)?;
 
     let fresh = CvcStore::open(temp_dir.path().join("fresh.db"))?;
-    sync::pull_from_ref(&repo, &fresh, ref_name)?;
-    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    sync::pull_from_ref(&repo, &fresh, ref_name, TEST_DESTINATION)?;
+    sync::pull_from_ref(&repo, &existing, ref_name, TEST_DESTINATION)?;
     for store in [&fresh, &existing] {
         let links = store.get_artifact_links(&interaction.id)?;
         assert_eq!(links.len(), 1);
@@ -832,7 +845,7 @@ fn v4_tombstone_precedes_nodes_links_and_stale_clone_data() -> anyhow::Result<()
 
     // A second clone first sees the published node and link.
     let second_clone = CvcStore::open(temp_dir.path().join("second.db"))?;
-    sync::pull_from_ref(&repo, &second_clone, ref_name)?;
+    sync::pull_from_ref(&repo, &second_clone, ref_name, TEST_DESTINATION)?;
     assert!(second_clone.get_interaction(&interaction.id)?.is_some());
     assert_eq!(second_clone.get_artifact_links(&interaction.id)?.len(), 1);
 
@@ -846,13 +859,26 @@ fn v4_tombstone_precedes_nodes_links_and_stale_clone_data() -> anyhow::Result<()
         Some(TEST_DESTINATION),
     )?;
     project_fixture_to_ref(&repo, &source, ref_name)?;
-    sync::pull_from_ref(&repo, &second_clone, ref_name)?;
-    assert!(second_clone.is_tombstoned(&interaction.id)?);
+    sync::pull_from_ref(&repo, &second_clone, ref_name, TEST_DESTINATION)?;
+    // A pull records what it receives for the destination it came from, so the
+    // tombstone is this destination's, not a local suppression.
+    assert!(!second_clone.is_tombstoned(&interaction.id)?);
+    let scope: (String, String) = Connection::open(temp_dir.path().join("second.db"))?.query_row(
+        "SELECT scope_kind, remote_fingerprint FROM tombstones WHERE interaction_id=?1",
+        [interaction.id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(scope, ("remote".to_owned(), TEST_DESTINATION.to_owned()));
     assert!(second_clone.get_interaction(&interaction.id)?.is_none());
     assert!(second_clone.get_artifact_links(&interaction.id)?.is_empty());
 
     // Replaying a stale clone's old node/link tree must not resurrect it.
-    sync::pull_from_ref(&repo, &second_clone, "refs/cvc/stale-before-redaction")?;
+    sync::pull_from_ref(
+        &repo,
+        &second_clone,
+        "refs/cvc/stale-before-redaction",
+        TEST_DESTINATION,
+    )?;
     assert!(second_clone.get_interaction(&interaction.id)?.is_none());
 
     let tree = repo.find_reference(ref_name)?.peel_to_commit()?.tree()?;
@@ -1156,29 +1182,14 @@ fn remote_tombstones_only_suppress_stale_data_from_the_matching_source() -> anyh
     let target = CvcStore::open(temp_dir.path().join("target.db"))?;
     // Exercise the production remote-aware pull API: the received tombstone is
     // authority only for this exact source fingerprint.
-    sync::pull_from_ref_for_remote(
-        &repo,
-        &target,
-        "refs/cvc/redacted-remote",
-        Some(TEST_DESTINATION),
-    )?;
-    sync::pull_from_ref_for_remote(
-        &repo,
-        &target,
-        "refs/cvc/stale-remote",
-        Some(TEST_DESTINATION),
-    )?;
+    sync::pull_from_ref(&repo, &target, "refs/cvc/redacted-remote", TEST_DESTINATION)?;
+    sync::pull_from_ref(&repo, &target, "refs/cvc/stale-remote", TEST_DESTINATION)?;
     assert!(target.get_interaction(&interaction.id)?.is_none());
     assert!(target.get_artifact_links(&interaction.id)?.is_empty());
 
     // A tombstone from this destination must not suppress an independently
     // authorized source, even where the immutable interaction ID is identical.
-    sync::pull_from_ref_for_remote(
-        &repo,
-        &target,
-        "refs/cvc/stale-remote",
-        Some(&"f".repeat(64)),
-    )?;
+    sync::pull_from_ref(&repo, &target, "refs/cvc/stale-remote", &"f".repeat(64))?;
     assert!(target.get_interaction(&interaction.id)?.is_some());
     assert_eq!(target.get_artifact_links(&interaction.id)?.len(), 1);
     assert!(!target.is_tombstoned(&interaction.id)?);
@@ -1244,12 +1255,7 @@ fn matching_wire_tombstone_reconciles_pending_redaction_on_no_change_projection(
     assert_eq!(pending_state, "pending");
     // The pending local record already suppresses a stale clone from this exact
     // destination; neither its node nor link may reappear before reconciliation.
-    sync::pull_from_ref_for_remote(
-        &repo,
-        &target,
-        "refs/cvc/reconcile-stale",
-        Some(TEST_DESTINATION),
-    )?;
+    sync::pull_from_ref(&repo, &target, "refs/cvc/reconcile-stale", TEST_DESTINATION)?;
     assert!(target.get_interaction(&interaction.id)?.is_none());
     assert!(target.get_artifact_links(&interaction.id)?.is_empty());
     project_fixture_to_ref(&repo, &source, "refs/cvc/reconcile-redaction")?;
@@ -1258,11 +1264,11 @@ fn matching_wire_tombstone_reconciles_pending_redaction_on_no_change_projection(
         .target()
         .expect("fixture ref has a direct target");
 
-    sync::pull_from_ref_for_remote(
+    sync::pull_from_ref(
         &repo,
         &target,
         "refs/cvc/reconcile-redaction",
-        Some(TEST_DESTINATION),
+        TEST_DESTINATION,
     )?;
     let state: String = connection.query_row(
         "SELECT state FROM tombstones WHERE interaction_id=?1 AND scope_kind='remote' AND remote_fingerprint=?2",
@@ -1309,8 +1315,13 @@ fn pull_rejects_a_tombstones_root_with_the_wrong_object_type() -> anyhow::Result
         &[],
     )?;
 
-    let error = sync::pull_from_ref(&repo, &store, "refs/cvc/bad-tombstones-root")
-        .expect_err("reserved tombstones root must be a tree");
+    let error = sync::pull_from_ref(
+        &repo,
+        &store,
+        "refs/cvc/bad-tombstones-root",
+        TEST_DESTINATION,
+    )
+    .expect_err("reserved tombstones root must be a tree");
     assert!(error.to_string().contains("tombstones must be a tree"));
     assert!(store.get_all_interaction_ids()?.is_empty());
     Ok(())
@@ -1381,10 +1392,14 @@ fn pull_tombstone_budgets_reject_before_database_mutation() -> anyhow::Result<()
         max_tombstone_bytes: 16 * 1024,
         max_total_bytes: 1024 * 1024,
     };
-    assert!(
-        sync::pull_from_ref_with_limits(&repo, &store, "refs/cvc/budget-count", None, limits)
-            .is_err()
-    );
+    assert!(sync::pull_from_ref_with_limits(
+        &repo,
+        &store,
+        "refs/cvc/budget-count",
+        TEST_DESTINATION,
+        limits
+    )
+    .is_err());
     assert!(store.get_interaction(&planted.id)?.is_some());
 
     commit_tombstone_tree(&repo, "refs/cvc/budget-bytes", &tombstones[..2])?;
@@ -1393,10 +1408,14 @@ fn pull_tombstone_budgets_reject_before_database_mutation() -> anyhow::Result<()
         max_tombstone_bytes: 16 * 1024,
         max_total_bytes: 1,
     };
-    assert!(
-        sync::pull_from_ref_with_limits(&repo, &store, "refs/cvc/budget-bytes", None, limits)
-            .is_err()
-    );
+    assert!(sync::pull_from_ref_with_limits(
+        &repo,
+        &store,
+        "refs/cvc/budget-bytes",
+        TEST_DESTINATION,
+        limits
+    )
+    .is_err());
     assert!(store.get_interaction(&planted.id)?.is_some());
     Ok(())
 }
@@ -1448,7 +1467,7 @@ fn pull_duplicate_node_and_tombstone_representations_are_atomic() -> anyhow::Res
         &tree,
         &[],
     )?;
-    sync::pull_from_ref(&repo, &store, "refs/cvc/duplicates-ok")?;
+    sync::pull_from_ref(&repo, &store, "refs/cvc/duplicates-ok", TEST_DESTINATION)?;
     assert_eq!(store.get_all_interaction_ids()?.len(), 1);
 
     let mut altered = node;
@@ -1478,7 +1497,9 @@ fn pull_duplicate_node_and_tombstone_representations_are_atomic() -> anyhow::Res
         &[],
     )?;
     let empty = CvcStore::open(temp.path().join("empty.db"))?;
-    assert!(sync::pull_from_ref(&repo, &empty, "refs/cvc/duplicates-bad").is_err());
+    assert!(
+        sync::pull_from_ref(&repo, &empty, "refs/cvc/duplicates-bad", TEST_DESTINATION).is_err()
+    );
     assert!(empty.get_all_interaction_ids()?.is_empty());
     // A valid Git tree cannot encode the same canonical shard/name twice. The
     // transport-neutral canonicalizer is the seam for pack/alternate readers.
@@ -1531,12 +1552,7 @@ fn tombstone_deletion_reports_logical_cleanup_for_local_and_imported_records() -
         "refs/cvc/import-cleanup",
         std::slice::from_ref(&tombstone),
     )?;
-    sync::pull_from_ref_for_remote(
-        &repo,
-        &store,
-        "refs/cvc/import-cleanup",
-        Some(TEST_DESTINATION),
-    )?;
+    sync::pull_from_ref(&repo, &store, "refs/cvc/import-cleanup", TEST_DESTINATION)?;
     assert!(store.get_interaction(&imported.id)?.is_none());
     let report = store.compact_after_deletion()?;
     assert_eq!(
@@ -1622,6 +1638,7 @@ fn failed_transport_cleanup_removes_projection_candidate() -> anyhow::Result<()>
         name: "unreachable".into(),
         effective_url: temp_dir.path().join("missing-remote").display().to_string(),
         fingerprint: "a".repeat(64),
+        legacy_fingerprint: None,
         ref_name: "refs/cvc/main".into(),
     };
     assert!(sync::push_temp_ref(&repo, &destination, &temp_ref).is_err());
@@ -1728,15 +1745,15 @@ fn push_upgrades_v2_format_without_downgrading_data() -> anyhow::Result<()> {
     )?;
 
     let existing = CvcStore::open(temp_dir.path().join("existing.db"))?;
-    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    sync::pull_from_ref(&repo, &existing, ref_name, TEST_DESTINATION)?;
     project_fixture_to_ref(&repo, &source, ref_name)?;
     let upgraded_tree = repo.find_reference(ref_name)?.peel_to_commit()?.tree()?;
     let marker = repo.find_blob(upgraded_tree.get_name("FORMAT").unwrap().id())?;
     assert_eq!(marker.content(), b"5");
 
     let fresh = CvcStore::open(temp_dir.path().join("fresh.db"))?;
-    sync::pull_from_ref(&repo, &fresh, ref_name)?;
-    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    sync::pull_from_ref(&repo, &fresh, ref_name, TEST_DESTINATION)?;
+    sync::pull_from_ref(&repo, &existing, ref_name, TEST_DESTINATION)?;
     assert!(fresh.get_interaction(&interaction.id)?.is_some());
     assert!(existing.get_interaction(&interaction.id)?.is_some());
     Ok(())
@@ -1768,7 +1785,7 @@ fn v3_pull_surfaces_conflicting_link_attribution() -> anyhow::Result<()> {
     let ref_name = "refs/cvc/conflict";
     project_fixture_to_ref(&repo, &source, ref_name)?;
     let target = CvcStore::open(temp_dir.path().join("target.db"))?;
-    sync::pull_from_ref(&repo, &target, ref_name)?;
+    sync::pull_from_ref(&repo, &target, ref_name, TEST_DESTINATION)?;
     let sha = CommitSha::new("c".repeat(40));
     target.link_automatic_interactions(
         std::slice::from_ref(&interaction.id),
@@ -1783,7 +1800,7 @@ fn v3_pull_surfaces_conflicting_link_attribution() -> anyhow::Result<()> {
         Some("remote@example.com"),
     )?;
     project_fixture_to_ref(&repo, &source, ref_name)?;
-    assert!(sync::pull_from_ref(&repo, &target, ref_name).is_err());
+    assert!(sync::pull_from_ref(&repo, &target, ref_name, TEST_DESTINATION).is_err());
     Ok(())
 }
 
@@ -1877,7 +1894,7 @@ fn pull_rejects_malformed_legacy_embedded_link() -> anyhow::Result<()> {
         &[],
     )?;
     let store = CvcStore::open(temp_dir.path().join("target.db"))?;
-    assert!(sync::pull_from_ref(&repo, &store, "refs/cvc/bad").is_err());
+    assert!(sync::pull_from_ref(&repo, &store, "refs/cvc/bad", TEST_DESTINATION).is_err());
     assert!(store.get_all_interaction_ids()?.is_empty());
     Ok(())
 }
@@ -1932,7 +1949,7 @@ fn test_sync_push_pull() -> anyhow::Result<()> {
     let store_2 = CvcStore::open(&db_path_2)?;
     store_2.init()?;
 
-    sync::pull_from_ref(&repo, &store_2, ref_name)?;
+    sync::pull_from_ref(&repo, &store_2, ref_name, TEST_DESTINATION)?;
 
     // 5. Verify Data in store_2
     let fetched_inter = store_2.get_interaction(&inter.id)?;
@@ -2216,7 +2233,7 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
     )?;
 
     // Pull/Ingest from remote ref
-    sync::pull_from_ref(&repo_b, &store_b, remote_tracking_ref)?;
+    sync::pull_from_ref(&repo_b, &store_b, remote_tracking_ref, TEST_DESTINATION)?;
 
     // Verify we have A's thought
     assert!(store_b.get_interaction(&inter_a.id)?.is_some());
@@ -2241,7 +2258,7 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
         None,
         None,
     )?;
-    sync::pull_from_ref(&repo_a, &store_a, remote_tracking_ref)?;
+    sync::pull_from_ref(&repo_a, &store_a, remote_tracking_ref, TEST_DESTINATION)?;
 
     assert!(store_a.get_interaction(&inter_b.id)?.is_some());
 
@@ -2538,14 +2555,18 @@ fn test_sync_v2_round_trip() -> anyhow::Result<()> {
     // Pull into a fresh clone/DB and compare.
     let store_2 = CvcStore::open(temp_dir.path().join("cvc_2.db"))?;
     store_2.init()?;
-    sync::pull_from_ref(&repo, &store_2, ref_name)?;
+    sync::pull_from_ref(&repo, &store_2, ref_name, TEST_DESTINATION)?;
 
     for original in [&linked, &floating] {
         let fetched = store_2
             .get_interaction(&original.id)?
             .unwrap_or_else(|| panic!("interaction {} missing after pull", original.id));
         assert_eq!(fetched.user_prompt, original.user_prompt);
-        assert_eq!(fetched.conversation_id, original.conversation_id);
+        // An imported conversation is always namespaced by its destination.
+        assert_eq!(
+            fetched.conversation_id,
+            format!("remote:{TEST_DESTINATION}:{}", original.conversation_id)
+        );
         assert_eq!(fetched.parent_id, original.parent_id);
         assert_eq!(fetched.author, original.author);
         assert_eq!(fetched.model_cot, original.model_cot);
@@ -2613,7 +2634,7 @@ fn test_pull_from_ref_reads_legacy_v1_layout() -> anyhow::Result<()> {
 
     let store = CvcStore::open(temp_dir.path().join("cvc.db"))?;
     store.init()?;
-    sync::pull_from_ref(&repo, &store, "refs/cvc/main")?;
+    sync::pull_from_ref(&repo, &store, "refs/cvc/main", TEST_DESTINATION)?;
 
     let fetched = store.get_interaction(&id)?;
     assert!(
@@ -2624,8 +2645,8 @@ fn test_pull_from_ref_reads_legacy_v1_layout() -> anyhow::Result<()> {
 
     // A push against this legacy tree should leave the old entry alone and start
     // writing new interactions under the v2 layout -- no disruptive migration.
-    // (conv-legacy already exists: pull_from_ref auto-created it while ingesting the
-    // legacy interaction above.)
+    // (The pull filed the legacy interaction under its namespaced conversation,
+    // `remote:<fingerprint>:conv-legacy`; this local thought starts `conv-legacy`.)
     let new_id = InteractionId::new();
     store.create_interaction(&Interaction {
         id: new_id.clone(),
@@ -2664,7 +2685,7 @@ fn test_pull_from_ref_reads_legacy_v1_layout() -> anyhow::Result<()> {
     // And a pull against this mixed tree picks up both.
     let store_2 = CvcStore::open(temp_dir.path().join("cvc_2.db"))?;
     store_2.init()?;
-    sync::pull_from_ref(&repo, &store_2, "refs/cvc/main")?;
+    sync::pull_from_ref(&repo, &store_2, "refs/cvc/main", TEST_DESTINATION)?;
     assert!(store_2.get_interaction(&id)?.is_some());
     assert!(store_2.get_interaction(&new_id)?.is_some());
 
@@ -2763,7 +2784,7 @@ fn test_sync_cycle_detection() -> anyhow::Result<()> {
 
     // 3. Try to Pull
     // This should FAIL with Cycle detected error.
-    let result = sync::pull_from_ref(&repo, &store, "refs/cvc/cycle");
+    let result = sync::pull_from_ref(&repo, &store, "refs/cvc/cycle", TEST_DESTINATION);
     assert!(result.is_err(), "Pull should fail on cycle");
 
     let err = result.unwrap_err();
@@ -3034,9 +3055,14 @@ fn publication_summary_does_not_count_legacy_flat_baseline_nodes() -> anyhow::Re
     repo.reference(SUMMARY_BASELINE, legacy_commit, true, "legacy baseline")?;
 
     let store = CvcStore::open(temp_dir.path().join("cvc.db"))?;
-    sync::pull_from_ref(&repo, &store, "refs/cvc/legacy-source")?;
-    // Sharing the (already imported) conversation puts the legacy node in this
-    // destination's projection next to the genuinely new one.
+    sync::pull_from_ref(&repo, &store, "refs/cvc/legacy-source", TEST_DESTINATION)?;
+    // Sharing the (already imported, so namespaced) conversation puts the legacy
+    // node in this destination's projection next to the genuinely new one.
+    store.share_conversation_for_remote(
+        &format!("remote:{TEST_DESTINATION}:conv-legacy"),
+        TEST_DESTINATION,
+        FutureSharePolicy::Private,
+    )?;
     let fresh = summary_interaction("conv-legacy", "Post-upgrade thought");
     store.create_interaction(&fresh)?;
 
@@ -3071,14 +3097,14 @@ fn publication_marks_preserve_the_timestamp_of_already_published_rows() -> anyho
     const SENTINEL: i64 = 1_000;
 
     // Fetch/import records the node as published for this exact destination.
-    sync::pull_from_ref_for_remote(&repo, &target, "refs/cvc/stamped", Some(TEST_DESTINATION))?;
+    sync::pull_from_ref(&repo, &target, "refs/cvc/stamped", TEST_DESTINATION)?;
     let (state, stamped) = row(&raw)?;
     assert_eq!(state, "published");
     assert!(stamped > SENTINEL);
 
     // Observing the same node at a later fetch must not re-stamp the row.
     raw.execute("UPDATE publications SET updated_at=?1", [SENTINEL])?;
-    sync::pull_from_ref_for_remote(&repo, &target, "refs/cvc/stamped", Some(TEST_DESTINATION))?;
+    sync::pull_from_ref(&repo, &target, "refs/cvc/stamped", TEST_DESTINATION)?;
     assert_eq!(row(&raw)?, ("published".to_owned(), SENTINEL));
 
     // Re-asserting `published` through the publication mark is equally inert...
@@ -3099,12 +3125,7 @@ fn publication_marks_preserve_the_timestamp_of_already_published_rows() -> anyho
             rusqlite::params![not_published, SENTINEL],
         )?;
         if not_published == "unknown" {
-            sync::pull_from_ref_for_remote(
-                &repo,
-                &target,
-                "refs/cvc/stamped",
-                Some(TEST_DESTINATION),
-            )?;
+            sync::pull_from_ref(&repo, &target, "refs/cvc/stamped", TEST_DESTINATION)?;
         } else {
             target.mark_publication(
                 std::slice::from_ref(&interaction.id),
@@ -3229,6 +3250,490 @@ fn publication_summary_is_structural_only_for_a_format_upgrade() -> anyhow::Resu
     Ok(())
 }
 
+// --- Tombstoned pushes keep what other clones published (#125) -----------------
+
+/// A well-formed range body with its canonical ID. `seed` is a lowercase hex
+/// digit; it varies every hash-shaped field, so each seed has its own ID.
+fn range_fixture(seed: char) -> RangeEvidence {
+    assert!(seed.is_ascii_hexdigit() && !seed.is_ascii_uppercase());
+    let oid = |c: char| c.to_string().repeat(40);
+    let mut range = RangeEvidence {
+        range_id: String::new(),
+        format: "cvc.range-evidence/v2".into(),
+        version: 2,
+        repository_identity: seed.to_string().repeat(64),
+        object_format: "sha1".into(),
+        base_oid: CommitSha::new(oid('a')),
+        tip_oid: CommitSha::new(oid(seed)),
+        base_tree_oid: oid('b'),
+        result_tree_oid: oid(seed),
+        commits: vec![RangeMember {
+            commit_oid: CommitSha::new(oid(seed)),
+        }],
+        changeset_algorithm: "cvc.changeset/v1".into(),
+        changeset_digest: seed.to_string().repeat(64),
+    };
+    range.range_id = range.canonical_id();
+    assert!(range.verify_id());
+    range
+}
+
+/// Records `range` as an explicit local observation, so the projection
+/// publishes it once an authorized, locally trusted event references it.
+fn observe_range_locally(db_path: &std::path::Path, range: &RangeEvidence) -> anyhow::Result<()> {
+    let payload = serde_json::to_string(range)?;
+    let digest = hex::encode(Sha256::digest(payload.as_bytes()));
+    let db = Connection::open(db_path)?;
+    db.execute(
+        "INSERT INTO range_evidence(range_id,payload,payload_digest,changeset_algorithm,changeset_digest) VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![
+            range.range_id,
+            payload,
+            digest,
+            range.changeset_algorithm,
+            range.changeset_digest
+        ],
+    )?;
+    db.execute(
+        "INSERT INTO range_observations(range_id,source_key,origin,trusted_local) VALUES(?1,'fixture-local','explicit',1)",
+        [&range.range_id],
+    )?;
+    Ok(())
+}
+
+/// A squash event of `interaction_id` over `range`.
+fn squash_derivation(
+    interaction_id: &InteractionId,
+    commit: char,
+    source_event_ids: Vec<String>,
+    range: &RangeEvidence,
+) -> DerivationEvent {
+    let mut event = derivation(interaction_id, commit, source_event_ids);
+    event.relation = DerivationRelation::SquashExact;
+    event.origin = DerivationOrigin::LocalHook;
+    event.range_id = Some(range.range_id.clone());
+    event.event_id = event.canonical_id();
+    event
+}
+
+/// What another clone's push adds to the tip of `ref_name`: a new commit whose
+/// tree also holds `ranges/<id[0..2]>/<id>.json`. Returns the blob it wrote.
+fn publish_foreign_range(
+    repo: &Repository,
+    ref_name: &str,
+    range: &RangeEvidence,
+) -> anyhow::Result<git2::Oid> {
+    let tip = repo.find_reference(ref_name)?.peel_to_commit()?;
+    let tree = tip.tree()?;
+    let ranges = tree
+        .get_name("ranges")
+        .expect("a FORMAT5 tree always holds ranges/")
+        .to_object(repo)?
+        .peel_to_tree()?;
+    let shard = &range.range_id[..2];
+    let mut shard_builder = match ranges.get_name(shard) {
+        Some(entry) => repo.treebuilder(Some(&entry.to_object(repo)?.peel_to_tree()?))?,
+        None => repo.treebuilder(None)?,
+    };
+    let blob = repo.blob(&serde_json::to_vec(range)?)?;
+    shard_builder.insert(
+        format!("{}.json", range.range_id),
+        blob,
+        FileMode::Blob.into(),
+    )?;
+    let mut ranges_builder = repo.treebuilder(Some(&ranges))?;
+    ranges_builder.insert(shard, shard_builder.write()?, FileMode::Tree.into())?;
+    let mut root = repo.treebuilder(Some(&tree))?;
+    root.insert("ranges", ranges_builder.write()?, FileMode::Tree.into())?;
+    let signature = Signature::now("Other Clone", "other@example.com")?;
+    let commit = repo.commit(
+        None,
+        &signature,
+        &signature,
+        "another clone publishes a range",
+        &repo.find_tree(root.write()?)?,
+        &[&tip],
+    )?;
+    repo.reference(ref_name, commit, true, "fixture: another clone's range")?;
+    Ok(blob)
+}
+
+fn wire_range_ids(repo: &Repository, tree: &git2::Tree<'_>) -> anyhow::Result<Vec<String>> {
+    let Some(ranges) = tree.get_name("ranges") else {
+        return Ok(Vec::new());
+    };
+    let mut ids = Vec::new();
+    for shard in ranges.to_object(repo)?.peel_to_tree()?.iter() {
+        for entry in shard.to_object(repo)?.peel_to_tree()?.iter() {
+            let range: RangeEvidence =
+                serde_json::from_slice(entry.to_object(repo)?.peel_to_blob()?.content())?;
+            ids.push(range.range_id);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+fn sorted(mut ids: Vec<String>) -> Vec<String> {
+    ids.sort();
+    ids
+}
+
+/// A clone that holds a tombstone pushes over a tip carrying a range that no
+/// event references, which its own database never published. With
+/// `import_first` the database has also imported that tip, as the CLI does
+/// before every projection; the range is then known to it only as untrusted
+/// remote evidence, which is never projected.
+fn tombstoned_push_over_an_unreferenced_range(import_first: bool) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("source.db"))?;
+    let kept = summary_interaction("kept", "stays");
+    let redacted = summary_interaction("redacted", "suppressed");
+    store.create_interaction(&kept)?;
+    store.create_interaction(&redacted)?;
+    project_and_accept(&repo, &store)?.expect("first candidate");
+
+    let foreign = range_fixture('1');
+    let foreign_blob = publish_foreign_range(&repo, SUMMARY_BASELINE, &foreign)?;
+    if import_first {
+        sync::pull_from_ref(&repo, &store, SUMMARY_BASELINE, TEST_DESTINATION)?;
+    }
+    store.tombstone_remote(
+        &redacted.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::UserRequested,
+        None,
+    )?;
+
+    let publication = project_and_accept(&repo, &store)?.expect("the tombstone is a change");
+    let tip = accepted_tip(&repo)?;
+    assert_eq!(
+        wire_range_ids(&repo, &tip)?,
+        vec![foreign.range_id.clone()],
+        "a range no event references is not about the tombstoned interaction, \
+         so a tombstoned push must keep it"
+    );
+    let path = format!(
+        "ranges/{}/{}.json",
+        &foreign.range_id[..2],
+        foreign.range_id
+    );
+    assert_eq!(
+        tip.get_path(std::path::Path::new(&path))?.id(),
+        foreign_blob,
+        "the kept range is the very blob the other clone published"
+    );
+    assert!(has_path(&tip, &tombstone_path(&redacted.id)));
+    assert!(!has_path(&tip, &node_path(&redacted.id)));
+    assert_eq!(publication.new_tombstones, 1);
+    assert_eq!(publication.removed_interactions, 1);
+    assert_eq!(
+        publication.removed_records, 0,
+        "the summary names removals as records of tombstoned interactions; \
+         the range is not one"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_tombstoned_push_keeps_a_range_no_event_references() -> anyhow::Result<()> {
+    tombstoned_push_over_an_unreferenced_range(false)
+}
+
+#[test]
+fn a_tombstoned_push_keeps_an_unreferenced_range_the_database_imported_as_remote_evidence(
+) -> anyhow::Result<()> {
+    tombstoned_push_over_an_unreferenced_range(true)
+}
+
+/// The tree a destination's accepted candidate holds.
+fn accepted_tip(repo: &Repository) -> anyhow::Result<git2::Tree<'_>> {
+    Ok(repo
+        .find_reference(SUMMARY_BASELINE)?
+        .peel_to_commit()?
+        .tree()?)
+}
+
+fn has_path(tree: &git2::Tree<'_>, path: &str) -> bool {
+    tree.get_path(std::path::Path::new(path)).is_ok()
+}
+
+fn node_path(id: &InteractionId) -> String {
+    format!("nodes/{}/{}.json", &id.to_string()[..2], id)
+}
+
+fn tombstone_path(id: &InteractionId) -> String {
+    format!("tombstones/{}/{}.json", &id.to_string()[..2], id)
+}
+
+/// What `publish_squash_scenario` put on the destination.
+struct SquashScenario {
+    redacted: Interaction,
+    kept: Interaction,
+    /// Referenced only by a squash event of `redacted`.
+    tied: RangeEvidence,
+    /// Referenced by a squash event of `redacted` and one of `kept`.
+    common: RangeEvidence,
+    /// Event IDs of `kept`, which must survive the tombstone of `redacted`.
+    kept_events: Vec<String>,
+}
+
+/// Publishes two interactions with squash evidence. A squash range is shared by
+/// every interaction whose commits it covers, so `common` belongs to both while
+/// `tied` belongs to `redacted` alone.
+fn publish_squash_scenario(
+    repo: &Repository,
+    store: &CvcStore,
+    db_path: &std::path::Path,
+) -> anyhow::Result<SquashScenario> {
+    let kept = summary_interaction("kept", "stays");
+    let redacted = summary_interaction("redacted", "suppressed");
+    store.create_interaction(&kept)?;
+    store.create_interaction(&redacted)?;
+    let tied = range_fixture('1');
+    let common = range_fixture('2');
+    for range in [&tied, &common] {
+        observe_range_locally(db_path, range)?;
+    }
+    let redacted_source = derivation(&redacted.id, 'a', Vec::new());
+    let redacted_tied = squash_derivation(
+        &redacted.id,
+        'b',
+        vec![redacted_source.event_id.clone()],
+        &tied,
+    );
+    let redacted_common = squash_derivation(
+        &redacted.id,
+        'c',
+        vec![redacted_source.event_id.clone()],
+        &common,
+    );
+    let kept_source = derivation(&kept.id, 'd', Vec::new());
+    let kept_common = squash_derivation(&kept.id, 'e', vec![kept_source.event_id.clone()], &common);
+    let kept_events = [&kept_source, &kept_common];
+    for event in [&redacted_source, &redacted_tied, &redacted_common]
+        .into_iter()
+        .chain(kept_events)
+    {
+        insert_event_fixture(db_path, event)?;
+        trust_and_authorize_event(db_path, event)?;
+    }
+    project_and_accept(repo, store)?.expect("first candidate");
+    let tip = accepted_tip(repo)?;
+    assert_eq!(
+        wire_range_ids(repo, &tip)?,
+        sorted(vec![tied.range_id.clone(), common.range_id.clone()]),
+        "the projection publishes both ranges"
+    );
+    assert_eq!(wire_event_ids(repo, &tip)?.len(), 5);
+    Ok(SquashScenario {
+        redacted,
+        kept,
+        tied,
+        common,
+        kept_events: kept_events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect(),
+    })
+}
+
+#[test]
+fn a_tombstone_prunes_the_ranges_only_its_events_referenced() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let db_path = temp_dir.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let scenario = publish_squash_scenario(&repo, &store, &db_path)?;
+
+    store.tombstone_remote(
+        &scenario.redacted.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::Security,
+        None,
+    )?;
+    let publication = project_and_accept(&repo, &store)?.expect("the tombstone is a change");
+    let tip = accepted_tip(&repo)?;
+
+    let ranges = wire_range_ids(&repo, &tip)?;
+    assert!(
+        !ranges.contains(&scenario.tied.range_id),
+        "the range only the tombstoned interaction's events referenced is pruned"
+    );
+    assert_eq!(
+        ranges,
+        vec![scenario.common.range_id.clone()],
+        "the range a surviving event also references stays"
+    );
+    assert_eq!(
+        wire_event_ids(&repo, &tip)?,
+        sorted(scenario.kept_events.clone()),
+        "no event of the tombstoned interaction survives"
+    );
+    assert!(has_path(&tip, &node_path(&scenario.kept.id)));
+    assert!(!has_path(&tip, &node_path(&scenario.redacted.id)));
+    assert_eq!(publication.removed_interactions, 1);
+    assert_eq!(
+        publication.removed_records, 4,
+        "three events and the one range they alone referenced"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_tombstoned_push_keeps_every_kind_of_entry_another_clone_published() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let store = CvcStore::open(temp_dir.path().join("this-clone.db"))?;
+    let kept = summary_interaction("kept", "stays");
+    let redacted = summary_interaction("redacted", "suppressed");
+    store.create_interaction(&kept)?;
+    store.create_interaction(&redacted)?;
+    project_and_accept(&repo, &store)?.expect("this clone publishes first");
+
+    // Another clone adds a node, an automatic link, a derivation event (and so
+    // `by-commit/` pointers), and a range. This clone's database never saw any
+    // of it.
+    let other_db = temp_dir.path().join("other-clone.db");
+    let other = CvcStore::open(&other_db)?;
+    let foreign = summary_interaction("foreign", "published elsewhere");
+    other.create_interaction(&foreign)?;
+    let linked_commit = "c".repeat(40);
+    other.link_interaction(
+        &foreign.id,
+        &CommitSha::new(linked_commit.clone()),
+        "generated",
+    )?;
+    let foreign_event = derivation(&foreign.id, 'f', Vec::new());
+    insert_event_fixture(&other_db, &foreign_event)?;
+    trust_and_authorize_event(&other_db, &foreign_event)?;
+    project_and_accept(&repo, &other)?.expect("the other clone publishes");
+    let foreign_range = range_fixture('1');
+    publish_foreign_range(&repo, SUMMARY_BASELINE, &foreign_range)?;
+
+    store.tombstone_remote(
+        &redacted.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::UserRequested,
+        None,
+    )?;
+    project_and_accept(&repo, &store)?.expect("the tombstone is a change");
+    let tip = accepted_tip(&repo)?;
+
+    assert!(
+        !has_path(&tip, &node_path(&redacted.id)),
+        "the tombstone still removes its node"
+    );
+    assert!(has_path(&tip, &tombstone_path(&redacted.id)));
+    assert!(has_path(&tip, &node_path(&kept.id)));
+
+    let mut dropped = Vec::new();
+    if !has_path(&tip, &node_path(&foreign.id)) {
+        dropped.push("nodes/");
+    }
+    if !has_path(
+        &tip,
+        &format!("links/{}/{}.json", foreign.id, linked_commit),
+    ) {
+        dropped.push("links/");
+    }
+    if !wire_event_ids(&repo, &tip)?.contains(&foreign_event.event_id) {
+        dropped.push("events/");
+    }
+    if !has_path(&tip, &format!("by-commit/{}/{}", linked_commit, foreign.id))
+        || !has_path(
+            &tip,
+            &format!("by-commit/{}/{}", "f".repeat(40), foreign.id),
+        )
+    {
+        dropped.push("by-commit/");
+    }
+    if !wire_range_ids(&repo, &tip)?.contains(&foreign_range.range_id) {
+        dropped.push("ranges/");
+    }
+    assert!(
+        dropped.is_empty(),
+        "a tombstoned push dropped what another clone published under {dropped:?}"
+    );
+
+    // A reader still accepts the result: the kept entries agree with the
+    // rebuilt `by-commit/` index.
+    let reader = CvcStore::open(temp_dir.path().join("reader.db"))?;
+    sync::pull_from_ref(&repo, &reader, SUMMARY_BASELINE, TEST_DESTINATION)?;
+    assert!(reader.get_interaction(&foreign.id)?.is_some());
+    assert!(reader.get_interaction(&kept.id)?.is_some());
+    assert!(reader.get_interaction(&redacted.id)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn hard_redaction_prunes_the_ranges_only_the_target_referenced_and_keeps_the_rest(
+) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let db_path = temp_dir.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let scenario = publish_squash_scenario(&repo, &store, &db_path)?;
+    let unredacted = accepted_tip(&repo)?;
+    let stale_events = unredacted.get_name("events").unwrap().id();
+    let stale_ranges = unredacted.get_name("ranges").unwrap().id();
+
+    store.tombstone_remote(
+        &scenario.redacted.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::Security,
+        None,
+    )?;
+    project_and_accept(&repo, &store)?.expect("the tombstone is a change");
+
+    // The destination tip a redaction plan starts from: it holds the tombstone
+    // but an older client left the target's derivation evidence next to it, and
+    // another clone has added a range of its own.
+    let suppressed = accepted_tip(&repo)?;
+    let mut stale = repo.treebuilder(Some(&suppressed))?;
+    stale.insert("events", stale_events, FileMode::Tree.into())?;
+    stale.insert("ranges", stale_ranges, FileMode::Tree.into())?;
+    let signature = Signature::now("Old Client", "old@example.com")?;
+    let tip = repo.find_reference(SUMMARY_BASELINE)?.peel_to_commit()?;
+    let stale_tip = repo.commit(
+        None,
+        &signature,
+        &signature,
+        "an older client leaves the derivation evidence",
+        &repo.find_tree(stale.write()?)?,
+        &[&tip],
+    )?;
+    repo.reference(SUMMARY_BASELINE, stale_tip, true, "stale fixture")?;
+    let foreign = range_fixture('3');
+    publish_foreign_range(&repo, SUMMARY_BASELINE, &foreign)?;
+
+    let candidate = sync::build_hard_redaction_plan(
+        &repo,
+        Some(SUMMARY_BASELINE),
+        TEST_DESTINATION,
+        &scenario.redacted.id,
+    )?;
+    let replacement = repo
+        .find_commit(git2::Oid::from_str(&candidate.plan.replacement_commit)?)?
+        .tree()?;
+    assert_eq!(
+        wire_event_ids(&repo, &replacement)?,
+        sorted(scenario.kept_events.clone()),
+        "no event of the target survives the replacement"
+    );
+    assert_eq!(
+        wire_range_ids(&repo, &replacement)?,
+        sorted(vec![
+            scenario.common.range_id.clone(),
+            foreign.range_id.clone()
+        ]),
+        "the replacement drops the range only the target referenced, keeps the one \
+         a surviving event references, and keeps the one nothing references"
+    );
+    Ok(())
+}
+
 // --- Baseline pinning and the publication-state guard (#106 round 2) -----------
 
 const PIN_TRACKING_REF: &str = "refs/remotes/fixture/cvc/main";
@@ -3238,6 +3743,7 @@ fn pin_destination() -> cvc_core::privacy::RemoteDestination {
         name: "fixture".into(),
         effective_url: "unused-in-these-tests".into(),
         fingerprint: TEST_DESTINATION.into(),
+        legacy_fingerprint: None,
         ref_name: "refs/cvc/main".into(),
     }
 }
@@ -3510,6 +4016,7 @@ fn a_failed_transport_leaves_baseline_held_rows_published_and_marks_only_new_one
         name: "unreachable".into(),
         effective_url: temp_dir.path().join("missing-remote").display().to_string(),
         fingerprint: TEST_DESTINATION.into(),
+        legacy_fingerprint: None,
         ref_name: "refs/cvc/main".into(),
     };
     assert!(sync::push_temp_ref(&repo, &unreachable, candidate.ref_name()).is_err());
@@ -3528,5 +4035,742 @@ fn a_failed_transport_leaves_baseline_held_rows_published_and_marks_only_new_one
         Some("unknown".to_owned())
     );
     assert_eq!(rows.len(), 2);
+    Ok(())
+}
+
+// ---- a node already published that the privacy check now refuses ------------------------
+
+const FETCHED_BASELINE: &str = "refs/remotes/fixture/cvc/main";
+
+fn published_item(text: &str) -> Interaction {
+    Interaction {
+        id: InteractionId::new(),
+        conversation_id: "published".into(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        author: Author::Human,
+        user_prompt: text.into(),
+        model_name: None,
+        model_cot: None,
+        model_response: None,
+        source_request_id: None,
+    }
+}
+
+/// Publishes the item, then rewrites its node in the published tree the way an
+/// earlier version could have written it, and makes the result the fetched
+/// baseline of the remote called `fixture`.
+fn fetch_baseline_with_edited_node(
+    repo: &Repository,
+    store: &CvcStore,
+    id: &InteractionId,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> anyhow::Result<()> {
+    project_fixture_to_ref(repo, store, "refs/cvc/published")?;
+    let commit = repo
+        .find_reference("refs/cvc/published")?
+        .peel_to_commit()?;
+    let tree = commit.tree()?;
+    let id_text = id.to_string();
+    let shard = &id_text[..2];
+    let file = format!("{id_text}.json");
+    let blob = repo.find_blob(
+        tree.get_path(std::path::Path::new(&format!("nodes/{shard}/{file}")))?
+            .id(),
+    )?;
+    let mut value: serde_json::Value = serde_json::from_slice(blob.content())?;
+    edit(&mut value);
+    let edited = repo.blob(&serde_json::to_vec_pretty(&value)?)?;
+    let nodes = tree
+        .get_name("nodes")
+        .expect("nodes")
+        .to_object(repo)?
+        .peel_to_tree()?;
+    let shard_tree = nodes
+        .get_name(shard)
+        .expect("shard")
+        .to_object(repo)?
+        .peel_to_tree()?;
+    let mut shard_builder = repo.treebuilder(Some(&shard_tree))?;
+    shard_builder.insert(&file, edited, FileMode::Blob.into())?;
+    let mut nodes_builder = repo.treebuilder(Some(&nodes))?;
+    nodes_builder.insert(shard, shard_builder.write()?, FileMode::Tree.into())?;
+    let mut root = repo.treebuilder(Some(&tree))?;
+    root.insert("nodes", nodes_builder.write()?, FileMode::Tree.into())?;
+    let rewritten = repo.find_tree(root.write()?)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    repo.commit(
+        Some(FETCHED_BASELINE),
+        &signature,
+        &signature,
+        "a node as an earlier version wrote it",
+        &rewritten,
+        &[&commit],
+    )?;
+    Ok(())
+}
+
+fn push_error(repo: &Repository, store: &CvcStore) -> String {
+    match sync::push_projection_to_ref(
+        repo,
+        store,
+        &pinned(repo, FETCHED_BASELINE),
+        TEST_DESTINATION,
+    ) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("the push was expected to stop at the published node"),
+    }
+}
+
+#[test]
+fn a_published_node_with_an_unterminated_key_header_stops_the_push_and_says_how_to_go_on(
+) -> anyhow::Result<()> {
+    let header = "output\n-----BEGIN RSA PRIVATE KEY-----\nMIIEfakeFAKEfake0123456789";
+    // The key text before a lone END line is the same case from the other side.
+    let footer =
+        "MIIEfakeFAKEfake0123456789\nQ2VudCB0aGUgZW5k==\n-----END RSA PRIVATE KEY-----\nok";
+    for (place, text) in [
+        ("prompt", header),
+        ("response", header),
+        ("tool arguments", header),
+        ("end line", footer),
+    ] {
+        let temp = TempDir::new()?;
+        let repo = Repository::init(temp.path())?;
+        let store = CvcStore::open(temp.path().join("source.db"))?;
+        let item = published_item("an ordinary prompt");
+        store.create_interaction(&item)?;
+        let id = item.id.to_string();
+        fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| match place {
+            "prompt" => node["interaction"]["user_prompt"] = text.into(),
+            "response" | "end line" => node["interaction"]["model_response"] = text.into(),
+            _ => {
+                node["tool_executions"] = serde_json::json!([{
+                    "id": 1, "interaction_id": id, "tool_protocol": "native",
+                    "tool_name": "Write", "status": "success",
+                    "arguments": serde_json::json!({"content": text}).to_string(),
+                }]);
+            }
+        })?;
+
+        let message = push_error(&repo, &store);
+        assert!(message.contains(&id), "{place}: {message}");
+        assert!(
+            message.contains("already-published text holds an unterminated private-key block"),
+            "{place}: {message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "`cvc redact {id} --remote fixture --rewrite-plan redaction-plan.json`"
+            )),
+            "{place}: {message}"
+        );
+        assert!(
+            message.contains("`cvc push --manual --remote fixture`"),
+            "{place}: {message}"
+        );
+        assert!(message.contains("rotate it first"), "{place}: {message}");
+        assert!(
+            message.contains("also removes the node from this machine's database"),
+            "{place}: {message}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn suppressing_the_node_for_the_destination_is_what_lets_the_push_go_on() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("an ordinary prompt");
+    let other = Interaction {
+        user_prompt: "another turn, also published".into(),
+        ..published_item("unused")
+    };
+    store.create_interaction(&item)?;
+    store.create_interaction(&other)?;
+    let id = item.id.to_string();
+    fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
+        node["interaction"]["user_prompt"] =
+            "-----BEGIN PRIVATE KEY-----\nMIIEfakeFAKEfake0123456789".into();
+    })?;
+    assert!(push_error(&repo, &store).contains(&id));
+
+    // What `cvc redact <id> --remote fixture` records, then the next push.
+    store.authorize_and_tombstone_remote(
+        &item.id,
+        TEST_DESTINATION,
+        TombstoneReasonCode::UserRequested,
+    )?;
+    let sync::ProjectionResult::Candidate { oid, .. } = sync::push_projection_to_ref(
+        &repo,
+        &store,
+        &pinned(&repo, FETCHED_BASELINE),
+        TEST_DESTINATION,
+    )?
+    else {
+        panic!("the tombstone is something to publish")
+    };
+    let tree = repo.find_commit(oid)?.tree()?;
+    let at = |dir: &str, who: &str| {
+        tree.get_path(std::path::Path::new(&format!(
+            "{dir}/{}/{who}.json",
+            &who[..2]
+        )))
+        .is_ok()
+    };
+    assert!(!at("nodes", &id), "the suppressed node left the tree");
+    assert!(at("tombstones", &id), "its tombstone is published");
+    assert!(
+        at("nodes", &other.id.to_string()),
+        "the other node is still there"
+    );
+    Ok(())
+}
+
+#[test]
+fn any_published_node_that_fails_the_check_is_named_with_its_own_reason() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("an ordinary prompt");
+    store.create_interaction(&item)?;
+    fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
+        node["interaction"]["model_response"] = "key AKIAABCDEFGHIJKLMNOP here".into();
+    })?;
+    let message = push_error(&repo, &store);
+    assert!(message.contains(&item.id.to_string()), "{message}");
+    assert!(
+        message.contains("no longer passes the privacy check"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("unterminated private-key block"),
+        "{message}"
+    );
+    assert!(message.contains("cvc redact"), "{message}");
+    Ok(())
+}
+
+#[test]
+fn a_clean_published_node_does_not_stop_a_push() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("an ordinary prompt");
+    store.create_interaction(&item)?;
+    // A key block that has its END line is redacted whole, not unterminated, and
+    // text that only mentions the words is not a header.
+    fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
+        node["interaction"]["user_prompt"] = "see the PRIVATE KEY section of the BEGIN docs".into();
+    })?;
+    assert!(sync::push_projection_to_ref(
+        &repo,
+        &store,
+        &pinned(&repo, FETCHED_BASELINE),
+        TEST_DESTINATION
+    )
+    .is_ok());
+    Ok(())
+}
+
+#[test]
+fn a_published_node_that_only_mentions_a_key_header_does_not_stop_a_push() -> anyhow::Result<()> {
+    for (place, text) in [
+        (
+            "prompt",
+            "A key file must start with -----BEGIN RSA PRIVATE KEY----- and end with its END line.",
+        ),
+        (
+            "response",
+            "Header:\n-----BEGIN PRIVATE KEY-----\nThe next line is ordinary text, not a key.",
+        ),
+        ("tool arguments", "-----END PRIVATE KEY-----"),
+    ] {
+        let temp = TempDir::new()?;
+        let repo = Repository::init(temp.path())?;
+        let store = CvcStore::open(temp.path().join("source.db"))?;
+        let item = published_item("an ordinary prompt");
+        store.create_interaction(&item)?;
+        let id = item.id.to_string();
+        fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| match place {
+            "prompt" => node["interaction"]["user_prompt"] = text.into(),
+            "response" => node["interaction"]["model_response"] = text.into(),
+            _ => {
+                node["tool_executions"] = serde_json::json!([{
+                    "id": 1, "interaction_id": id, "tool_protocol": "native",
+                    "tool_name": "Write", "status": "success",
+                    "arguments": serde_json::json!({"content": text}).to_string(),
+                }]);
+            }
+        })?;
+        assert!(
+            sync::push_projection_to_ref(
+                &repo,
+                &store,
+                &pinned(&repo, FETCHED_BASELINE),
+                TEST_DESTINATION
+            )
+            .is_ok(),
+            "{place}: prose that mentions a header must not stop the push"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_secret_in_a_marker_name_of_a_remote_node_is_refused_on_push_and_rewritten_on_import(
+) -> anyhow::Result<()> {
+    use cvc_core::stimulus::{self, Reading, StimulusPart};
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("an ordinary prompt");
+    store.create_interaction(&item)?;
+    let id = item.id.to_string();
+    // A node as a hostile remote could write it: a stimulus that verifies, with
+    // a token where a tool's name goes. Names are not covered by the boundary.
+    let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    let crafted = stimulus::render(
+        &item.id,
+        &[
+            StimulusPart::tool_result(Some(secret), false, "output"),
+            StimulusPart::prompt("then a person"),
+        ],
+        &|text| Ok(text.to_owned()),
+    );
+    assert!(crafted.contains(&format!("[tool_result {secret} ")));
+    fetch_baseline_with_edited_node(&repo, &store, &item.id, |node| {
+        node["interaction"]["user_prompt"] = crafted.clone().into();
+    })?;
+
+    // Pushing on top of it stops: the node no longer passes the privacy check.
+    let message = push_error(&repo, &store);
+    assert!(message.contains(&id), "{message}");
+    assert!(
+        message.contains("no longer passes the privacy check"),
+        "{message}"
+    );
+
+    // Pulling it rewrites the name before the first write, and what is stored
+    // is still the verified stimulus.
+    let imported = CvcStore::open(temp.path().join("imported.db"))?;
+    sync::pull_from_ref(&repo, &imported, FETCHED_BASELINE, TEST_DESTINATION)?;
+    let stored = imported
+        .get_interaction(&item.id)?
+        .expect("the node was imported")
+        .user_prompt;
+    assert!(!stored.contains("ghp_"), "{stored}");
+    assert!(stored.contains("[tool_result redacted-tool "), "{stored}");
+    assert!(matches!(
+        stimulus::read(&item.id, &stored),
+        Reading::Verified(_)
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_context_range_an_earlier_version_stored_with_a_negative_line_is_published_without_it(
+) -> anyhow::Result<()> {
+    // A Read with huge numbers wrapped around in a release build and stored a negative
+    // end line; a remote refuses such an item, so a push of its conversation failed
+    // every time. The item is published, without a range.
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("source.db"))?;
+    let item = published_item("a thought that read three ranges");
+    let range = |path: &str, start: Option<i32>, end: Option<i32>| ContextItem {
+        id: None,
+        interaction_id: item.id.clone(),
+        file_path: path.into(),
+        git_blob_sha: None,
+        dirty_patch: None,
+        start_line: start,
+        end_line: end,
+    };
+    store.capture_mcp(McpCapture::new(
+        Conversation {
+            id: item.conversation_id.clone(),
+            title: "fixture".into(),
+            created_at: item.timestamp,
+        },
+        item.clone(),
+        vec![
+            range("src/wrapped.rs", Some(5), Some(-3)),
+            range("src/negative_start.rs", Some(-1), Some(9)),
+            range("src/fine.rs", Some(3), Some(8)),
+        ],
+        Vec::new(),
+        PreparedPolicy::built_ins_only(),
+        "0".repeat(64),
+    ))?;
+    store.share_conversation_for_remote(
+        &item.conversation_id,
+        TEST_DESTINATION,
+        FutureSharePolicy::Private,
+    )?;
+    let sync::ProjectionResult::Candidate { oid, candidate, .. } =
+        sync::push_projection_to_ref(&repo, &store, &pinned(&repo, ""), TEST_DESTINATION)?
+    else {
+        panic!("the thought is something to publish")
+    };
+    drop(candidate);
+    let id = item.id.to_string();
+    let tree = repo.find_commit(oid)?.tree()?;
+    let entry = tree.get_path(std::path::Path::new(&format!(
+        "nodes/{}/{id}.json",
+        &id[..2]
+    )))?;
+    let node: serde_json::Value = serde_json::from_slice(repo.find_blob(entry.id())?.content())?;
+    let ranges: std::collections::BTreeMap<String, (serde_json::Value, serde_json::Value)> = node
+        ["context_items"]
+        .as_array()
+        .expect("context items")
+        .iter()
+        .map(|item| {
+            (
+                item["file_path"].as_str().unwrap().to_owned(),
+                (item["start_line"].clone(), item["end_line"].clone()),
+            )
+        })
+        .collect();
+    assert_eq!(ranges.len(), 3);
+    assert_eq!(
+        ranges["src/wrapped.rs"],
+        (serde_json::Value::Null, serde_json::Value::Null)
+    );
+    assert_eq!(
+        ranges["src/negative_start.rs"],
+        (serde_json::Value::Null, serde_json::Value::Null)
+    );
+    assert_eq!(ranges["src/fine.rs"], (3.into(), 8.into()));
+    // The stored rows are not touched: the repair is made on what is published.
+    let stored = store.get_context_items(&item.id)?;
+    assert!(stored.iter().any(|row| row.end_line == Some(-3)));
+    Ok(())
+}
+
+// ---- hostile names in a remote tree --------------------------------------------------------
+
+const HOSTILE_REF: &str = "refs/cvc/hostile";
+
+/// A ref whose tree holds `<namespace>/<shard>/<file>`, as a hostile remote could
+/// publish it. The events and ranges namespaces come with FORMAT 5 and the empty
+/// sibling tree that format requires, so a name is all that is wrong with them.
+fn hostile_ref(
+    repo: &Repository,
+    namespace: &str,
+    shard: &str,
+    file: &str,
+    body: &[u8],
+) -> anyhow::Result<()> {
+    let mut shard_tree = repo.treebuilder(None)?;
+    shard_tree.insert(file, repo.blob(body)?, FileMode::Blob.into())?;
+    let mut outer = repo.treebuilder(None)?;
+    outer.insert(shard, shard_tree.write()?, FileMode::Tree.into())?;
+    let mut root = repo.treebuilder(None)?;
+    root.insert(namespace, outer.write()?, FileMode::Tree.into())?;
+    if namespace != "tombstones" {
+        let empty = repo.treebuilder(None)?.write()?;
+        let sibling = if namespace == "events" {
+            "ranges"
+        } else {
+            "events"
+        };
+        root.insert(sibling, empty, FileMode::Tree.into())?;
+        root.insert("FORMAT", repo.blob(b"5\n")?, FileMode::Blob.into())?;
+    }
+    let tree = repo.find_tree(root.write()?)?;
+    let signature = Signature::now("test", "test@example.test")?;
+    repo.commit(
+        Some(HOSTILE_REF),
+        &signature,
+        &signature,
+        "hostile names",
+        &tree,
+        &[],
+    )?;
+    Ok(())
+}
+
+/// What pulling that ref does: an `Err` with its message, `Ok` for a tree that is
+/// accepted, and a failure of the test for a panic.
+fn pull_hostile(
+    namespace: &str,
+    shard: &str,
+    file: &str,
+    body: &[u8],
+) -> anyhow::Result<Result<(), String>> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let store = CvcStore::open(temp.path().join("pulled.db"))?;
+    hostile_ref(&repo, namespace, shard, file, body)?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sync::pull_from_ref(&repo, &store, HOSTILE_REF, TEST_DESTINATION)
+    }));
+    match outcome {
+        Ok(result) => Ok(result.map_err(|error| error.to_string())),
+        Err(_) => panic!("pulling {namespace}/{shard}/{file:?} panicked"),
+    }
+}
+
+#[test]
+fn a_remote_tombstone_name_that_is_not_a_canonical_id_is_an_error_never_a_panic(
+) -> anyhow::Result<()> {
+    let id = InteractionId::new().to_string();
+    let body = serde_json::to_vec(&Tombstone::new(
+        id.parse()?,
+        TombstoneReasonCode::Security,
+        None,
+    ))?;
+    let other_shard = if id.starts_with("00") { "01" } else { "00" };
+    let simple = id.replace('-', "");
+    let cases: Vec<(&str, String, String, &str)> = vec![
+        (
+            "a one-byte stem",
+            "ab".into(),
+            "a.json".into(),
+            "invalid tombstone filename",
+        ),
+        (
+            "an empty stem",
+            "ab".into(),
+            ".json".into(),
+            "invalid tombstone filename",
+        ),
+        (
+            "a multibyte character across byte 2",
+            "ab".into(),
+            "aé.json".into(),
+            "invalid tombstone filename",
+        ),
+        (
+            "a multibyte stem as long as an id",
+            "c3".into(),
+            format!("{}.json", "é".repeat(18)),
+            "invalid tombstone filename",
+        ),
+        (
+            "an uppercase id",
+            id[..2].to_uppercase(),
+            format!("{}.json", id.to_uppercase()),
+            "invalid tombstone filename",
+        ),
+        (
+            "an id without hyphens",
+            id[..2].into(),
+            format!("{simple}.json"),
+            "invalid tombstone filename",
+        ),
+        (
+            "a name that is not an id",
+            "ab".into(),
+            "ab-not-an-interaction-id.json".into(),
+            "invalid tombstone filename",
+        ),
+        (
+            "a name without .json",
+            id[..2].into(),
+            id.clone(),
+            "invalid tombstone filename",
+        ),
+        (
+            "an id in the wrong shard",
+            other_shard.into(),
+            format!("{id}.json"),
+            "tombstone shard mismatch",
+        ),
+    ];
+    for (case, shard, file, message) in cases {
+        let result = pull_hostile("tombstones", &shard, &file, &body)?;
+        let error = result.expect_err(case);
+        assert!(error.contains(message), "{case}: {error}");
+    }
+    // A valid tree is still accepted.
+    assert_eq!(
+        pull_hostile("tombstones", &id[..2], &format!("{id}.json"), &body)?,
+        Ok(())
+    );
+    Ok(())
+}
+
+#[test]
+fn a_remote_event_or_range_name_that_is_not_a_digest_is_an_error_never_a_panic(
+) -> anyhow::Result<()> {
+    for (namespace, lower_only, invalid, mismatch) in [
+        (
+            "events",
+            false,
+            "invalid event filename",
+            "event path mismatch",
+        ),
+        (
+            "ranges",
+            true,
+            "invalid range filename",
+            "range path mismatch",
+        ),
+    ] {
+        let digest = "a".repeat(64);
+        let mut cases: Vec<(&str, String, String, &str)> = vec![
+            ("a one-byte stem", "aa".into(), "a.json".into(), invalid),
+            ("an empty stem", "aa".into(), ".json".into(), invalid),
+            (
+                "a multibyte character across byte 2",
+                "aa".into(),
+                "aé.json".into(),
+                invalid,
+            ),
+            (
+                "a multibyte stem as long as a digest",
+                "c3".into(),
+                format!("{}.json", "é".repeat(32)),
+                invalid,
+            ),
+            (
+                "a stem of the right length that is not hex",
+                "aa".into(),
+                format!("{}.json", "g".repeat(64)),
+                invalid,
+            ),
+            (
+                "a digest in the wrong shard",
+                "bb".into(),
+                format!("{digest}.json"),
+                mismatch,
+            ),
+        ];
+        if lower_only {
+            cases.push((
+                "an uppercase stem",
+                "aa".into(),
+                format!("{}.json", "A".repeat(64)),
+                invalid,
+            ));
+            cases.push((
+                "an uppercase shard",
+                "AA".into(),
+                format!("{digest}.json"),
+                "invalid range shard",
+            ));
+        }
+        for (case, shard, file, message) in cases {
+            let result = pull_hostile(namespace, &shard, &file, b"{}")?;
+            let error = result.expect_err(case);
+            assert!(error.contains(message), "{namespace}, {case}: {error}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_local_event_with_a_malformed_id_is_an_error_at_projection() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let repo = Repository::init(temp.path())?;
+    let db_path = temp.path().join("source.db");
+    let store = CvcStore::open(&db_path)?;
+    let item = published_item("an ordinary prompt");
+    store.create_interaction(&item)?;
+    let mut event = derivation(&item.id, 'a', Vec::new());
+    event.event_id = "a".into();
+    insert_event_fixture(&db_path, &event)?;
+    trust_and_authorize_event(&db_path, &event)?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sync::push_projection_to_ref(&repo, &store, &pinned(&repo, ""), TEST_DESTINATION).is_err()
+    }));
+    assert_eq!(outcome.ok(), Some(true), "projecting a malformed event id");
+    Ok(())
+}
+
+/// No public way of importing a CVC ref leaves a conversation id as the remote
+/// wrote it: each one takes the destination's fingerprint and namespaces every
+/// imported conversation as `remote:<fingerprint>:<id>`, so a remote session id
+/// can never become, or join, a local conversation and its share policy.
+#[test]
+fn every_import_is_namespaced_by_its_destination() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let source = CvcStore::open(temp_dir.path().join("source.db"))?;
+    for conversation in ["session-a", "session-b"] {
+        source.create_interaction(&summary_interaction(conversation, "a thought"))?;
+    }
+    let ref_name = "refs/cvc/namespaced";
+    project_fixture_to_ref(&repo, &source, ref_name)?;
+    // What a fetch leaves for the production pull to read.
+    let tip = repo.find_reference(ref_name)?.target().expect("direct ref");
+    repo.reference(PIN_TRACKING_REF, tip, true, "fixture: fetched")?;
+
+    let expected = vec![
+        format!("remote:{TEST_DESTINATION}:session-a"),
+        format!("remote:{TEST_DESTINATION}:session-b"),
+    ];
+    let imported = |name: &str| -> anyhow::Result<(Vec<String>, Vec<String>, Vec<String>)> {
+        let raw = Connection::open(temp_dir.path().join(name))?;
+        let column = |sql: &str| -> anyhow::Result<Vec<String>> {
+            Ok(raw
+                .prepare(sql)?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?)
+        };
+        Ok((
+            column("SELECT id FROM conversations ORDER BY id")?,
+            column("SELECT DISTINCT conversation_id FROM interactions ORDER BY conversation_id")?,
+            column("SELECT DISTINCT remote_fingerprint FROM publications")?,
+        ))
+    };
+
+    let plain = CvcStore::open(temp_dir.path().join("plain.db"))?;
+    sync::pull_from_ref(&repo, &plain, ref_name, TEST_DESTINATION)?;
+    let bounded = CvcStore::open(temp_dir.path().join("bounded.db"))?;
+    sync::pull_from_ref_with_limits(
+        &repo,
+        &bounded,
+        ref_name,
+        TEST_DESTINATION,
+        sync::SyncReadLimits::default(),
+    )?;
+    let fetched = CvcStore::open(temp_dir.path().join("fetched.db"))?;
+    assert_eq!(
+        sync::pull_destination(&repo, &fetched, &pin_destination())?,
+        2
+    );
+    for name in ["plain.db", "bounded.db", "fetched.db"] {
+        let (conversations, interactions, publications) = imported(name)?;
+        assert_eq!(conversations, expected, "{name}");
+        assert_eq!(interactions, expected, "{name}");
+        assert_eq!(publications, vec![TEST_DESTINATION.to_owned()], "{name}");
+    }
+
+    // A fingerprint that is not one is refused before anything is read.
+    let short = "0".repeat(63);
+    let not_hex = "g".repeat(64);
+    let suffixed = format!("{TEST_DESTINATION}:x");
+    for bad in [
+        "",
+        "remote",
+        short.as_str(),
+        not_hex.as_str(),
+        suffixed.as_str(),
+    ] {
+        let store = CvcStore::open(temp_dir.path().join("refused.db"))?;
+        for result in [
+            sync::pull_from_ref(&repo, &store, ref_name, bad),
+            sync::pull_from_ref_with_limits(
+                &repo,
+                &store,
+                ref_name,
+                bad,
+                sync::SyncReadLimits::default(),
+            ),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("invalid destination fingerprint"),
+                "{bad:?}: {error}"
+            );
+        }
+        assert!(store.get_all_interaction_ids()?.is_empty(), "{bad:?}");
+    }
     Ok(())
 }

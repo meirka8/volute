@@ -44,9 +44,10 @@ const TEMPORAL_COMMIT_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const idWith = (version: string, variant: string) => `123e4567-e89b-${version}2d3-${variant}456-426614174000`;
 
 /**
- * Every real node id the shipped harness wrote (see src/test/wire/README.md), each once: the
- * edge-case step that holds a server-side search was recorded twice, by the 0.7.0 harness and
- * again by the one that records server-side outcomes, and is one interaction.
+ * Every real node id the harness wrote (see src/test/wire/README.md), each once: a step recorded
+ * again by a later harness (the server-side search by the one that records server-side outcomes,
+ * and several steps of the edge-case session by the one that marks the parts of a stimulus) is one
+ * interaction, however many files hold it.
  */
 const REAL_WIRE_IDS = [
   ...new Set(
@@ -405,6 +406,43 @@ describe("usePRInteractions", () => {
     expect(mockGetTree).toHaveBeenCalledWith(
       expect.objectContaining({ recursive: "false" }),
     );
+  });
+
+  it("returns the pull request's commits, oldest first, with their subjects, for the timeline's commit filter", async () => {
+    mockGetRef.mockResolvedValue({ data: { object: { sha: CVC_MAIN_SHA } } });
+    mockListCommits.mockResolvedValue({
+      data: [{ sha: "commit-a", commit: { message: "feat: first\n\nbody" } }, { sha: "commit-b", commit: { message: "fix: second" } }],
+    });
+    mockGetTree.mockResolvedValue({ data: { tree: [{ path: "by-commit", type: "tree" }, { path: "nodes", type: "tree" }] } });
+    mockGetContent.mockImplementation(({ path }: { path: string }) =>
+      path === "by-commit/commit-a" ? Promise.resolve({ data: [{ name: ID_ONE }] }) : Promise.reject(notFoundError()),
+    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, text: () => Promise.resolve(JSON.stringify(rawInteractionBlob(ID_ONE, ["commit-a"]))) }));
+
+    const { result } = renderWithClient("owner", "repo", 1);
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.commits).toEqual([
+      { sha: "commit-a", subject: "feat: first" },
+      { sha: "commit-b", subject: "fix: second" },
+    ]);
+    // Looked up once, with the listing the interactions were found from: no request for the subjects.
+    expect(mockListCommits).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the commits from the capped fallback too, and none when there is no history to look up", async () => {
+    mockGetRef.mockResolvedValue({ data: { object: { sha: CVC_MAIN_SHA } } });
+    mockListCommits.mockResolvedValue({ data: [{ sha: "commit-a", commit: { message: "legacy commit" } }] });
+    mockGetTree.mockResolvedValue({ data: { tree: [] } });
+    const first = renderWithClient("owner", "repo", 1);
+    await waitFor(() => expect(first.result.current.isSuccess).toBe(true));
+    expect(first.result.current.data?.commits).toEqual([{ sha: "commit-a", subject: "legacy commit" }]);
+    first.unmount();
+
+    mockGetRef.mockRejectedValue(notFoundError());
+    const second = renderWithClient("owner", "repo", 2);
+    await waitFor(() => expect(second.result.current.isSuccess).toBe(true));
+    expect(second.result.current.data?.commits).toBeUndefined();
   });
 
   it("v3 path: merges append-only temporal link metadata into a floating node", async () => {

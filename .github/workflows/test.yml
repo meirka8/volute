@@ -235,6 +235,31 @@ jobs:
       - name: Check the Claude Code plugin and marketplace
         run: node .github/scripts/check-claude-plugin.mjs
 
+  installer-unix:
+    name: Shell installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # install.sh itself downloads a release, so it is not run against the
+      # network. The script runs the real install.sh in a throwaway HOME with a
+      # stand-in for curl that serves archives built there, and checks what ends
+      # up where: the binaries, and LICENSE and THIRD-PARTY-NOTICES.md in
+      # share/cvc beside the install directory (one copy of each after a re-run,
+      # replaced in place by an upgrade); archives that lack the notices;
+      # destinations that must be refused; and that the checksum and extraction
+      # checks still stop an install before anything is written. It runs under
+      # each runner's own sh and tar: dash and GNU tar on Ubuntu, bash and bsdtar
+      # on macOS.
+      - name: Test install.sh
+        run: sh .github/scripts/test-install-sh.sh
+
   installer-windows:
     name: PowerShell installer (Windows)
     runs-on: windows-latest

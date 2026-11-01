@@ -41,6 +41,12 @@
 //! ingestion place reasoning into the database before a mid-session commit's
 //! post-commit hook runs.
 //!
+//! The planner does not render the stimulus. It hands over its *parts*, typed
+//! (a person's text, a subagent's task, harness meta text, a compaction
+//! summary, a tool result with its tool's name), and ingestion renders them
+//! with the capture's policy: scrubbed part by part, then bounded, then marked
+//! (see `crate::stimulus`).
+//!
 //! # Provider-side (server) tools
 //!
 //! A tool the model provider runs (web search, web fetch, code execution, ...)
@@ -53,6 +59,8 @@
 //! interrupted call. Only a `[<block type>]` placeholder reaches the response
 //! text, never the result's content, which is third-party text.
 use crate::models::{Author, ContextItem, InteractionId, ToolExecution, ToolStatus};
+use crate::privacy::PreparedPolicy;
+use crate::stimulus::{self, PartKind, StimulusPart};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
@@ -70,16 +78,6 @@ pub const SUPPORTED_MAJOR_VERSION: u64 = 2;
 /// A single transcript line larger than this is treated as corruption rather
 /// than buffered; Claude Code writes oversized tool output out of line.
 const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
-/// Tool output rendered into the next node's prompt keeps its head and tail.
-const TOOL_RESULT_HEAD_BYTES: usize = 6 * 1024;
-const TOOL_RESULT_TAIL_BYTES: usize = 2 * 1024;
-const MAX_PROMPT_BYTES: usize = 64 * 1024;
-const MAX_TEXT_BYTES: usize = 256 * 1024;
-/// Tool arguments stay valid JSON: long string values are truncated in place.
-const MAX_ARGUMENT_STRING_BYTES: usize = 16 * 1024;
-const MAX_ARGUMENTS_BYTES: usize = 64 * 1024;
-const MAX_TOOL_ARGUMENTS_TOTAL_BYTES: usize = 2 * 1024 * 1024;
-const MAX_TITLE_BYTES: usize = 120;
 /// Claude Code records this title before a session has a real one.
 const PLACEHOLDER_TITLE: &str = "New session";
 /// A tool the model provider runs is recorded as `server:<name>`.
@@ -740,6 +738,10 @@ pub struct PlanInput<'a> {
     /// Stop/SessionEnd semantics: every response is complete, missing tool
     /// results are failures, nothing stays pending.
     pub final_mode: bool,
+    /// The transcript is a subagent's. No person types into one, so the text
+    /// its user entries carry (the delegating agent's task, and any follow-up
+    /// it sends) is recorded as a `task`, never as a person's `prompt`.
+    pub subagent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -749,8 +751,13 @@ pub struct PlannedInteraction {
     pub parent_id: Option<InteractionId>,
     pub timestamp: DateTime<Utc>,
     pub author: Author,
-    pub user_prompt: String,
+    /// What the model was reacting to, as typed parts, raw. Render it with
+    /// [`PlannedInteraction::user_prompt`].
+    pub stimulus: Vec<StimulusPart>,
     pub model_name: Option<String>,
+    /// The model's reasoning and text, and the arguments of its tool calls
+    /// (compact JSON), all raw: neither scrubbed nor bounded. The ingest step
+    /// scrubs each in full and only then bounds it (see `fields`).
     pub model_cot: Option<String>,
     pub model_response: Option<String>,
     pub tool_executions: Vec<ToolExecution>,
@@ -768,6 +775,14 @@ pub struct PlannedInteraction {
     pub first_offset: u64,
 }
 
+impl PlannedInteraction {
+    /// The stimulus as it is stored under `policy`: each part scrubbed in full,
+    /// then bounded, then marked (see [`crate::stimulus`]).
+    pub fn user_prompt(&self, policy: &PreparedPolicy) -> String {
+        stimulus::render(&self.id, &self.stimulus, &|text| policy.scrub(text))
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Plan {
     pub interactions: Vec<PlannedInteraction>,
@@ -777,6 +792,7 @@ pub struct Plan {
     /// response, so its tool names and results stay in view for the next
     /// response's stimulus. Never moves backwards within one session.
     pub cursor_offset: u64,
+    /// The title Claude Code recorded, raw.
     pub title: Option<String>,
     /// First human prompt in the window, for conversation titling.
     pub first_human_prompt: Option<String>,
@@ -796,12 +812,6 @@ struct ToolCall<'a> {
     server: bool,
 }
 
-enum Stimulus<'a> {
-    Human { text: &'a str, meta: bool },
-    CompactSummary(&'a str),
-    ToolResult(&'a ToolResultBlock),
-}
-
 /// Plans captures for one window of parsed lines starting at `window_start`.
 pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> Plan {
     let entries: Vec<&Entry> = lines
@@ -815,9 +825,7 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
     // the user set wins over one Claude Code generated.
     let latest_title = |wanted: TitleSource| {
         lines.iter().rev().find_map(|line| match line {
-            ParsedLine::Title { text, source } if *source == wanted => {
-                Some(bounded_text(text, MAX_TITLE_BYTES))
-            }
+            ParsedLine::Title { text, source } if *source == wanted => Some(text.clone()),
             _ => None,
         })
     };
@@ -973,7 +981,7 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
             cursor = entries[position].parent_uuid.as_deref();
         }
         stimulus_positions.reverse();
-        let mut stimuli = Vec::new();
+        let mut stimulus: Vec<StimulusPart> = Vec::new();
         // Block types this parser does not record are visible in the text as
         // placeholders and reported by name, so an omission is never silent.
         let mut unrecorded_blocks: Vec<String> = Vec::new();
@@ -981,21 +989,41 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
             if let Payload::User(message) = &entries[position].payload {
                 unrecorded_blocks.extend(message.unrecorded.iter().cloned());
                 for text in &message.texts {
-                    if message.compact_summary {
-                        stimuli.push(Stimulus::CompactSummary(text));
+                    let kind = if message.compact_summary {
+                        PartKind::CompactionSummary
+                    } else if message.meta {
+                        PartKind::Meta
+                    } else if input.subagent {
+                        PartKind::Task
                     } else {
-                        stimuli.push(Stimulus::Human {
-                            text,
-                            meta: message.meta,
-                        });
-                    }
+                        PartKind::Prompt
+                    };
+                    stimulus.push(StimulusPart {
+                        kind,
+                        name: None,
+                        is_error: false,
+                        text: text.clone(),
+                    });
                 }
                 for result in &message.tool_results {
-                    stimuli.push(Stimulus::ToolResult(result));
+                    stimulus.push(StimulusPart::tool_result(
+                        tool_names.get(result.tool_use_id.as_str()).copied(),
+                        result.is_error,
+                        result.content.clone(),
+                    ));
                 }
             }
         }
-        let (user_prompt, author) = render_stimuli(&stimuli, &tool_names);
+        // A person (or, in a subagent, the agent that delegated to it) wrote
+        // some of it, or none did.
+        let author = if stimulus
+            .iter()
+            .any(|part| matches!(part.kind, PartKind::Prompt | PartKind::Task))
+        {
+            Author::Human
+        } else {
+            Author::System
+        };
 
         let id = derived_interaction_id(input.session_id, &group.key);
         let parent_id =
@@ -1034,10 +1062,9 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
                 }
             }
         }
-        let model_response = join_bounded(&texts, MAX_TEXT_BYTES);
-        let model_cot = join_bounded(&thoughts, MAX_TEXT_BYTES);
+        let model_response = join_texts(&texts);
+        let model_cot = join_texts(&thoughts);
 
-        let mut budget = MAX_TOOL_ARGUMENTS_TOTAL_BYTES;
         let mut tool_executions = Vec::with_capacity(tool_uses.len());
         let mut context_items: Vec<ContextItem> = Vec::new();
         let mut commit_candidates: Vec<String> = Vec::new();
@@ -1079,7 +1106,7 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
                     "native".to_owned()
                 },
                 tool_name: call.name.to_owned(),
-                arguments: bounded_arguments(call.input, &mut budget),
+                arguments: call.input.to_string(),
                 status,
             });
             if let Some(item) = context_item_for(call.name, call.input, input, &id) {
@@ -1102,7 +1129,7 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
             parent_id,
             timestamp,
             author,
-            user_prompt,
+            stimulus,
             model_name,
             model_cot,
             model_response,
@@ -1195,49 +1222,7 @@ fn is_hex_token(token: &str) -> bool {
     (7..=40).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn render_stimuli(stimuli: &[Stimulus<'_>], tool_names: &HashMap<&str, &str>) -> (String, Author) {
-    let mut author = Author::System;
-    let mut parts = Vec::with_capacity(stimuli.len());
-    for stimulus in stimuli {
-        match stimulus {
-            Stimulus::Human { text, meta } => {
-                if !*meta {
-                    author = Author::Human;
-                    parts.push(bounded_text(text, MAX_PROMPT_BYTES));
-                } else {
-                    parts.push(format!("[meta] {}", bounded_text(text, MAX_PROMPT_BYTES)));
-                }
-            }
-            Stimulus::CompactSummary(text) => parts.push(format!(
-                "[compaction summary]\n{}",
-                bounded_text(text, MAX_PROMPT_BYTES)
-            )),
-            Stimulus::ToolResult(result) => {
-                let name = tool_names
-                    .get(result.tool_use_id.as_str())
-                    .copied()
-                    .unwrap_or("unknown-tool");
-                let outcome = if result.is_error { " error" } else { "" };
-                parts.push(format!(
-                    "[tool_result {name}{outcome}] {}",
-                    bounded_head_tail(
-                        &result.content,
-                        TOOL_RESULT_HEAD_BYTES,
-                        TOOL_RESULT_TAIL_BYTES
-                    )
-                ));
-            }
-        }
-    }
-    let prompt = if parts.is_empty() {
-        "[no stimulus recorded]".to_owned()
-    } else {
-        bounded_text(&parts.join("\n\n"), MAX_PROMPT_BYTES)
-    };
-    (prompt, author)
-}
-
-fn join_bounded(parts: &[&str], max: usize) -> Option<String> {
+fn join_texts(parts: &[&str]) -> Option<String> {
     let joined = parts
         .iter()
         .filter(|part| !part.trim().is_empty())
@@ -1247,38 +1232,7 @@ fn join_bounded(parts: &[&str], max: usize) -> Option<String> {
     if joined.is_empty() {
         None
     } else {
-        Some(bounded_text(&joined, max))
-    }
-}
-
-/// Serializes tool input as JSON that stays valid after size bounding.
-fn bounded_arguments(input: &Value, budget: &mut usize) -> String {
-    let mut value = input.clone();
-    bound_strings(&mut value, MAX_ARGUMENT_STRING_BYTES);
-    let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
-    if serialized.len() > MAX_ARGUMENTS_BYTES || serialized.len() > *budget {
-        return serde_json::json!({
-            "cvc_truncated": true,
-            "bytes": input.to_string().len(),
-        })
-        .to_string();
-    }
-    *budget -= serialized.len();
-    serialized
-}
-
-fn bound_strings(value: &mut Value, max: usize) {
-    match value {
-        Value::String(text) => {
-            if text.len() > max {
-                *text = bounded_text(text, max);
-            }
-        }
-        Value::Array(items) => items.iter_mut().for_each(|item| bound_strings(item, max)),
-        Value::Object(fields) => fields
-            .values_mut()
-            .for_each(|item| bound_strings(item, max)),
-        _ => {}
+        Some(joined)
     }
 }
 
@@ -1299,22 +1253,7 @@ fn context_item_for(
     let raw = input.get(path_key)?.as_str()?;
     let file_path = worktree_relative(raw, plan_input.worktree_root, plan_input.path_aliases)?;
     let (start_line, end_line) = if tool_name == "Read" {
-        let offset = input
-            .get("offset")
-            .and_then(Value::as_i64)
-            .filter(|value| *value >= 1);
-        let limit = input
-            .get("limit")
-            .and_then(Value::as_i64)
-            .filter(|value| *value >= 1);
-        match (offset, limit) {
-            (Some(offset), Some(limit)) => (
-                Some(offset.min(i32::MAX as i64) as i32),
-                Some((offset + limit - 1).min(i32::MAX as i64) as i32),
-            ),
-            (Some(offset), None) => (Some(offset.min(i32::MAX as i64) as i32), None),
-            _ => (None, None),
-        }
+        read_range(input)
     } else {
         (None, None)
     };
@@ -1327,6 +1266,31 @@ fn context_item_for(
         start_line,
         end_line,
     })
+}
+
+/// The first and last line a Read call asked for, as a context item records
+/// them. `offset` is the line to start at and `limit` how many lines to read; the
+/// model chooses both, and `i64::MAX` is a valid JSON integer it can write. Lines
+/// are numbered from 1 and held in 32 bits, so a value outside `1..=i32::MAX` is
+/// clamped to it (a value below 1 is no line at all and gives no range), and the
+/// last line is worked out without overflowing.
+fn read_range(input: &Value) -> (Option<i32>, Option<i32>) {
+    let line = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 1)
+    };
+    let held = |value: i64| value.clamp(1, i64::from(i32::MAX)) as i32;
+    match (line("offset"), line("limit")) {
+        (Some(offset), Some(limit)) => {
+            // offset + limit - 1, which is at least `offset` because `limit` is at least 1.
+            let last = offset.saturating_add(limit - 1);
+            (Some(held(offset)), Some(held(last)))
+        }
+        (Some(offset), None) => (Some(held(offset)), None),
+        _ => (None, None),
+    }
 }
 
 fn worktree_relative(
@@ -1363,58 +1327,163 @@ fn worktree_relative(
     Some(rendered)
 }
 
-fn truncate_to_boundary(text: &str, max: usize) -> &str {
-    if text.len() <= max {
-        return text;
-    }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
-fn bounded_text(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_owned();
-    }
-    let kept = truncate_to_boundary(text, max);
-    format!(
-        "{kept}\n…[cvc: truncated {} bytes]",
-        text.len() - kept.len()
-    )
-}
-
-fn bounded_head_tail(text: &str, head: usize, tail: usize) -> String {
-    if text.len() <= head + tail {
-        return text.to_owned();
-    }
-    let kept_head = truncate_to_boundary(text, head);
-    let mut start = text.len() - tail;
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    let omitted = start - kept_head.len();
-    format!(
-        "{kept_head}\n…[cvc: truncated {omitted} bytes]…\n{}",
-        &text[start..]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ---- the line range of a Read call: the model chooses the numbers -------------
+
     #[test]
-    fn bounded_helpers_respect_char_boundaries() {
-        let text = "héllo wörld";
-        assert_eq!(truncate_to_boundary(text, 2), "h");
-        assert!(bounded_text(text, 3).starts_with("hé"));
-        let long = "a".repeat(100) + "é" + &"b".repeat(100);
-        let rendered = bounded_head_tail(&long, 10, 10);
-        assert!(rendered.starts_with(&"a".repeat(10)));
-        assert!(rendered.ends_with(&"b".repeat(10)));
-        assert!(rendered.contains("truncated"));
+    fn a_read_range_is_clamped_and_never_overflows() {
+        let max = i64::MAX;
+        let big = i32::MAX;
+        let wide = i64::from(i32::MAX);
+        let cases = [
+            // Ordinary ranges are as they were.
+            (
+                serde_json::json!({"offset": 10, "limit": 5}),
+                (Some(10), Some(14)),
+            ),
+            (
+                serde_json::json!({"offset": 1, "limit": 1}),
+                (Some(1), Some(1)),
+            ),
+            (serde_json::json!({"offset": 7}), (Some(7), None)),
+            (serde_json::json!({"limit": 5}), (None, None)),
+            (serde_json::json!({}), (None, None)),
+            // Below 1 is no line.
+            (serde_json::json!({"offset": 0, "limit": 5}), (None, None)),
+            (serde_json::json!({"offset": -5, "limit": 5}), (None, None)),
+            (
+                serde_json::json!({"offset": i64::MIN, "limit": i64::MIN}),
+                (None, None),
+            ),
+            (
+                serde_json::json!({"offset": 5, "limit": 0}),
+                (Some(5), None),
+            ),
+            (
+                serde_json::json!({"offset": 5, "limit": -1}),
+                (Some(5), None),
+            ),
+            (
+                serde_json::json!({"offset": 5, "limit": i64::MIN}),
+                (Some(5), None),
+            ),
+            // Huge numbers are held at the largest line.
+            (
+                serde_json::json!({"offset": max, "limit": max}),
+                (Some(big), Some(big)),
+            ),
+            (
+                serde_json::json!({"offset": 1, "limit": max}),
+                (Some(1), Some(big)),
+            ),
+            (
+                serde_json::json!({"offset": max, "limit": 1}),
+                (Some(big), Some(big)),
+            ),
+            (serde_json::json!({"offset": max}), (Some(big), None)),
+            (
+                serde_json::json!({"offset": 5, "limit": max}),
+                (Some(5), Some(big)),
+            ),
+            (
+                serde_json::json!({"offset": wide, "limit": 1}),
+                (Some(big), Some(big)),
+            ),
+            (
+                serde_json::json!({"offset": wide + 1, "limit": 1}),
+                (Some(big), Some(big)),
+            ),
+            (
+                serde_json::json!({"offset": 3_000_000_000i64, "limit": 3_000_000_000i64}),
+                (Some(big), Some(big)),
+            ),
+            (
+                serde_json::json!({"offset": 100, "limit": 10_000_000_000i64}),
+                (Some(100), Some(big)),
+            ),
+            // Not integers a line number can be.
+            (serde_json::json!({"offset": 1.5, "limit": 2}), (None, None)),
+            (
+                serde_json::json!({"offset": "10", "limit": "5"}),
+                (None, None),
+            ),
+            (
+                serde_json::json!({"offset": u64::MAX, "limit": 5}),
+                (None, None),
+            ),
+            (
+                serde_json::json!({"offset": null, "limit": null}),
+                (None, None),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(read_range(&input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn every_pair_of_extreme_numbers_gives_a_range_that_can_be_stored_and_published() {
+        let numbers = [
+            i64::MIN,
+            i64::MIN + 1,
+            -1,
+            0,
+            1,
+            2,
+            i64::from(i32::MAX) - 1,
+            i64::from(i32::MAX),
+            i64::from(i32::MAX) + 1,
+            i64::MAX / 2,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        for offset in numbers {
+            for limit in numbers {
+                let (start, end) =
+                    read_range(&serde_json::json!({"offset": offset, "limit": limit}));
+                if let Some(start) = start {
+                    assert!(start >= 1, "{offset} {limit}");
+                }
+                if let Some(end) = end {
+                    assert!(
+                        end >= start.expect("an end has a start") && end >= 1,
+                        "{offset} {limit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_with_extreme_numbers_is_planned_with_a_valid_range() {
+        let calls: Vec<serde_json::Value> = [
+            (i64::MAX, i64::MAX),
+            (1, i64::MAX),
+            (i64::MAX, 1),
+            (i64::MIN, i64::MIN),
+            (0, 0),
+            (-7, 3),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(n, (offset, limit))| {
+            serde_json::json!({"type": "tool_use", "id": format!("toolu_{n}"), "name": "Read",
+                               "input": {"file_path": "/work/repo/src/lib.rs",
+                                         "offset": offset, "limit": limit}})
+        })
+        .collect();
+        let planned = respond(serde_json::Value::Array(calls));
+        assert!(!planned.context_items.is_empty());
+        for item in &planned.context_items {
+            assert!(item.start_line.is_none_or(|line| line >= 1), "{item:?}");
+            assert!(item.end_line.is_none_or(|line| line >= 1), "{item:?}");
+            if let (Some(start), Some(end)) = (item.start_line, item.end_line) {
+                assert!(end >= start, "{item:?}");
+            }
+        }
     }
 
     #[test]
@@ -1604,6 +1673,7 @@ mod tests {
                 worktree_root: Path::new("/work/repo"),
                 path_aliases: &[],
                 final_mode,
+                subagent: false,
             },
         )
     }

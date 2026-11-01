@@ -255,7 +255,7 @@ mod scripts {
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
     use std::fs;
-    use std::io::Write;
+    use std::io::{self, Write};
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::Path;
     use std::process::{Command, Output, Stdio};
@@ -319,10 +319,60 @@ mod scripts {
         );
     }
 
+    /// `BrokenPipe` from a write to a command's stdin says that the command
+    /// stopped reading: it exited, or closed its stdin, before it had all of
+    /// what was written. Nothing else does.
+    fn stopped_reading(written: io::Result<()>) -> io::Result<()> {
+        match written {
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+            other => other,
+        }
+    }
+
+    /// Runs `command` with `input` on its stdin and returns what it did, as
+    /// `Command::output` does for a command that is given no input.
+    ///
+    /// A command may decide before it has read its input, and exit: the
+    /// launcher does when it finds no `cvc`, and so does a shell that cannot
+    /// open the script it is told to run. Whether the write then meets the
+    /// closed pipe depends on which side is quicker. It is the command's
+    /// answer, not a failure of the harness: the status, stdout and stderr say
+    /// the rest, and the tests assert on them. Every other write error still
+    /// fails the test.
+    ///
+    /// The input is written from a thread of its own, and the pipe is closed
+    /// behind it so that a command that reads to the end sees the end, while
+    /// this thread collects the output. A command that writes more than a pipe
+    /// holds before it reads its stdin cannot deadlock the test, and there is
+    /// no sleeping on either side.
+    fn output_with_stdin(command: &mut Command, input: &[u8]) -> Output {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                let written = stdin.write_all(input);
+                drop(stdin);
+                stopped_reading(written)
+            });
+            let output = child.wait_with_output().unwrap();
+            writer
+                .join()
+                .expect("the thread writing the input panicked")
+                .unwrap_or_else(|error| panic!("cannot write the input to the command: {error}"));
+            output
+        })
+    }
+
     /// Runs a hook command from `hooks.json` as Claude Code does: through
     /// `/bin/sh -c`, in `cwd` (where the session started, too), with
     /// `CLAUDE_PLUGIN_ROOT` set to `root` and a PATH of just `path`, `input`
-    /// on stdin. Nothing else of this process's environment is inherited.
+    /// on stdin. Nothing else of this process's environment is inherited. The
+    /// command may exit without reading `input` (see [`output_with_stdin`]).
     fn run_hook_command_from(
         command: &str,
         root: &Path,
@@ -331,26 +381,22 @@ mod scripts {
         home: &Path,
         input: &[u8],
     ) -> Output {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", command])
-            .current_dir(cwd)
-            .env_clear()
-            .env("PATH", path)
-            .env("HOME", home)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", home.join("empty.gitconfig"))
-            .env("GIT_TEMPLATE_DIR", home.join("templates"))
-            .env("CLAUDE_PLUGIN_ROOT", root)
-            // The directory the session was started in, which Claude Code
-            // exports to every hook.
-            .env("CLAUDE_PROJECT_DIR", cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(input).unwrap();
-        child.wait_with_output().unwrap()
+        output_with_stdin(
+            Command::new("/bin/sh")
+                .args(["-c", command])
+                .current_dir(cwd)
+                .env_clear()
+                .env("PATH", path)
+                .env("HOME", home)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", home.join("empty.gitconfig"))
+                .env("GIT_TEMPLATE_DIR", home.join("templates"))
+                .env("CLAUDE_PLUGIN_ROOT", root)
+                // The directory the session was started in, which Claude Code
+                // exports to every hook.
+                .env("CLAUDE_PROJECT_DIR", cwd),
+            input,
+        )
     }
 
     fn run_hook_command(
@@ -424,6 +470,58 @@ mod scripts {
             .unwrap();
         assert_eq!(output.status.code(), Some(0));
         assert!(marker.exists(), "a program that runs leaves its marker");
+    }
+
+    /// A command that exits without reading its input is not an error of the
+    /// harness: what it did is in its status, stdout and stderr. The input is
+    /// more than a pipe holds, so the write cannot be over before the command
+    /// is gone, and meets the closed pipe whichever side is quicker.
+    #[test]
+    fn a_command_that_exits_without_reading_its_input_is_not_an_error_of_the_harness() {
+        let input = vec![b'x'; 1 << 20];
+        let output = output_with_stdin(
+            Command::new("/bin/sh").args(["-c", "echo out; echo err >&2; exit 3"]),
+            &input,
+        );
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+    }
+
+    /// A command that reads its input is given all of it, and its end. What
+    /// `cat` writes back is as much as it was given, more than a pipe holds in
+    /// either direction, so it comes back whole only if the input is written
+    /// while the output is collected.
+    #[test]
+    fn a_command_that_reads_its_input_is_given_all_of_it_and_its_end() {
+        let input: Vec<u8> = (0..1u32 << 20).map(|n| (n % 251) as u8).collect();
+        let output = output_with_stdin(&mut Command::new("cat"), &input);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            output.stdout == input,
+            "{} bytes came back of {}",
+            output.stdout.len(),
+            input.len()
+        );
+        assert!(output.stderr.is_empty());
+    }
+
+    /// Only a broken pipe means that the command stopped reading; any other
+    /// error from the write still fails the test that made it.
+    #[test]
+    fn only_a_broken_pipe_means_that_the_command_stopped_reading() {
+        assert!(stopped_reading(Ok(())).is_ok());
+        assert!(stopped_reading(Err(io::ErrorKind::BrokenPipe.into())).is_ok());
+        for kind in [
+            io::ErrorKind::WriteZero,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::Other,
+        ] {
+            let error = stopped_reading(Err(kind.into())).unwrap_err();
+            assert_eq!(error.kind(), kind);
+        }
     }
 
     #[test]
@@ -895,24 +993,17 @@ mod scripts {
             "#!/bin/sh\nprintf 'ran cvc\\n'\nfor argument in \"$@\"; do printf 'argument [%s]\\n' \"$argument\"; done\nwhile IFS= read -r line; do printf 'input [%s]\\n' \"$line\"; done\nexit 42\n",
         );
         let launcher = plugin_file("scripts/run-cvc.sh");
-        let mut child = Command::new("/bin/sh")
-            .arg(&launcher)
-            .args(["one two", "*", "", "--hook"])
-            .current_dir(temp.path())
-            .env_clear()
-            .env("PATH", format!(".:{}", bin.display()))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"first\nsecond line\n")
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
+        // The stand-in reads all of stdin. If the launcher did not find it,
+        // the assertions below would say so, rather than a broken pipe.
+        let output = output_with_stdin(
+            Command::new("/bin/sh")
+                .arg(&launcher)
+                .args(["one two", "*", "", "--hook"])
+                .current_dir(temp.path())
+                .env_clear()
+                .env("PATH", format!(".:{}", bin.display())),
+            b"first\nsecond line\n",
+        );
         assert_eq!(output.status.code(), Some(42));
         assert!(output.stderr.is_empty());
         assert_eq!(

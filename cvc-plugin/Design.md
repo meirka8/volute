@@ -488,7 +488,7 @@ Interaction IDs are UUIDs; they are not Git content addresses. The JSON blobs ar
     
 - **Transport:** The custom ref is pushed only after destination consent and the required manual TTY acknowledgement (unless that destination has acknowledged auto-push).
 
-**3. Redaction and local cleanup:** `cvc redact` confirms an authorized interaction and creates a pending, destination-scoped tombstone. The required next command is `cvc push --manual --remote <name>`, which projects that tombstone. A later `redact` may build a `RedactionPlan` only after the fetched v5 baseline contains the tombstone; `--apply-local` changes only the local current CVC ref. `cvc delete-local` is local suppression and never propagates. Projection prunes the tombstoned node, indexes, derivation events, and range-source closure, while retaining the tombstone itself.
+**3. Redaction and local cleanup:** `cvc redact` confirms an authorized interaction and creates a pending, destination-scoped tombstone. The required next command is `cvc push --manual --remote <name>`, which projects that tombstone. A later `redact` may build a `RedactionPlan` only after the fetched v5 baseline contains the tombstone; `--apply-local` changes only the local current CVC ref. `cvc delete-local` is local suppression and never propagates. Projection prunes the tombstoned node, indexes, and derivation events, and each range that only those events referenced (a range no event references is not tied to the interaction and stays), while retaining the tombstone itself.
 
 Tombstones are suppression, not physical erasure. SQLite uses `secure_delete` and attempts `wal_checkpoint(TRUNCATE)` followed by `VACUUM` after logical deletion, but those best-effort operations cannot guarantee removal from filesystem layers, SSD wear leveling, snapshots, backups, failed-operation WAL remnants, or immutable Git objects. Rotate exposed credentials first. Remote hard rewrite is unsupported pending an atomic force-with-lease design; no blind force-push procedure is supported.
     
@@ -549,7 +549,7 @@ Scans maintain a cursor per worktree and symbolic branch. Newly discovered candi
 
 - **The Need:** A user may want to commit the code publicly but keep the conversation private (e.g., "Explain this basic concept to me").
     
-- **Implemented:** Interactions are private by default. Sharing records an exact current conversation snapshot for one remote; `--future` separately opts future turns into sharing for that remote. Consent is a separate, destination-fingerprinted acknowledgement, and auto-push is off until separately acknowledged.
+- **Implemented:** Interactions are private by default. Sharing records an exact current conversation snapshot for one remote; `--future` separately opts future thoughts that passive capture records (VS Code, Claude Code) into sharing for that remote. Thoughts recorded through MCP are always recorded private and stay private until the conversation is shared again. Consent is a separate, destination-fingerprinted acknowledgement, and auto-push is off until separately acknowledged.
     
 
 ### 13.5 Large Context Blobs

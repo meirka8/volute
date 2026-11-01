@@ -155,6 +155,19 @@ A dedicated Tree View in the Side Bar (or Explorer Container).
         - _History Items:_ "Copy Prompt", "View Diff".
 
 
+### 3.4 Feature D: Sharing With a Remote in a Terminal
+
+**`Volute: Share with Remote in Terminal`** (`volute.shareRemote`) hands sharing to the CLI. The extension records no consent and answers no typed phrase: every share ends in the CLI's own typed challenge at a terminal.
+
+- **Linux and macOS, CLI 0.7.1 or later:** runs `cvc conversations` in a terminal that takes the keyboard focus, with no input boxes. The CLI's interactive view picks the conversation (nested subagent conversations included) and the remote, and shares, unshares and publishes through the same typed phrases as the matching commands. The view needs a terminal of at least 60 columns by 12 rows; in a smaller panel the CLI prints the plain listing and says why.
+
+- **Windows:** keeps the two input boxes (conversation ID, remote name) and runs `cvc share <id> --remote <remote>` in a terminal. The view only browses on Windows, because the CLI cannot yet discard type-ahead before a typed phrase there.
+
+- **A CLI that predates the view (before 0.7.1), or whose version cannot be read:** the same input-box flow, which works with every release.
+
+- **Version source:** the extension caches only the CLI's path (found at activation or by Check Setup), so the command reads the version from that binary with `cvc --version` each time it runs, and only on Linux and macOS, where the answer can matter. The platform and the version decide the flow in one pure function, `chooseShareFlow` in `src/setup/shareFlow.ts`, covered by `src/unit/shareFlow.test.ts`.
+
+
 ## 4. UX Doctrine: "The Invisible Scribe"
 
 The extension should feel invisible until needed.

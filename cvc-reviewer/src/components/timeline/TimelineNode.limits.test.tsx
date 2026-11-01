@@ -17,6 +17,9 @@ import type { InteractionNode } from '../../types/cvc';
 
 vi.mock('framer-motion', async () => (await import('../../test/motionStub')).framerMotionStub);
 
+// Heavy jsdom rendering; the default timeout is not a performance budget.
+vi.setConfig({ testTimeout: 30_000 });
+
 beforeEach(installDomStubs);
 afterEach(() => {
   cleanup();
@@ -57,6 +60,7 @@ describe('the limits', () => {
   it('are the ones in the specification', () => {
     expect(RENDER_LIMITS).toEqual({
       stimulusBlocks: 100,
+      contentPieces: 3,
       toolResultsPerGroup: 20,
       todos: 100,
       fieldRows: 25,

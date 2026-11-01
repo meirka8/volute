@@ -418,7 +418,7 @@ fn linked_worktree_sync_history_imports_remote_projection_into_common_store() {
     assert!(synced["result"]["content"][0]["text"]
         .as_str()
         .unwrap()
-        .contains("Pulled 1 new interaction"));
+        .contains("Pulled 1 new thought"));
     let history = mcp.request(
         3,
         "tools/call",

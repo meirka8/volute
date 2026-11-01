@@ -22,7 +22,7 @@ enum Commands {
     Init,
     /// Show the state of CVC
     Status,
-    /// Push CVC interactions to the remote
+    /// Push CVC thoughts to the remote
     Push {
         #[arg(long)]
         remote: Option<String>,
@@ -30,7 +30,7 @@ enum Commands {
         #[arg(long)]
         manual: bool,
     },
-    /// Pull CVC interactions from the remote
+    /// Pull CVC thoughts from the remote
     Pull,
     /// Inspect or change local privacy acknowledgements
     Privacy {
@@ -122,12 +122,12 @@ enum Commands {
         #[command(subcommand)]
         command: HookCommands,
     },
-    /// Run a command and capture the interaction
+    /// Run a command and capture it as a thought
     Run {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// View the interaction log
+    /// View the thought log
     Log,
 }
 
@@ -249,14 +249,15 @@ fn main() -> std::process::ExitCode {
 /// terminal, so every control and format character is replaced, a line feed
 /// excepted: an error is several lines when it has several (the usage that
 /// follows a command-line mistake), and a line feed cannot redraw what came
-/// before it.
+/// before it. A URL quoted in it (libgit2 quotes a `file://` URL it cannot
+/// resolve as it was configured) is printed without its user information.
 fn error_text(error: &anyhow::Error, chain: bool) -> String {
     let text = if chain {
         format!("{error:#}")
     } else {
         error.to_string()
     };
-    terminal_text::sanitize_lines_for_terminal(&text).into_owned()
+    terminal_text::sanitize_error_for_terminal(&text).into_owned()
 }
 
 async fn dispatch(cli: Cli) -> Result<()> {
@@ -618,6 +619,24 @@ mod hook_cli_tests {
         assert_eq!(
             error_text(&plain, true),
             "שלום – café ✓\nUsage: cvc <COMMAND>"
+        );
+    }
+
+    #[test]
+    fn a_printed_error_names_no_user_information_of_a_url_it_quotes() {
+        let error = anyhow::anyhow!(
+            "failed to resolve path 'file://deploy:s3cret@localhost/srv/x.git': No such file or directory"
+        )
+        .context("Git error");
+        assert_eq!(
+            error_text(&error, true),
+            "Git error: failed to resolve path 'file://localhost/srv/x.git': No such file or directory"
+        );
+        // A URL without user information is printed as it is.
+        let plain = anyhow::anyhow!("cannot reach https://example.invalid/acme/repo.git");
+        assert_eq!(
+            error_text(&plain, false),
+            "cannot reach https://example.invalid/acme/repo.git"
         );
     }
 

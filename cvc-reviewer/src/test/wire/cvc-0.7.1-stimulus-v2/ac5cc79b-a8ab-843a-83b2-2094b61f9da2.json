@@ -1,0 +1,33 @@
+{
+  "interaction": {
+    "id": "ac5cc79b-a8ab-843a-83b2-2094b61f9da2",
+    "conversation_id": "5e0d6a42-7b1c-4d3e-9a8f-1c2b3d4e5f60",
+    "parent_id": null,
+    "timestamp": "2026-10-10T11:00:01Z",
+    "author": "human",
+    "user_prompt": "[prompt ~cvc-e3365f86021cb2a9] Please deploy using the key [CVC_REDACTED:v1:aws_access_key:d69789d9-ffe2-4a10-8b69-2585b99a394e] and [CVC_REDACTED:v1:secret_assignment:f5cfff04-96f0-426e-ae85-4fa17564d176] clone [CVC_REDACTED:v1:url_credentials:a9cfff8e-6f3e-4649-93f7-a2d07b2e9995]example.invalid/repo.git, and mention [CVC_REDACTED:v1:policy_literal:68d3926d-b7a0-43b6-b3b2-354a9e102fa1].\n\n[prompt ~cvc-e3365f86021cb2a9] Second block of the same prompt.\n\n[prompt ~cvc-e3365f86021cb2a9] [image]\n\n[prompt ~cvc-e3365f86021cb2a9] [document]",
+    "model_name": "claude-fixture-edge",
+    "model_cot": "Plan step one: file the issue.\n\nPlan step two: then search the web.",
+    "model_response": "I'll create an issue.\n\nSecond text block.\n\n[mystery]",
+    "source_request_id": "req_E1"
+  },
+  "context_items": [],
+  "tool_executions": [
+    {
+      "id": 1,
+      "interaction_id": "ac5cc79b-a8ab-843a-83b2-2094b61f9da2",
+      "tool_protocol": "mcp",
+      "tool_name": "mcp__github__create_issue",
+      "arguments": "{\"body\":\"[CVC_REDACTED:v1:secret_assignment:1c4971aa-6fee-4197-ba3d-731faf06dbc2]\",\"labels\":[\"bug\"],\"title\":\"Deploy\"}",
+      "status": "success"
+    }
+  ],
+  "artifact_links": [
+    {
+      "interaction_id": "ac5cc79b-a8ab-843a-83b2-2094b61f9da2",
+      "git_commit_hash": "ed3791688a0bed750c415aac82e2c36f7a1a7c40",
+      "link_type": "generated",
+      "linked_by": "fixture@example.invalid"
+    }
+  ]
+}

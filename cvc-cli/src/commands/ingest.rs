@@ -2,6 +2,7 @@
 //!
 //! Not to be confused with sync ingestion (`cvc pull`), which imports another
 //! machine's already-shared projection: this is first-party local capture.
+use crate::terminal_text::sanitize_for_terminal;
 use anyhow::{anyhow, bail, Context, Result};
 use cvc_core::claude_code::{ingest, IngestError, IngestMode, IngestReport};
 use cvc_core::db::CvcStore;
@@ -55,30 +56,80 @@ pub async fn claude_code(
         session.as_deref(),
         IngestMode::Final,
     )?;
-    println!(
+    for line in report_lines(&report) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// What `cvc ingest claude-code --transcript` prints of a run. The session id
+/// passed the capture policy's identifier rule, but the block types are
+/// whatever the transcript's `type` fields say, so both are shown with every
+/// control and format character replaced by `?`, each on the line it belongs
+/// to.
+fn report_lines(report: &IngestReport) -> Vec<String> {
+    let mut lines = vec![format!(
         "CVC: Claude Code session {}: {} new thought(s), {} already recorded, {} pending, {} linked to session commits; cursor at byte {} of {}",
-        report.session_id,
+        sanitize_for_terminal(&report.session_id),
         report.inserted,
         report.already_present,
         report.pending_responses,
         report.linked_from_commits,
         report.cursor,
         report.transcript_len
-    );
+    )];
     if report.subagent_sessions > 0 {
-        println!(
+        lines.push(format!(
             "  plus {} subagent session(s): {} new thought(s), {} linked to commits",
             report.subagent_sessions, report.subagent_inserted, report.subagent_linked
-        );
+        ));
     }
     if report.unrecorded_blocks > 0 {
-        println!(
+        let types: Vec<_> = report
+            .unrecorded_block_types
+            .iter()
+            .map(|kind| sanitize_for_terminal(kind))
+            .collect();
+        lines.push(format!(
             "  {} content block(s) of a type this version does not record were kept as placeholders: {}",
             report.unrecorded_blocks,
-            report.unrecorded_block_types.join(", ")
-        );
+            types.join(", ")
+        ));
     }
-    Ok(())
+    lines.extend(left_out_lines(report));
+    lines
+}
+
+/// What the capture boundary could not keep, as lines to print, so that a
+/// response recorded as a stand-in, or left out, is never silent. None of the
+/// text of such a response is in them, only the limit that was hit.
+fn left_out_lines(report: &IngestReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    if report.withheld > 0 || report.lost > 0 {
+        let mut parts = Vec::new();
+        if report.withheld > 0 {
+            parts.push(format!(
+                "{} recorded as a stand-in that says its response was withheld",
+                report.withheld
+            ));
+        }
+        if report.lost > 0 {
+            parts.push(format!("{} not recorded at all", report.lost));
+        }
+        lines.push(format!(
+            "  could not scrub {} response(s) within the limits: {} ({})",
+            report.withheld + report.lost,
+            parts.join(", "),
+            sanitize_for_terminal(&report.withheld_reasons.join("; "))
+        ));
+    }
+    if report.omitted_tool_calls > 0 || report.omitted_context_items > 0 {
+        lines.push(format!(
+            "  left out of the responses recorded now: {} tool call(s) beyond the 255 a response records, {} context item(s) (a path that cannot be scrubbed, or beyond the 256 a response records); each such response ends with a cvc-omitted record that says so",
+            report.omitted_tool_calls, report.omitted_context_items
+        ));
+    }
+    lines
 }
 
 /// Hook mode reads Claude Code's JSON payload from stdin and writes nothing to
@@ -493,6 +544,55 @@ mod tests {
         assert!(input.oversize);
     }
 
+    fn report(session_id: &str, unrecorded_block_types: &[&str]) -> IngestReport {
+        IngestReport {
+            session_id: session_id.into(),
+            inserted: 2,
+            already_present: 1,
+            pending_responses: 0,
+            linked_from_commits: 0,
+            cursor: 10,
+            transcript_len: 10,
+            subagent_sessions: 0,
+            subagent_inserted: 0,
+            subagent_linked: 0,
+            unrecorded_blocks: unrecorded_block_types.len(),
+            unrecorded_block_types: unrecorded_block_types
+                .iter()
+                .map(|kind| (*kind).to_owned())
+                .collect(),
+            withheld: 0,
+            lost: 0,
+            withheld_reasons: Vec::new(),
+            omitted_tool_calls: 0,
+            omitted_context_items: 0,
+        }
+    }
+
+    #[test]
+    fn the_report_shows_the_session_id_and_the_block_types_as_plain_text() {
+        let hostile = report(
+            "s\u{1b}[2J\u{202e}1",
+            &[
+                "mys\u{1b}[2Jtery\u{1b}]52;c;SGVsbG8=\u{7}",
+                "x\u{202e}y\u{2028}z",
+            ],
+        );
+        assert_eq!(
+            report_lines(&hostile),
+            [
+                "CVC: Claude Code session s?[2J?1: 2 new thought(s), 1 already recorded, 0 pending, 0 linked to session commits; cursor at byte 10 of 10",
+                "  2 content block(s) of a type this version does not record were kept as placeholders: mys?[2Jtery?]52;c;SGVsbG8=?, x?y?z",
+            ]
+        );
+        // What a run of a well-formed transcript reports is printed as it is.
+        assert_eq!(
+            report_lines(&report("7c1e9f5a-2b2f", &["mystery"]))[1],
+            "  1 content block(s) of a type this version does not record were kept as placeholders: mystery"
+        );
+        assert_eq!(report_lines(&report("7c1e9f5a-2b2f", &[])).len(), 1);
+    }
+
     #[test]
     fn only_a_session_that_waited_in_vain_is_busy() {
         let busy = anyhow::Error::new(IngestError::SessionBusy {
@@ -506,5 +606,61 @@ mod tests {
         assert!(!session_is_busy(&anyhow::Error::new(
             IngestError::UnknownSession
         )));
+    }
+
+    fn clean_report() -> IngestReport {
+        IngestReport {
+            session_id: "s".into(),
+            inserted: 3,
+            already_present: 0,
+            pending_responses: 0,
+            linked_from_commits: 0,
+            cursor: 10,
+            transcript_len: 10,
+            subagent_sessions: 0,
+            subagent_inserted: 0,
+            subagent_linked: 0,
+            unrecorded_blocks: 0,
+            unrecorded_block_types: Vec::new(),
+            withheld: 0,
+            lost: 0,
+            withheld_reasons: Vec::new(),
+            omitted_tool_calls: 0,
+            omitted_context_items: 0,
+        }
+    }
+
+    #[test]
+    fn a_clean_ingest_prints_nothing_about_what_was_left_out() {
+        assert!(left_out_lines(&clean_report()).is_empty());
+    }
+
+    #[test]
+    fn withheld_lost_and_omitted_responses_are_said_with_their_reasons_and_no_text() {
+        let lines = left_out_lines(&IngestReport {
+            withheld: 2,
+            lost: 1,
+            withheld_reasons: vec![
+                "capture collection exceeds limit".into(),
+                "too many secret matches".into(),
+            ],
+            omitted_tool_calls: 45,
+            omitted_context_items: 44,
+            ..clean_report()
+        });
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            "  could not scrub 3 response(s) within the limits: 2 recorded as a stand-in that says its response was withheld, 1 not recorded at all (capture collection exceeds limit; too many secret matches)"
+        );
+        assert!(lines[1].contains("45 tool call(s)"), "{lines:?}");
+        assert!(lines[1].contains("44 context item(s)"), "{lines:?}");
+        assert!(lines[1].contains("cvc-omitted"), "{lines:?}");
+        // Only counts and limits: never any text of a response.
+        let only_omitted = left_out_lines(&IngestReport {
+            omitted_context_items: 1,
+            ..clean_report()
+        });
+        assert_eq!(only_omitted.len(), 1);
     }
 }
