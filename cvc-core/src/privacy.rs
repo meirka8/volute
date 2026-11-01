@@ -41,6 +41,12 @@ const PRIVACY_NOTICE_VERSION: u32 = 1;
 struct PrivacyFile {
     version: u32,
     capture_acknowledged_version: Option<u32>,
+    /// The checkout and user the capture acknowledgement was given for: the
+    /// [`capture_binding`] of the common Git directory and the user that
+    /// completed `cvc privacy acknowledge-capture`. Absent from files written
+    /// by cvc 0.7.0 and earlier, which recorded the notice version alone.
+    #[serde(default)]
+    capture_acknowledged_binding: Option<String>,
     sharing: Vec<SharingConsent>,
 }
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -49,9 +55,35 @@ struct SharingConsent {
     notice_version: u32,
     auto_push: bool,
 }
+/// Where the repository-local capture acknowledgement stands for the checkout
+/// and user asking. Only [`CaptureAcknowledgement::Acknowledged`] lets passive
+/// capture run; the other two differ only in what to tell the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptureAcknowledgement {
+    /// The current notice was acknowledged in this checkout (this common Git
+    /// directory, at this path) by this user.
+    Acknowledged,
+    /// The current notice was never acknowledged in this repository.
+    #[default]
+    NotAcknowledged,
+    /// An acknowledgement of the current notice is on record, but not for this
+    /// checkout and user: it was given at another path or by another user (the
+    /// repository was copied, moved or restored together with its `.git`), it
+    /// was recorded by cvc 0.7.0 or earlier without saying for whom, or the
+    /// current user cannot be identified. It grants nothing here; acknowledging
+    /// again here replaces it.
+    OtherCheckoutOrUser,
+}
+impl CaptureAcknowledgement {
+    pub fn is_acknowledged(self) -> bool {
+        self == Self::Acknowledged
+    }
+}
 #[derive(Debug, Clone, Default)]
 pub struct PrivacyStatus {
+    /// `capture_acknowledgement.is_acknowledged()`.
     pub capture_acknowledged: bool,
+    pub capture_acknowledgement: CaptureAcknowledgement,
     pub sharing_consented: bool,
     pub auto_push: bool,
     pub remote_fingerprint: String,
@@ -569,22 +601,165 @@ pub fn privacy_status_for_fingerprint(repo: &git2::Repository, fp: &str) -> Resu
         .sharing
         .iter()
         .find(|x| x.fingerprint == fp && x.notice_version == PRIVACY_NOTICE_VERSION);
+    let capture = capture_acknowledgement_in(repo, &state, current_user().as_deref());
     Ok(PrivacyStatus {
-        capture_acknowledged: state.capture_acknowledged_version == Some(PRIVACY_NOTICE_VERSION),
+        capture_acknowledged: capture.is_acknowledged(),
+        capture_acknowledgement: capture,
         sharing_consented: consent.is_some(),
         auto_push: consent.is_some_and(|x| x.auto_push),
         remote_fingerprint: fp.to_owned(),
     })
 }
+
+/// The first line of the [`capture_binding`] layout.
+const CAPTURE_BINDING_DOMAIN: &[u8] = b"cvc.capture-acknowledgement/v1\n";
+
+/// What a capture acknowledgement is bound to: the checkout, as the canonical
+/// path of its common Git directory, and the user. It is lowercase hex of the
+/// SHA-256 of
+///
+/// ```text
+/// cvc.capture-acknowledgement/v1\n
+/// path:<path>\n
+/// user:<user>
+/// ```
+///
+/// with no line feed after `<user>`. `<path>` is `std::fs::canonicalize` of
+/// the common Git directory: its bytes on Unix, its UTF-16 code units
+/// (little-endian) on Windows. `<user>` is [`current_user`]'s, and must be
+/// non-empty and free of control characters, so the layout reads back one way
+/// only, whatever the path holds: `user:<user>` follows the last line feed,
+/// and the path is everything between `path:` and that line feed. Linked
+/// worktrees share the common directory, and so one binding.
+///
+/// Nothing that changes across boots or mounts (host name, machine id, device
+/// or inode numbers) is part of it, so the same checkout opened by the same
+/// user keeps its binding across reboots and remounts. A copy, a move or a
+/// restore of the repository at another path, or the repository opened by
+/// another user, yields another. A copy at the same path, opened by a user
+/// with the same identity, yields the same one. `None` when the directory
+/// cannot be canonicalized or the user is unusable: no acknowledgement
+/// matches that.
+fn capture_binding(common_git_dir: &Path, user: &str) -> Option<String> {
+    if user.is_empty() || user.chars().any(char::is_control) {
+        return None;
+    }
+    let path = std::fs::canonicalize(common_git_dir).ok()?;
+    let mut hash = Sha256::new();
+    hash.update(CAPTURE_BINDING_DOMAIN);
+    hash.update(b"path:");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hash.update(path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in path.as_os_str().encode_wide() {
+            hash.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    hash.update(path.to_str()?.as_bytes());
+    hash.update(b"\nuser:");
+    hash.update(user.as_bytes());
+    Some(hex::encode(hash.finalize()))
+}
+
+/// The user a capture acknowledgement is recorded for and checked against:
+/// the real user id of this process, in decimal.
+#[cfg(unix)]
+fn current_user() -> Option<String> {
+    // SAFETY: getuid(2) takes no arguments and cannot fail.
+    Some(unsafe { libc::getuid() }.to_string())
+}
+/// The user a capture acknowledgement is recorded for and checked against:
+/// the `USERNAME` of this process. Unset or not Unicode is no user, which no
+/// acknowledgement matches.
+#[cfg(windows)]
+fn current_user() -> Option<String> {
+    std::env::var("USERNAME").ok()
+}
+/// No user can be named here, so no capture acknowledgement matches.
+#[cfg(not(any(unix, windows)))]
+fn current_user() -> Option<String> {
+    None
+}
+
+/// The binding `user` would have in `repo` (see [`capture_binding`]).
+fn capture_binding_for(repo: &git2::Repository, user: &str) -> Option<String> {
+    let common_git_dir = crate::repository::common_git_dir(repo).ok()?;
+    capture_binding(&common_git_dir, user)
+}
+
+/// Judges the capture acknowledgement recorded in `state` for `user` in
+/// `repo`. This is the one place that does: [`capture_acknowledged`],
+/// [`capture_acknowledgement`] and [`privacy_status_for_fingerprint`] all
+/// come here. Only the current notice version, recorded together with exactly
+/// the binding this checkout and `user` have now, is
+/// [`CaptureAcknowledgement::Acknowledged`]; a missing, different or
+/// unreadable binding, and an unknown user, are not.
+fn capture_acknowledgement_in(
+    repo: &git2::Repository,
+    state: &PrivacyFile,
+    user: Option<&str>,
+) -> CaptureAcknowledgement {
+    if state.capture_acknowledged_version != Some(PRIVACY_NOTICE_VERSION) {
+        return CaptureAcknowledgement::NotAcknowledged;
+    }
+    let current = user.and_then(|user| capture_binding_for(repo, user));
+    match (state.capture_acknowledged_binding.as_deref(), current) {
+        (Some(recorded), Some(current)) if recorded == current => {
+            CaptureAcknowledgement::Acknowledged
+        }
+        _ => CaptureAcknowledgement::OtherCheckoutOrUser,
+    }
+}
+
+/// Where the capture acknowledgement stands for this checkout and the user
+/// running this process (see [`CaptureAcknowledgement`]).
+pub fn capture_acknowledgement(repo: &git2::Repository) -> Result<CaptureAcknowledgement> {
+    capture_acknowledgement_as(repo, current_user().as_deref())
+}
+fn capture_acknowledgement_as(
+    repo: &git2::Repository,
+    user: Option<&str>,
+) -> Result<CaptureAcknowledgement> {
+    let state = read_privacy(repo)?;
+    Ok(capture_acknowledgement_in(repo, &state, user))
+}
 /// Passive collection is opt-in. Explicit local actions may still persist private
 /// data, but background IDE observation must fail closed until this is true.
+/// True only for an acknowledgement given in this checkout by this user; one
+/// that came with a copy of the repository is not (see
+/// [`capture_acknowledgement`] for which it is).
 pub fn capture_acknowledged(repo: &git2::Repository) -> Result<bool> {
-    Ok(read_privacy(repo)?.capture_acknowledged_version == Some(PRIVACY_NOTICE_VERSION))
+    Ok(capture_acknowledgement(repo)?.is_acknowledged())
 }
+/// Records the capture acknowledgement for this checkout and the user running
+/// this process, replacing whatever acknowledgement was on record. Production
+/// code calls this only once the typed challenge of
+/// `cvc privacy acknowledge-capture` has been answered.
 pub fn acknowledge_capture(repo: &git2::Repository) -> Result<()> {
+    acknowledge_capture_as(repo, current_user().as_deref())
+}
+fn acknowledge_capture_as(repo: &git2::Repository, user: Option<&str>) -> Result<()> {
+    let user = user.ok_or_else(|| {
+        PrivacyError::Policy(
+            "the current user cannot be identified, so capture cannot be acknowledged for them"
+                .into(),
+        )
+    })?;
+    let binding = capture_binding_for(repo, user).ok_or_else(|| {
+        PrivacyError::Policy(
+            "the capture acknowledgement cannot be bound to this checkout and user".into(),
+        )
+    })?;
     let _lock = privacy_lock(repo)?;
     let mut s = read_privacy(repo)?;
     s.capture_acknowledged_version = Some(PRIVACY_NOTICE_VERSION);
+    s.capture_acknowledged_binding = Some(binding);
     write_privacy(repo, &s)
 }
 pub fn acknowledge_sharing(repo: &git2::Repository, remote: &str) -> Result<()> {
@@ -2339,4 +2514,159 @@ pub fn final_validate_links(links: &mut [ArtifactLink]) -> Result<()> {
             .transpose()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn repository() -> (TempDir, git2::Repository) {
+        let temp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(temp.path()).unwrap();
+        (temp, repo)
+    }
+
+    #[test]
+    fn the_binding_is_the_sha256_of_the_documented_layout() {
+        let (temp, repo) = repository();
+        let common = crate::repository::common_git_dir(&repo).unwrap();
+        let canonical = std::fs::canonicalize(&common).unwrap();
+        let mut layout = b"cvc.capture-acknowledgement/v1\npath:".to_vec();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            layout.extend_from_slice(canonical.as_os_str().as_bytes());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            for unit in canonical.as_os_str().encode_wide() {
+                layout.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        layout.extend_from_slice(b"\nuser:1000");
+        let binding = capture_binding(&common, "1000").unwrap();
+        assert_eq!(binding, hex::encode(Sha256::digest(&layout)));
+        assert_eq!(binding.len(), 64);
+        assert!(binding
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+
+        // The same directory spelled another way is the same checkout.
+        let spelled = temp.path().join(".git").join("..").join(".git");
+        assert_eq!(capture_binding(&spelled, "1000"), Some(binding.clone()));
+        #[cfg(unix)]
+        {
+            let link = TempDir::new().unwrap();
+            std::os::unix::fs::symlink(temp.path(), link.path().join("via")).unwrap();
+            let through_link = link.path().join("via").join(".git");
+            assert_eq!(
+                capture_binding(&through_link, "1000"),
+                Some(binding.clone())
+            );
+        }
+        // Another user, or another directory, is another binding.
+        assert_ne!(capture_binding(&common, "1001"), Some(binding.clone()));
+        let elsewhere = TempDir::new().unwrap();
+        assert_ne!(
+            capture_binding(elsewhere.path(), "1000"),
+            Some(binding.clone())
+        );
+        // A user that would make the layout ambiguous, or that is no user at
+        // all, binds nothing, and neither does a directory that is not there.
+        for user in ["", "10\n00", "1000\n", "1000\r", "\0", "\u{85}"] {
+            assert_eq!(capture_binding(&common, user), None, "{user:?}");
+        }
+        assert_eq!(capture_binding(&temp.path().join("missing"), "1000"), None);
+    }
+
+    /// The identity is a parameter here, so another user of the same checkout
+    /// can be tried without running as one.
+    #[test]
+    fn an_acknowledgement_counts_only_for_the_user_who_gave_it() {
+        use CaptureAcknowledgement::{Acknowledged, NotAcknowledged, OtherCheckoutOrUser};
+        let (_temp, repo) = repository();
+        assert_eq!(
+            capture_acknowledgement_as(&repo, Some("1000")).unwrap(),
+            NotAcknowledged
+        );
+        acknowledge_capture_as(&repo, Some("1000")).unwrap();
+        assert_eq!(
+            capture_acknowledgement_as(&repo, Some("1000")).unwrap(),
+            Acknowledged
+        );
+        // Another user at the same path: an image restored for another
+        // account, a shared directory.
+        assert_eq!(
+            capture_acknowledgement_as(&repo, Some("1001")).unwrap(),
+            OtherCheckoutOrUser
+        );
+        // A user who cannot be identified is no user it was given for.
+        assert_eq!(
+            capture_acknowledgement_as(&repo, None).unwrap(),
+            OtherCheckoutOrUser
+        );
+
+        // Nor can such a user give one: the state on record stays as it was.
+        let path = privacy_path(&repo).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for user in [None, Some(""), Some("10\n01")] {
+            assert!(acknowledge_capture_as(&repo, user).is_err(), "{user:?}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // The other user acknowledging replaces the binding on record.
+        acknowledge_capture_as(&repo, Some("1001")).unwrap();
+        assert_eq!(
+            capture_acknowledgement_as(&repo, Some("1001")).unwrap(),
+            Acknowledged
+        );
+        assert_eq!(
+            capture_acknowledgement_as(&repo, Some("1000")).unwrap(),
+            OtherCheckoutOrUser
+        );
+    }
+
+    /// The production wrappers name the process's own user, and the status
+    /// report judges exactly as the gate does.
+    #[test]
+    fn what_this_process_acknowledges_is_for_its_own_user_only() {
+        let (_temp, repo) = repository();
+        let me = current_user().expect("the test process has a user");
+        let someone_else = format!("{me}0");
+        acknowledge_capture(&repo).unwrap();
+        assert!(capture_acknowledged(&repo).unwrap());
+        assert_eq!(
+            capture_acknowledgement_as(&repo, Some(&me)).unwrap(),
+            CaptureAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            capture_acknowledgement_as(&repo, Some(&someone_else)).unwrap(),
+            CaptureAcknowledgement::OtherCheckoutOrUser
+        );
+        let status = privacy_status_for_fingerprint(&repo, &"0".repeat(64)).unwrap();
+        assert!(status.capture_acknowledged);
+        assert_eq!(
+            status.capture_acknowledgement,
+            CaptureAcknowledgement::Acknowledged
+        );
+
+        acknowledge_capture_as(&repo, Some(&someone_else)).unwrap();
+        assert!(!capture_acknowledged(&repo).unwrap());
+        let status = privacy_status_for_fingerprint(&repo, &"0".repeat(64)).unwrap();
+        assert!(!status.capture_acknowledged);
+        assert_eq!(
+            status.capture_acknowledgement,
+            CaptureAcknowledgement::OtherCheckoutOrUser
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_the_user_is_the_real_uid() {
+        // SAFETY: getuid(2) takes no arguments and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        assert_eq!(current_user(), Some(uid.to_string()));
+    }
 }

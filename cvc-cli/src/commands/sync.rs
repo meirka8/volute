@@ -49,7 +49,16 @@ pub async fn privacy_status(requested: Option<&str>) -> Result<()> {
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
     let s = privacy::privacy_status_for_fingerprint(&repo, &destination.fingerprint)?;
-    println!("capture_acknowledged: {}\nsharing_consented: {}\nauto_push: {}\nremote: {}\ndestination_fingerprint: {}", s.capture_acknowledged, s.sharing_consented, s.auto_push, name, s.remote_fingerprint);
+    println!("capture_acknowledged: {}", s.capture_acknowledged);
+    // Only when an acknowledgement is on record that does not count here, so
+    // that the reason for `false` is not left to guess.
+    if s.capture_acknowledgement == privacy::CaptureAcknowledgement::OtherCheckoutOrUser {
+        println!("note: {}", super::harness::ACKNOWLEDGED_ELSEWHERE);
+    }
+    println!(
+        "sharing_consented: {}\nauto_push: {}\nremote: {}\ndestination_fingerprint: {}",
+        s.sharing_consented, s.auto_push, name, s.remote_fingerprint
+    );
     Ok(())
 }
 pub async fn acknowledge_capture() -> Result<()> {

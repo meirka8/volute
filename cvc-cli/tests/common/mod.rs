@@ -156,6 +156,32 @@ impl Fixture {
     pub fn index_db_path(&self) -> PathBuf {
         self.open_repo().commondir().join("cvc").join("index.db")
     }
+
+    /// A copy of the repository, `.git` and all, at `<temp>/<name>`: what an
+    /// archive, `cp -a` or a backup restore at another path produces.
+    pub fn copy_repo(&self, name: &str) -> PathBuf {
+        let copy = self.temp.path().join(name);
+        copy_tree(&self.repo, &copy);
+        copy
+    }
+}
+
+/// Copies the tree at `from` to `to`, file and directory permissions included.
+pub fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    fs::create_dir(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &target).unwrap();
+        } else {
+            std::os::unix::fs::symlink(fs::read_link(entry.path()).unwrap(), &target).unwrap();
+        }
+    }
+    fs::set_permissions(to, fs::metadata(from).unwrap().permissions()).unwrap();
 }
 
 /// A child process whose stdin, stdout, and stderr are the slave side of a

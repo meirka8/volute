@@ -767,6 +767,59 @@ fn a_missing_acknowledgement_is_reported_and_never_fails_git() {
     assert!(!second.join(".claude").exists());
 }
 
+/// Copies the tree at `from` to `to`, file and directory permissions included,
+/// as an archive, `cp -a` or a backup restore at another path does.
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &target).unwrap();
+        } else {
+            symlink(fs::read_link(entry.path()).unwrap(), &target).unwrap();
+        }
+    }
+    fs::set_permissions(to, fs::metadata(from).unwrap().permissions()).unwrap();
+}
+
+/// A copy of an installed repository carries the harness record and the
+/// acknowledgement on record, but that acknowledgement was given for the
+/// original's path: a new worktree of the copy gets no hooks, and the line
+/// says why. The original keeps propagating.
+#[test]
+fn a_new_worktree_of_a_copied_repository_says_its_acknowledgement_is_elsewhere() {
+    let fixture = Fixture::ready();
+    fixture.install(&fixture.repo);
+    let copy = fixture.root.join("copy");
+    copy_tree(&fixture.repo, &copy);
+
+    let worktree = fixture.root.join("copy-wt");
+    let run = fixture.git(
+        &copy,
+        &[
+            "worktree",
+            "add",
+            worktree.to_str().unwrap(),
+            "-b",
+            "copy-wt",
+        ],
+    );
+    assert!(run.success, "{}", run.stderr);
+    let expected = format!(
+        "{DECLINED}capture was acknowledged for another checkout or user, or by an older cvc; run `cvc privacy acknowledge-capture` here"
+    );
+    assert_eq!(run.cvc_lines(), [expected.as_str()], "{}", run.all());
+    assert!(!worktree.join(".claude").exists());
+
+    let (original, run) = fixture.worktree_add("original-wt");
+    assert!(run.all().contains(INSTALLED_LINE), "{}", run.all());
+    assert!(original.join(SETTINGS).exists());
+}
+
 #[test]
 fn a_clone_is_a_no_op_even_when_the_hook_runs() {
     let fixture = Fixture::ready();

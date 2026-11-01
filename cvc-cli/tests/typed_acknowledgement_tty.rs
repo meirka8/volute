@@ -120,6 +120,74 @@ fn an_answer_that_is_not_text_does_not_confirm_a_challenge_and_reads_as_not_matc
     assert!(status.contains("capture_acknowledged: true"), "{status}");
 }
 
+/// The line `cvc privacy status` adds when an acknowledgement is on record that
+/// was not given for this checkout and user.
+const ELSEWHERE_NOTE: &str = "note: capture was acknowledged for another checkout or user, or by an older cvc; run `cvc privacy acknowledge-capture` here";
+
+/// Answers `cvc privacy acknowledge-capture` in `dir` on a terminal, as a
+/// person would.
+fn acknowledge_capture_in(fixture: &Fixture, dir: &std::path::Path) {
+    let mut command = fixture.cvc_command(&["privacy", "acknowledge-capture"]);
+    command.current_dir(dir);
+    let mut session = PtySession::spawn(command, b"");
+    assert_eq!(session.wait_for_challenge(1), "I UNDERSTAND LOCAL CAPTURE");
+    session.write(b"I UNDERSTAND LOCAL CAPTURE\n");
+    let (status, output) = session.wait_exit();
+    assert!(status.success(), "{output}");
+}
+
+fn privacy_status_in(fixture: &Fixture, dir: &std::path::Path) -> String {
+    let output = fixture
+        .cvc_command(&["privacy", "status"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The acknowledgement is bound to the checkout it was typed in. A copy of the
+/// repository, `.git` included, carries the privacy state but is asked again,
+/// and `cvc privacy status` says why; answering in the copy binds it there and
+/// leaves the original's alone.
+#[test]
+fn a_copied_repository_is_asked_again_and_the_answer_binds_the_copy() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    let status = privacy_status_in(&fixture, &fixture.repo);
+    assert!(status.contains("capture_acknowledged: false"), "{status}");
+    // Never acknowledged is not "acknowledged elsewhere".
+    assert!(!status.contains("note:"), "{status}");
+    acknowledge_capture_in(&fixture, &fixture.repo);
+
+    let copy = fixture.copy_repo("copy");
+    let status = privacy_status_in(&fixture, &copy);
+    assert!(
+        status.starts_with(&format!(
+            "capture_acknowledged: false\n{ELSEWHERE_NOTE}\nsharing_consented: false\n"
+        )),
+        "{status}"
+    );
+    let status = privacy_status_in(&fixture, &fixture.repo);
+    assert!(
+        status.starts_with("capture_acknowledged: true\nsharing_consented: false\n"),
+        "{status}"
+    );
+
+    acknowledge_capture_in(&fixture, &copy);
+    for dir in [&copy, &fixture.repo] {
+        let status = privacy_status_in(&fixture, dir);
+        assert!(
+            status.starts_with("capture_acknowledged: true\nsharing_consented: false\n"),
+            "{status}"
+        );
+    }
+}
+
 /// What `cvc privacy acknowledge-sharing --remote origin` shows right before it
 /// asks for its phrase. The phrase itself, `I AUTHORIZE SHARING <fingerprint>`,
 /// can be worked out from the remote before the command is even started.
