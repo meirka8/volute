@@ -9,6 +9,12 @@
 //! remote's projection says. Anything of that kind that is printed or drawn goes
 //! through [`sanitize_for_terminal`] first.
 //!
+//! The text of an error can also quote a URL as it was configured, with its user
+//! information (a user name and a password or token): libgit2 does so for a
+//! `file://` URL it cannot resolve. What `cvc` prints of an error goes through
+//! [`sanitize_error_for_terminal`], which also takes the user information out of
+//! every URL in it ([`without_url_userinfo`]).
+//!
 //! Defense in depth, not a promise: this keeps control and format characters off
 //! the terminal, and says nothing about whether the visible text is true.
 
@@ -73,6 +79,59 @@ pub(crate) fn sanitize_for_terminal(text: &str) -> Cow<'_, str> {
 /// [`sanitize_for_terminal`], so that it stays one line.
 pub(crate) fn sanitize_lines_for_terminal(text: &str) -> Cow<'_, str> {
     replace_where(text, |c| c != '\n' && is_unsafe_for_terminal(c))
+}
+
+/// The text of an error as it may be printed: every control and format character
+/// but the line feed replaced, as [`sanitize_lines_for_terminal`] does, then the
+/// user information taken out of every URL in it ([`without_url_userinfo`]).
+/// Borrows when there is nothing to change.
+///
+/// Replacing first means that a control character inside a URL's user
+/// information (a tab, a carriage return) cannot end the URL early and keep the
+/// rest of the user information in.
+pub(crate) fn sanitize_error_for_terminal(text: &str) -> Cow<'_, str> {
+    match sanitize_lines_for_terminal(text) {
+        Cow::Borrowed(text) => without_url_userinfo(text),
+        Cow::Owned(text) => Cow::Owned(without_url_userinfo(&text).into_owned()),
+    }
+}
+
+/// `text` with the user information taken out of every URL in it, the way
+/// `cvc_core::privacy::url_without_userinfo` takes it out of a push URL: in each
+/// `<scheme>://<authority>`, everything in the authority up to and including its
+/// last `@` goes (libgit2 takes the host from after the last `@`), and nothing
+/// else changes. Borrows when there is nothing to take out.
+///
+/// libgit2 ends an authority at the first `/` only. A URL quoted in a message has
+/// words around it, so here the authority also ends at white space, and at the
+/// end of the text. What follows a URL that has no path (a closing quote, a
+/// colon) is then read as part of its authority, which changes anything only
+/// when an `@` comes before the next `/` or white space: the text up to that `@`
+/// goes too, so this can show less than the message said, never more.
+pub(crate) fn without_url_userinfo(text: &str) -> Cow<'_, str> {
+    let mut stripped: Option<String> = None;
+    // Everything before `kept_until` is in `stripped` already, or stays as it is.
+    let mut kept_until = 0;
+    let mut from = 0;
+    while let Some(found) = text[from..].find("://") {
+        let authority_start = from + found + "://".len();
+        let authority_end = text[authority_start..]
+            .find(|c: char| c == '/' || c.is_whitespace())
+            .map_or(text.len(), |end| authority_start + end);
+        if let Some(at) = text[authority_start..authority_end].rfind('@') {
+            let out = stripped.get_or_insert_with(String::new);
+            out.push_str(&text[kept_until..authority_start]);
+            kept_until = authority_start + at + 1;
+        }
+        from = authority_end;
+    }
+    match stripped {
+        None => Cow::Borrowed(text),
+        Some(mut out) => {
+            out.push_str(&text[kept_until..]);
+            Cow::Owned(out)
+        }
+    }
 }
 
 /// `text` with every character `is_unsafe` accepts replaced by `?`. Borrows when
@@ -196,6 +255,74 @@ mod tests {
         // Tabs are controls too, and nothing else is spared.
         assert_eq!(sanitize_lines_for_terminal("a\tb\u{85}c"), "a?b?c");
         assert!(matches!(sanitize_lines_for_terminal(""), Cow::Borrowed("")));
+    }
+
+    #[test]
+    fn user_information_is_taken_out_of_every_url_and_nothing_else_changes() {
+        for text in [
+            "",
+            "failed to connect to 127.0.0.1: Connection refused",
+            "https://github.com/acme/repo.git",
+            "git@github.com:acme/repo.git",
+            "file:///srv/repo.git and mailto:someone@example.invalid",
+            "https://example.invalid/@scope/package, from user@example.invalid",
+        ] {
+            assert!(
+                matches!(without_url_userinfo(text), Cow::Borrowed(t) if t == text),
+                "{text}"
+            );
+        }
+        // How libgit2 quotes a `file://` URL it cannot resolve.
+        assert_eq!(
+            without_url_userinfo(
+                "failed to resolve path 'file://user:s3cret@localhost/srv/x.git': No such file or directory"
+            ),
+            "failed to resolve path 'file://localhost/srv/x.git': No such file or directory"
+        );
+        // The host is what follows the last `@`, as libgit2 reads it.
+        assert_eq!(
+            without_url_userinfo("https://a@b:c@example.invalid:8443/x"),
+            "https://example.invalid:8443/x"
+        );
+        // A URL without a path ends at white space.
+        assert_eq!(
+            without_url_userinfo("'https://deploy:tok@example.invalid': refused"),
+            "'https://example.invalid': refused"
+        );
+        // Every URL in the text, whatever its scheme.
+        assert_eq!(
+            without_url_userinfo(
+                "ssh://git@example.invalid:2222/o/r.git, then http://u:p@10.0.0.1/r"
+            ),
+            "ssh://example.invalid:2222/o/r.git, then http://10.0.0.1/r"
+        );
+        // An `@` after the authority is part of the path and stays.
+        assert_eq!(
+            without_url_userinfo("https://u:p@example.invalid/@scope/x"),
+            "https://example.invalid/@scope/x"
+        );
+    }
+
+    #[test]
+    fn an_error_cannot_act_on_the_terminal_and_names_no_user_information() {
+        assert_eq!(
+            sanitize_error_for_terminal(
+                "push failed\nGit error: failed to resolve path 'file://user:s3cret@localhost/x\u{1b}[2J.git'\u{202e}"
+            ),
+            "push failed\nGit error: failed to resolve path 'file://localhost/x?[2J.git'?"
+        );
+        // A control character inside the user information does not keep the
+        // rest of it in.
+        assert_eq!(
+            sanitize_error_for_terminal("https://us\ter:p\rw@example.invalid/r"),
+            "https://example.invalid/r"
+        );
+        // Text with nothing to change, several lines and a URL included.
+        let plain = "error: first\n  caused by: https://example.invalid/r";
+        assert!(matches!(
+            sanitize_error_for_terminal(plain),
+            Cow::Borrowed(t) if t == plain
+        ));
     }
 
     /// The table above is the Unicode definition: every scalar value agrees with

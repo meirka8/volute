@@ -1,8 +1,10 @@
+use crate::terminal_text::sanitize_for_terminal;
 use anyhow::{Context, Result};
 use cvc_core::db::CvcStore;
 use cvc_core::models::Interaction;
 use cvc_core::repository::RepositoryLayout;
 use cvc_core::stimulus::{self, PartKind, Reading};
+use std::borrow::Cow;
 use std::env;
 
 pub async fn run() -> Result<()> {
@@ -33,13 +35,7 @@ pub async fn run() -> Result<()> {
             println!("Prom: {}", prompt_preview(&interaction));
             println!(
                 "Resp: {:.80}...",
-                interaction
-                    .model_response
-                    .as_deref()
-                    .unwrap_or("")
-                    .lines()
-                    .next()
-                    .unwrap_or("")
+                first_line(interaction.model_response.as_deref().unwrap_or(""))
             );
             println!("----------------------------------------");
         }
@@ -52,19 +48,20 @@ pub async fn run() -> Result<()> {
 /// boundary markers shows the first line of the person's text (or, in a
 /// subagent, of its task), or a short label of what it holds when there is
 /// none; any other text, version 1 or a stimulus whose boundary does not
-/// verify, shows its first line as it always did.
+/// verify, shows its first line as it always did. Whichever it is, the line is
+/// made by `first_line` below, so nothing in it can act on the terminal.
 fn prompt_preview(interaction: &Interaction) -> String {
-    let first_line = |text: &str| format!("{:.80}...", text.lines().next().unwrap_or(""));
+    let preview = |text: &str| format!("{:.80}...", first_line(text));
     let text = &interaction.user_prompt;
     let Reading::Verified(verified) = stimulus::read(&interaction.id, text) else {
-        return first_line(text);
+        return preview(text);
     };
     if let Some(part) = verified
         .parts
         .iter()
         .find(|part| matches!(part.kind, PartKind::Prompt | PartKind::Task))
     {
-        return first_line(part.content_of(text));
+        return preview(part.content_of(text));
     }
     let tool_results = verified
         .parts
@@ -84,9 +81,19 @@ fn prompt_preview(interaction: &Interaction) -> String {
     }
 }
 
+/// The first line of a prompt or a response, as the log shows it. Captured text
+/// is whatever a person, a model or a harness wrote, and a pulled thought's is
+/// whatever the remote's projection says, so it is shown with every control and
+/// format character replaced by `?`, one for one, so the log's 80-character cut
+/// falls where it did. The line is taken first: a prompt of several lines shows
+/// its first line, as it always did.
+fn first_line(text: &str) -> Cow<'_, str> {
+    sanitize_for_terminal(text.lines().next().unwrap_or(""))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::prompt_preview;
+    use super::{first_line, prompt_preview};
     use chrono::Utc;
     use cvc_core::models::{Author, Interaction, InteractionId};
     use cvc_core::privacy::scrub;
@@ -192,5 +199,19 @@ mod tests {
         // Nothing recorded.
         let none = interaction(&id, "[no stimulus recorded]".into());
         assert_eq!(prompt_preview(&none), "[no stimulus recorded]...");
+    }
+
+    #[test]
+    fn the_first_line_is_shown_as_plain_text() {
+        assert_eq!(first_line("Fix the build\nand the tests"), "Fix the build");
+        assert_eq!(first_line("one line\r\nanother"), "one line");
+        assert_eq!(first_line(""), "");
+        // An erase, an OSC 52 clipboard write, a right-to-left override, a line
+        // separator and a carriage return do not end the line; each is a `?`.
+        assert_eq!(
+            first_line("a\u{1b}[2Jb\u{1b}]52;c;SGVsbG8=\u{7}c\u{202e}d\u{2028}e\rf\nsecond"),
+            "a?[2Jb?]52;c;SGVsbG8=?c?d?e?f"
+        );
+        assert_eq!(format!("{:.4}...", first_line("\u{1b}[2Jabc")), "?[2J...");
     }
 }

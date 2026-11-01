@@ -803,7 +803,7 @@ fn a_node_with_withheld_fields_is_published_and_imported_as_it_is() {
 
     // And another machine imports exactly that.
     let imported = CvcStore::open(fixture.root.join("imported.db")).unwrap();
-    sync::pull_from_ref(repo, &imported, "refs/cvc/withheld-source").unwrap();
+    sync::pull_from_ref(repo, &imported, "refs/cvc/withheld-source", DESTINATION).unwrap();
     let id = derived_interaction_id(SESSION, "req_A");
     let pulled = imported.get_interaction(&id).unwrap().unwrap();
     assert_eq!(
@@ -1603,7 +1603,7 @@ fn a_stand_in_is_published_and_imported_like_any_node() {
         .unwrap();
     drop(candidate);
     let imported = CvcStore::open(fixture.root.join("imported.db")).unwrap();
-    sync::pull_from_ref(repo, &imported, "refs/cvc/stand-in-source").unwrap();
+    sync::pull_from_ref(repo, &imported, "refs/cvc/stand-in-source", DESTINATION).unwrap();
     let id = derived_interaction_id(SESSION, "req_A");
     let pulled = imported.get_interaction(&id).unwrap().unwrap();
     assert_eq!(pulled.model_response.as_deref(), Some(WITHHELD_RESPONSE));

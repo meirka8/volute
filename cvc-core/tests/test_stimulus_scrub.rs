@@ -536,7 +536,7 @@ fn projection_and_import_keep_a_verified_stimulus_verified() {
     drop(candidate);
 
     let imported = CvcStore::open(dir.path().join("imported.db")).unwrap();
-    sync::pull_from_ref(&repo, &imported, "refs/cvc/stimulus-source").unwrap();
+    sync::pull_from_ref(&repo, &imported, "refs/cvc/stimulus-source", DESTINATION).unwrap();
     let pulled = imported
         .get_interaction(&id())
         .unwrap()

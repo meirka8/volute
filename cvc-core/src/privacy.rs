@@ -26,12 +26,29 @@ pub(crate) const MAX_CONTEXT: usize = 256;
 pub(crate) const MAX_TOOLS: usize = 256;
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Why a privacy operation refused. Each variant names the kind of problem and
+/// its text says what it was. No text holds a remote URL or a destination
+/// fingerprint: every remote problem is a fixed sentence.
 #[derive(Error, Debug)]
 pub enum PrivacyError {
     #[error("capture value exceeds limit")]
     TooLarge,
+    /// The repository's `.thoughtignore` could not be read or is not valid.
     #[error("invalid .thoughtignore: {0}")]
     Policy(String),
+    /// A remote cannot be a destination: it is not configured, it has no usable
+    /// push URL, or no destination identity can be established for it.
+    #[error("{0}")]
+    Remote(String),
+    /// The repository-local consent state (`privacy.json`, its directory and its
+    /// locks) cannot be read, written or locked, or it holds no consent where
+    /// one is required.
+    #[error("{0}")]
+    ConsentState(String),
+    /// A value offered for capture, import or publication was refused: it is
+    /// not valid, or sanitizing it went over a bound.
+    #[error("{0}")]
+    Validation(String),
 }
 pub type Result<T> = std::result::Result<T, PrivacyError>;
 
@@ -97,11 +114,25 @@ pub struct PrivacyStatus {
 ///
 /// `effective_url` may embed credentials. `Debug` therefore leaves it out, and
 /// anything shown to a person uses [`display_location`] instead.
+///
+/// `fingerprint` is the destination's identity: the hex SHA-256 of
+/// `remote-url:<location>\nref:<ref_name>`, where `<location>` is
+/// `effective_url` without user information ([`url_without_userinfo`]). It is
+/// what consent, shares and publication state are recorded under, and what the
+/// typed challenges show.
+///
+/// `legacy_fingerprint` is set only when `effective_url` had user information:
+/// it is the fingerprint the same destination had when it was computed over
+/// the whole URL, user information included, which records made before that
+/// changed are still kept under until they are moved
+/// (`sync::adopt_legacy_records`). It is a hash over the credential-bearing
+/// URL, so it is never shown: `Debug` leaves it out too.
 #[derive(Clone)]
 pub struct RemoteDestination {
     pub name: String,
     pub effective_url: String,
     pub fingerprint: String,
+    pub legacy_fingerprint: Option<String>,
     pub ref_name: String,
 }
 
@@ -111,6 +142,10 @@ impl std::fmt::Debug for RemoteDestination {
             .field("name", &self.name)
             .field("effective_url", &"<redacted>")
             .field("fingerprint", &self.fingerprint)
+            .field(
+                "legacy_fingerprint",
+                &self.legacy_fingerprint.as_ref().map(|_| "<redacted>"),
+            )
             .field("ref_name", &self.ref_name)
             .finish()
     }
@@ -119,31 +154,115 @@ impl std::fmt::Debug for RemoteDestination {
 pub fn remote_destination(repo: &git2::Repository, remote_name: &str) -> Result<RemoteDestination> {
     let remote = repo
         .find_remote(remote_name)
-        .map_err(|_| PrivacyError::Policy("remote is not configured".into()))?;
+        .map_err(|_| PrivacyError::Remote("remote is not configured".into()))?;
     let url = remote
         .pushurl()
         .or_else(|| remote.url())
-        .ok_or_else(|| PrivacyError::Policy("remote has no push URL".into()))?
+        .ok_or_else(|| PrivacyError::Remote("remote has no push URL".into()))?
         .trim()
         .to_owned();
     if url.is_empty() {
-        return Err(PrivacyError::Policy("remote has an empty push URL".into()));
+        return Err(PrivacyError::Remote("remote has an empty push URL".into()));
     }
     let ref_name = "refs/cvc/main".to_owned();
-    let fingerprint = hex::encode(Sha256::digest(
-        format!("remote-url:{url}\nref:{ref_name}").as_bytes(),
-    ));
+    let location = url_without_userinfo(&url)?;
+    let fingerprint = destination_fingerprint(&location, &ref_name);
+    let legacy_fingerprint = (location != url).then(|| destination_fingerprint(&url, &ref_name));
     Ok(RemoteDestination {
         name: remote_name.to_owned(),
         effective_url: url,
         fingerprint,
+        legacy_fingerprint,
         ref_name,
     })
 }
 
+/// The fingerprint of a destination: hex SHA-256 over `location` and the CVC
+/// ref. `location` is the effective push URL without its user information
+/// ([`url_without_userinfo`]); for the legacy fingerprint, the whole URL.
+fn destination_fingerprint(location: &str, ref_name: &str) -> String {
+    hex::encode(Sha256::digest(
+        format!("remote-url:{location}\nref:{ref_name}").as_bytes(),
+    ))
+}
+
+/// Whether `value` has the form of a destination fingerprint: 64 ASCII hex
+/// digits. Only such a value is used in a lock file name or as the namespace of
+/// an imported conversation.
+pub fn is_destination_fingerprint(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// What a remote URL with no host that can be located is refused with. It is a
+/// fixed text: the URL is never part of it.
+fn unlocatable_host() -> PrivacyError {
+    PrivacyError::Remote("remote push URL has no host that can be located".into())
+}
+
+/// The effective push URL with its user information removed: the text a
+/// destination fingerprint is computed over (see [`RemoteDestination`]).
+///
+/// Unlike [`display_location`], which builds a form to show, this keeps the
+/// URL exactly as it is and takes one part out of it. It reads the URL the way
+/// libgit2 does, since libgit2 is what CVC fetches and pushes with:
+///
+/// - The text is a URL when it starts with a run of scheme characters (ASCII
+///   letters, digits, `+`, `-`, `.`) followed by `://`. Its authority is what
+///   follows the `://`, up to the first `/` or to the end. When the authority
+///   holds an `@`, everything in it up to and including its last `@` is user
+///   information (libgit2 takes the host from after the last `@`), so a user
+///   name and a password or token both go: `scheme://userinfo@host:port/path`
+///   becomes `scheme://host:port/path`. Everything else is kept byte for byte,
+///   in the case it was written in: scheme, host, port, path, query and
+///   fragment. A URL without user information is returned unchanged.
+/// - Anything else is returned unchanged: a transport-helper address
+///   (`<transport>::<address>`, checked first), an scp-like `[user@]host:path`
+///   and a local path. Their text is what git resolves, so nothing is taken out
+///   of it.
+///
+/// It fails closed, with an error that does not hold the URL, when the text is
+/// a URL in the sense above but no host can be told apart from its user
+/// information: the scheme is empty (`://user@host/r`), or nothing but a port
+/// or nothing at all follows the last `@` of the authority
+/// (`https://user:token@/r`, `https://user@:443/r`). The URL itself is never
+/// returned when user information may be in it but cannot be located.
+pub fn url_without_userinfo(url: &str) -> Result<String> {
+    if is_transport_helper(url) || !has_url_scheme_separator(url) {
+        return Ok(url.to_owned());
+    }
+    let (scheme, authority, rest) = split_scheme_url(url).ok_or_else(unlocatable_host)?;
+    match authority.rsplit_once('@') {
+        None => Ok(url.to_owned()),
+        Some((_, host_port)) if host_port.is_empty() || host_port.starts_with(':') => {
+            Err(unlocatable_host())
+        }
+        Some((_, host_port)) => Ok(format!("{scheme}://{host_port}{rest}")),
+    }
+}
+
+/// Whether libgit2 reads `url` as a URL with a scheme (`git_net_str_is_url`): a
+/// run of scheme characters, possibly empty, then `://`.
+fn has_url_scheme_separator(url: &str) -> bool {
+    let scheme_length = url.bytes().take_while(|&byte| is_scheme_byte(byte)).count();
+    url[scheme_length..].starts_with("://")
+}
+
+/// Splits `<scheme>://<authority><rest>` the way libgit2 reads a URL: the
+/// scheme is the unbroken run of scheme characters before the first `://`, and
+/// must not be empty; the authority ends at the first `/` after it, which
+/// starts `rest`. `None` when the text is not such a URL.
+fn split_scheme_url(url: &str) -> Option<(&str, &str, &str)> {
+    let (scheme, after) = url.split_once("://")?;
+    if scheme.is_empty() || !scheme.bytes().all(is_scheme_byte) {
+        return None;
+    }
+    let end = after.find('/').unwrap_or(after.len());
+    Some((scheme, &after[..end], &after[end..]))
+}
+
 fn privacy_path(repo: &git2::Repository) -> Result<PathBuf> {
     Ok(crate::repository::common_git_dir(repo)
-        .map_err(|e| PrivacyError::Policy(e.to_string()))?
+        .map_err(|e| PrivacyError::ConsentState(format!("cannot locate privacy state: {e}")))?
         .join("cvc")
         .join("privacy.json"))
 }
@@ -250,15 +369,11 @@ fn url_location(url: &str) -> Option<String> {
     // unbroken run of scheme characters before the first `://` and the
     // authority ends at the first `/`. Whatever else the `url` crate would make
     // of the string is not what is contacted.
-    let (scheme, rest) = url.split_once("://")?;
-    if scheme.is_empty() || !scheme.bytes().all(is_scheme_byte) {
-        return None;
-    }
+    let (_, authority, _) = split_scheme_url(url)?;
     // `\` is a path separator to the `url` crate in a URL with a special
     // scheme, and a character like any other to libgit2, so the path shown
     // would not be the path used. In the authority it also moves the end of the
     // host, as do `?` and `#`.
-    let authority = rest.split('/').next().unwrap_or("");
     if url.contains('\\') || authority.contains(['?', '#']) {
         return None;
     }
@@ -397,10 +512,10 @@ fn read_privacy(repo: &git2::Repository) -> Result<PrivacyFile> {
                 ..Default::default()
             })
         }
-        Err(e) => return Err(PrivacyError::Policy(e.to_string())),
+        Err(e) => return Err(consent_state("cannot inspect privacy state", e)),
     };
     if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err(PrivacyError::Policy(
+        return Err(PrivacyError::ConsentState(
             "privacy state is not a regular file".into(),
         ));
     }
@@ -408,7 +523,7 @@ fn read_privacy(repo: &git2::Repository) -> Result<PrivacyFile> {
     {
         use std::os::unix::fs::MetadataExt;
         if meta.mode() & 0o077 != 0 {
-            return Err(PrivacyError::Policy(
+            return Err(PrivacyError::ConsentState(
                 "privacy state permissions are insecure".into(),
             ));
         }
@@ -421,56 +536,62 @@ fn read_privacy(repo: &git2::Repository) -> Result<PrivacyFile> {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
-            .map_err(|e| PrivacyError::Policy(e.to_string()))?;
+            .map_err(|e| consent_state("cannot open privacy state", e))?;
         let opened = file
             .metadata()
-            .map_err(|e| PrivacyError::Policy(e.to_string()))?;
+            .map_err(|e| consent_state("cannot inspect privacy state", e))?;
         if !opened.is_file()
             || opened.dev() != meta.dev()
             || opened.ino() != meta.ino()
             || opened.mode() & 0o077 != 0
         {
-            return Err(PrivacyError::Policy(
+            return Err(PrivacyError::ConsentState(
                 "privacy state changed while opening".into(),
             ));
         }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
-            .map_err(|e| PrivacyError::Policy(e.to_string()))?;
+            .map_err(|e| consent_state("cannot read privacy state", e))?;
         bytes
     };
     #[cfg(not(unix))]
-    let bytes = std::fs::read(path).map_err(|e| PrivacyError::Policy(e.to_string()))?;
+    let bytes = std::fs::read(path).map_err(|e| consent_state("cannot read privacy state", e))?;
     let state: PrivacyFile = serde_json::from_slice(&bytes)
-        .map_err(|_| PrivacyError::Policy("privacy state is malformed".into()))?;
+        .map_err(|_| PrivacyError::ConsentState("privacy state is malformed".into()))?;
     if state.version != PRIVACY_NOTICE_VERSION {
-        return Err(PrivacyError::Policy(
+        return Err(PrivacyError::ConsentState(
             "privacy notice version is unsupported".into(),
         ));
     }
     Ok(state)
 }
+/// A consent-state failure that has an underlying error: what was being done,
+/// then the system's own words.
+fn consent_state(doing: &str, error: impl std::fmt::Display) -> PrivacyError {
+    PrivacyError::ConsentState(format!("{doing}: {error}"))
+}
 fn write_privacy(repo: &git2::Repository, state: &PrivacyFile) -> Result<()> {
     let path = privacy_path(repo)?;
     let parent = path
         .parent()
-        .ok_or_else(|| PrivacyError::Policy("invalid privacy path".into()))?;
-    std::fs::create_dir_all(parent).map_err(|e| PrivacyError::Policy(e.to_string()))?;
+        .ok_or_else(|| PrivacyError::ConsentState("invalid privacy path".into()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| consent_state("cannot create the privacy directory", e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         // The CVC directory is repository-private state. Tighten directories we
         // create before placing any state in them.
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| PrivacyError::Policy(e.to_string()))?;
-        let meta =
-            std::fs::symlink_metadata(parent).map_err(|e| PrivacyError::Policy(e.to_string()))?;
+            .map_err(|e| consent_state("cannot secure the privacy directory", e))?;
+        let meta = std::fs::symlink_metadata(parent)
+            .map_err(|e| consent_state("cannot inspect the privacy directory", e))?;
         if meta.file_type().is_symlink()
             || !meta.is_dir()
             || meta.uid() != unsafe { libc::geteuid() }
             || meta.mode() & 0o077 != 0
         {
-            return Err(PrivacyError::Policy(
+            return Err(PrivacyError::ConsentState(
                 "privacy directory ownership or permissions are insecure".into(),
             ));
         }
@@ -484,28 +605,30 @@ fn write_privacy(repo: &git2::Repository, state: &PrivacyFile) -> Result<()> {
             .write(true)
             .mode(0o600)
             .open(&tmp)
-            .map_err(|e| PrivacyError::Policy(e.to_string()))?;
+            .map_err(|e| consent_state("cannot write privacy state", e))?;
         serde_json::to_writer_pretty(&mut f, state)
-            .map_err(|e| PrivacyError::Policy(e.to_string()))?;
+            .map_err(|e| consent_state("cannot write privacy state", e))?;
         use std::io::Write;
-        f.flush().map_err(|e| PrivacyError::Policy(e.to_string()))?;
+        f.flush()
+            .map_err(|e| consent_state("cannot write privacy state", e))?;
         f.sync_all()
-            .map_err(|e| PrivacyError::Policy(e.to_string()))?;
+            .map_err(|e| consent_state("cannot write privacy state", e))?;
     }
     #[cfg(not(unix))]
     {
         std::fs::write(
             &tmp,
-            serde_json::to_vec_pretty(state).map_err(|e| PrivacyError::Policy(e.to_string()))?,
+            serde_json::to_vec_pretty(state)
+                .map_err(|e| consent_state("cannot write privacy state", e))?,
         )
-        .map_err(|e| PrivacyError::Policy(e.to_string()))?;
+        .map_err(|e| consent_state("cannot write privacy state", e))?;
     }
-    std::fs::rename(tmp, &path).map_err(|e| PrivacyError::Policy(e.to_string()))?;
+    std::fs::rename(tmp, &path).map_err(|e| consent_state("cannot replace privacy state", e))?;
     #[cfg(unix)]
     {
         std::fs::File::open(parent)
             .and_then(|d| d.sync_all())
-            .map_err(|e| PrivacyError::Policy(e.to_string()))?;
+            .map_err(|e| consent_state("cannot write privacy state", e))?;
     }
     Ok(())
 }
@@ -519,22 +642,25 @@ fn privacy_lock(repo: &git2::Repository) -> Result<PrivacyLock> {
     let path = privacy_path(repo)?;
     let parent = path
         .parent()
-        .ok_or_else(|| PrivacyError::Policy("invalid privacy path".into()))?;
-    std::fs::create_dir_all(parent).map_err(|e| PrivacyError::Policy(e.to_string()))?;
+        .ok_or_else(|| PrivacyError::ConsentState("invalid privacy path".into()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| consent_state("cannot create the privacy directory", e))?;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| PrivacyError::Policy(e.to_string()))?;
-        let meta =
-            std::fs::symlink_metadata(parent).map_err(|e| PrivacyError::Policy(e.to_string()))?;
+            .map_err(|e| consent_state("cannot secure the privacy directory", e))?;
+        let meta = std::fs::symlink_metadata(parent)
+            .map_err(|e| consent_state("cannot inspect the privacy directory", e))?;
         if meta.file_type().is_symlink()
             || meta.uid() != unsafe { libc::geteuid() }
             || meta.mode() & 0o077 != 0
         {
-            return Err(PrivacyError::Policy("privacy directory is insecure".into()));
+            return Err(PrivacyError::ConsentState(
+                "privacy directory is insecure".into(),
+            ));
         }
     }
     let mut options = std::fs::OpenOptions::new();
@@ -545,19 +671,21 @@ fn privacy_lock(repo: &git2::Repository) -> Result<PrivacyLock> {
     }
     let file = options
         .open(parent.join("privacy.lock"))
-        .map_err(|e| PrivacyError::Policy(e.to_string()))?;
+        .map_err(|e| consent_state("cannot open the privacy lock", e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         let meta = file
             .metadata()
-            .map_err(|e| PrivacyError::Policy(e.to_string()))?;
+            .map_err(|e| consent_state("cannot inspect the privacy lock", e))?;
         if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
-            return Err(PrivacyError::Policy("privacy lock is insecure".into()));
+            return Err(PrivacyError::ConsentState(
+                "privacy lock is insecure".into(),
+            ));
         }
     }
     fs2::FileExt::lock_exclusive(&file)
-        .map_err(|e| PrivacyError::Policy(format!("cannot lock privacy state: {e}")))?;
+        .map_err(|e| consent_state("cannot lock privacy state", e))?;
     Ok(PrivacyLock(file))
 }
 /// Serializes the full publication state machine for one immutable destination.
@@ -566,16 +694,17 @@ pub fn destination_operation_lock(
     repo: &git2::Repository,
     fingerprint: &str,
 ) -> Result<PrivacyLock> {
-    if fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(PrivacyError::Policy(
+    if !is_destination_fingerprint(fingerprint) {
+        return Err(PrivacyError::Remote(
             "invalid destination fingerprint".into(),
         ));
     }
     let path = privacy_path(repo)?;
     let parent = path
         .parent()
-        .ok_or_else(|| PrivacyError::Policy("invalid privacy path".into()))?;
-    std::fs::create_dir_all(parent).map_err(|e| PrivacyError::Policy(e.to_string()))?;
+        .ok_or_else(|| PrivacyError::ConsentState("invalid privacy path".into()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| consent_state("cannot create the privacy directory", e))?;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     let mut options = std::fs::OpenOptions::new();
@@ -586,9 +715,8 @@ pub fn destination_operation_lock(
     }
     let file = options
         .open(parent.join(format!("publish-{fingerprint}.lock")))
-        .map_err(|e| PrivacyError::Policy(e.to_string()))?;
-    fs2::FileExt::lock_exclusive(&file)
-        .map_err(|e| PrivacyError::Policy(format!("cannot lock destination: {e}")))?;
+        .map_err(|e| consent_state("cannot open the destination lock", e))?;
+    fs2::FileExt::lock_exclusive(&file).map_err(|e| consent_state("cannot lock destination", e))?;
     Ok(PrivacyLock(file))
 }
 pub fn privacy_status(repo: &git2::Repository, remote: &str) -> Result<PrivacyStatus> {
@@ -798,7 +926,7 @@ pub fn set_auto_push_destination(
         .find(|x| {
             x.fingerprint == destination.fingerprint && x.notice_version == PRIVACY_NOTICE_VERSION
         })
-        .ok_or_else(|| PrivacyError::Policy("sharing consent is required".into()))?;
+        .ok_or_else(|| PrivacyError::ConsentState("sharing consent is required".into()))?;
     consent.auto_push = enabled;
     write_privacy(repo, &s)
 }
@@ -806,6 +934,77 @@ pub fn set_auto_push_destination(
 /// The kinds of redaction marker the repository policy writes. The built-in
 /// detectors each write one named as they are.
 const POLICY_MARKER_KINDS: [&str; 2] = ["policy_literal", "policy_regex"];
+
+/// `destination`'s legacy fingerprint, once it is shown to be the one its own
+/// push URL had: `fingerprint` must be the fingerprint of `effective_url`
+/// without user information, and `legacy_fingerprint` the fingerprint of the
+/// whole `effective_url`, the two differing. `None` when the destination has
+/// no legacy fingerprint.
+///
+/// Records are only ever moved between the two fingerprints of one push URL,
+/// so a destination assembled by hand with any other pair is refused, with an
+/// error that holds neither the URL nor the legacy fingerprint.
+pub(crate) fn verified_legacy_fingerprint(destination: &RemoteDestination) -> Result<Option<&str>> {
+    let Some(legacy) = destination.legacy_fingerprint.as_deref() else {
+        return Ok(None);
+    };
+    let location = url_without_userinfo(&destination.effective_url)?;
+    if location == destination.effective_url
+        || destination.fingerprint != destination_fingerprint(&location, &destination.ref_name)
+        || legacy != destination_fingerprint(&destination.effective_url, &destination.ref_name)
+    {
+        return Err(PrivacyError::Remote(
+            "destination fingerprints do not match its push URL".into(),
+        ));
+    }
+    Ok(Some(legacy))
+}
+
+/// Whether `state` keeps a sharing consent under `legacy` and none under
+/// `fingerprint`: the only case in which one is moved. A consent already kept
+/// under `fingerprint` wins, and nothing is merged into it.
+fn consent_awaits_adoption(state: &PrivacyFile, legacy: &str, fingerprint: &str) -> bool {
+    state.sharing.iter().any(|x| x.fingerprint == legacy)
+        && !state.sharing.iter().any(|x| x.fingerprint == fingerprint)
+}
+
+/// Whether `privacy.json` keeps a sharing consent under `legacy` that
+/// [`adopt_legacy_sharing_consent`] would move to `fingerprint`. Read-only: no
+/// lock is taken and nothing is created.
+pub(crate) fn legacy_sharing_consent_pending(
+    repo: &git2::Repository,
+    legacy: &str,
+    fingerprint: &str,
+) -> Result<bool> {
+    Ok(consent_awaits_adoption(
+        &read_privacy(repo)?,
+        legacy,
+        fingerprint,
+    ))
+}
+
+/// Moves the sharing consent kept under `legacy` (its notice version and its
+/// auto-push setting with it) to `fingerprint`, when there is one and none is
+/// kept under `fingerprint`. Under the privacy state lock; `privacy.json` is
+/// rewritten only when something moved. Returns whether it did.
+pub(crate) fn adopt_legacy_sharing_consent(
+    repo: &git2::Repository,
+    legacy: &str,
+    fingerprint: &str,
+) -> Result<bool> {
+    let _lock = privacy_lock(repo)?;
+    let mut state = read_privacy(repo)?;
+    if !consent_awaits_adoption(&state, legacy, fingerprint) {
+        return Ok(false);
+    }
+    for consent in &mut state.sharing {
+        if consent.fingerprint == legacy {
+            consent.fingerprint = fingerprint.to_owned();
+        }
+    }
+    write_privacy(repo, &state)?;
+    Ok(true)
+}
 
 fn marker(kind: &str) -> String {
     debug_assert!(
@@ -1513,7 +1712,7 @@ fn orphan_pem_replace(text: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     if regions.len() > MAX_MATCHES {
-        return Err(PrivacyError::Policy("too many secret matches".into()));
+        return Err(PrivacyError::Validation("too many secret matches".into()));
     }
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
@@ -1554,7 +1753,7 @@ fn settle_orphan_blocks(mut text: String) -> Result<String> {
             Some(redacted) => text = restore_markers(&redacted, &protected),
         }
     }
-    Err(PrivacyError::Policy("too many secret matches".into()))
+    Err(PrivacyError::Validation("too many secret matches".into()))
 }
 
 /// `input` with each redaction marker replaced by a placeholder, and the markers
@@ -1594,7 +1793,7 @@ pub fn scrub(input: &str) -> Result<String> {
     for (kind, regex) in builtin_detectors() {
         let count = regex.find_iter(&out).count();
         if count > MAX_MATCHES {
-            return Err(PrivacyError::Policy("too many secret matches".into()));
+            return Err(PrivacyError::Validation("too many secret matches".into()));
         }
         out = regex
             .replace_all(&out, |_: &regex::Captures<'_>| marker(kind))
@@ -1619,7 +1818,7 @@ pub fn scrub_json(input: &str) -> Result<String> {
     match serde_json::from_str::<Value>(input) {
         Ok(mut value) => {
             scrub_value(&mut value)?;
-            serde_json::to_string(&value).map_err(|e| PrivacyError::Policy(e.to_string()))
+            serde_json::to_string(&value).map_err(|e| PrivacyError::Validation(e.to_string()))
         }
         Err(_) => scrub(input),
     }
@@ -1631,7 +1830,7 @@ pub fn scrub_json_with_policy(input: &str, policy: &ThoughtIgnore) -> Result<Str
     match serde_json::from_str::<Value>(input) {
         Ok(mut value) => {
             scrub_value_with_policy(&mut value, policy)?;
-            serde_json::to_string(&value).map_err(|e| PrivacyError::Policy(e.to_string()))
+            serde_json::to_string(&value).map_err(|e| PrivacyError::Validation(e.to_string()))
         }
         Err(_) => policy.scrub(input),
     }
@@ -1711,7 +1910,7 @@ fn is_redaction_marker(value: &str) -> bool {
 /// patterns).
 pub fn validate_sanitized_json(input: &str) -> Result<()> {
     if scrub_json(input)? != input {
-        return Err(PrivacyError::Policy("unsanitized JSON value".into()));
+        return Err(PrivacyError::Validation("unsanitized JSON value".into()));
     }
     Ok(())
 }
@@ -1834,7 +2033,7 @@ impl ThoughtIgnore {
             while let Some(found) = staged.text[at..].find(literal.as_str()) {
                 matches += 1;
                 if matches > MAX_MATCHES {
-                    return Err(PrivacyError::Policy("too many policy matches".into()));
+                    return Err(PrivacyError::Validation("too many policy matches".into()));
                 }
                 let start = at + found;
                 at = start + literal.len();
@@ -1850,7 +2049,7 @@ impl ThoughtIgnore {
                 }
                 matches += 1;
                 if matches > MAX_MATCHES {
-                    return Err(PrivacyError::Policy("too many policy matches".into()));
+                    return Err(PrivacyError::Validation("too many policy matches".into()));
                 }
                 ranges.push(found.range());
             }
@@ -1892,7 +2091,7 @@ impl Staged {
             .iter()
             .position(|used| !used)
             .and_then(|index| char::from_u32(PLACEHOLDER_FIRST + index as u32))
-            .ok_or_else(|| PrivacyError::Policy("no free placeholder character".into()))?;
+            .ok_or_else(|| PrivacyError::Validation("no free placeholder character".into()))?;
         let mut text = String::with_capacity(scrubbed.len());
         let mut markers = Vec::new();
         let mut at = 0;
@@ -1960,7 +2159,7 @@ impl Staged {
                 out.push_str(
                     &markers
                         .next()
-                        .ok_or_else(|| PrivacyError::Policy("marker staging failed".into()))?,
+                        .ok_or_else(|| PrivacyError::Validation("marker staging failed".into()))?,
                 );
             } else {
                 out.push(c);
@@ -2199,7 +2398,7 @@ pub(crate) fn sync_import_capture(
 }
 pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
     if capture.context_items.len() > MAX_CONTEXT || capture.tool_executions.len() > MAX_TOOLS {
-        return Err(PrivacyError::Policy(
+        return Err(PrivacyError::Validation(
             "capture collection exceeds limit".into(),
         ));
     }
@@ -2247,7 +2446,7 @@ pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
     if !is_safe_identifier(&capture.conversation.id)
         || capture.interaction.conversation_id != capture.conversation.id
     {
-        return Err(PrivacyError::Policy(
+        return Err(PrivacyError::Validation(
             "unsafe or inconsistent conversation id".into(),
         ));
     }
@@ -2256,7 +2455,7 @@ pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
         .source_request_id
         .map(|s| {
             if !is_safe_identifier(&s) {
-                return Err(PrivacyError::Policy("unsafe source request id".into()));
+                return Err(PrivacyError::Validation("unsafe source request id".into()));
             }
             scrub(&s)
         })
@@ -2291,7 +2490,7 @@ pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
         x.file_path = policy.scrub(&x.file_path)?;
         if let Some(sha) = &x.git_blob_sha {
             if !is_oid(sha) {
-                return Err(PrivacyError::Policy("invalid git blob oid".into()));
+                return Err(PrivacyError::Validation("invalid git blob oid".into()));
             }
         }
         x.dirty_patch = x.dirty_patch.take().map(|s| policy.scrub(&s)).transpose()?;
@@ -2337,7 +2536,15 @@ pub(crate) enum HarnessCapture {
 fn refusal_reason(error: &PrivacyError) -> String {
     match error {
         PrivacyError::TooLarge => "a value exceeds the scrubber's size limit".into(),
-        PrivacyError::Policy(reason) => reason.clone(),
+        // What the scrubber and the policy say when they refuse a value is a limit
+        // they name, never the value.
+        PrivacyError::Policy(reason) | PrivacyError::Validation(reason) => reason.clone(),
+        // Preparing a capture neither resolves a remote nor reads the consent
+        // state, so these do not arise here. Their messages can name what they
+        // concern, which a reason must not, so a fixed one stands in.
+        PrivacyError::Remote(_) | PrivacyError::ConsentState(_) => {
+            "the capture could not be prepared".into()
+        }
     }
 }
 
@@ -2499,13 +2706,13 @@ pub fn final_scrub_for_sync(
 pub fn final_validate_links(links: &mut [ArtifactLink]) -> Result<()> {
     for link in links {
         if !is_oid(link.git_commit_hash.as_str()) {
-            return Err(PrivacyError::Policy("invalid link oid".into()));
+            return Err(PrivacyError::Validation("invalid link oid".into()));
         }
         if !matches!(
             link.link_type.as_str(),
             "generated" | "temporal" | "verified"
         ) {
-            return Err(PrivacyError::Policy("invalid link type".into()));
+            return Err(PrivacyError::Validation("invalid link type".into()));
         }
         link.linked_by = link
             .linked_by

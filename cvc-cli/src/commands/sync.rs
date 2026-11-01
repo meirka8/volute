@@ -45,48 +45,48 @@ fn open(cwd: &Path) -> Result<(Repository, CvcStore)> {
     Ok((layout.into_repository(), store))
 }
 pub async fn privacy_status(requested: Option<&str>) -> Result<()> {
-    let (repo, _) = open(&env::current_dir()?)?;
+    let (repo, store) = open(&env::current_dir()?)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let s = privacy::privacy_status_for_fingerprint(&repo, &destination.fingerprint)?;
-    println!("capture_acknowledged: {}", s.capture_acknowledged);
-    // Only when an acknowledgement is on record that does not count here, so
-    // that the reason for `false` is not left to guess.
-    if s.capture_acknowledgement == privacy::CaptureAcknowledgement::OtherCheckoutOrUser {
-        println!("note: {}", super::harness::ACKNOWLEDGED_ELSEWHERE);
-    }
-    println!(
-        "sharing_consented: {}\nauto_push: {}\nremote: {}\ndestination_fingerprint: {}",
-        s.sharing_consented, s.auto_push, name, s.remote_fingerprint
-    );
+    println!("{}", privacy_status_report(&s, &name));
     Ok(())
 }
 pub async fn acknowledge_capture() -> Result<()> {
     let (repo, _) = open(&env::current_dir()?)?;
-    typed_acknowledgement("I UNDERSTAND LOCAL CAPTURE")?;
+    typed_acknowledgement(capture_challenge())?;
     privacy::acknowledge_capture(&repo)?;
     println!("Capture acknowledgement saved locally; it is never synced.");
     Ok(())
 }
 pub async fn acknowledge_sharing(requested: Option<&str>) -> Result<()> {
-    let (repo, _) = open(&env::current_dir()?)?;
+    let (repo, store) = open(&env::current_dir()?)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
-    acknowledge_sharing_for(&repo, &destination)
+    acknowledge_sharing_for(&repo, &store, &destination)
 }
 
 /// What `cvc privacy acknowledge-sharing --remote <destination.name>` does once
 /// the destination is known: show its fingerprint, then require the typed
-/// `I AUTHORIZE SHARING <fingerprint>` challenge before recording the consent.
+/// `I AUTHORIZE SHARING <fingerprint> <nonce>` challenge before recording the
+/// consent.
 /// The consent is bound to `destination.fingerprint` and grants nothing for
 /// any other destination; it does not enable automatic push.
+///
+/// Records an earlier version kept for the destination under its legacy
+/// fingerprint are moved to its fingerprint first
+/// (`sync::adopt_legacy_records`), as in every flow that reads or writes a
+/// destination's consent or publication state.
 pub(crate) fn acknowledge_sharing_for(
     repo: &Repository,
+    store: &CvcStore,
     destination: &privacy::RemoteDestination,
 ) -> Result<()> {
+    sync::adopt_legacy_records(repo, store, destination)?;
     let s = privacy::privacy_status_for_fingerprint(repo, &destination.fingerprint)?;
     println!("Acknowledging immutable publication to remote '{}' (fingerprint {}). This does not enable automatic push.", sanitize_for_terminal(&destination.name), s.remote_fingerprint);
-    typed_acknowledgement(&format!("I AUTHORIZE SHARING {}", s.remote_fingerprint))?;
+    typed_acknowledgement(sharing_challenge(&s.remote_fingerprint))?;
     privacy::acknowledge_sharing_destination(repo, destination)?;
     Ok(())
 }
@@ -183,7 +183,101 @@ fn ensure_phrase_can_be_shown(challenge: &str) -> Result<()> {
     Ok(())
 }
 
-/// Consent gate: the human must type `challenge` verbatim after seeing it.
+/// The phrase a typed acknowledgement asks for, by whether it can be worked out
+/// before its prompt is shown.
+///
+/// A phrase made only of constants, a destination fingerprint (a hash of a push
+/// URL, which anyone who knows the URL can compute), conversation or
+/// interaction ids and commit ids can be. Sent to the terminal by something that
+/// cannot see the prompt but gets the moment right, it would pass, so it is
+/// asked with a nonce after it that is drawn for that one prompt
+/// ([`crate::tty::challenge_nonce`]).
+///
+/// A phrase that carries what only this command has just read or built, the
+/// token of a share's exact snapshot or the commit that a publish or a
+/// redaction plan writes, cannot be, and is asked as it is.
+#[derive(Debug)]
+enum Challenge {
+    /// Can be worked out in advance: every prompt appends a nonce of its own.
+    Predictable(String),
+    /// Carries something that is not known before the prompt: asked as it is.
+    Unpredictable(String),
+}
+
+impl Challenge {
+    /// The phrase without any nonce.
+    fn phrase(&self) -> &str {
+        match self {
+            Self::Predictable(phrase) | Self::Unpredictable(phrase) => phrase,
+        }
+    }
+
+    /// The exact text one prompt asks to be typed. `nonce` is called for a
+    /// predictable phrase only, once, at the moment the prompt is built.
+    fn to_type(&self, nonce: impl FnOnce() -> String) -> String {
+        match self {
+            Self::Predictable(phrase) => format!("{phrase} {}", nonce()),
+            Self::Unpredictable(phrase) => phrase.clone(),
+        }
+    }
+}
+
+/// `cvc privacy acknowledge-capture`.
+fn capture_challenge() -> Challenge {
+    Challenge::Predictable("I UNDERSTAND LOCAL CAPTURE".to_owned())
+}
+
+/// `cvc privacy acknowledge-sharing`, and authorizing publishing from the
+/// interactive view.
+fn sharing_challenge(fingerprint: &str) -> Challenge {
+    Challenge::Predictable(format!("I AUTHORIZE SHARING {fingerprint}"))
+}
+
+/// `cvc privacy set-auto-push on|off`.
+fn auto_push_challenge(enabled: bool, fingerprint: &str) -> Challenge {
+    let setting = if enabled { "ON" } else { "OFF" };
+    Challenge::Predictable(format!("I AUTHORIZE AUTO PUSH {setting} {fingerprint}"))
+}
+
+/// `cvc share`: `count` and `token` pin the exact snapshot. With future sharing
+/// the word `FUTURE` follows `I SHARE`, so the standing grant over thoughts not
+/// captured yet is part of what is typed: the phrase of a snapshot share does
+/// not confirm a future share, and the phrase of a future share does not
+/// confirm a snapshot share.
+fn share_challenge(
+    id: &str,
+    fingerprint: &str,
+    count: usize,
+    token: &str,
+    future: FutureSharePolicy,
+) -> Challenge {
+    let marker = match future {
+        FutureSharePolicy::Shared => "FUTURE ",
+        FutureSharePolicy::Private => "",
+    };
+    Challenge::Unpredictable(format!(
+        "I SHARE {marker}{id} {fingerprint} {count} {token}"
+    ))
+}
+
+/// `cvc unshare`.
+fn unshare_challenge(id: &str, fingerprint: &str) -> Challenge {
+    Challenge::Predictable(format!("I UNSHARE {id} {fingerprint}"))
+}
+
+/// `cvc redact`, when it records the pending remote tombstone.
+fn redact_challenge(id: &InteractionId, fingerprint: &str) -> Challenge {
+    Challenge::Predictable(format!("I REDACT {id} {fingerprint}"))
+}
+
+/// `cvc relink observe-range --remote`.
+fn range_challenge(base: git2::Oid, tip: git2::Oid, fingerprint: &str) -> Challenge {
+    Challenge::Predictable(format!("I AUTHORIZE RANGE {base} {tip} {fingerprint}"))
+}
+
+/// Consent gate: the human must type the phrase of `challenge` verbatim after
+/// seeing it, followed, for a phrase that can be worked out in advance, by the
+/// nonce its prompt shows.
 ///
 /// The answer is read from the controlling terminal itself, not from the
 /// process-global stdin, and whatever was queued before the prompt is
@@ -193,18 +287,26 @@ fn ensure_phrase_can_be_shown(challenge: &str) -> Result<()> {
 /// picker, or a preceding challenge in the same command) may already hold the
 /// next line; answering from that would let type-ahead or a paste satisfy a
 /// challenge that was never displayed. See `crate::tty`.
-fn typed_acknowledgement(challenge: &str) -> Result<()> {
+///
+/// The nonce is drawn after that wait, right before the prompt is written, and
+/// anew for every prompt, so nothing sent before the prompt, and no answer to
+/// an earlier prompt, holds it. The answer is compared with the whole text
+/// exactly.
+fn typed_acknowledgement(challenge: Challenge) -> Result<()> {
     if !crate::tty::stdio_is_terminal() {
         bail!("acknowledgement requires an interactive TTY");
     }
-    ensure_phrase_can_be_shown(challenge)?;
+    // A nonce is made of capital letters and digits, so the phrase is what
+    // decides whether the prompt can be shown.
+    ensure_phrase_can_be_shown(challenge.phrase())?;
     let mut terminal = crate::tty::Terminal::open()
         .context("acknowledgement requires access to the controlling terminal")?;
     terminal.discard_pending_input().map_err(answer_error)?;
+    let expected = challenge.to_type(crate::tty::challenge_nonce);
     let answer = terminal
-        .prompt_line(&format!("Type exactly '{challenge}' to continue: "))
+        .prompt_line(&format!("Type exactly '{expected}' to continue: "))
         .map_err(answer_error)?;
-    if answer != challenge {
+    if answer != expected {
         return Err(ChallengeNotConfirmed::Mismatch.into());
     }
     Ok(())
@@ -243,20 +345,13 @@ pub async fn set_auto_push(value: &str, requested: Option<&str>) -> Result<()> {
         "off" => false,
         _ => bail!("auto-push must be 'on' or 'off'"),
     };
-    let (repo, _) = open(&env::current_dir()?)?;
+    let (repo, store) = open(&env::current_dir()?)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
-    typed_acknowledgement(&format!(
-        "I AUTHORIZE AUTO PUSH {} {}",
-        if enabled { "ON" } else { "OFF" },
-        destination.fingerprint
-    ))?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
+    typed_acknowledgement(auto_push_challenge(enabled, &destination.fingerprint))?;
     privacy::set_auto_push_destination(&repo, &destination, enabled)?;
-    println!(
-        "Auto-push {} for remote '{}'.",
-        if enabled { "enabled" } else { "disabled" },
-        name
-    );
+    println!("{}", auto_push_line(enabled, &name));
     Ok(())
 }
 pub async fn share(
@@ -271,6 +366,8 @@ pub async fn share(
     // implicit destination is origin; an explicit --remote is authoritative.
     let name = requested.unwrap_or("origin");
     let destination = privacy::remote_destination(&repo, name)?;
+    // Before the picker reads what is shared for the destination.
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let picked;
     let id = match id {
         Some(id) => id,
@@ -300,7 +397,9 @@ pub async fn share(
 /// conversation holding thoughts recorded through MCP, that future sharing does
 /// not extend to later ones), then requires the typed
 /// `I SHARE <id> <fingerprint> <count> <token>` challenge for the exact
-/// snapshot it just read, and only then records the share. The challenge goes
+/// snapshot it just read, `I SHARE FUTURE <id> <fingerprint> <count> <token>`
+/// when future thoughts are shared too, and only then records the share. The
+/// phrase of one never confirms the other. The challenge goes
 /// through `typed_acknowledgement`, so it needs an interactive terminal and a
 /// human typing the phrase after it is displayed. With `publish_after` the
 /// bundled publication follows, behind its own challenge unless the
@@ -324,6 +423,7 @@ pub(crate) fn share_conversation(
     future: FutureSharePolicy,
     publish_after: bool,
 ) -> Result<ShareOutcome> {
+    sync::adopt_legacy_records(repo, store, destination)?;
     // Make the consent legible: title and activity range alongside the
     // snapshot count already embedded in the challenge below.
     if let Some(summary) = store
@@ -339,11 +439,12 @@ pub(crate) fn share_conversation(
     let ids = store.share_snapshot(id)?;
     let closure = ids.iter().map(|x| x.as_str()).collect::<String>();
     let token = hex::encode(Sha256::digest(closure.as_bytes()));
-    typed_acknowledgement(&format!(
-        "I SHARE {id} {} {} {}",
-        destination.fingerprint,
+    typed_acknowledgement(share_challenge(
+        id,
+        &destination.fingerprint,
         ids.len(),
-        &token[..12]
+        &token[..12],
+        future,
     ))?;
     store.share_exact_snapshot(id, &destination.fingerprint, &ids, future)?;
     let count = ids.len();
@@ -405,7 +506,7 @@ pub async fn unshare(id: &str, requested: Option<&str>) -> Result<()> {
 /// What `cvc unshare <conversation_id> --remote <destination.name>` does once
 /// the destination is known: under the destination's operation lock, refuse at
 /// once, asking nothing, if the store would refuse; otherwise require the
-/// typed `I UNSHARE <id> <fingerprint>` challenge, then make the
+/// typed `I UNSHARE <id> <fingerprint> <nonce>` challenge, then make the
 /// conversation's thoughts private for that destination. The store refuses, and
 /// nothing changes, while any thought of the conversation is pending, published
 /// or of unknown state there, because unsharing cannot recall content a
@@ -425,9 +526,10 @@ pub(crate) fn unshare_conversation(
     destination: &privacy::RemoteDestination,
     id: &str,
 ) -> Result<usize> {
+    sync::adopt_legacy_records(repo, store, destination)?;
     let _operation_lock = privacy::destination_operation_lock(repo, &destination.fingerprint)?;
     refuse_unshare_that_cannot_happen(store, destination, id)?;
-    typed_acknowledgement(&format!("I UNSHARE {id} {}", destination.fingerprint))?;
+    typed_acknowledgement(unshare_challenge(id, &destination.fingerprint))?;
     let made_private = store.unshare_conversation_for_remote(id, &destination.fingerprint)?;
     println!("{made_private} unpublished thought(s) made private.");
     Ok(made_private)
@@ -529,6 +631,7 @@ pub async fn redact(
     let (repo, store) = open(&env::current_dir()?)?;
     let id: InteractionId = id.parse().context("invalid interaction id")?;
     let destination = privacy::remote_destination(&repo, remote_name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let _operation_lock = privacy::destination_operation_lock(&repo, &destination.fingerprint)?;
     // Fresh authenticated advertisement/fetch is both the baseline proof and the
     // stale-plan lease. This command deliberately has no push path.
@@ -545,28 +648,27 @@ pub async fn redact(
         .iter()
         .any(|t| t.interaction_id == id)
     {
-        typed_acknowledgement(&format!("I REDACT {id} {}", destination.fingerprint))?;
+        typed_acknowledgement(redact_challenge(&id, &destination.fingerprint))?;
         store.authorize_and_tombstone_remote(
             &id,
             &destination.fingerprint,
             TombstoneReasonCode::UserRequested,
         )?;
-        println!(
-            "Remote tombstone is pending; run `cvc push --manual --remote {}` then rerun redact to build the local-only rewrite plan.",
-            destination.name
-        );
+        println!("{}", pending_tombstone_line(&destination.name));
         return Ok(());
     }
     let candidate =
         sync::build_hard_redaction_plan(&repo, Some(&baseline), &destination.fingerprint, &id)?;
     let plan = candidate.plan.clone();
-    typed_acknowledgement(&format!(
+    // The prefix of the replacement commit just built, as `I PUBLISH` carries
+    // the candidate's.
+    typed_acknowledgement(Challenge::Unpredictable(format!(
         "I PLAN HARD REDACTION {} {} {} {}",
         id,
         destination.fingerprint,
         plan.expected_remote_tip.as_deref().unwrap_or("ABSENT"),
         &plan.replacement_commit[..12]
-    ))?;
+    )))?;
     write_redaction_plan(plan_path, &plan)?;
     if apply_local {
         sync::apply_hard_redaction_locally(&repo, &plan)?;
@@ -584,6 +686,7 @@ pub async fn redact(
 pub async fn verify_redaction_plan(path: &Path, remote_name: &str) -> Result<()> {
     let (repo, store) = open(&env::current_dir()?)?;
     let destination = privacy::remote_destination(&repo, remote_name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let _operation_lock = privacy::destination_operation_lock(&repo, &destination.fingerprint)?;
     let plan = read_redaction_plan(path)?;
     if plan.destination_fingerprint != destination.fingerprint {
@@ -632,9 +735,10 @@ pub async fn auto_push_remote(cwd: &Path, requested: Option<&str>) -> Result<()>
     let (repo, store) = open(cwd)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let status = privacy::privacy_status_for_fingerprint(&repo, &destination.fingerprint)?;
     if !status.sharing_consented || !status.auto_push {
-        eprintln!("CVC: auto publication disabled for '{}'.", name);
+        eprintln!("{}", auto_publication_disabled_line(&name));
         return Ok(());
     }
     push_destination(&repo, &store, &destination, PublicationTrigger::Hook).map(|_| ())
@@ -700,6 +804,7 @@ fn push_destination(
     destination: &privacy::RemoteDestination,
     trigger: PublicationTrigger,
 ) -> Result<PublishOutcome> {
+    sync::adopt_legacy_records(repo, store, destination)?;
     let _operation_lock = privacy::destination_operation_lock(repo, &destination.fingerprint)?;
     let status = privacy::privacy_status_for_fingerprint(repo, &destination.fingerprint)?;
     if !status.sharing_consented {
@@ -746,7 +851,8 @@ fn push_destination(
             &publication,
         );
         println!("{}", prompt.summary);
-        typed_acknowledgement(&prompt.challenge)?;
+        // It names the candidate commit just built from this clone's shares.
+        typed_acknowledgement(Challenge::Unpredictable(prompt.challenge))?;
     }
     // Publication state is recorded only for interactions this candidate newly
     // writes. Rows the baseline already holds are neither re-marked nor demoted
@@ -831,6 +937,74 @@ fn nothing_to_publish_line(remote: &str, shared_total: usize) -> String {
     } else {
         format!("No new shared thoughts to publish to '{remote}'.")
     }
+}
+
+// The lines below name a remote. Its name is what the repository's configuration
+// says, or what Git passed a hook. libgit2 resolves a remote only by a name that
+// passes Git's ref-name rules, and of the controls those refuse only the ASCII
+// ones: a name can still carry format characters, line separators and C1
+// controls. So each line shows the name with every control and format character
+// replaced, and on the one line it belongs to.
+
+/// What `cvc privacy status` prints, one `key: value` per line. A note follows
+/// `capture_acknowledged` only when an acknowledgement is on record that does
+/// not count here, so that the reason for `false` is not left to guess.
+fn privacy_status_report(status: &privacy::PrivacyStatus, remote: &str) -> String {
+    let elsewhere =
+        if status.capture_acknowledgement == privacy::CaptureAcknowledgement::OtherCheckoutOrUser {
+            format!("\nnote: {}", super::harness::ACKNOWLEDGED_ELSEWHERE)
+        } else {
+            String::new()
+        };
+    format!(
+        "capture_acknowledged: {}{elsewhere}\nsharing_consented: {}\nauto_push: {}\nremote: {}\ndestination_fingerprint: {}",
+        status.capture_acknowledged,
+        status.sharing_consented,
+        status.auto_push,
+        sanitize_for_terminal(remote),
+        status.remote_fingerprint
+    )
+}
+
+/// What `cvc privacy set-auto-push` prints once the setting is recorded.
+fn auto_push_line(enabled: bool, remote: &str) -> String {
+    format!(
+        "Auto-push {} for remote '{}'.",
+        if enabled { "enabled" } else { "disabled" },
+        sanitize_for_terminal(remote)
+    )
+}
+
+/// What `cvc redact` prints once it has recorded the pending remote tombstone.
+fn pending_tombstone_line(remote: &str) -> String {
+    format!(
+        "Remote tombstone is pending; run `cvc push --manual --remote {}` then rerun redact to build the local-only rewrite plan.",
+        sanitize_for_terminal(remote)
+    )
+}
+
+/// What the pre-push hook prints when the destination has no auto-push grant.
+fn auto_publication_disabled_line(remote: &str) -> String {
+    format!(
+        "CVC: auto publication disabled for '{}'.",
+        sanitize_for_terminal(remote)
+    )
+}
+
+/// What `cvc privacy reconcile` prints when it is done.
+fn reconciled_line(remote: &str) -> String {
+    format!(
+        "Reconciled publication state for '{}'.",
+        sanitize_for_terminal(remote)
+    )
+}
+
+/// What `cvc pull`, and so the post-merge hook, prints when it is done.
+fn pulled_line(count: usize, remote: &str) -> String {
+    format!(
+        "Pulled {count} thought(s) from '{}'.",
+        sanitize_for_terminal(remote)
+    )
 }
 
 /// The typed phrase that authorizes one publication. The trailing number is the
@@ -981,20 +1155,22 @@ pub async fn reconcile(requested: Option<&str>) -> Result<()> {
     let (repo, store) = open(&env::current_dir()?)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let _operation_lock = privacy::destination_operation_lock(&repo, &destination.fingerprint)?;
     reconcile_destination(&repo, &store, &destination)?;
-    println!("Reconciled publication state for '{}'.", name);
+    println!("{}", reconciled_line(&name));
     Ok(())
 }
 pub async fn pull() -> Result<()> {
     let (repo, mut store) = open(&env::current_dir()?)?;
     let name = remote(&repo, None)?;
     let destination = privacy::remote_destination(&repo, &name)?;
+    sync::adopt_legacy_records(&repo, &store, &destination)?;
     let _operation_lock = privacy::destination_operation_lock(&repo, &destination.fingerprint)?;
     let n = sync::fetch_and_pull_destination(&repo, &store, &destination)?;
     let _ =
         cvc_core::squash::scan_for(&repo, &mut store, false, std::time::Duration::from_secs(30))?;
-    println!("Pulled {n} thought(s) from '{name}'.");
+    println!("{}", pulled_line(n, &name));
     Ok(())
 }
 
@@ -1004,10 +1180,8 @@ pub async fn observe_range(base: &str, tip: &str, requested: Option<&str>) -> Re
     let tip = repo.revparse_single(tip)?.peel_to_commit()?.id();
     let authorization = if let Some(name) = requested {
         let destination = privacy::remote_destination(&repo, name)?;
-        typed_acknowledgement(&format!(
-            "I AUTHORIZE RANGE {} {} {}",
-            base, tip, destination.fingerprint
-        ))?;
+        sync::adopt_legacy_records(&repo, &store, &destination)?;
+        typed_acknowledgement(range_challenge(base, tip, &destination.fingerprint))?;
         Some(destination.fingerprint)
     } else {
         None
@@ -1570,11 +1744,13 @@ mod settle_tests {
 #[cfg(test)]
 mod output_tests {
     use super::{
-        describe_publication, ensure_phrase_can_be_shown, nothing_to_publish_line, share_summary,
-        PublicationPhase,
+        auto_publication_disabled_line, auto_push_line, describe_publication,
+        ensure_phrase_can_be_shown, nothing_to_publish_line, pending_tombstone_line,
+        privacy_status_report, pulled_line, reconciled_line, share_summary, PublicationPhase,
     };
     use crate::terminal_text::is_unsafe_for_terminal;
     use cvc_core::db::ConversationSummary;
+    use cvc_core::privacy::PrivacyStatus;
     use cvc_core::sync::ProjectionPublication;
 
     fn acts_on_a_terminal(text: &str) -> bool {
@@ -1643,6 +1819,121 @@ mod output_tests {
         assert_eq!(
             nothing_to_publish_line("origin", 0),
             "No new shared thoughts to publish to 'origin'."
+        );
+    }
+
+    #[test]
+    fn the_status_says_why_an_acknowledgement_on_record_does_not_count_here() {
+        let status = |capture_acknowledgement| PrivacyStatus {
+            capture_acknowledged: capture_acknowledgement
+                == cvc_core::privacy::CaptureAcknowledgement::Acknowledged,
+            capture_acknowledgement,
+            sharing_consented: false,
+            auto_push: false,
+            remote_fingerprint: "f".repeat(64),
+        };
+        let elsewhere = privacy_status_report(
+            &status(cvc_core::privacy::CaptureAcknowledgement::OtherCheckoutOrUser),
+            "origin",
+        );
+        assert_eq!(
+            elsewhere.lines().take(3).collect::<Vec<_>>(),
+            [
+                "capture_acknowledged: false".to_owned(),
+                format!("note: {}", super::super::harness::ACKNOWLEDGED_ELSEWHERE),
+                "sharing_consented: false".to_owned(),
+            ]
+        );
+        // Never acknowledged, or acknowledged here: no note.
+        for plain in [
+            cvc_core::privacy::CaptureAcknowledgement::NotAcknowledged,
+            cvc_core::privacy::CaptureAcknowledgement::Acknowledged,
+        ] {
+            let report = privacy_status_report(&status(plain), "origin");
+            assert!(!report.contains("note:"), "{report}");
+        }
+    }
+
+    /// An erase, an OSC 52 clipboard write ended by BEL, a right-to-left override
+    /// and a line separator. libgit2 does not resolve a remote whose name holds
+    /// the ESC or the BEL (`cvc` then reports the remote as not configured,
+    /// without its name), but does resolve one with the other two, or with the
+    /// C1 forms of the first two; every line is held to the whole set.
+    const HOSTILE_NAME: &str = "or\u{1b}[2Jig\u{1b}]52;c;SGVsbG8=\u{7}in\u{202e}x\u{2028}y";
+
+    /// [`HOSTILE_NAME`] as every line shows it.
+    const SHOWN_NAME: &str = "or?[2Jig?]52;c;SGVsbG8=?in?x?y";
+
+    #[test]
+    fn every_line_that_names_a_remote_names_it_as_plain_text_on_its_line() {
+        let status = PrivacyStatus {
+            capture_acknowledged: true,
+            capture_acknowledgement: cvc_core::privacy::CaptureAcknowledgement::Acknowledged,
+            sharing_consented: false,
+            auto_push: false,
+            remote_fingerprint: "f".repeat(64),
+        };
+        let report = privacy_status_report(&status, HOSTILE_NAME);
+        assert!(!acts_on_a_terminal(&report), "{report:?}");
+        assert_eq!(
+            report,
+            format!(
+                "capture_acknowledged: true\nsharing_consented: false\nauto_push: false\nremote: {SHOWN_NAME}\ndestination_fingerprint: {}",
+                "f".repeat(64)
+            )
+        );
+        for (line, expected) in [
+            (
+                auto_push_line(true, HOSTILE_NAME),
+                format!("Auto-push enabled for remote '{SHOWN_NAME}'."),
+            ),
+            (
+                auto_push_line(false, HOSTILE_NAME),
+                format!("Auto-push disabled for remote '{SHOWN_NAME}'."),
+            ),
+            (
+                pending_tombstone_line(HOSTILE_NAME),
+                format!("Remote tombstone is pending; run `cvc push --manual --remote {SHOWN_NAME}` then rerun redact to build the local-only rewrite plan."),
+            ),
+            (
+                auto_publication_disabled_line(HOSTILE_NAME),
+                format!("CVC: auto publication disabled for '{SHOWN_NAME}'."),
+            ),
+            (
+                reconciled_line(HOSTILE_NAME),
+                format!("Reconciled publication state for '{SHOWN_NAME}'."),
+            ),
+            (
+                pulled_line(3, HOSTILE_NAME),
+                format!("Pulled 3 thought(s) from '{SHOWN_NAME}'."),
+            ),
+        ] {
+            assert!(!acts_on_a_terminal(&line), "{line:?}");
+            assert!(!line.contains('\n'), "{line:?}");
+            assert_eq!(line, expected);
+        }
+
+        // An ordinary name is printed as it is.
+        let status = PrivacyStatus::default();
+        assert_eq!(
+            privacy_status_report(&status, "origin"),
+            "capture_acknowledged: false\nsharing_consented: false\nauto_push: false\nremote: origin\ndestination_fingerprint: "
+        );
+        assert_eq!(
+            auto_push_line(true, "origin"),
+            "Auto-push enabled for remote 'origin'."
+        );
+        assert_eq!(
+            auto_publication_disabled_line("origin"),
+            "CVC: auto publication disabled for 'origin'."
+        );
+        assert_eq!(
+            reconciled_line("origin"),
+            "Reconciled publication state for 'origin'."
+        );
+        assert_eq!(
+            pulled_line(0, "origin"),
+            "Pulled 0 thought(s) from 'origin'."
         );
     }
 
@@ -1755,5 +2046,152 @@ mod answer_tests {
             let error = answer_error(error);
             assert_eq!(classify_failure(&error), FlowFailure::Other(text));
         }
+    }
+}
+
+/// The phrases the typed acknowledgements ask, exactly.
+#[cfg(test)]
+mod challenge_tests {
+    use super::{
+        auto_push_challenge, capture_challenge, publish_challenge, range_challenge,
+        redact_challenge, share_challenge, sharing_challenge, unshare_challenge, Challenge,
+    };
+    use cvc_core::models::{FutureSharePolicy, InteractionId};
+
+    const NONCE: &str = "K7Q2M";
+
+    fn fingerprint() -> String {
+        "f".repeat(64)
+    }
+
+    fn no_nonce() -> String {
+        panic!("a nonce was drawn for a phrase that is asked as it is")
+    }
+
+    #[test]
+    fn every_phrase_that_can_be_worked_out_in_advance_ends_with_the_nonce_of_its_prompt() {
+        let fp = fingerprint();
+        let id: InteractionId = "0b6e0f2c-4d43-4f4e-9a59-1c2d3e4f5a6b".parse().unwrap();
+        let base = git2::Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let tip = git2::Oid::from_str("89abcdef0123456789abcdef0123456789abcdef").unwrap();
+        for (challenge, expected) in [
+            (
+                capture_challenge(),
+                format!("I UNDERSTAND LOCAL CAPTURE {NONCE}"),
+            ),
+            (
+                sharing_challenge(&fp),
+                format!("I AUTHORIZE SHARING {fp} {NONCE}"),
+            ),
+            (
+                auto_push_challenge(true, &fp),
+                format!("I AUTHORIZE AUTO PUSH ON {fp} {NONCE}"),
+            ),
+            (
+                auto_push_challenge(false, &fp),
+                format!("I AUTHORIZE AUTO PUSH OFF {fp} {NONCE}"),
+            ),
+            (
+                unshare_challenge("run-0d2a:agent_1.b", &fp),
+                format!("I UNSHARE run-0d2a:agent_1.b {fp} {NONCE}"),
+            ),
+            (
+                redact_challenge(&id, &fp),
+                format!("I REDACT 0b6e0f2c-4d43-4f4e-9a59-1c2d3e4f5a6b {fp} {NONCE}"),
+            ),
+            (
+                range_challenge(base, tip, &fp),
+                format!(
+                    "I AUTHORIZE RANGE 0123456789abcdef0123456789abcdef01234567 89abcdef0123456789abcdef0123456789abcdef {fp} {NONCE}"
+                ),
+            ),
+        ] {
+            assert!(
+                matches!(challenge, Challenge::Predictable(_)),
+                "{challenge:?}"
+            );
+            assert_eq!(challenge.to_type(|| NONCE.to_owned()), expected);
+            // The phrase checked before the prompt is shown has no nonce yet.
+            assert_eq!(
+                format!("{} {NONCE}", challenge.phrase()),
+                expected,
+                "{challenge:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_phrase_that_carries_a_token_or_a_commit_is_asked_as_it_is() {
+        let fp = fingerprint();
+        let oid = git2::Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+        for (challenge, expected) in [
+            (
+                share_challenge("c-1", &fp, 3, "a1b2c3d4e5f6", FutureSharePolicy::Private),
+                format!("I SHARE c-1 {fp} 3 a1b2c3d4e5f6"),
+            ),
+            (
+                share_challenge("c-1", &fp, 3, "a1b2c3d4e5f6", FutureSharePolicy::Shared),
+                format!("I SHARE FUTURE c-1 {fp} 3 a1b2c3d4e5f6"),
+            ),
+            (
+                Challenge::Unpredictable(publish_challenge(&fp, oid, 21)),
+                format!("I PUBLISH {fp} 0123456789ab 21"),
+            ),
+        ] {
+            assert!(
+                matches!(challenge, Challenge::Unpredictable(_)),
+                "{challenge:?}"
+            );
+            assert_eq!(challenge.to_type(no_nonce), expected);
+            assert_eq!(challenge.phrase(), expected);
+        }
+    }
+
+    #[test]
+    fn the_phrase_of_a_share_says_whether_future_thoughts_are_shared_and_never_stands_for_the_other(
+    ) {
+        let fp = fingerprint();
+        let snapshot = share_challenge("c-1", &fp, 3, "a1b2c3d4e5f6", FutureSharePolicy::Private)
+            .to_type(no_nonce);
+        let future = share_challenge("c-1", &fp, 3, "a1b2c3d4e5f6", FutureSharePolicy::Shared)
+            .to_type(no_nonce);
+        // `FUTURE` comes right after `I SHARE`, and only for a future share.
+        assert!(future.starts_with("I SHARE FUTURE c-1 "), "{future}");
+        assert!(!snapshot.contains("FUTURE"), "{snapshot}");
+        // The answers are compared exactly, so neither phrase answers the other.
+        assert_ne!(snapshot, future);
+        assert_eq!(future.replacen("I SHARE FUTURE ", "I SHARE ", 1), snapshot);
+        // A conversation called FUTURE does not make one phrase the other either:
+        // its future share has the word twice.
+        let named = share_challenge("FUTURE", &fp, 3, "a1b2c3d4e5f6", FutureSharePolicy::Private)
+            .to_type(no_nonce);
+        let named_future =
+            share_challenge("FUTURE", &fp, 3, "a1b2c3d4e5f6", FutureSharePolicy::Shared)
+                .to_type(no_nonce);
+        assert_eq!(named, format!("I SHARE FUTURE {fp} 3 a1b2c3d4e5f6"));
+        assert_eq!(
+            named_future,
+            format!("I SHARE FUTURE FUTURE {fp} 3 a1b2c3d4e5f6")
+        );
+    }
+
+    #[test]
+    fn every_prompt_of_a_phrase_draws_its_own_nonce() {
+        let challenge = unshare_challenge("c-1", &fingerprint());
+        let mut drawn = ["AAAAA", "BBBBB"].into_iter();
+        let first = challenge.to_type(|| drawn.next().unwrap().to_owned());
+        let second = challenge.to_type(|| drawn.next().unwrap().to_owned());
+        assert!(first.ends_with(" AAAAA"), "{first}");
+        assert!(second.ends_with(" BBBBB"), "{second}");
+        // What answered the first prompt does not answer the second.
+        assert_ne!(first, second);
+        // And a real draw is a nonce: the alphabet and length are pinned in `tty`.
+        let real = challenge.to_type(crate::tty::challenge_nonce);
+        let (phrase, nonce) = real.rsplit_once(' ').unwrap();
+        assert_eq!(phrase, challenge.phrase());
+        assert_eq!(nonce.len(), crate::tty::NONCE_LENGTH);
+        assert!(nonce
+            .bytes()
+            .all(|c| crate::tty::NONCE_ALPHABET.contains(&c)));
     }
 }

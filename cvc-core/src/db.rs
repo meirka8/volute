@@ -482,6 +482,38 @@ pub const HARNESS_REASONS_SHOWN: usize = 8;
 /// No destination (`NULL`) shares nothing, wildcard included.
 const SHARED_FOR_DESTINATION: &str = "(?1 IS NOT NULL AND EXISTS (SELECT 1 FROM interaction_shares s WHERE s.interaction_id = i.id AND s.remote_fingerprint IN (?1, '*')))";
 
+/// Whether any row is kept under the destination fingerprint `?1`, in any of
+/// the places [`ADOPT_DESTINATION_ROWS`] moves rows between fingerprints.
+const DESTINATION_ROWS_EXIST: &str = "SELECT EXISTS(SELECT 1 FROM conversation_shares WHERE remote_fingerprint = ?1)
+    OR EXISTS(SELECT 1 FROM interaction_shares WHERE remote_fingerprint = ?1)
+    OR EXISTS(SELECT 1 FROM publications WHERE remote_fingerprint = ?1)
+    OR EXISTS(SELECT 1 FROM tombstones WHERE scope_kind = 'remote' AND remote_fingerprint = ?1)
+    OR EXISTS(SELECT 1 FROM derivation_authorizations WHERE remote_fingerprint = ?1)
+    OR EXISTS(SELECT 1 FROM range_authorizations WHERE remote_fingerprint = ?1)
+    OR EXISTS(SELECT 1 FROM derivation_observations WHERE origin = 'remote_sync' AND (source_fingerprint = ?1 OR source_key = ?1))
+    OR EXISTS(SELECT 1 FROM range_observations WHERE origin = 'remote_sync' AND (source_key = ?1 OR source_remote = ?1))";
+
+/// Moves every row kept under the destination fingerprint `?1` to `?2`. The
+/// observations a pull recorded (`remote_sync`) carry the fingerprint in their
+/// key column too. Run only when nothing is kept under `?2` yet, so that no
+/// primary key can collide.
+const ADOPT_DESTINATION_ROWS: [&str; 8] = [
+    "UPDATE conversation_shares SET remote_fingerprint = ?2 WHERE remote_fingerprint = ?1",
+    "UPDATE interaction_shares SET remote_fingerprint = ?2 WHERE remote_fingerprint = ?1",
+    "UPDATE publications SET remote_fingerprint = ?2 WHERE remote_fingerprint = ?1",
+    "UPDATE tombstones SET remote_fingerprint = ?2 WHERE scope_kind = 'remote' AND remote_fingerprint = ?1",
+    "UPDATE derivation_authorizations SET remote_fingerprint = ?2 WHERE remote_fingerprint = ?1",
+    "UPDATE range_authorizations SET remote_fingerprint = ?2 WHERE remote_fingerprint = ?1",
+    "UPDATE derivation_observations SET
+         source_fingerprint = CASE WHEN source_fingerprint = ?1 THEN ?2 ELSE source_fingerprint END,
+         source_key = CASE WHEN source_key = ?1 THEN ?2 ELSE source_key END
+     WHERE origin = 'remote_sync' AND (source_fingerprint = ?1 OR source_key = ?1)",
+    "UPDATE range_observations SET
+         source_key = CASE WHEN source_key = ?1 THEN ?2 ELSE source_key END,
+         source_remote = CASE WHEN source_remote = ?1 THEN ?2 ELSE source_remote END
+     WHERE origin = 'remote_sync' AND (source_key = ?1 OR source_remote = ?1)",
+];
+
 /// The summary query up to its `tail` (`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`).
 /// `?1` is the destination fingerprint, or `NULL` for none. Every reader of
 /// summaries goes through this one statement, so no two of them can disagree
@@ -972,7 +1004,7 @@ impl CvcStore {
             let id = Self::insert_capture(&tx, capture)?;
             // Publication observed on one remote is not local sharing intent.  Keep
             // imported turns private until the user explicitly shares their
-            // conversation; `pull_from_ref_for_remote` separately records the
+            // conversation; the pull separately records the
             // remote-specific publication proof.
             tx.execute("UPDATE interactions SET visibility='private', capture_source='sync_import', scrubber_version=1 WHERE id=?1", params![id.to_string()])?;
         }
@@ -2973,6 +3005,59 @@ impl CvcStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Whether this store keeps rows under the destination fingerprint `legacy`
+    /// and none under `fingerprint`, so that
+    /// [`adopt_destination_fingerprint`](Self::adopt_destination_fingerprint)
+    /// would move them. Read-only.
+    pub(crate) fn destination_rows_pending_adoption(
+        &self,
+        legacy: &str,
+        fingerprint: &str,
+    ) -> Result<bool> {
+        Self::destination_rows_await_adoption(&self.conn, legacy, fingerprint)
+    }
+
+    fn destination_rows_await_adoption(
+        conn: &Connection,
+        legacy: &str,
+        fingerprint: &str,
+    ) -> Result<bool> {
+        let holds = |value: &str| -> Result<bool> {
+            Ok(conn.query_row(DESTINATION_ROWS_EXIST, params![value], |row| row.get(0))?)
+        };
+        Ok(holds(legacy)? && !holds(fingerprint)?)
+    }
+
+    /// Moves every row this store keeps under the destination fingerprint
+    /// `legacy` to `fingerprint`, in one transaction, when there is at least one
+    /// and none is kept under `fingerprint` yet: rows already kept under
+    /// `fingerprint` win, and nothing is merged into them. Returns whether rows
+    /// were moved.
+    ///
+    /// The rows are those of every table that records a destination: shares
+    /// (`conversation_shares`, `interaction_shares`), publication state
+    /// (`publications`), remote tombstones, derivation and range
+    /// authorizations, and what a pull observed at the destination
+    /// (`derivation_observations` and `range_observations` of origin
+    /// `remote_sync`, which key those rows by the fingerprint). The
+    /// `remote:<fingerprint>:` namespace of conversation ids imported by a pull
+    /// is not touched.
+    pub(crate) fn adopt_destination_fingerprint(
+        &self,
+        legacy: &str,
+        fingerprint: &str,
+    ) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if !Self::destination_rows_await_adoption(&tx, legacy, fingerprint)? {
+            return Ok(false);
+        }
+        for statement in ADOPT_DESTINATION_ROWS {
+            tx.execute(statement, params![legacy, fingerprint])?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn get_context_items(&self, interaction_id: &InteractionId) -> Result<Vec<ContextItem>> {

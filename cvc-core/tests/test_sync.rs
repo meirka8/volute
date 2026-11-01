@@ -55,7 +55,7 @@ fn pull_rejects_non_utf8_sync_paths() -> anyhow::Result<()> {
         &[],
     )?;
     let store = CvcStore::open(temp.path().join("index.db"))?;
-    assert!(sync::pull_from_ref(&repo, &store, "refs/cvc/non-utf8").is_err());
+    assert!(sync::pull_from_ref(&repo, &store, "refs/cvc/non-utf8", TEST_DESTINATION).is_err());
     Ok(())
 }
 
@@ -392,7 +392,13 @@ fn format5_always_emits_and_requires_empty_reserved_trees() -> anyhow::Result<()
         &[],
     )?;
     let imported = CvcStore::open(temp.path().join("imported.db"))?;
-    assert!(sync::pull_from_ref(&repo, &imported, "refs/cvc/missing-v5-namespace").is_err());
+    assert!(sync::pull_from_ref(
+        &repo,
+        &imported,
+        "refs/cvc/missing-v5-namespace",
+        TEST_DESTINATION
+    )
+    .is_err());
     Ok(())
 }
 
@@ -509,7 +515,13 @@ fn pull_rejects_dangling_event_before_tombstone_pruning_with_duplicate_legacy_en
         &[],
     )?;
     let imported = CvcStore::open(temp.path().join("imported.db"))?;
-    assert!(sync::pull_from_ref(&repo, &imported, "refs/cvc/pre-prune-malformed").is_err());
+    assert!(sync::pull_from_ref(
+        &repo,
+        &imported,
+        "refs/cvc/pre-prune-malformed",
+        TEST_DESTINATION
+    )
+    .is_err());
     assert!(imported.get_all_interaction_ids()?.is_empty());
     Ok(())
 }
@@ -634,7 +646,8 @@ fn format5_rejects_malformed_ranges_and_by_commit_shapes_or_targets() -> anyhow:
     ] {
         let store = CvcStore::open(temp.path().join(format!("{name}.db")))?;
         assert!(
-            sync::pull_from_ref(&repo, &store, &format!("refs/cvc/{name}")).is_err(),
+            sync::pull_from_ref(&repo, &store, &format!("refs/cvc/{name}"), TEST_DESTINATION)
+                .is_err(),
             "accepted {name}"
         );
     }
@@ -772,7 +785,7 @@ fn post_node_link_records_reach_fresh_and_existing_pulls() -> anyhow::Result<()>
     project_fixture_to_ref(&repo, &source, ref_name)?;
 
     let existing = CvcStore::open(temp_dir.path().join("existing.db"))?;
-    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    sync::pull_from_ref(&repo, &existing, ref_name, TEST_DESTINATION)?;
     assert!(existing.get_artifact_links(&interaction.id)?.is_empty());
 
     let sha = CommitSha::new("a".repeat(40));
@@ -785,8 +798,8 @@ fn post_node_link_records_reach_fresh_and_existing_pulls() -> anyhow::Result<()>
     project_fixture_to_ref(&repo, &source, ref_name)?;
 
     let fresh = CvcStore::open(temp_dir.path().join("fresh.db"))?;
-    sync::pull_from_ref(&repo, &fresh, ref_name)?;
-    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    sync::pull_from_ref(&repo, &fresh, ref_name, TEST_DESTINATION)?;
+    sync::pull_from_ref(&repo, &existing, ref_name, TEST_DESTINATION)?;
     for store in [&fresh, &existing] {
         let links = store.get_artifact_links(&interaction.id)?;
         assert_eq!(links.len(), 1);
@@ -832,7 +845,7 @@ fn v4_tombstone_precedes_nodes_links_and_stale_clone_data() -> anyhow::Result<()
 
     // A second clone first sees the published node and link.
     let second_clone = CvcStore::open(temp_dir.path().join("second.db"))?;
-    sync::pull_from_ref(&repo, &second_clone, ref_name)?;
+    sync::pull_from_ref(&repo, &second_clone, ref_name, TEST_DESTINATION)?;
     assert!(second_clone.get_interaction(&interaction.id)?.is_some());
     assert_eq!(second_clone.get_artifact_links(&interaction.id)?.len(), 1);
 
@@ -846,13 +859,26 @@ fn v4_tombstone_precedes_nodes_links_and_stale_clone_data() -> anyhow::Result<()
         Some(TEST_DESTINATION),
     )?;
     project_fixture_to_ref(&repo, &source, ref_name)?;
-    sync::pull_from_ref(&repo, &second_clone, ref_name)?;
-    assert!(second_clone.is_tombstoned(&interaction.id)?);
+    sync::pull_from_ref(&repo, &second_clone, ref_name, TEST_DESTINATION)?;
+    // A pull records what it receives for the destination it came from, so the
+    // tombstone is this destination's, not a local suppression.
+    assert!(!second_clone.is_tombstoned(&interaction.id)?);
+    let scope: (String, String) = Connection::open(temp_dir.path().join("second.db"))?.query_row(
+        "SELECT scope_kind, remote_fingerprint FROM tombstones WHERE interaction_id=?1",
+        [interaction.id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(scope, ("remote".to_owned(), TEST_DESTINATION.to_owned()));
     assert!(second_clone.get_interaction(&interaction.id)?.is_none());
     assert!(second_clone.get_artifact_links(&interaction.id)?.is_empty());
 
     // Replaying a stale clone's old node/link tree must not resurrect it.
-    sync::pull_from_ref(&repo, &second_clone, "refs/cvc/stale-before-redaction")?;
+    sync::pull_from_ref(
+        &repo,
+        &second_clone,
+        "refs/cvc/stale-before-redaction",
+        TEST_DESTINATION,
+    )?;
     assert!(second_clone.get_interaction(&interaction.id)?.is_none());
 
     let tree = repo.find_reference(ref_name)?.peel_to_commit()?.tree()?;
@@ -1156,29 +1182,14 @@ fn remote_tombstones_only_suppress_stale_data_from_the_matching_source() -> anyh
     let target = CvcStore::open(temp_dir.path().join("target.db"))?;
     // Exercise the production remote-aware pull API: the received tombstone is
     // authority only for this exact source fingerprint.
-    sync::pull_from_ref_for_remote(
-        &repo,
-        &target,
-        "refs/cvc/redacted-remote",
-        Some(TEST_DESTINATION),
-    )?;
-    sync::pull_from_ref_for_remote(
-        &repo,
-        &target,
-        "refs/cvc/stale-remote",
-        Some(TEST_DESTINATION),
-    )?;
+    sync::pull_from_ref(&repo, &target, "refs/cvc/redacted-remote", TEST_DESTINATION)?;
+    sync::pull_from_ref(&repo, &target, "refs/cvc/stale-remote", TEST_DESTINATION)?;
     assert!(target.get_interaction(&interaction.id)?.is_none());
     assert!(target.get_artifact_links(&interaction.id)?.is_empty());
 
     // A tombstone from this destination must not suppress an independently
     // authorized source, even where the immutable interaction ID is identical.
-    sync::pull_from_ref_for_remote(
-        &repo,
-        &target,
-        "refs/cvc/stale-remote",
-        Some(&"f".repeat(64)),
-    )?;
+    sync::pull_from_ref(&repo, &target, "refs/cvc/stale-remote", &"f".repeat(64))?;
     assert!(target.get_interaction(&interaction.id)?.is_some());
     assert_eq!(target.get_artifact_links(&interaction.id)?.len(), 1);
     assert!(!target.is_tombstoned(&interaction.id)?);
@@ -1244,12 +1255,7 @@ fn matching_wire_tombstone_reconciles_pending_redaction_on_no_change_projection(
     assert_eq!(pending_state, "pending");
     // The pending local record already suppresses a stale clone from this exact
     // destination; neither its node nor link may reappear before reconciliation.
-    sync::pull_from_ref_for_remote(
-        &repo,
-        &target,
-        "refs/cvc/reconcile-stale",
-        Some(TEST_DESTINATION),
-    )?;
+    sync::pull_from_ref(&repo, &target, "refs/cvc/reconcile-stale", TEST_DESTINATION)?;
     assert!(target.get_interaction(&interaction.id)?.is_none());
     assert!(target.get_artifact_links(&interaction.id)?.is_empty());
     project_fixture_to_ref(&repo, &source, "refs/cvc/reconcile-redaction")?;
@@ -1258,11 +1264,11 @@ fn matching_wire_tombstone_reconciles_pending_redaction_on_no_change_projection(
         .target()
         .expect("fixture ref has a direct target");
 
-    sync::pull_from_ref_for_remote(
+    sync::pull_from_ref(
         &repo,
         &target,
         "refs/cvc/reconcile-redaction",
-        Some(TEST_DESTINATION),
+        TEST_DESTINATION,
     )?;
     let state: String = connection.query_row(
         "SELECT state FROM tombstones WHERE interaction_id=?1 AND scope_kind='remote' AND remote_fingerprint=?2",
@@ -1309,8 +1315,13 @@ fn pull_rejects_a_tombstones_root_with_the_wrong_object_type() -> anyhow::Result
         &[],
     )?;
 
-    let error = sync::pull_from_ref(&repo, &store, "refs/cvc/bad-tombstones-root")
-        .expect_err("reserved tombstones root must be a tree");
+    let error = sync::pull_from_ref(
+        &repo,
+        &store,
+        "refs/cvc/bad-tombstones-root",
+        TEST_DESTINATION,
+    )
+    .expect_err("reserved tombstones root must be a tree");
     assert!(error.to_string().contains("tombstones must be a tree"));
     assert!(store.get_all_interaction_ids()?.is_empty());
     Ok(())
@@ -1381,10 +1392,14 @@ fn pull_tombstone_budgets_reject_before_database_mutation() -> anyhow::Result<()
         max_tombstone_bytes: 16 * 1024,
         max_total_bytes: 1024 * 1024,
     };
-    assert!(
-        sync::pull_from_ref_with_limits(&repo, &store, "refs/cvc/budget-count", None, limits)
-            .is_err()
-    );
+    assert!(sync::pull_from_ref_with_limits(
+        &repo,
+        &store,
+        "refs/cvc/budget-count",
+        TEST_DESTINATION,
+        limits
+    )
+    .is_err());
     assert!(store.get_interaction(&planted.id)?.is_some());
 
     commit_tombstone_tree(&repo, "refs/cvc/budget-bytes", &tombstones[..2])?;
@@ -1393,10 +1408,14 @@ fn pull_tombstone_budgets_reject_before_database_mutation() -> anyhow::Result<()
         max_tombstone_bytes: 16 * 1024,
         max_total_bytes: 1,
     };
-    assert!(
-        sync::pull_from_ref_with_limits(&repo, &store, "refs/cvc/budget-bytes", None, limits)
-            .is_err()
-    );
+    assert!(sync::pull_from_ref_with_limits(
+        &repo,
+        &store,
+        "refs/cvc/budget-bytes",
+        TEST_DESTINATION,
+        limits
+    )
+    .is_err());
     assert!(store.get_interaction(&planted.id)?.is_some());
     Ok(())
 }
@@ -1448,7 +1467,7 @@ fn pull_duplicate_node_and_tombstone_representations_are_atomic() -> anyhow::Res
         &tree,
         &[],
     )?;
-    sync::pull_from_ref(&repo, &store, "refs/cvc/duplicates-ok")?;
+    sync::pull_from_ref(&repo, &store, "refs/cvc/duplicates-ok", TEST_DESTINATION)?;
     assert_eq!(store.get_all_interaction_ids()?.len(), 1);
 
     let mut altered = node;
@@ -1478,7 +1497,9 @@ fn pull_duplicate_node_and_tombstone_representations_are_atomic() -> anyhow::Res
         &[],
     )?;
     let empty = CvcStore::open(temp.path().join("empty.db"))?;
-    assert!(sync::pull_from_ref(&repo, &empty, "refs/cvc/duplicates-bad").is_err());
+    assert!(
+        sync::pull_from_ref(&repo, &empty, "refs/cvc/duplicates-bad", TEST_DESTINATION).is_err()
+    );
     assert!(empty.get_all_interaction_ids()?.is_empty());
     // A valid Git tree cannot encode the same canonical shard/name twice. The
     // transport-neutral canonicalizer is the seam for pack/alternate readers.
@@ -1531,12 +1552,7 @@ fn tombstone_deletion_reports_logical_cleanup_for_local_and_imported_records() -
         "refs/cvc/import-cleanup",
         std::slice::from_ref(&tombstone),
     )?;
-    sync::pull_from_ref_for_remote(
-        &repo,
-        &store,
-        "refs/cvc/import-cleanup",
-        Some(TEST_DESTINATION),
-    )?;
+    sync::pull_from_ref(&repo, &store, "refs/cvc/import-cleanup", TEST_DESTINATION)?;
     assert!(store.get_interaction(&imported.id)?.is_none());
     let report = store.compact_after_deletion()?;
     assert_eq!(
@@ -1622,6 +1638,7 @@ fn failed_transport_cleanup_removes_projection_candidate() -> anyhow::Result<()>
         name: "unreachable".into(),
         effective_url: temp_dir.path().join("missing-remote").display().to_string(),
         fingerprint: "a".repeat(64),
+        legacy_fingerprint: None,
         ref_name: "refs/cvc/main".into(),
     };
     assert!(sync::push_temp_ref(&repo, &destination, &temp_ref).is_err());
@@ -1728,15 +1745,15 @@ fn push_upgrades_v2_format_without_downgrading_data() -> anyhow::Result<()> {
     )?;
 
     let existing = CvcStore::open(temp_dir.path().join("existing.db"))?;
-    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    sync::pull_from_ref(&repo, &existing, ref_name, TEST_DESTINATION)?;
     project_fixture_to_ref(&repo, &source, ref_name)?;
     let upgraded_tree = repo.find_reference(ref_name)?.peel_to_commit()?.tree()?;
     let marker = repo.find_blob(upgraded_tree.get_name("FORMAT").unwrap().id())?;
     assert_eq!(marker.content(), b"5");
 
     let fresh = CvcStore::open(temp_dir.path().join("fresh.db"))?;
-    sync::pull_from_ref(&repo, &fresh, ref_name)?;
-    sync::pull_from_ref(&repo, &existing, ref_name)?;
+    sync::pull_from_ref(&repo, &fresh, ref_name, TEST_DESTINATION)?;
+    sync::pull_from_ref(&repo, &existing, ref_name, TEST_DESTINATION)?;
     assert!(fresh.get_interaction(&interaction.id)?.is_some());
     assert!(existing.get_interaction(&interaction.id)?.is_some());
     Ok(())
@@ -1768,7 +1785,7 @@ fn v3_pull_surfaces_conflicting_link_attribution() -> anyhow::Result<()> {
     let ref_name = "refs/cvc/conflict";
     project_fixture_to_ref(&repo, &source, ref_name)?;
     let target = CvcStore::open(temp_dir.path().join("target.db"))?;
-    sync::pull_from_ref(&repo, &target, ref_name)?;
+    sync::pull_from_ref(&repo, &target, ref_name, TEST_DESTINATION)?;
     let sha = CommitSha::new("c".repeat(40));
     target.link_automatic_interactions(
         std::slice::from_ref(&interaction.id),
@@ -1783,7 +1800,7 @@ fn v3_pull_surfaces_conflicting_link_attribution() -> anyhow::Result<()> {
         Some("remote@example.com"),
     )?;
     project_fixture_to_ref(&repo, &source, ref_name)?;
-    assert!(sync::pull_from_ref(&repo, &target, ref_name).is_err());
+    assert!(sync::pull_from_ref(&repo, &target, ref_name, TEST_DESTINATION).is_err());
     Ok(())
 }
 
@@ -1877,7 +1894,7 @@ fn pull_rejects_malformed_legacy_embedded_link() -> anyhow::Result<()> {
         &[],
     )?;
     let store = CvcStore::open(temp_dir.path().join("target.db"))?;
-    assert!(sync::pull_from_ref(&repo, &store, "refs/cvc/bad").is_err());
+    assert!(sync::pull_from_ref(&repo, &store, "refs/cvc/bad", TEST_DESTINATION).is_err());
     assert!(store.get_all_interaction_ids()?.is_empty());
     Ok(())
 }
@@ -1932,7 +1949,7 @@ fn test_sync_push_pull() -> anyhow::Result<()> {
     let store_2 = CvcStore::open(&db_path_2)?;
     store_2.init()?;
 
-    sync::pull_from_ref(&repo, &store_2, ref_name)?;
+    sync::pull_from_ref(&repo, &store_2, ref_name, TEST_DESTINATION)?;
 
     // 5. Verify Data in store_2
     let fetched_inter = store_2.get_interaction(&inter.id)?;
@@ -2216,7 +2233,7 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
     )?;
 
     // Pull/Ingest from remote ref
-    sync::pull_from_ref(&repo_b, &store_b, remote_tracking_ref)?;
+    sync::pull_from_ref(&repo_b, &store_b, remote_tracking_ref, TEST_DESTINATION)?;
 
     // Verify we have A's thought
     assert!(store_b.get_interaction(&inter_a.id)?.is_some());
@@ -2241,7 +2258,7 @@ fn test_sync_divergence_recovery() -> anyhow::Result<()> {
         None,
         None,
     )?;
-    sync::pull_from_ref(&repo_a, &store_a, remote_tracking_ref)?;
+    sync::pull_from_ref(&repo_a, &store_a, remote_tracking_ref, TEST_DESTINATION)?;
 
     assert!(store_a.get_interaction(&inter_b.id)?.is_some());
 
@@ -2538,14 +2555,18 @@ fn test_sync_v2_round_trip() -> anyhow::Result<()> {
     // Pull into a fresh clone/DB and compare.
     let store_2 = CvcStore::open(temp_dir.path().join("cvc_2.db"))?;
     store_2.init()?;
-    sync::pull_from_ref(&repo, &store_2, ref_name)?;
+    sync::pull_from_ref(&repo, &store_2, ref_name, TEST_DESTINATION)?;
 
     for original in [&linked, &floating] {
         let fetched = store_2
             .get_interaction(&original.id)?
             .unwrap_or_else(|| panic!("interaction {} missing after pull", original.id));
         assert_eq!(fetched.user_prompt, original.user_prompt);
-        assert_eq!(fetched.conversation_id, original.conversation_id);
+        // An imported conversation is always namespaced by its destination.
+        assert_eq!(
+            fetched.conversation_id,
+            format!("remote:{TEST_DESTINATION}:{}", original.conversation_id)
+        );
         assert_eq!(fetched.parent_id, original.parent_id);
         assert_eq!(fetched.author, original.author);
         assert_eq!(fetched.model_cot, original.model_cot);
@@ -2613,7 +2634,7 @@ fn test_pull_from_ref_reads_legacy_v1_layout() -> anyhow::Result<()> {
 
     let store = CvcStore::open(temp_dir.path().join("cvc.db"))?;
     store.init()?;
-    sync::pull_from_ref(&repo, &store, "refs/cvc/main")?;
+    sync::pull_from_ref(&repo, &store, "refs/cvc/main", TEST_DESTINATION)?;
 
     let fetched = store.get_interaction(&id)?;
     assert!(
@@ -2624,8 +2645,8 @@ fn test_pull_from_ref_reads_legacy_v1_layout() -> anyhow::Result<()> {
 
     // A push against this legacy tree should leave the old entry alone and start
     // writing new interactions under the v2 layout -- no disruptive migration.
-    // (conv-legacy already exists: pull_from_ref auto-created it while ingesting the
-    // legacy interaction above.)
+    // (The pull filed the legacy interaction under its namespaced conversation,
+    // `remote:<fingerprint>:conv-legacy`; this local thought starts `conv-legacy`.)
     let new_id = InteractionId::new();
     store.create_interaction(&Interaction {
         id: new_id.clone(),
@@ -2664,7 +2685,7 @@ fn test_pull_from_ref_reads_legacy_v1_layout() -> anyhow::Result<()> {
     // And a pull against this mixed tree picks up both.
     let store_2 = CvcStore::open(temp_dir.path().join("cvc_2.db"))?;
     store_2.init()?;
-    sync::pull_from_ref(&repo, &store_2, "refs/cvc/main")?;
+    sync::pull_from_ref(&repo, &store_2, "refs/cvc/main", TEST_DESTINATION)?;
     assert!(store_2.get_interaction(&id)?.is_some());
     assert!(store_2.get_interaction(&new_id)?.is_some());
 
@@ -2763,7 +2784,7 @@ fn test_sync_cycle_detection() -> anyhow::Result<()> {
 
     // 3. Try to Pull
     // This should FAIL with Cycle detected error.
-    let result = sync::pull_from_ref(&repo, &store, "refs/cvc/cycle");
+    let result = sync::pull_from_ref(&repo, &store, "refs/cvc/cycle", TEST_DESTINATION);
     assert!(result.is_err(), "Pull should fail on cycle");
 
     let err = result.unwrap_err();
@@ -3034,9 +3055,14 @@ fn publication_summary_does_not_count_legacy_flat_baseline_nodes() -> anyhow::Re
     repo.reference(SUMMARY_BASELINE, legacy_commit, true, "legacy baseline")?;
 
     let store = CvcStore::open(temp_dir.path().join("cvc.db"))?;
-    sync::pull_from_ref(&repo, &store, "refs/cvc/legacy-source")?;
-    // Sharing the (already imported) conversation puts the legacy node in this
-    // destination's projection next to the genuinely new one.
+    sync::pull_from_ref(&repo, &store, "refs/cvc/legacy-source", TEST_DESTINATION)?;
+    // Sharing the (already imported, so namespaced) conversation puts the legacy
+    // node in this destination's projection next to the genuinely new one.
+    store.share_conversation_for_remote(
+        &format!("remote:{TEST_DESTINATION}:conv-legacy"),
+        TEST_DESTINATION,
+        FutureSharePolicy::Private,
+    )?;
     let fresh = summary_interaction("conv-legacy", "Post-upgrade thought");
     store.create_interaction(&fresh)?;
 
@@ -3071,14 +3097,14 @@ fn publication_marks_preserve_the_timestamp_of_already_published_rows() -> anyho
     const SENTINEL: i64 = 1_000;
 
     // Fetch/import records the node as published for this exact destination.
-    sync::pull_from_ref_for_remote(&repo, &target, "refs/cvc/stamped", Some(TEST_DESTINATION))?;
+    sync::pull_from_ref(&repo, &target, "refs/cvc/stamped", TEST_DESTINATION)?;
     let (state, stamped) = row(&raw)?;
     assert_eq!(state, "published");
     assert!(stamped > SENTINEL);
 
     // Observing the same node at a later fetch must not re-stamp the row.
     raw.execute("UPDATE publications SET updated_at=?1", [SENTINEL])?;
-    sync::pull_from_ref_for_remote(&repo, &target, "refs/cvc/stamped", Some(TEST_DESTINATION))?;
+    sync::pull_from_ref(&repo, &target, "refs/cvc/stamped", TEST_DESTINATION)?;
     assert_eq!(row(&raw)?, ("published".to_owned(), SENTINEL));
 
     // Re-asserting `published` through the publication mark is equally inert...
@@ -3099,12 +3125,7 @@ fn publication_marks_preserve_the_timestamp_of_already_published_rows() -> anyho
             rusqlite::params![not_published, SENTINEL],
         )?;
         if not_published == "unknown" {
-            sync::pull_from_ref_for_remote(
-                &repo,
-                &target,
-                "refs/cvc/stamped",
-                Some(TEST_DESTINATION),
-            )?;
+            sync::pull_from_ref(&repo, &target, "refs/cvc/stamped", TEST_DESTINATION)?;
         } else {
             target.mark_publication(
                 std::slice::from_ref(&interaction.id),
@@ -3376,7 +3397,7 @@ fn tombstoned_push_over_an_unreferenced_range(import_first: bool) -> anyhow::Res
     let foreign = range_fixture('1');
     let foreign_blob = publish_foreign_range(&repo, SUMMARY_BASELINE, &foreign)?;
     if import_first {
-        sync::pull_from_ref_for_remote(&repo, &store, SUMMARY_BASELINE, Some(TEST_DESTINATION))?;
+        sync::pull_from_ref(&repo, &store, SUMMARY_BASELINE, TEST_DESTINATION)?;
     }
     store.tombstone_remote(
         &redacted.id,
@@ -3639,7 +3660,7 @@ fn a_tombstoned_push_keeps_every_kind_of_entry_another_clone_published() -> anyh
     // A reader still accepts the result: the kept entries agree with the
     // rebuilt `by-commit/` index.
     let reader = CvcStore::open(temp_dir.path().join("reader.db"))?;
-    sync::pull_from_ref_for_remote(&repo, &reader, SUMMARY_BASELINE, Some(TEST_DESTINATION))?;
+    sync::pull_from_ref(&repo, &reader, SUMMARY_BASELINE, TEST_DESTINATION)?;
     assert!(reader.get_interaction(&foreign.id)?.is_some());
     assert!(reader.get_interaction(&kept.id)?.is_some());
     assert!(reader.get_interaction(&redacted.id)?.is_none());
@@ -3722,6 +3743,7 @@ fn pin_destination() -> cvc_core::privacy::RemoteDestination {
         name: "fixture".into(),
         effective_url: "unused-in-these-tests".into(),
         fingerprint: TEST_DESTINATION.into(),
+        legacy_fingerprint: None,
         ref_name: "refs/cvc/main".into(),
     }
 }
@@ -3994,6 +4016,7 @@ fn a_failed_transport_leaves_baseline_held_rows_published_and_marks_only_new_one
         name: "unreachable".into(),
         effective_url: temp_dir.path().join("missing-remote").display().to_string(),
         fingerprint: TEST_DESTINATION.into(),
+        legacy_fingerprint: None,
         ref_name: "refs/cvc/main".into(),
     };
     assert!(sync::push_temp_ref(&repo, &unreachable, candidate.ref_name()).is_err());
@@ -4333,7 +4356,7 @@ fn a_secret_in_a_marker_name_of_a_remote_node_is_refused_on_push_and_rewritten_o
     // Pulling it rewrites the name before the first write, and what is stored
     // is still the verified stimulus.
     let imported = CvcStore::open(temp.path().join("imported.db"))?;
-    sync::pull_from_ref(&repo, &imported, FETCHED_BASELINE)?;
+    sync::pull_from_ref(&repo, &imported, FETCHED_BASELINE, TEST_DESTINATION)?;
     let stored = imported
         .get_interaction(&item.id)?
         .expect("the node was imported")
@@ -4484,7 +4507,7 @@ fn pull_hostile(
     let store = CvcStore::open(temp.path().join("pulled.db"))?;
     hostile_ref(&repo, namespace, shard, file, body)?;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        sync::pull_from_ref(&repo, &store, HOSTILE_REF)
+        sync::pull_from_ref(&repo, &store, HOSTILE_REF, TEST_DESTINATION)
     }));
     match outcome {
         Ok(result) => Ok(result.map_err(|error| error.to_string())),
@@ -4657,5 +4680,97 @@ fn a_local_event_with_a_malformed_id_is_an_error_at_projection() -> anyhow::Resu
         sync::push_projection_to_ref(&repo, &store, &pinned(&repo, ""), TEST_DESTINATION).is_err()
     }));
     assert_eq!(outcome.ok(), Some(true), "projecting a malformed event id");
+    Ok(())
+}
+
+/// No public way of importing a CVC ref leaves a conversation id as the remote
+/// wrote it: each one takes the destination's fingerprint and namespaces every
+/// imported conversation as `remote:<fingerprint>:<id>`, so a remote session id
+/// can never become, or join, a local conversation and its share policy.
+#[test]
+fn every_import_is_namespaced_by_its_destination() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let repo = Repository::init(temp_dir.path())?;
+    let source = CvcStore::open(temp_dir.path().join("source.db"))?;
+    for conversation in ["session-a", "session-b"] {
+        source.create_interaction(&summary_interaction(conversation, "a thought"))?;
+    }
+    let ref_name = "refs/cvc/namespaced";
+    project_fixture_to_ref(&repo, &source, ref_name)?;
+    // What a fetch leaves for the production pull to read.
+    let tip = repo.find_reference(ref_name)?.target().expect("direct ref");
+    repo.reference(PIN_TRACKING_REF, tip, true, "fixture: fetched")?;
+
+    let expected = vec![
+        format!("remote:{TEST_DESTINATION}:session-a"),
+        format!("remote:{TEST_DESTINATION}:session-b"),
+    ];
+    let imported = |name: &str| -> anyhow::Result<(Vec<String>, Vec<String>, Vec<String>)> {
+        let raw = Connection::open(temp_dir.path().join(name))?;
+        let column = |sql: &str| -> anyhow::Result<Vec<String>> {
+            Ok(raw
+                .prepare(sql)?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?)
+        };
+        Ok((
+            column("SELECT id FROM conversations ORDER BY id")?,
+            column("SELECT DISTINCT conversation_id FROM interactions ORDER BY conversation_id")?,
+            column("SELECT DISTINCT remote_fingerprint FROM publications")?,
+        ))
+    };
+
+    let plain = CvcStore::open(temp_dir.path().join("plain.db"))?;
+    sync::pull_from_ref(&repo, &plain, ref_name, TEST_DESTINATION)?;
+    let bounded = CvcStore::open(temp_dir.path().join("bounded.db"))?;
+    sync::pull_from_ref_with_limits(
+        &repo,
+        &bounded,
+        ref_name,
+        TEST_DESTINATION,
+        sync::SyncReadLimits::default(),
+    )?;
+    let fetched = CvcStore::open(temp_dir.path().join("fetched.db"))?;
+    assert_eq!(
+        sync::pull_destination(&repo, &fetched, &pin_destination())?,
+        2
+    );
+    for name in ["plain.db", "bounded.db", "fetched.db"] {
+        let (conversations, interactions, publications) = imported(name)?;
+        assert_eq!(conversations, expected, "{name}");
+        assert_eq!(interactions, expected, "{name}");
+        assert_eq!(publications, vec![TEST_DESTINATION.to_owned()], "{name}");
+    }
+
+    // A fingerprint that is not one is refused before anything is read.
+    let short = "0".repeat(63);
+    let not_hex = "g".repeat(64);
+    let suffixed = format!("{TEST_DESTINATION}:x");
+    for bad in [
+        "",
+        "remote",
+        short.as_str(),
+        not_hex.as_str(),
+        suffixed.as_str(),
+    ] {
+        let store = CvcStore::open(temp_dir.path().join("refused.db"))?;
+        for result in [
+            sync::pull_from_ref(&repo, &store, ref_name, bad),
+            sync::pull_from_ref_with_limits(
+                &repo,
+                &store,
+                ref_name,
+                bad,
+                sync::SyncReadLimits::default(),
+            ),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("invalid destination fingerprint"),
+                "{bad:?}: {error}"
+            );
+        }
+        assert!(store.get_all_interaction_ids()?.is_empty(), "{bad:?}");
+    }
     Ok(())
 }
