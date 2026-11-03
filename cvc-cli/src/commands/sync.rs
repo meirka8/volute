@@ -328,7 +328,7 @@ pub(crate) fn share_conversation(
     store.share_exact_snapshot(id, &destination.fingerprint, &ids, future)?;
     let count = ids.len();
     println!(
-        "{} turn(s) marked shared; future turns are {}.",
+        "{} thought(s) marked shared; future thoughts are {}.",
         count,
         match future {
             FutureSharePolicy::Shared => "shared",
@@ -383,12 +383,19 @@ pub async fn unshare(id: &str, requested: Option<&str>) -> Result<()> {
 }
 
 /// What `cvc unshare <conversation_id> --remote <destination.name>` does once
-/// the destination is known: under the destination's operation lock, require
-/// the typed `I UNSHARE <id> <fingerprint>` challenge, then make the
-/// conversation's turns private for that destination. The store refuses, and
-/// nothing changes, while any turn of the conversation is pending, published
+/// the destination is known: under the destination's operation lock, refuse at
+/// once, asking nothing, if the store would refuse; otherwise require the
+/// typed `I UNSHARE <id> <fingerprint>` challenge, then make the
+/// conversation's thoughts private for that destination. The store refuses, and
+/// nothing changes, while any thought of the conversation is pending, published
 /// or of unknown state there, because unsharing cannot recall content a
 /// destination may already hold.
+///
+/// The refusal before the phrase comes from `CvcStore::can_unshare`, which
+/// applies the very rule the store enforces, so no phrase is asked for an
+/// unshare that cannot happen; it gives the reason the interactive view gives
+/// for the same check. The store's own refusal after the phrase stays the
+/// authority.
 ///
 /// On success it returns how many thoughts were made private, the number it
 /// prints; `cvc unshare` ignores it.
@@ -399,10 +406,30 @@ pub(crate) fn unshare_conversation(
     id: &str,
 ) -> Result<usize> {
     let _operation_lock = privacy::destination_operation_lock(repo, &destination.fingerprint)?;
+    refuse_unshare_that_cannot_happen(store, destination, id)?;
     typed_acknowledgement(&format!("I UNSHARE {id} {}", destination.fingerprint))?;
     let made_private = store.unshare_conversation_for_remote(id, &destination.fingerprint)?;
-    println!("{made_private} unpublished turn(s) made private.");
+    println!("{made_private} unpublished thought(s) made private.");
     Ok(made_private)
+}
+
+/// Fails with the reason, before any phrase is asked, when `can_unshare` says
+/// the store would refuse this unshare: some thought of the conversation is
+/// published, pending or of unknown state for the destination. The caller holds
+/// the destination's operation lock, which every publish, pull and reconcile for
+/// it also takes, so none of them can change what this reads before the phrase
+/// is answered. The reason is `UnshareRefused`, which the view classifies as the
+/// store's own refusal (`FlowFailure::UnshareBlocked`).
+fn refuse_unshare_that_cannot_happen(
+    store: &CvcStore,
+    destination: &privacy::RemoteDestination,
+    id: &str,
+) -> Result<()> {
+    let check = store.can_unshare(id, &destination.fingerprint)?;
+    match crate::tui::unshare_refusal(&check, &sanitize_for_terminal(&destination.name)) {
+        Some(reason) => Err(crate::commands::failure::UnshareRefused::new(reason).into()),
+        None => Ok(()),
+    }
 }
 pub async fn delete_local(id: &str) -> Result<()> {
     let (_, store) = open(&env::current_dir()?)?;
@@ -769,11 +796,9 @@ fn settle_push(
 fn nothing_to_publish_line(remote: &str, shared_total: usize) -> String {
     let remote = sanitize_for_terminal(remote);
     if shared_total > 0 {
-        format!(
-            "No new shared interactions to publish to '{remote}' ({shared_total} shared in total)."
-        )
+        format!("No new shared thoughts to publish to '{remote}' ({shared_total} shared in total).")
     } else {
-        format!("No new shared interactions to publish to '{remote}'.")
+        format!("No new shared thoughts to publish to '{remote}'.")
     }
 }
 
@@ -830,11 +855,11 @@ fn removal_phrase(publication: &sync::ProjectionPublication) -> Option<String> {
         publication.removed_records,
     ) {
         (0, 0) => return None,
-        (interactions, 0) => format!("{SCOPE} {interactions} tombstoned interaction(s)"),
+        (interactions, 0) => format!("{SCOPE} {interactions} tombstoned thought(s)"),
         (interactions, records) if interactions > 0 => format!(
-            "{SCOPE} {interactions} tombstoned interaction(s) with {records} attached record(s)"
+            "{SCOPE} {interactions} tombstoned thought(s) with {records} attached record(s)"
         ),
-        (_, records) => format!("{SCOPE} {records} record(s) of tombstoned interaction(s)"),
+        (_, records) => format!("{SCOPE} {records} record(s) of tombstoned thought(s)"),
     };
     Some(format!("{removed} (not erased from history)"))
 }
@@ -890,10 +915,10 @@ fn describe_publication(
         // Only the ref's format, empty namespaces, or the derived by-commit index
         // differ: no interaction, link, tombstone, or derivation record moves.
         (0, None) => format!(
-            "{lead} a format/index update of refs/cvc/main to '{remote}' (no new interactions, links, or tombstones)."
+            "{lead} a format/index update of refs/cvc/main to '{remote}' (no new thoughts, links, or tombstones)."
         ),
         (0, Some(extras)) => format!(
-            "{lead} {extras} to '{remote}' (no new shared interactions; {total} shared in total)."
+            "{lead} {extras} to '{remote}' (no new shared thoughts; {total} shared in total)."
         ),
         (new, extras) => {
             // On a first push the total is the new count; say it once.
@@ -905,7 +930,7 @@ fn describe_publication(
             let tail = extras
                 .map(|extras| format!(", plus {extras}"))
                 .unwrap_or_default();
-            format!("{lead} {new} new shared interaction(s) to '{remote}'{context}{tail}.")
+            format!("{lead} {new} new shared thought(s) to '{remote}'{context}{tail}.")
         }
     }
 }
@@ -938,7 +963,7 @@ pub async fn pull() -> Result<()> {
     let n = sync::fetch_and_pull_destination(&repo, &store, &destination)?;
     let _ =
         cvc_core::squash::scan_for(&repo, &mut store, false, std::time::Duration::from_secs(30))?;
-    println!("Pulled {n} interaction(s) from '{name}'.");
+    println!("Pulled {n} thought(s) from '{name}'.");
     Ok(())
 }
 
@@ -1096,11 +1121,11 @@ mod publication_summary_tests {
         let p = publication(21, 42, [0; 5]);
         assert_eq!(
             line(&p, Planned),
-            "Publishing 21 new shared interaction(s) to 'origin' (42 shared in total)."
+            "Publishing 21 new shared thought(s) to 'origin' (42 shared in total)."
         );
         assert_eq!(
             line(&p, Done),
-            "Published 21 new shared interaction(s) to 'origin' (42 shared in total)."
+            "Published 21 new shared thought(s) to 'origin' (42 shared in total)."
         );
     }
 
@@ -1109,18 +1134,18 @@ mod publication_summary_tests {
         let p = publication(21, 21, [0; 5]);
         assert_eq!(
             line(&p, Planned),
-            "Publishing 21 new shared interaction(s) to 'origin'."
+            "Publishing 21 new shared thought(s) to 'origin'."
         );
         assert_eq!(
             line(&p, Done),
-            "Published 21 new shared interaction(s) to 'origin'."
+            "Published 21 new shared thought(s) to 'origin'."
         );
         // With something else riding along the context stays, so the line keeps
         // one shape.
         let with_links = publication(21, 21, [3, 0, 0, 0, 0]);
         assert_eq!(
             line(&with_links, Done),
-            "Published 21 new shared interaction(s) to 'origin' (21 shared in total), plus 3 commit link(s)."
+            "Published 21 new shared thought(s) to 'origin' (21 shared in total), plus 3 commit link(s)."
         );
     }
 
@@ -1128,19 +1153,19 @@ mod publication_summary_tests {
     fn other_records_ride_along_and_zero_categories_are_omitted() {
         assert_eq!(
             line(&publication(21, 42, [3, 0, 0, 0, 0]), Planned),
-            "Publishing 21 new shared interaction(s) to 'origin' (42 shared in total), plus 3 commit link(s)."
+            "Publishing 21 new shared thought(s) to 'origin' (42 shared in total), plus 3 commit link(s)."
         );
         assert_eq!(
             line(&publication(21, 42, [3, 1, 0, 0, 0]), Planned),
-            "Publishing 21 new shared interaction(s) to 'origin' (42 shared in total), plus 3 commit link(s) and 1 tombstone(s)."
+            "Publishing 21 new shared thought(s) to 'origin' (42 shared in total), plus 3 commit link(s) and 1 tombstone(s)."
         );
         assert_eq!(
             line(&publication(5, 9, [3, 1, 2, 0, 0]), Done),
-            "Published 5 new shared interaction(s) to 'origin' (9 shared in total), plus 3 commit link(s), 1 tombstone(s) and 2 derivation record(s)."
+            "Published 5 new shared thought(s) to 'origin' (9 shared in total), plus 3 commit link(s), 1 tombstone(s) and 2 derivation record(s)."
         );
         assert_eq!(
             line(&publication(1, 4, [0, 2, 0, 0, 0]), Done),
-            "Published 1 new shared interaction(s) to 'origin' (4 shared in total), plus 2 tombstone(s)."
+            "Published 1 new shared thought(s) to 'origin' (4 shared in total), plus 2 tombstone(s)."
         );
     }
 
@@ -1149,15 +1174,15 @@ mod publication_summary_tests {
         let p = publication(0, 42, [3, 1, 0, 0, 0]);
         assert_eq!(
             line(&p, Planned),
-            "Publishing 3 commit link(s) and 1 tombstone(s) to 'origin' (no new shared interactions; 42 shared in total)."
+            "Publishing 3 commit link(s) and 1 tombstone(s) to 'origin' (no new shared thoughts; 42 shared in total)."
         );
         assert_eq!(
             line(&p, Done),
-            "Published 3 commit link(s) and 1 tombstone(s) to 'origin' (no new shared interactions; 42 shared in total)."
+            "Published 3 commit link(s) and 1 tombstone(s) to 'origin' (no new shared thoughts; 42 shared in total)."
         );
         assert_eq!(
             line(&publication(0, 2, [0, 0, 1, 0, 0]), Done),
-            "Published 1 derivation record(s) to 'origin' (no new shared interactions; 2 shared in total)."
+            "Published 1 derivation record(s) to 'origin' (no new shared thoughts; 2 shared in total)."
         );
     }
 
@@ -1167,23 +1192,23 @@ mod publication_summary_tests {
         assert!(!removal.is_structural_only());
         assert_eq!(
             line(&removal, Planned),
-            "Publishing the removal from the current tree of 2 tombstoned interaction(s) (not erased from history) to 'origin' (no new shared interactions; 40 shared in total)."
+            "Publishing the removal from the current tree of 2 tombstoned thought(s) (not erased from history) to 'origin' (no new shared thoughts; 40 shared in total)."
         );
         let redaction = publication(0, 41, [0, 1, 0, 1, 2]);
         assert_eq!(
             line(&redaction, Done),
-            "Published 1 tombstone(s) and the removal from the current tree of 1 tombstoned interaction(s) with 2 attached record(s) (not erased from history) to 'origin' (no new shared interactions; 41 shared in total)."
+            "Published 1 tombstone(s) and the removal from the current tree of 1 tombstoned thought(s) with 2 attached record(s) (not erased from history) to 'origin' (no new shared thoughts; 41 shared in total)."
         );
         let stale = publication(0, 41, [0, 0, 0, 0, 3]);
         assert_eq!(
             line(&stale, Done),
-            "Published the removal from the current tree of 3 record(s) of tombstoned interaction(s) (not erased from history) to 'origin' (no new shared interactions; 41 shared in total)."
+            "Published the removal from the current tree of 3 record(s) of tombstoned thought(s) (not erased from history) to 'origin' (no new shared thoughts; 41 shared in total)."
         );
         // One trailing element, after links, tombstones, and derivations.
         let everything = publication(2, 9, [3, 1, 2, 1, 4]);
         assert_eq!(
             line(&everything, Planned),
-            "Publishing 2 new shared interaction(s) to 'origin' (9 shared in total), plus 3 commit link(s), 1 tombstone(s), 2 derivation record(s) and the removal from the current tree of 1 tombstoned interaction(s) with 4 attached record(s) (not erased from history)."
+            "Publishing 2 new shared thought(s) to 'origin' (9 shared in total), plus 3 commit link(s), 1 tombstone(s), 2 derivation record(s) and the removal from the current tree of 1 tombstoned thought(s) with 4 attached record(s) (not erased from history)."
         );
         for p in [&removal, &redaction, &stale] {
             assert!(!line(p, Planned).contains("format/index"));
@@ -1196,11 +1221,11 @@ mod publication_summary_tests {
         assert!(p.is_structural_only());
         assert_eq!(
             line(&p, Planned),
-            "Publishing a format/index update of refs/cvc/main to 'origin' (no new interactions, links, or tombstones)."
+            "Publishing a format/index update of refs/cvc/main to 'origin' (no new thoughts, links, or tombstones)."
         );
         assert_eq!(
             line(&p, Done),
-            "Published a format/index update of refs/cvc/main to 'origin' (no new interactions, links, or tombstones)."
+            "Published a format/index update of refs/cvc/main to 'origin' (no new thoughts, links, or tombstones)."
         );
         for text in [line(&p, Planned), line(&p, Done)] {
             assert!(!text.contains("Published 0"), "{text}");
@@ -1212,11 +1237,11 @@ mod publication_summary_tests {
     fn nothing_to_publish_mentions_the_total_only_when_there_is_one() {
         assert_eq!(
             nothing_to_publish_line("origin", 42),
-            "No new shared interactions to publish to 'origin' (42 shared in total)."
+            "No new shared thoughts to publish to 'origin' (42 shared in total)."
         );
         assert_eq!(
             nothing_to_publish_line("origin", 0),
-            "No new shared interactions to publish to 'origin'."
+            "No new shared thoughts to publish to 'origin'."
         );
     }
 
@@ -1233,15 +1258,14 @@ mod publication_summary_tests {
 
     /// The count the user reads in the summary line.
     fn count_in_summary(summary: &str) -> usize {
-        if summary.contains("no new shared interactions") || summary.contains("no new interactions")
-        {
+        if summary.contains("no new shared thoughts") || summary.contains("no new thoughts") {
             return 0;
         }
         summary
             .strip_prefix("Publishing ")
             .and_then(|rest| rest.split_whitespace().next())
             .and_then(|count| count.parse().ok())
-            .unwrap_or_else(|| panic!("no interaction count in {summary:?}"))
+            .unwrap_or_else(|| panic!("no thought count in {summary:?}"))
     }
 
     #[test]
@@ -1527,7 +1551,7 @@ mod output_tests {
         let nothing = nothing_to_publish_line(name, 3);
         assert_eq!(
             nothing,
-            "No new shared interactions to publish to 'or?[2Jigin' (3 shared in total)."
+            "No new shared thoughts to publish to 'or?[2Jigin' (3 shared in total)."
         );
         let publication = ProjectionPublication {
             shared_total: 3,
@@ -1541,7 +1565,7 @@ mod output_tests {
         // And an ordinary name is printed as it is.
         assert_eq!(
             nothing_to_publish_line("origin", 0),
-            "No new shared interactions to publish to 'origin'."
+            "No new shared thoughts to publish to 'origin'."
         );
     }
 

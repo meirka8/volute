@@ -8,14 +8,21 @@
 // names derive their version from. Packing happens only in staged copies in temporary
 // directories, never in the source directory, because release.test.js packs
 // there and the two would race over THIRD-PARTY-NOTICES.md under `node --test`.
+// Staging does read the source directory while that pack runs, though. The tests
+// that build a source directory of their own pin that staging never looks at what
+// a pack leaves there (the staged notices, a tarball) and skips an entry that
+// vanished after it was listed, which the real directory cannot reproduce on demand.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const { syncBuiltinESMExports } = require('node:module');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
+
+const { mock } = test;
 
 const UNIX_ONLY = { skip: process.platform === 'win32' };
 const packageRoot = path.resolve(__dirname, '..');
@@ -65,6 +72,36 @@ function changedLines(a, b) {
   const right = b.toString().split('\n');
   assert.equal(left.length, right.length, 'same number of lines');
   return left.map((line, index) => [line, right[index]]).filter(([x, y]) => x !== y);
+}
+
+// A throwaway repository holding a small package directory shaped like npm/cvc-mcp
+// (stagePackage finds the notices two levels above it). It lets a test put into the
+// source directory what a concurrent `npm pack` puts into the real one, which no
+// test may touch. `body` gets the repository root and the package directory.
+async function withSource(body) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cvc-stage-source-'));
+  const dir = path.join(root, 'npm', 'cvc-mcp');
+  try {
+    fs.mkdirSync(path.join(dir, 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'readmes'));
+    fs.writeFileSync(path.join(root, 'THIRD-PARTY-NOTICES.md'), 'notices\n');
+    for (const file of ['package.json', 'README.md', 'readmes/cvc.md']) fs.writeFileSync(path.join(dir, file), source(file));
+    fs.writeFileSync(path.join(dir, 'LICENSE'), 'license\n');
+    fs.writeFileSync(path.join(dir, 'bin', 'cvc.js'), '// launcher\n');
+    return await body({ root, dir });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// The files of a package staged from withSource's directory.
+const FIXTURE_FILES = ['LICENSE', 'README.md', path.join('bin', 'cvc.js'), 'package.json'];
+
+// Stages `name` from withSource's directory into the repository root, so that the
+// stage goes with it even when staging throws.
+async function stageFixture({ root, dir }, name = '@volute_cvc/cvc') {
+  const { stagePackage } = await loadStage();
+  return stagePackage(name, { sourceDir: dir, out: path.join(root, 'stage', name.split('/').pop()) });
 }
 
 test('the names, in publish order, start with the one the source manifest carries', async () => {
@@ -187,6 +224,104 @@ test('staging rejects unknown names, bad versions and a used --out directory', a
   } finally {
     fs.rmSync(used, { recursive: true, force: true });
   }
+});
+
+test('the tarball and the staged notices a pack leaves in the source are left out without being looked at', UNIX_ONLY, async () => {
+  const { packageNames } = await loadStage();
+  await withSource(async fixture => {
+    // Staging refuses a symbolic link wherever it would stage one. These are links
+    // (to nowhere, too), so staging gets past them only if it never looks at them.
+    const names = [`volute_cvc-cvc-mcp-${sourceManifest.version}.tgz`, 'another.tgz', 'THIRD-PARTY-NOTICES.md', 'node_modules', '.git', 'test', 'test-local-install.sh', 'README.txt'];
+    for (const name of names) fs.symlinkSync(path.join(fixture.root, 'missing'), path.join(fixture.dir, name));
+    for (const name of packageNames()) {
+      assert.deepEqual(filesUnder((await stageFixture(fixture, name)).dir), FIXTURE_FILES, name);
+    }
+  });
+});
+
+test('an entry that vanishes after the directory was listed is skipped, not an error', async () => {
+  await loadStage();
+  await withSource(async fixture => {
+    const vanishing = path.join(fixture.dir, 'vanishing.txt');
+    fs.writeFileSync(vanishing, 'listed, then gone');
+    // cpSync lists a directory and only then calls the filter on each entry, so
+    // whatever someone else removes in between is gone when the filter looks at it.
+    // Remove this entry right before the staging looks at it, as a concurrent
+    // `npm pack` removes its tarball. The staging script takes lstatSync from
+    // node:fs: replace it there and sync the live bindings to reach that script.
+    const lstat = fs.lstatSync;
+    let looked = false;
+    mock.method(fs, 'lstatSync', (file, ...rest) => {
+      if (file === vanishing) {
+        fs.unlinkSync(file);
+        looked = true;
+      }
+      return lstat(file, ...rest);
+    });
+    syncBuiltinESMExports();
+    try {
+      const staged = await stageFixture(fixture);
+      assert.equal(looked, true, 'the staging looked at the entry after it was listed');
+      assert.deepEqual(filesUnder(staged.dir), FIXTURE_FILES);
+    } finally {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+  });
+});
+
+test('a symbolic link that would be staged is still refused', UNIX_ONLY, async () => {
+  for (const link of ['extra', path.join('bin', 'extra')]) {
+    for (const live of [true, false]) {
+      await withSource(async fixture => {
+        fs.symlinkSync(live ? path.join(fixture.dir, 'LICENSE') : path.join(fixture.root, 'missing'), path.join(fixture.dir, link));
+        await assert.rejects(stageFixture(fixture), /Refusing to stage a symbolic link: \S*extra$/, `${link}, ${live ? 'live' : 'dangling'}`);
+      });
+    }
+  }
+});
+
+test('shouldStage decides the exclusions from the top-level name, before it looks at the entry', UNIX_ONLY, async () => {
+  const { shouldStage } = await loadStage();
+  await withSource(({ root, dir }) => {
+    // Under a regular file every lookup fails with ENOTDIR, so an answer instead of
+    // an exception means that the entry was left out by its name alone.
+    fs.writeFileSync(path.join(root, 'a-file'), '');
+    const unreachable = path.join(root, 'a-file', 'package');
+    for (const name of ['volute_cvc-cvc-mcp-0.7.0.tgz', 'another.tgz', 'THIRD-PARTY-NOTICES.md', 'node_modules', '.git', 'test', 'readmes', 'test-local-install.sh', 'README.md', 'README', 'readme.txt']) {
+      assert.equal(shouldStage(path.join(unreachable, name), unreachable), false, name);
+      assert.equal(shouldStage(path.join(unreachable, name, 'deeper', 'file'), unreachable), false, `${name}/deeper/file`);
+    }
+    for (const name of ['package.json', 'bin', 'LICENSE', '.gitignore', 'readmes.md', 'notes.tgz.bak']) {
+      assert.throws(() => shouldStage(path.join(unreachable, name), unreachable), { code: 'ENOTDIR' }, `${name} is looked at`);
+    }
+    // Only the top-level name counts: below a directory that is staged, so is everything.
+    fs.writeFileSync(path.join(dir, 'bin', 'inner.tgz'), '');
+    fs.writeFileSync(path.join(dir, 'bin', 'README.md'), '');
+    assert.equal(shouldStage(path.join(dir, 'bin', 'inner.tgz'), dir), true);
+    assert.equal(shouldStage(path.join(dir, 'bin', 'README.md'), dir), true);
+  });
+});
+
+test('shouldStage skips an entry that is gone and answers for one that is there', async () => {
+  const { shouldStage } = await loadStage();
+  await withSource(({ dir }) => {
+    assert.equal(shouldStage(dir, dir), true, 'the source directory itself');
+    assert.equal(shouldStage(path.join(dir, 'bin'), dir), true, 'a directory');
+    assert.equal(shouldStage(path.join(dir, 'LICENSE'), dir), true, 'a regular file');
+    assert.equal(shouldStage(path.join(dir, 'gone.txt'), dir), false, 'gone from the top level');
+    assert.equal(shouldStage(path.join(dir, 'bin', 'gone.js'), dir), false, 'gone from a directory');
+    assert.equal(shouldStage(path.join(dir, 'gone', 'deeper.js'), dir), false, 'gone with its directory');
+  });
+});
+
+test('shouldStage throws every error from looking at an entry but ENOENT', UNIX_ONLY, async () => {
+  const { shouldStage } = await loadStage();
+  await withSource(({ root, dir }) => {
+    assert.throws(() => shouldStage(path.join(dir, 'LICENSE', 'inside'), dir), { code: 'ENOTDIR' }, 'a path through a file');
+    fs.symlinkSync('loop', path.join(root, 'loop'));
+    assert.throws(() => shouldStage(path.join(root, 'loop', 'inside'), root), { code: 'ELOOP' }, 'a path through a symbolic link loop');
+  });
 });
 
 test('the command line lists the names, prints the staged directory and rejects misuse', UNIX_ONLY, () => {

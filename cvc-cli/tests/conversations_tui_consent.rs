@@ -954,7 +954,7 @@ fn a_publish_reports_what_is_new_against_the_total_and_asks_nothing_when_nothing
     assert!(asked.ends_with(" 1"), "{asked}");
     let summary = flat(&view.session.screen());
     assert!(
-        summary.contains("Publishing 1 new shared interaction(s) to 'origin' (2 shared in total)."),
+        summary.contains("Publishing 1 new shared thought(s) to 'origin' (2 shared in total)."),
         "{summary}"
     );
     view.type_back(&asked);

@@ -122,14 +122,14 @@ fn a_second_push_asks_for_and_reports_only_what_is_new() {
     assert!(
         initial
             .before_answer
-            .contains("Publishing 1 new shared interaction(s) to 'origin'.\r\nType exactly"),
+            .contains("Publishing 1 new shared thought(s) to 'origin'.\r\nType exactly"),
         "{}",
         initial.before_answer
     );
     assert!(
         initial
             .output
-            .contains("Published 1 new shared interaction(s) to 'origin'."),
+            .contains("Published 1 new shared thought(s) to 'origin'."),
         "{}",
         initial.output
     );
@@ -153,7 +153,7 @@ fn a_second_push_asks_for_and_reports_only_what_is_new() {
         "{}",
         push.challenge
     );
-    let summary = "Publishing 1 new shared interaction(s) to 'origin' (2 shared in total).";
+    let summary = "Publishing 1 new shared thought(s) to 'origin' (2 shared in total).";
     let summary_at = push
         .before_answer
         .find(summary)
@@ -168,7 +168,7 @@ fn a_second_push_asks_for_and_reports_only_what_is_new() {
     );
     assert!(
         push.output
-            .contains("Published 1 new shared interaction(s) to 'origin' (2 shared in total)."),
+            .contains("Published 1 new shared thought(s) to 'origin' (2 shared in total)."),
         "{}",
         push.output
     );
@@ -191,12 +191,12 @@ fn a_second_push_asks_for_and_reports_only_what_is_new() {
         b"",
     );
     let (status, output) = {
-        session.wait_for_text("No new shared interactions to publish to 'origin'");
+        session.wait_for_text("No new shared thoughts to publish to 'origin'");
         session.wait_exit()
     };
     assert!(status.success(), "{output}");
     assert!(
-        output.contains("No new shared interactions to publish to 'origin' (2 shared in total)."),
+        output.contains("No new shared thoughts to publish to 'origin' (2 shared in total)."),
         "{output}"
     );
     assert!(challenges(&output).is_empty(), "{output}");

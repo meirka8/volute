@@ -20,7 +20,7 @@ pub async fn run() -> Result<()> {
     // Simplistic log: Get all IDs and show them.
     let ids = store.get_all_interaction_ids()?;
 
-    println!("CVC Log ({} interactions)", ids.len());
+    println!("CVC Log ({} thought(s))", ids.len());
     println!("----------------------------------------");
 
     for id in ids {

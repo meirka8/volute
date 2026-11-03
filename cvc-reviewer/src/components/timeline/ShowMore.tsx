@@ -1,3 +1,5 @@
+import { matchesLabel } from './searchHighlight';
+
 interface ShowMoreProps {
   /** How many items are not drawn yet. */
   remaining: number;
@@ -7,6 +9,8 @@ interface ShowMoreProps {
   one: string;
   many: string;
   onShow: () => void;
+  /** While the timeline is searched: how many matches the items not drawn yet hold. */
+  matches?: number;
 }
 
 const count = (value: number) => value.toLocaleString('en-US');
@@ -21,7 +25,7 @@ const count = (value: number) => value.toLocaleString('en-US');
  * which selects the step on a click anywhere on it. It reveals more; it is not a
  * toggle, so it has no expanded state.
  */
-export function ShowMore({ remaining, page, one, many, onShow }: ShowMoreProps) {
+export function ShowMore({ remaining, page, one, many, onShow, matches = 0 }: ShowMoreProps) {
   if (remaining <= 0) return null;
   const next = Math.min(page, remaining);
   return (
@@ -33,7 +37,7 @@ export function ShowMore({ remaining, page, one, many, onShow }: ShowMoreProps) 
       }}
       className="mt-2 text-xs text-action transition-colors hover:opacity-80"
     >
-      {`Show ${count(next)} more ${next === 1 ? one : many}${remaining > next ? ` (${count(remaining)} not shown)` : ''}`}
+      {`Show ${count(next)} more ${next === 1 ? one : many}${remaining > next ? ` (${count(remaining)} not shown)` : ''}${matchesLabel(matches)}`}
     </button>
   );
 }

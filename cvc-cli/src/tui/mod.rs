@@ -40,6 +40,11 @@ mod tree;
 mod view;
 mod words;
 
+/// Why an unshare would be refused, in the view's words. The one thing the
+/// commands take from `words`: `cvc unshare` refuses with it, and asks no phrase,
+/// for an unshare the store would refuse (`commands::sync::unshare_conversation`).
+pub(crate) use words::unshare_refusal;
+
 use std::io::{self, Write};
 
 use anyhow::Result;

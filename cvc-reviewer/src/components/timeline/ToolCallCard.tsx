@@ -1,12 +1,15 @@
-import { useId, useMemo, useState, type ReactNode } from 'react';
+import { useId, useMemo, type ReactNode } from 'react';
 import { CircleCheck, CircleDashed, CircleDot } from 'lucide-react';
 import { clsx } from 'clsx';
 import { usePaged } from '../../hooks/usePaged';
 import {
   describeToolCall,
+  PATH_ARGUMENTS,
   ranProviderSide,
+  splitChip,
   toolOutcome,
   type ToolCallView,
+  type ToolEdit,
   type ToolField,
   type ToolOutcome,
 } from '../../lib/toolCalls';
@@ -15,12 +18,33 @@ import { ClampedText } from './ClampedText';
 import { CollapsibleCode } from './CollapsibleCode';
 import { ExpandToggle } from './ExpandToggle';
 import { HiddenText } from './HiddenText';
+import type { CountedText } from '../../lib/timelineSearch';
 import { RENDER_LIMITS } from './limits';
+import { usePersistentToggle } from './nodeUiState';
+import { Section } from './NodeUiScope';
+import { useHiddenMatches, useIsSearching, useMatchCount } from './searchHighlight';
 import { ShowMore } from './ShowMore';
 import { TextDiff } from './TextDiff';
 import { BADGE_DANGER, BADGE_NEUTRAL, BADGE_SUCCESS, CHIP } from './styles';
 
 const count = (value: number) => value.toLocaleString('en-US');
+
+/**
+ * One option of a call: "timeout 120s", "in /repo/src", "runs in background". The words are the Reviewer's and the
+ * value after them is what the capture recorded, so only the value is searched and marked; a chip that is the
+ * Reviewer's words alone is not. Without a search it is drawn as one piece of text, as it always was.
+ */
+function ChipText({ chip }: { chip: string }) {
+  const searching = useIsSearching();
+  const parts = splitChip(chip);
+  if (parts === null || !searching) return <HiddenText text={chip} mode="strict" marks={false} />;
+  return (
+    <>
+      <HiddenText text={parts.label} mode="strict" marks={false} />
+      <HiddenText text={parts.value} mode="strict" scope={parts.scope} />
+    </>
+  );
+}
 
 function Chips({ chips }: { chips: string[] }) {
   if (chips.length === 0) return null;
@@ -28,7 +52,7 @@ function Chips({ chips }: { chips: string[] }) {
     <ul className="mt-2 flex flex-wrap gap-1.5">
       {chips.map((chip, index) => (
         <li key={index} className={clsx(CHIP, 'break-all')}>
-          <HiddenText text={chip} mode="strict" />
+          <ChipText chip={chip} />
         </li>
       ))}
     </ul>
@@ -39,7 +63,7 @@ function Chips({ chips }: { chips: string[] }) {
 function Path({ text }: { text: string }) {
   return (
     <div className="break-all font-mono text-xs text-muted">
-      <HiddenText text={text} mode="strict" />
+      <HiddenText text={text} mode="strict" scope="path" />
     </div>
   );
 }
@@ -61,25 +85,30 @@ function Muted({ children, className }: { children: ReactNode; className?: strin
   return <p className={clsx('text-xs italic text-muted', className)}>{children}</p>;
 }
 
+/**
+ * One recorded argument as a row: its name as a label, and its value. The name is not searched or marked (`tool:` finds
+ * a call by what it is called); a value that is a file, by the name of the argument it is, is a path.
+ */
 function FieldRow({ field }: { field: ToolField }) {
   if (field.unrenderable) {
     return (
       <div className="flex min-w-0 gap-2">
         <dt className="shrink-0 font-mono text-muted">
-          <HiddenText text={field.key} mode="strict" />
+          <HiddenText text={field.key} mode="strict" marks={false} />
         </dt>
         <dd className="min-w-0 italic text-muted">(too deeply nested to display)</dd>
       </div>
     );
   }
+  const scope = (PATH_ARGUMENTS as readonly string[]).includes(field.key) ? 'path' : undefined;
   if (field.block) {
     return (
       <div className="min-w-0">
         <dt className="break-all font-mono text-muted">
-          <HiddenText text={field.key} mode="strict" />
+          <HiddenText text={field.key} mode="strict" marks={false} />
         </dt>
         <dd className="mt-1">
-          <CollapsibleCode text={field.value} wrap />
+          <CollapsibleCode text={field.value} wrap scope={scope} />
           {field.omitted ? <Muted className="mt-1">{`… ${count(field.omitted)} more characters not shown`}</Muted> : null}
         </dd>
       </div>
@@ -88,25 +117,35 @@ function FieldRow({ field }: { field: ToolField }) {
   return (
     <div className="flex min-w-0 gap-2">
       <dt className="shrink-0 font-mono text-muted">
-        <HiddenText text={field.key} mode="strict" />
+        <HiddenText text={field.key} mode="strict" marks={false} />
       </dt>
       <dd className="min-w-0 break-words font-mono text-ink">
-        <HiddenText text={field.value} mode="strict" />
+        <HiddenText text={field.value} mode="strict" scope={scope} />
       </dd>
     </div>
   );
 }
 
+/** What the rows of a call hold that a search can match. (A row's value is worked out only now, for the rows not drawn yet.) */
+const fieldTexts = (field: ToolField): readonly CountedText[] =>
+  field.unrenderable ? [] : [(PATH_ARGUMENTS as readonly string[]).includes(field.key) ? { text: field.value, scope: 'path' as const } : field.value];
+const todoTexts = (todo: { content: string; activeForm?: string }): readonly string[] => (todo.activeForm === undefined ? [todo.content] : [todo.content, todo.activeForm]);
+/** An edit is drawn as a diff, a line at a time: a phrase does not run from one line to the next. */
+const editTexts = (edit: ToolEdit): readonly string[] => [...edit.oldText.split('\n'), ...edit.newText.split('\n')];
+
 function FieldRows({ fields }: { fields: ToolField[] }) {
-  const { visible, remaining, showMore } = usePaged(fields.length, RENDER_LIMITS.fieldRows);
+  const { visible, remaining, showMore } = usePaged(fields.length, RENDER_LIMITS.fieldRows, 'fields');
+  const hiddenMatches = useHiddenMatches(fields, visible, fieldTexts);
   return (
     <>
       <dl className="space-y-1.5 text-xs">
         {fields.slice(0, visible).map((field, index) => (
-          <FieldRow key={index} field={field} />
+          <Section key={index} name={`field-${index}`}>
+            <FieldRow field={field} />
+          </Section>
         ))}
       </dl>
-      <ShowMore remaining={remaining} page={RENDER_LIMITS.fieldRows} one="field" many="fields" onShow={showMore} />
+      <ShowMore remaining={remaining} page={RENDER_LIMITS.fieldRows} one="field" many="fields" onShow={showMore} matches={hiddenMatches} />
     </>
   );
 }
@@ -124,14 +163,15 @@ function TodoStatus({ status }: { status: string }) {
     <span className="mt-0.5 shrink-0">
       {icon}
       <span className="sr-only">
-        <HiddenText text={`${status.replaceAll('_', ' ')}: `} mode="strict" />
+        <HiddenText text={`${status.replaceAll('_', ' ')}: `} mode="strict" marks={false} />
       </span>
     </span>
   );
 }
 
 function TodoList({ todos }: { todos: Extract<ToolCallView, { kind: 'todos' }>['todos'] }) {
-  const { visible, remaining, showMore } = usePaged(todos.length, RENDER_LIMITS.todos);
+  const { visible, remaining, showMore } = usePaged(todos.length, RENDER_LIMITS.todos, 'todos');
+  const hiddenMatches = useHiddenMatches(todos, visible, todoTexts);
   return (
     <>
       <ul className="space-y-1.5">
@@ -151,13 +191,14 @@ function TodoList({ todos }: { todos: Extract<ToolCallView, { kind: 'todos' }>['
           </li>
         ))}
       </ul>
-      <ShowMore remaining={remaining} page={RENDER_LIMITS.todos} one="item" many="items" onShow={showMore} />
+      <ShowMore remaining={remaining} page={RENDER_LIMITS.todos} one="item" many="items" onShow={showMore} matches={hiddenMatches} />
     </>
   );
 }
 
 function EditList({ view }: { view: Extract<ToolCallView, { kind: 'edit' }> }) {
-  const { visible, remaining, showMore } = usePaged(view.edits.length, RENDER_LIMITS.edits);
+  const { visible, remaining, showMore } = usePaged(view.edits.length, RENDER_LIMITS.edits, 'edits');
+  const hiddenMatches = useHiddenMatches(view.edits, visible, editTexts);
   return (
     <>
       <div className="mt-2 space-y-3">
@@ -168,29 +209,34 @@ function EditList({ view }: { view: Extract<ToolCallView, { kind: 'edit' }> }) {
                 {view.edits.length > 1 && <span>{`Edit ${index + 1} of ${view.edits.length}`}</span>}
                 {edit.chips.map((chip) => (
                   <span key={chip} className={CHIP}>
-                    <HiddenText text={chip} mode="strict" />
+                    <ChipText chip={chip} />
                   </span>
                 ))}
               </div>
             )}
-            <TextDiff oldText={edit.oldText} newText={edit.newText} />
+            <Section name={`edit-${index}`}>
+              <TextDiff oldText={edit.oldText} newText={edit.newText} />
+            </Section>
           </div>
         ))}
       </div>
-      <ShowMore remaining={remaining} page={RENDER_LIMITS.edits} one="edit" many="edits" onShow={showMore} />
+      <ShowMore remaining={remaining} page={RENDER_LIMITS.edits} one="edit" many="edits" onShow={showMore} matches={hiddenMatches} />
     </>
   );
 }
 
 /** A sub-agent's prompt can be long and is rarely the point: hidden until asked for. */
 function PromptDisclosure({ prompt }: { prompt: string }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = usePersistentToggle('open', false);
   const id = useId();
+  const matches = useMatchCount(prompt, !open);
   return (
     <div className="min-w-0">
       {open && (
         <div id={id}>
-          <CollapsibleCode text={prompt} wrap maxLines={12} mode="prose" />
+          <Section name="prompt">
+            <CollapsibleCode text={prompt} wrap maxLines={12} mode="prose" />
+          </Section>
         </div>
       )}
       <ExpandToggle
@@ -199,6 +245,7 @@ function PromptDisclosure({ prompt }: { prompt: string }) {
         collapsedLabel="Show subagent prompt"
         expandedLabel="Hide subagent prompt"
         controls={open ? id : undefined}
+        matches={matches}
       />
     </div>
   );
@@ -245,7 +292,7 @@ function ToolCallBodyView({ view }: { view: ToolCallView }) {
           <div className="flex min-w-0 items-baseline gap-2">
             <span className="shrink-0 text-[11px] uppercase tracking-[0.14em] text-muted">{view.label}</span>
             <span className="min-w-0 break-all font-mono text-xs text-ink">
-              <HiddenText text={view.value} mode="strict" />
+              <HiddenText text={view.value} mode="strict" scope={view.label === 'file' ? 'path' : undefined} />
             </span>
           </div>
           {view.detail && (
@@ -362,14 +409,18 @@ export function ToolCallCard({ exec }: { exec: ToolExecution }) {
     <div className="min-w-0 rounded-2xl bg-canvas/75 px-3 py-2.5" data-status={outcome}>
       <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1">
         <span className="min-w-0 break-words font-mono text-xs font-semibold text-ink">
-          <HiddenText text={view.title} mode="strict" />
+          <HiddenText text={view.title} mode="strict" scope="tool" full={view.tool} />
         </span>
         <OutcomeBadge outcome={outcome} providerSide={providerSide} />
       </div>
-      <ToolCallBodyView view={view} />
+      <Section name="body">
+        <ToolCallBodyView view={view} />
+      </Section>
       {view.extras.length > 0 && (
         <div className="mt-2 border-t border-line/70 pt-2">
-          <FieldRows fields={view.extras} />
+          <Section name="extras">
+            <FieldRows fields={view.extras} />
+          </Section>
         </div>
       )}
     </div>

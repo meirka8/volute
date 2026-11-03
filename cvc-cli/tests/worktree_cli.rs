@@ -154,8 +154,7 @@ fn cli_uses_common_storage_and_active_worktree_policy() {
     fixture.cvc_ok(&nested, &["run", "--", "printf", "captured"]);
     let before_hook = fixture.cvc_ok(&nested, &["status"]);
     assert!(
-        String::from_utf8_lossy(&before_hook.stdout)
-            .contains("Floating Interactions (Unlinked): 1"),
+        String::from_utf8_lossy(&before_hook.stdout).contains("Floating Thoughts (Unlinked): 1"),
         "{}",
         String::from_utf8_lossy(&before_hook.stdout)
     );
@@ -256,8 +255,7 @@ fn linked_relative_hookspath_is_worktree_relative_and_advisory() {
     fixture.cvc_ok(&nested, &["run", "--", "printf", "captured"]);
     let before_hook = fixture.cvc_ok(&nested, &["status"]);
     assert!(
-        String::from_utf8_lossy(&before_hook.stdout)
-            .contains("Floating Interactions (Unlinked): 1"),
+        String::from_utf8_lossy(&before_hook.stdout).contains("Floating Thoughts (Unlinked): 1"),
         "{}",
         String::from_utf8_lossy(&before_hook.stdout)
     );

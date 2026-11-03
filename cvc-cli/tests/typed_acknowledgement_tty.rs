@@ -77,7 +77,7 @@ fn a_chained_challenge_waits_for_fresh_input_instead_of_the_previous_lines_type_
     let (status, output) = session.wait_exit();
     assert!(status.success(), "{output}");
     assert!(
-        output.contains("Published 1 new shared interaction(s) to 'origin'."),
+        output.contains("Published 1 new shared thought(s) to 'origin'."),
         "{output}"
     );
     let remote = git2::Repository::open_bare(&fixture.remote).unwrap();
