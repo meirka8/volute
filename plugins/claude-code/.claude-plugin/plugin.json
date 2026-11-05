@@ -1,6 +1,6 @@
 {
   "name": "cvc",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Records Claude Code sessions, as Claude Code's transcript exposes them, into CVC's local, private-by-default history linked to your Git commits, in repositories where you ran cvc init and acknowledged capture. Requires the cvc CLI 0.7.1+ on PATH.",
   "author": {
     "name": "Volute",
