@@ -12,7 +12,7 @@
         "source": "git-subdir",
         "url": "https://github.com/meirka8/volute.git",
         "path": "plugins/claude-code",
-        "ref": "v0.7.0"
+        "ref": "v0.7.1"
       },
       "description": "Records Claude Code sessions, as Claude Code's transcript exposes them, into CVC's local, private-by-default history linked to your Git commits, in repositories where you ran cvc init and acknowledged capture. Requires the cvc CLI 0.7.1+ on PATH.",
       "author": {
