@@ -314,6 +314,17 @@ pub fn observe_explicit_range_with_abort<F: FnMut() -> bool>(
     )
 }
 
+/// Observes the range a pre-push hook was given.
+///
+/// `source_remote` is what Git passed the hook as the remote: the remote's
+/// name, or, for a push to a URL that names no configured remote, the URL
+/// itself, with any user information (a user name and a password or token) in
+/// it. It names the source in the observation's key and in its stored remote,
+/// so it is kept without that user information
+/// ([`crate::privacy::url_without_userinfo`]); a name, an scp-like address or
+/// a path is kept as it is. A URL whose host cannot be told apart from its user
+/// information is not observed at all: nothing is recorded, and the error says
+/// why without quoting it.
 #[allow(clippy::too_many_arguments)]
 pub fn observe_pre_push_range_with_abort<F: FnMut() -> bool>(
     repo: &Repository,
@@ -325,6 +336,10 @@ pub fn observe_pre_push_range_with_abort<F: FnMut() -> bool>(
     authorized_remote: Option<&str>,
     abort: F,
 ) -> Result<RangeEvidence, SquashError> {
+    let source_remote = source_remote
+        .map(crate::privacy::url_without_userinfo)
+        .transpose()
+        .map_err(|_| SquashError::Invalid("pre-push remote URL has no host that can be located"))?;
     observe_range_with_abort(
         repo,
         store,
@@ -332,7 +347,7 @@ pub fn observe_pre_push_range_with_abort<F: FnMut() -> bool>(
         tip,
         RangeObservationOrigin::PrePush,
         source_ref,
-        source_remote,
+        source_remote.as_deref(),
         authorized_remote,
         abort,
     )

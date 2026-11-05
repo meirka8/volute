@@ -1,0 +1,26 @@
+{
+  "interaction": {
+    "id": "a6c820c1-a3b8-8766-ba5b-e6ab38c4eeb7",
+    "conversation_id": "5e0d6a42-7b1c-4d3e-9a8f-1c2b3d4e5f60:agent-a1b2c3d4e5f60718",
+    "parent_id": null,
+    "timestamp": "2026-10-10T11:20:21Z",
+    "author": "human",
+    "user_prompt": "[task ~cvc-a23369d0c1c2a9cd] List the files.",
+    "model_name": "claude-fixture-edge",
+    "model_cot": "Subagent reasoning.",
+    "model_response": null,
+    "source_request_id": "req_S1"
+  },
+  "context_items": [],
+  "tool_executions": [
+    {
+      "id": 29,
+      "interaction_id": "a6c820c1-a3b8-8766-ba5b-e6ab38c4eeb7",
+      "tool_protocol": "native",
+      "tool_name": "Bash",
+      "arguments": "{\"command\":\"ls\",\"description\":\"List\"}",
+      "status": "success"
+    }
+  ],
+  "artifact_links": []
+}

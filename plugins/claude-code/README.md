@@ -36,7 +36,7 @@ cvc privacy acknowledge-capture
 
 The second command is a typed challenge at an interactive terminal. The plugin's hooks never run the acknowledgement, share or publish commands, and installing it changes no consent state. Those commands accept their phrase only at an interactive terminal, which is a confirmation step, not a security boundary (see [Privacy.md](https://github.com/meirka8/volute/blob/main/Privacy.md)). Capture stays off in a repository until you grant it there. Then start Claude Code in that repository (or one of its worktrees), work as usual, and run `cvc conversations` to see the captured sessions.
 
-In a repository where capture was already acknowledged (for the VS Code extension or a per-checkout install), the plugin starts recording Claude Code sessions from the next session, with no new prompt.
+In a repository where capture was already acknowledged (for the VS Code extension or a per-checkout install), the plugin starts recording Claude Code sessions from the next session, with no new prompt. The acknowledgement is per checkout and user: a copied or moved repository asks again, and so does one acknowledged with cvc 0.7.0 or earlier.
 
 ## What you will see
 
@@ -46,7 +46,7 @@ A session is recorded in the repository it was started in: the repository that c
 | --- | --- |
 | A project outside a CVC-initialized repository (not a Git repository, `cvc init` never run, a bare repository, a directory that no longer exists, or a repository owned by another user, which Git itself refuses) | Nothing. The hook exits 0 and prints nothing. |
 | A parent folder or another project, even if the session later works inside an initialized repository | Nothing is recorded, and nothing is printed. The repository the session visits receives nothing. |
-| An initialized repository without the capture acknowledgement | `consent-required: …` in the session, without blocking it. Nothing is recorded. The message ends by saying how to stop the hooks: `/plugin disable cvc@volute` for this plugin, `cvc harness uninstall claude-code` for a checkout's per-checkout hooks. |
+| An initialized repository without the capture acknowledgement, which is per checkout and user (a copied or moved repository asks again) | `consent-required: …` in the session, without blocking it. Nothing is recorded. The message ends by saying how to stop the hooks: `/plugin disable cvc@volute` for this plugin, `cvc harness uninstall claude-code` for a checkout's per-checkout hooks. |
 | An initialized repository with the acknowledgement | The whole session is recorded there, including work in other directories. Nothing is printed on success. A commit made there from a Claude Code session prints `CVC: Linked N thought(s) to commit <sha>.` (N can be 0), whether or not that session is being recorded there. |
 | Another repository that a recorded session works in | Nothing is recorded there. Its content goes to the repository the session was started in. |
 | A `.git` entry that Git cannot open (for example a dangling gitfile) | An error that names the path, without blocking the session. |
@@ -125,7 +125,7 @@ The first stops the hooks and keeps the plugin installed; the second removes it.
 - **The session-start message says the `cvc` found on the `PATH` could not be run.** The `cvc` the hooks found exists but does not start with the `PATH` Claude Code runs hooks with. A typical case is an npm-installed `cvc`, which is a Node launcher, when `node` is not on that `PATH`. Run `cvc --version` with the same `PATH` Claude Code sees (an IDE or desktop-app session can differ from your terminal), fix what fails, and start a new session. Putting `~/.cvc/bin` ahead of npm's global bin directory on that `PATH` avoids the launcher once the binary has been published there (see Requirements).
 - **A `.git` error that names a path.** Git cannot open that `.git` entry, for example a gitfile whose worktree is gone. Fix or remove the entry.
 - **Slow hooks in every project, or a download at the first event after an upgrade.** The `cvc` found first on the `PATH` is probably the npm launcher. See Requirements.
-- **`consent-required`.** The repository is initialized but has no capture acknowledgement. Run `cvc privacy acknowledge-capture` there, or stop the hooks as the message says.
+- **`consent-required`.** The repository is initialized but has no capture acknowledgement for this checkout and user; a copied or moved repository asks again. Run `cvc privacy acknowledge-capture` there, or stop the hooks as the message says.
 
 ## Windows
 

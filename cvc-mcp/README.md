@@ -26,7 +26,7 @@ Common client locations include workspace `.vscode/mcp.json`, client settings, a
 
 ## Tools and privacy boundary
 
-- `commit_thought` saves a concise task record, reasoning supplied by the client, and an optional result locally. A client that manages its own sessions may name the conversation with `conversation_id`: 1 to 256 ASCII letters, digits, `.`, `_`, `-` or `:`; any other id is refused before anything is recorded.
+- `commit_thought` saves a concise task record, reasoning supplied by the client, and an optional result locally. A client that manages its own sessions may name the conversation with `conversation_id`: 1 to 256 ASCII letters, digits, `.`, `_`, `-` or `:`; any other id is refused before anything is recorded. A conversation that does not exist yet is created. Thoughts recorded through MCP stay private until shared with `cvc share`: a thought does not take on the sharing of the conversation it names, including future sharing recorded with `cvc share --future`, which covers what passive capture (VS Code, Claude Code) records later. The result's first text block is `Thought recorded. ID: <id>`; a second one states that the thought stays private until shared with `cvc share`.
 - `read_history` reads local saved history.
 - `get_context` inspects Git-backed context for one file.
 - `setup_cvc` initializes CVC storage and hooks.

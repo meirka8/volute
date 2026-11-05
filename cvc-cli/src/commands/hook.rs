@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use cvc_core::claude_code::{harness_record, settings};
 use cvc_core::db::CvcStore;
 use cvc_core::linker;
-use cvc_core::privacy;
+use cvc_core::privacy::{self, CaptureAcknowledgement};
 use cvc_core::repository::{RepositoryLayout, RepositoryLayoutError};
 use git2::Repository;
 use std::env;
@@ -54,6 +54,17 @@ pub(crate) fn not_shell_warning(
     )
 }
 
+/// What a hook warning says of an error or a reason. That text can be a
+/// remote's (the error text of a server, or a URL libgit2 quotes from the
+/// configuration, user information included), or quote captured text and
+/// repository paths, and Git shows a hook's output as it is, so it is printed
+/// as `cvc` prints any error: control and format characters replaced, a line
+/// feed excepted, and every URL without its user information (see
+/// [`crate::terminal_text::sanitize_error_for_terminal`]).
+fn warning_text(error: &dyn std::fmt::Display) -> String {
+    crate::terminal_text::sanitize_error_for_terminal(&error.to_string()).into_owned()
+}
+
 /// Git's null object id: all zeros, 40 digits (SHA-1) or 64 (SHA-256).
 fn is_null_oid(text: &str) -> bool {
     matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte == b'0')
@@ -82,18 +93,24 @@ pub async fn post_checkout(previous: &str, _new: &str, flag: &str) -> Result<()>
             "CVC: installed the Claude Code capture hooks in this worktree ({})",
             settings::SETTINGS_RELATIVE_PATH
         ),
-        Ok(Propagation::Declined(reason)) => {
-            eprintln!("CVC: Claude Code hooks not installed in this worktree: {reason}")
-        }
-        Err(error) => eprintln!("CVC: post-checkout: {error:#}"),
+        Ok(Propagation::Declined(reason)) => eprintln!(
+            "CVC: Claude Code hooks not installed in this worktree: {}",
+            warning_text(&reason)
+        ),
+        Err(error) => eprintln!(
+            "CVC: post-checkout: {}",
+            warning_text(&format!("{error:#}"))
+        ),
     }
     Ok(())
 }
 
 /// Installs the Claude Code hook entries into the worktree at `cwd` when the
 /// repository's harness record asks for them. Reads one small file and the
-/// repository's consent state; it opens no database and touches no network,
-/// because it runs inside `git worktree add`.
+/// repository's consent state; it opens no database and, except that asking
+/// Git in a partial clone may fetch an ignore file the sparse checkout left
+/// out (as `git status` would), uses no network, because it runs inside
+/// `git worktree add`.
 fn propagate_claude_code_harness(cwd: &Path) -> Result<Propagation> {
     let layout = match RepositoryLayout::discover(cwd) {
         Ok(layout) => layout,
@@ -130,10 +147,18 @@ fn propagate_claude_code_harness(cwd: &Path) -> Result<Propagation> {
     }
     // Hook-driven ingestion needs the repository-local acknowledgement, and
     // installing hooks that would only report `consent-required` is no use.
-    if !privacy::capture_acknowledged(layout.repository())? {
-        return Ok(Propagation::Declined(
-            "local capture is not acknowledged for this repository".into(),
-        ));
+    match privacy::capture_acknowledgement(layout.repository())? {
+        CaptureAcknowledgement::Acknowledged => {}
+        CaptureAcknowledgement::NotAcknowledged => {
+            return Ok(Propagation::Declined(
+                "local capture is not acknowledged for this repository".into(),
+            ))
+        }
+        CaptureAcknowledgement::OtherCheckoutOrUser => {
+            return Ok(Propagation::Declined(
+                super::harness::ACKNOWLEDGED_ELSEWHERE.into(),
+            ))
+        }
     }
     // Create-only: this runs unattended inside Git, so it never merges into a
     // settings file that is already there.
@@ -145,9 +170,14 @@ fn propagate_claude_code_harness(cwd: &Path) -> Result<Propagation> {
             settings::InstallAction::AlreadyPresent => Propagation::Nothing,
         }),
         // A settings file the checkout itself carries, tracked or not, is the
-        // user's (or the branch's), not ours.
+        // user's (or the branch's), not ours. Nor is one created that Git is
+        // not known to ignore, since a commit could carry it: Git said it does
+        // not ignore it, or could not be asked.
         Err(error)
-            if error.is::<settings::TrackedSettings>() || error.is::<settings::SettingsExist>() =>
+            if error.is::<settings::TrackedSettings>()
+                || error.is::<settings::SettingsExist>()
+                || error.is::<settings::SettingsNotIgnored>()
+                || error.is::<settings::SettingsIgnoreUnknown>() =>
         {
             Ok(Propagation::Declined(error.to_string()))
         }
@@ -161,7 +191,10 @@ pub async fn post_commit() -> Result<()> {
         run_post_commit_logic(&current_dir)
     })();
     if let Err(e) = result {
-        eprintln!("CVC Hook Warning: Failed to link artifacts: {}", e);
+        eprintln!(
+            "CVC Hook Warning: Failed to link artifacts: {}",
+            warning_text(&e)
+        );
     }
 
     Ok(()) // Explicitly return Ok to ensure we don't fail the hook script
@@ -180,15 +213,15 @@ pub async fn pre_push(remote_name: &str, remote_url: &str) -> Result<()> {
     let (cwd, raw) = match input {
         Ok(value) => value,
         Err(error) => {
-            eprintln!("CVC: pre-push input skipped ({error})");
+            eprintln!("CVC: pre-push input skipped ({})", warning_text(&error));
             return Ok(());
         }
     };
     if let Err(error) = observe_pre_push(&cwd, remote_name, remote_url, &raw) {
-        eprintln!("CVC: range observation skipped ({error})");
+        eprintln!("CVC: range observation skipped ({})", warning_text(&error));
     }
     if let Err(error) = crate::commands::sync::auto_push_remote(&cwd, Some(remote_name)).await {
-        eprintln!("CVC: sync skipped ({error})");
+        eprintln!("CVC: sync skipped ({})", warning_text(&error));
     }
     Ok(())
 }
@@ -281,7 +314,7 @@ fn observe_pre_push(
 
 pub async fn post_merge(_squash: Option<&str>) -> Result<()> {
     if let Err(e) = crate::commands::sync::pull().await {
-        eprintln!("CVC: post-merge pull skipped ({e})");
+        eprintln!("CVC: post-merge pull skipped ({})", warning_text(&e));
     }
     let result = (|| -> Result<()> {
         let cwd = env::current_dir()?;
@@ -293,7 +326,7 @@ pub async fn post_merge(_squash: Option<&str>) -> Result<()> {
         Ok(())
     })();
     if let Err(e) = result {
-        eprintln!("CVC: squash scan skipped ({e})");
+        eprintln!("CVC: squash scan skipped ({})", warning_text(&e));
     }
     Ok(())
 }
@@ -308,11 +341,15 @@ fn replay_inbox(repo: &Repository, store: &mut CvcStore, inbox: &std::path::Path
                 if let Err(error) = cvc_core::rewrite::apply_inbox(repo, store, &path) {
                     if error.is_permanent() {
                         eprintln!(
-                            "CVC Hook Warning: quarantining invalid rewrite inbox entry: {error}"
+                            "CVC Hook Warning: quarantining invalid rewrite inbox entry: {}",
+                            warning_text(&error)
                         );
                         cvc_core::rewrite::quarantine_inbox(&path)?;
                     } else {
-                        eprintln!("CVC Hook Warning: rewrite inbox retry deferred: {error}");
+                        eprintln!(
+                            "CVC Hook Warning: rewrite inbox retry deferred: {}",
+                            warning_text(&error)
+                        );
                     }
                 }
             }
@@ -344,7 +381,10 @@ pub async fn post_rewrite(mode: &str) -> Result<()> {
         Ok(())
     })();
     if let Err(e) = result {
-        eprintln!("CVC Hook Warning: post-rewrite skipped: {e}");
+        eprintln!(
+            "CVC Hook Warning: post-rewrite skipped: {}",
+            warning_text(&e)
+        );
     }
     Ok(())
 }
@@ -410,7 +450,7 @@ fn head_short_sha(repo: &Repository) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_null_oid, observe_pre_push};
+    use super::{is_null_oid, observe_pre_push, warning_text};
     use git2::{Repository, Signature};
     use tempfile::TempDir;
     fn commit(
@@ -477,6 +517,153 @@ mod tests {
             assert_eq!(trusted, configured as i64);
         }
         Ok(())
+    }
+
+    /// The pre-push hook's input for a push of `refs/heads/feature` at `tip`.
+    fn pushed_feature(tip: git2::Oid) -> String {
+        format!(
+            "refs/heads/feature {tip} refs/heads/feature {}\n",
+            "0".repeat(40)
+        )
+    }
+
+    /// The files under the repository's CVC directory (the index, its journal
+    /// files, the locks) whose bytes contain `needle`.
+    fn cvc_files_containing(repo: &Repository, needle: &[u8]) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut directories = vec![repo.path().join("cvc")];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else if std::fs::read(&path)
+                    .unwrap()
+                    .windows(needle.len())
+                    .any(|window| window == needle)
+                {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_push_to_a_url_is_observed_without_its_user_information() -> anyhow::Result<()> {
+        let (temp, repo, _, tip) = setup()?;
+        repo.config()?
+            .set_str("cvc.targetBranch", "refs/heads/main")?;
+        let raw = pushed_feature(tip);
+        // A push to a URL that names no remote: Git passes the URL as both the
+        // remote and its location.
+        let url = "https://user:s3cret@host/o/r.git";
+        observe_pre_push(temp.path(), url, url, raw.as_bytes())?;
+        // A remote's name and an scp-like address are kept as they are.
+        observe_pre_push(temp.path(), "origin", url, raw.as_bytes())?;
+        observe_pre_push(
+            temp.path(),
+            "git@host:o/r.git",
+            "git@host:o/r.git",
+            raw.as_bytes(),
+        )?;
+
+        assert_eq!(
+            cvc_files_containing(&repo, b"s3cret"),
+            Vec::<std::path::PathBuf>::new()
+        );
+        let db = rusqlite::Connection::open(repo.path().join("cvc/index.db"))?;
+        let observations = db
+            .prepare(
+                "SELECT source_key, source_remote, origin, trusted_local FROM range_observations ORDER BY source_key",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let observed = |remote: &str| {
+            (
+                format!("pre-push:{remote}:refs/heads/feature"),
+                Some(remote.to_owned()),
+                "pre_push".to_owned(),
+                1,
+            )
+        };
+        assert_eq!(
+            observations,
+            [
+                observed("git@host:o/r.git"),
+                observed("https://host/o/r.git"),
+                observed("origin"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_push_to_a_url_whose_host_cannot_be_located_is_not_observed() -> anyhow::Result<()> {
+        for url in [
+            "https://user:s3cret@/o/r.git",
+            "https://user:s3cret@:443/o/r.git",
+            "://user:s3cret@host/o/r.git",
+        ] {
+            let (temp, repo, _, tip) = setup()?;
+            repo.config()?
+                .set_str("cvc.targetBranch", "refs/heads/main")?;
+            let error = observe_pre_push(temp.path(), url, url, pushed_feature(tip).as_bytes())
+                .expect_err(url);
+            // What the hook's warning says names no part of the URL.
+            assert_eq!(
+                error.to_string(),
+                "invalid range: pre-push remote URL has no host that can be located"
+            );
+            let db = rusqlite::Connection::open(repo.path().join("cvc/index.db"))?;
+            for table in [
+                "range_observations",
+                "range_evidence",
+                "range_source_snapshots",
+            ] {
+                let rows: i64 =
+                    db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+                assert_eq!(rows, 0, "{url}: {table}");
+            }
+            drop(db);
+            assert_eq!(
+                cvc_files_containing(&repo, b"s3cret"),
+                Vec::<std::path::PathBuf>::new(),
+                "{url}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_warning_cannot_act_on_the_terminal_and_names_no_user_information() {
+        // A transport error that quotes a URL as libgit2 does, with an erase,
+        // an OSC 52 clipboard write, a right-to-left override and a line
+        // separator in it.
+        let error = anyhow::anyhow!(
+            "Git error: failed to resolve path 'file://user:s3cret@localhost/x\u{1b}[2J\u{1b}]52;c;SGVsbG8=\u{7}\u{202e}\u{2028}.git'"
+        );
+        assert_eq!(
+            warning_text(&error),
+            "Git error: failed to resolve path 'file://localhost/x?[2J?]52;c;SGVsbG8=???.git'"
+        );
+        // The causes, when a warning prints them, are one line each as before.
+        let chained = anyhow::anyhow!("inner\u{1b}[1A").context("outer");
+        assert_eq!(warning_text(&format!("{chained:#}")), "outer: inner?[1A");
+        // Text with nothing to change is printed as it is.
+        assert_eq!(
+            warning_text(&"remote is not configured"),
+            "remote is not configured"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod git;
 pub mod models;
 pub mod privacy;
 pub mod repository;
+pub mod stimulus;
 
 pub use models::*;
 
