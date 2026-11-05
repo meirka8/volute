@@ -23,10 +23,17 @@ Repository administrators must configure the following before a release:
 2. Create protected GitHub environments named `vscode-marketplace` and `npm-publish`.
    Restrict both to `v*` tags, disable administrator bypass, configure required
    reviewers, and prevent self-review where staffing permits. Required approvals occur
-   for every release according to these protection rules. Put the VS Code Marketplace
-   credential in the **environment-scoped** `VSCE_PAT` secret for
-   `vscode-marketplace`. The token authorizes publisher `volute`; never place its
-   value, or any other secret value, in this document, source, issues, or logs.
+   for every release according to these protection rules. Neither environment needs a
+   secret; never place a secret value in this document, source, issues, or logs.
+   The VS Code Marketplace authenticates the `vscode-marketplace` job with Trusted
+   Publishing, so on publisher `volute` create a Trusted Publishing policy with these
+   exact fields: repository owner `meirka8`, repository `volute`, workflow
+   `release.yml`, environment `vscode-marketplace`. The job has `id-token: write`;
+   `vsce publish --oidc` requests a GitHub OIDC token with the audience
+   `marketplace.visualstudio.com` and exchanges it for a Marketplace credential that
+   lasts 15 minutes. No Marketplace secret exists any more: the `VSCE_PAT` secret that
+   earlier releases used can be deleted from the environment, and the workflow has no
+   fallback to a Personal Access Token.
 3. In npm, configure Trusted Publisher for both public packages, `@volute_cvc/cvc-mcp`
    and `@volute_cvc/cvc`, with these exact fields, identical for the two: GitHub owner
    `meirka8`, repository `volute`, workflow filename `release.yml`, environment
@@ -510,11 +517,15 @@ rejected a version that does exist, wait a few minutes, confirm with `npm view`,
 rerun. To see what a rerun would do without publishing anything, run
 `node npm/cvc-mcp/scripts/publish-convergent.mjs --version X.Y.Z --decide-only`.
 
-For npm, preserve the Trusted Publisher workflow identity (`release.yml`); do not
-casually change npm trust. If the original artifacts or provenance cannot be preserved,
-release a new patch version. Document partial publication and repair forward. Public
-package versions and protected tags must not be overwritten; treat GitHub Release
-records/assets as administratively immutable unless Immutable Releases is enabled.
+For npm and for the VS Code Marketplace, preserve the Trusted Publisher workflow
+identity: the workflow filename (`release.yml`) and the environment names (`npm-publish`,
+`vscode-marketplace`) must not change, because the npm Trusted Publisher and the
+Marketplace Trusted Publishing policy match on them and a mismatch makes that channel's
+authentication fail. Do not casually change npm trust or the Marketplace policy. If the
+original artifacts or provenance cannot be preserved, release a new patch version.
+Document partial publication and repair forward. Public package versions and protected
+tags must not be overwritten; treat GitHub Release records/assets as administratively
+immutable unless Immutable Releases is enabled.
 
 If the release signing key may be compromised, stop all releases immediately. Remove
 or disable the key's authorization through the normal access process — its GitHub

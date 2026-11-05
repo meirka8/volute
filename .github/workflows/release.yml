@@ -302,8 +302,15 @@ jobs:
     # then the 10 min listing wait and ~2 min of job setup: ~56 min, so 60.
     timeout-minutes: 60
     needs: [check-release-version, create-release]
+    # Marketplace Trusted Publishing (GitHub OIDC): `vsce publish --oidc` asks GitHub
+    # for an OIDC token (audience marketplace.visualstudio.com) and exchanges it at
+    # the Marketplace for a credential that lasts 15 minutes, so the job holds no
+    # Marketplace secret. id-token: write is what allows the request. The policy on
+    # publisher volute trusts this repository, this workflow file (release.yml) and
+    # this environment (vscode-marketplace): renaming any of them breaks publishing.
     permissions:
       contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -329,10 +336,14 @@ jobs:
       # indexes an accepted upload asynchronously. It fails only if a target is
       # still unlisted after that, so "Re-run failed jobs" completes a partial
       # publication instead of tripping over "version exists".
+      #
+      # Each `vsce publish --oidc` the script runs requests its own OIDC token and
+      # exchanges it once, so every retry authenticates afresh from the job's
+      # identity. There is no secret and no PAT fallback; the `vsce show` liveness
+      # checks are anonymous. `--oidc` needs @vscode/vsce 4.0.0 or later, which the
+      # lockfile provides.
       - name: Publish VSIX files to VS Code Marketplace
         working-directory: cvc-plugin
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: node ../.github/scripts/publish-vsix-convergent.mjs --version "${GITHUB_REF_NAME#v}" --dir ../release-assets
 
   publish-npm:

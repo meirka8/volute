@@ -22,6 +22,15 @@
 // listed) and targets whose every publish attempt failed (a real failure).
 // A dry run never polls.
 //
+// Authentication is Marketplace Trusted Publishing, not a token: every publish
+// runs `vsce publish --oidc`, which asks GitHub Actions for an OIDC token and
+// exchanges it for a short-lived Marketplace credential. A token can be
+// exchanged once, so each attempt, a retry included, is its own `vsce publish`
+// process with its own token. The script reads and passes no secret, `vsce show`
+// is anonymous, and a real publish works only in a GitHub Actions job that has
+// `id-token: write` and a matching Trusted Publishing policy (RELEASING.md); a
+// dry run works anywhere.
+//
 // Usage (run from the extension directory so `npm exec` resolves vsce):
 //   node ../.github/scripts/publish-vsix-convergent.mjs --version 0.7.0 --dir ../release-assets [--dry-run] [--attempts 3]
 //   node .github/scripts/publish-vsix-convergent.mjs --self-test
@@ -111,6 +120,11 @@ function fetchLive(version) {
   return liveTargets(JSON.parse(result.stdout), version);
 }
 
+/** The vsce arguments that publish one VSIX: authenticate with OIDC, pass no token. */
+export function publishArguments(packagePath) {
+  return ['publish', '--oidc', '--packagePath', packagePath];
+}
+
 const sleep = seconds => new Promise(resolveSleep => setTimeout(resolveSleep, seconds * 1000));
 
 // Everything convergePublication touches outside itself, so the self-test can
@@ -118,7 +132,7 @@ const sleep = seconds => new Promise(resolveSleep => setTimeout(resolveSleep, se
 // exit status; `now` returns monotonic milliseconds.
 const REAL_DEPS = Object.freeze({
   fetchLive,
-  publish: (target, packagePath) => vsce(['publish', '--packagePath', packagePath], { capture: false }).status,
+  publish: (target, packagePath) => vsce(publishArguments(packagePath), { capture: false }).status,
   sleep,
   now: () => performance.now(),
   log: message => console.log(message),
@@ -263,6 +277,10 @@ async function selfTest() {
   rejects(['cvc-linux-x64-0.6.0.vsix'], /is version 0\.6\.0, release is 0\.7\.0/, 'wrong version');
   rejects(['cvc-linux-x64-0.7.0.vsix', 'other-linux-x64-0.7.0.vsix'], /Duplicate VSIX for target linux-x64/, 'duplicate target');
   rejects(['cvc-alpine-x64-0.7.0.vsix'], /Unexpected targets: alpine-x64/, 'unexpected target');
+
+  // The real publish invocation authenticates with OIDC and passes no token. The
+  // fake world below replaces `publish`, so this is the only check of its arguments.
+  assert(publishArguments('/r/cvc-linux-x64-0.7.0.vsix').join(' ') === 'publish --oidc --packagePath /r/cvc-linux-x64-0.7.0.vsix', 'publish uses --oidc, passes no token and names exactly one package');
 
   // Convergence against a fake world: a fake clock that only the injected
   // `sleep`, `fetchLive` and `publish` advance, so nothing waits or touches the

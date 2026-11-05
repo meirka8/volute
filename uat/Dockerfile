@@ -13,11 +13,12 @@ RUN apt-get update && apt-get install -y \
     libatspi2.0-0 libdrm2 libgbm1 libxcb-dri3-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Node.js 20 through an authenticated apt repository. Do not execute a
+# Install Node.js 24 through an authenticated apt repository. The lockfile-backed
+# vsce used below needs Node.js 22 or newer, and 24 matches CI. Do not execute a
 # remotely downloaded repository-setup shell script during the image build.
 RUN mkdir -p /etc/apt/keyrings && \
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
     apt-get update && apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
