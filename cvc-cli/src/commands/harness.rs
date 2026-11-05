@@ -436,6 +436,10 @@ pub async fn install_claude_code(binary: Option<PathBuf>) -> Result<()> {
             "  added {} to the repository's info/exclude so the machine-specific path is never committed",
             settings::SETTINGS_RELATIVE_PATH
         ),
+        ExcludeAction::NotIgnored => eprintln!(
+            "  warning: Git does not ignore {} in this checkout: a .gitignore rule overrides the entry CVC added to .git/info/exclude. The file holds a machine-specific path; do not commit it, or fix the rule.",
+            settings::SETTINGS_RELATIVE_PATH
+        ),
         ExcludeAction::AlreadyIgnored => {}
     }
     // The per-checkout install above is complete; what follows only makes new
