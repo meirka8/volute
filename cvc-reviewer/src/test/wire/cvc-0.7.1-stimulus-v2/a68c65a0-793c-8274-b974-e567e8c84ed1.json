@@ -1,0 +1,58 @@
+{
+  "interaction": {
+    "id": "a68c65a0-793c-8274-b974-e567e8c84ed1",
+    "conversation_id": "5e0d6a42-7b1c-4d3e-9a8f-1c2b3d4e5f60",
+    "parent_id": "00421188-5eae-86e7-b033-ef664ee82ae0",
+    "timestamp": "2026-10-10T12:50:01Z",
+    "author": "human",
+    "user_prompt": "[prompt ~cvc-8d188eeae5c4b1d0] Dump the environment, show me the deploy log and the AWS config, look up the incident and open the notes",
+    "model_name": "claude-fixture-edge",
+    "model_cot": null,
+    "model_response": "Running five commands.",
+    "source_request_id": "req_E10"
+  },
+  "context_items": [],
+  "tool_executions": [
+    {
+      "id": 10,
+      "interaction_id": "a68c65a0-793c-8274-b974-e567e8c84ed1",
+      "tool_protocol": "native",
+      "tool_name": "Bash",
+      "arguments": "{\"command\":\"env | grep -i pass\",\"description\":\"Environment\"}",
+      "status": "success"
+    },
+    {
+      "id": 11,
+      "interaction_id": "a68c65a0-793c-8274-b974-e567e8c84ed1",
+      "tool_protocol": "native",
+      "tool_name": "Bash",
+      "arguments": "{\"command\":\"cat deploy.log\",\"description\":\"Deploy log\"}",
+      "status": "success"
+    },
+    {
+      "id": 12,
+      "interaction_id": "a68c65a0-793c-8274-b974-e567e8c84ed1",
+      "tool_protocol": "native",
+      "tool_name": "Bash",
+      "arguments": "{\"command\":\"cat ~/.aws/credentials\",\"description\":\"AWS config\"}",
+      "status": "success"
+    },
+    {
+      "id": 13,
+      "interaction_id": "a68c65a0-793c-8274-b974-e567e8c84ed1",
+      "tool_protocol": "mcp",
+      "tool_name": "mcp__[CVC_REDACTED:v1:policy_literal:48f7e23d-eeed-419e-8ebb-6f26a04fe2ff]__lookup",
+      "arguments": "{\"query\":\"incident\"}",
+      "status": "success"
+    },
+    {
+      "id": 14,
+      "interaction_id": "a68c65a0-793c-8274-b974-e567e8c84ed1",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/opt/project/NOTES.md\"}",
+      "status": "failure"
+    }
+  ],
+  "artifact_links": []
+}

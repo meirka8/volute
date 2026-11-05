@@ -667,6 +667,65 @@ fn hook_mode_is_quiet_incremental_and_never_blocking() {
     assert!(output.stdout.is_empty());
 }
 
+/// `cvc log` shows what a person said, or a label of what the stimulus held,
+/// never the boundary markers a harness capture is written with.
+#[test]
+fn log_shows_the_persons_first_line_or_a_label_not_the_stimulus_markers() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let transcript = fixture.write_transcript(BASIC);
+    fixture.cvc_ok(&[
+        "ingest",
+        "claude-code",
+        "--transcript",
+        transcript.to_str().unwrap(),
+    ]);
+
+    let log = fixture.cvc_ok(&["log"]);
+    assert!(log.contains("CVC Log (7 thought(s))"), "{log}");
+    assert!(!log.contains("~cvc-"), "{log}");
+    let shown: Vec<&str> = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("Prom: "))
+        .collect();
+    assert_eq!(shown.len(), 7, "{log}");
+    // The person's prompt (its meta text is not shown), the two results of one
+    // response, the compaction summary, and results alone.
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|line| **line == "Add a greeting to lib.rs...")
+            .count(),
+        1,
+        "{shown:?}"
+    );
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|line| **line == "tool results (2)")
+            .count(),
+        1,
+        "{shown:?}"
+    );
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|line| **line == "compaction summary")
+            .count(),
+        1,
+        "{shown:?}"
+    );
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|line| **line == "tool results (1)")
+            .count(),
+        4,
+        "{shown:?}"
+    );
+}
+
 /// Public issue 102: the post-commit hook names the commit it ran for, so an
 /// agent's quiet commit still leaves exact evidence in its tool output. With
 /// nothing linked and no harness installed it stays silent, as before.
@@ -964,6 +1023,114 @@ fn hook_mode_refuses_visibly_in_a_cvc_repository_that_has_not_acknowledged_captu
         );
     }
     assert_eq!(fixture.interaction_count(), 0);
+}
+
+/// Copies the tree at `from` to `to`, file and directory permissions included,
+/// as an archive, `cp -a` or a backup restore at another path does.
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &target).unwrap();
+        } else {
+            std::os::unix::fs::symlink(fs::read_link(entry.path()).unwrap(), &target).unwrap();
+        }
+    }
+    fs::set_permissions(to, fs::metadata(from).unwrap().permissions()).unwrap();
+}
+
+/// What capture refuses with in a repository whose acknowledgement on record
+/// was given for another checkout or user (or by an older cvc).
+const ACKNOWLEDGED_ELSEWHERE: &str = "consent-required: Claude Code transcript capture is passive collection and needs the repository-local capture acknowledgement; capture was acknowledged for another checkout or user, or by an older cvc; run `cvc privacy acknowledge-capture` here (or stop the hooks: `/plugin disable cvc@volute` for the Claude Code plugin, `cvc harness uninstall claude-code` for this checkout's hooks)";
+
+/// A repository copied with its `.git` (an archive, `cp -a`, a backup
+/// restore) carries the privacy state of the original, acknowledgement
+/// included, but that acknowledgement was given for the original's path. The
+/// copy captures nothing until capture is acknowledged in it: hook mode and a
+/// manual ingest refuse visibly and say why, `harness install` refuses, and
+/// `cvc privacy status` says why. The original still captures.
+#[test]
+fn a_copy_of_an_acknowledged_repository_captures_nothing_and_says_why() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let copy = fixture.temp.path().join("copy");
+    copy_tree(&fixture.repo, &copy);
+    let cvc_in = |dir: &Path, args: &[&str]| {
+        fixture
+            .command(env!("CARGO_BIN_EXE_cvc"))
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    };
+
+    let transcript = fixture.write_transcript_for(&copy, BASIC);
+    let payload = fixture.hook_payload_in(&copy, &transcript, "Stop", "");
+    let project = copy.to_str().unwrap();
+    for env in [&[][..], &[("CLAUDE_PROJECT_DIR", project)][..]] {
+        let output = fixture.hook(&copy, payload.as_bytes(), env);
+        assert_visible_failure(&output, "consent-required", "a copied acknowledgement");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("{ACKNOWLEDGED_ELSEWHERE}\n")
+        );
+    }
+    let output = cvc_in(
+        &copy,
+        &[
+            "ingest",
+            "claude-code",
+            "--transcript",
+            transcript.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!("{ACKNOWLEDGED_ELSEWHERE}\n")
+    );
+    assert_eq!(fixture.interactions_in(&copy), Some(0));
+
+    let output = cvc_in(&copy, &["harness", "install", "claude-code"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!("{ACKNOWLEDGED_ELSEWHERE}\n")
+    );
+    assert!(!copy.join(".claude").exists());
+
+    let output = cvc_in(&copy, &["privacy", "status"]);
+    assert!(output.status.success());
+    let status = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        status.starts_with("capture_acknowledged: false\nnote: capture was acknowledged for another checkout or user, or by an older cvc; run `cvc privacy acknowledge-capture` here\nsharing_consented: false\n"),
+        "{status}"
+    );
+
+    // The original, where capture was acknowledged, records the session it
+    // started, and its status has nothing to add.
+    let transcript = fixture.write_transcript(BASIC);
+    let payload = fixture.hook_payload(&transcript, "Stop", "");
+    let project = fixture.repo.to_str().unwrap();
+    let output = fixture.hook(
+        &fixture.repo,
+        payload.as_bytes(),
+        &[("CLAUDE_PROJECT_DIR", project)],
+    );
+    assert_silent_success(&output, "the original");
+    assert_eq!(fixture.interaction_count(), 7);
+    let status = fixture.cvc_ok(&["privacy", "status"]);
+    assert!(
+        status.starts_with("capture_acknowledged: true\nsharing_consented: false\n"),
+        "{status}"
+    );
+    assert_eq!(fixture.interactions_in(&copy), Some(0));
 }
 
 /// The plugin's main gain over the checkout's hooks: it needs nothing in the
@@ -1632,4 +1799,176 @@ fn post_commit_hook_names_the_commit_for_a_claude_code_session_that_may_be_captu
         )),
         "{output}"
     );
+}
+
+/// One transcript entry as Claude Code writes it, for the worktree placeholder
+/// `write_transcript` fills in.
+fn entry(
+    n: usize,
+    kind: &str,
+    parent: Option<usize>,
+    message: serde_json::Value,
+    request: Option<&str>,
+) -> String {
+    let mut line = serde_json::json!({
+        "parentUuid": parent.map(|p| format!("e{p}")),
+        "isSidechain": false,
+        "type": kind,
+        "message": message,
+        "uuid": format!("e{n}"),
+        "timestamp": format!("2026-10-01T10:00:{n:02}.000Z"),
+        "sessionId": SESSION,
+        "version": "2.1.300",
+        "cwd": "__WORKTREE__",
+    });
+    if let Some(request) = request {
+        line["requestId"] = request.into();
+    }
+    line.to_string()
+}
+
+fn reply(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": "claude-fixture-1", "id": "msg_x", "type": "message", "role": "assistant",
+        "content": [{"type": "text", "text": text}], "stop_reason": "end_turn",
+        "stop_sequence": null, "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+}
+
+/// A session whose first response reads a path the model chose: inside the
+/// worktree, 5.4 KB, and with 300 matches the scrubber refuses to count.
+fn hostile_read_session(extra_turn: bool) -> String {
+    let hostile = format!(
+        "__WORKTREE__/notes/{}",
+        (0..300)
+            .map(|n| format!("token=hunter2hunter{n} "))
+            .collect::<String>()
+    );
+    let mut lines = vec![
+        entry(
+            1,
+            "user",
+            None,
+            serde_json::json!({"role": "user", "content": "Summarise the notes"}),
+            None,
+        ),
+        entry(
+            2,
+            "assistant",
+            Some(1),
+            serde_json::json!({
+                "model": "claude-fixture-1", "id": "msg_a", "type": "message", "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": hostile}}],
+                "stop_reason": "tool_use", "stop_sequence": null,
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+            Some("req_A"),
+        ),
+        entry(
+            3,
+            "user",
+            Some(2),
+            serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "the notes", "is_error": false}
+            ]}),
+            None,
+        ),
+        entry(4, "assistant", Some(3), reply("Summary."), Some("req_B")),
+        entry(
+            5,
+            "user",
+            Some(4),
+            serde_json::json!({"role": "user", "content": "Thanks"}),
+            None,
+        ),
+        entry(
+            6,
+            "assistant",
+            Some(5),
+            reply("You are welcome."),
+            Some("req_C"),
+        ),
+    ];
+    if extra_turn {
+        lines.push(entry(
+            7,
+            "user",
+            Some(6),
+            serde_json::json!({"role": "user", "content": "One more thing"}),
+            None,
+        ));
+        lines.push(entry(
+            8,
+            "assistant",
+            Some(7),
+            reply("Done."),
+            Some("req_D"),
+        ));
+    }
+    lines.join("\n") + "\n"
+}
+
+/// A response whose path cannot be scrubbed used to fail every ingest of its
+/// session, because the cursor does not move when a batch fails. It is left out
+/// now, the operator is told so, and hook mode (which prints nothing) goes on.
+#[test]
+fn a_path_the_scrubber_cannot_take_does_not_stop_the_session_from_being_recorded() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let transcript = fixture.write_transcript(&hostile_read_session(false));
+
+    let stdout = fixture.cvc_ok(&[
+        "ingest",
+        "claude-code",
+        "--transcript",
+        transcript.to_str().unwrap(),
+    ]);
+    assert!(stdout.contains("3 new thought(s)"), "{stdout}");
+    assert!(
+        stdout.contains("left out of the responses recorded now: 0 tool call(s)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("1 context item(s)"), "{stdout}");
+    assert!(!stdout.contains("hunter2"), "{stdout}");
+    assert_eq!(fixture.interaction_count(), 3);
+
+    // The session grows; the next run records the new turn.
+    fixture.write_transcript(&hostile_read_session(true));
+    let stdout = fixture.cvc_ok(&[
+        "ingest",
+        "claude-code",
+        "--transcript",
+        transcript.to_str().unwrap(),
+    ]);
+    assert!(stdout.contains("1 new thought(s)"), "{stdout}");
+    assert_eq!(fixture.interaction_count(), 4);
+}
+
+#[test]
+fn hook_mode_goes_on_past_a_path_the_scrubber_cannot_take() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let transcript = fixture.write_transcript(&hostile_read_session(false));
+    let output = fixture.cvc_with_stdin(
+        &["ingest", "claude-code", "--hook"],
+        &fixture.hook_payload(&transcript, "Stop", ""),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert_eq!(fixture.interaction_count(), 3);
+
+    fixture.write_transcript(&hostile_read_session(true));
+    let output = fixture.cvc_with_stdin(
+        &["ingest", "claude-code", "--hook"],
+        &fixture.hook_payload(&transcript, "Stop", ""),
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(fixture.interaction_count(), 4);
 }

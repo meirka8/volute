@@ -19,6 +19,7 @@
 //! * [`harness_record`] is the repository-wide record that the harness is
 //!   wanted, which Git's `post-checkout` hook reads to install the entries into
 //!   a new linked worktree.
+mod fields;
 pub mod harness_record;
 pub mod ingest;
 pub mod links;

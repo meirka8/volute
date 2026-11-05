@@ -6,23 +6,102 @@
 //! displayed. Input that was already queued on the terminal, whether pasted,
 //! typed ahead, or left over from a preceding challenge in the same command,
 //! must never satisfy it.
+//!
+//! A phrase that can be worked out in advance ends with a nonce drawn for its
+//! prompt, so not even input prepared in advance and sent once the prompt is
+//! shown can answer it. These tests read the nonce from the prompt, as a person
+//! does, and type it back.
 
 mod common;
 
-use common::{Fixture, PtySession};
+use common::{split_nonce, with_another_nonce, without_nonce, Fixture, PtySession};
 use std::time::Duration;
+
+/// `cvc init` and one `cvc run` conversation (one thought); returns its id.
+fn captured_conversation(fixture: &Fixture) -> String {
+    fixture.cvc_ok(&["init"]);
+    fixture.cvc_ok(&["run", "--", "printf", "captured"]);
+    fixture.only_run_conversation_id()
+}
+
+/// The destination fingerprint of `origin`.
+fn fingerprint(fixture: &Fixture) -> String {
+    cvc_core::privacy::remote_destination(&fixture.open_repo(), "origin")
+        .unwrap()
+        .fingerprint
+}
+
+/// `cvc privacy status --remote origin`.
+fn privacy_status(fixture: &Fixture) -> String {
+    fixture.cvc_ok(&["privacy", "status", "--remote", "origin"])
+}
+
+/// The bracketed share state the plain listing gives `id`, such as `[private]`.
+fn listed_state(fixture: &Fixture, id: &str) -> String {
+    let listing = fixture.cvc_ok(&["conversations"]);
+    let line = listing
+        .lines()
+        .find(|line| line.split_whitespace().any(|word| word == id))
+        .unwrap_or_else(|| panic!("{id} is not listed:\n{listing}"));
+    line[line
+        .rfind('[')
+        .unwrap_or_else(|| panic!("no state in {line:?}"))..]
+        .to_owned()
+}
+
+/// One number the index database gives for `sql`.
+fn count(fixture: &Fixture, sql: &str) -> i64 {
+    rusqlite::Connection::open(fixture.index_db_path())
+        .unwrap()
+        .query_row(sql, [], |row| row.get(0))
+        .unwrap()
+}
+
+/// The phrase `cvc share <id> --remote origin` asks, learned by starting the
+/// command and walking away from its prompt. A share's phrase has no nonce: it
+/// is a function of the thoughts shared, so the next prompt for the same
+/// snapshot asks the very same one.
+fn share_phrase_seen_earlier(fixture: &Fixture, id: &str) -> String {
+    let mut session = PtySession::spawn(
+        fixture.cvc_command(&["share", id, "--remote", "origin"]),
+        b"",
+    );
+    session.wait_for_challenge(1)
+}
+
+/// Runs `cvc <args>` and answers its one challenge with what `answer` makes of
+/// it. Returns the challenge, whether the command succeeded, and its output.
+fn answer_the_challenge(
+    fixture: &Fixture,
+    args: &[&str],
+    answer: impl FnOnce(&str) -> String,
+) -> (String, bool, String) {
+    let mut session = PtySession::spawn(fixture.cvc_command(args), b"");
+    let challenge = session.wait_for_challenge(1);
+    session.write(format!("{}\n", answer(&challenge)).as_bytes());
+    let (status, output) = session.wait_exit();
+    (challenge, status.success(), output)
+}
+
+/// Runs `cvc <args>` and types its one challenge back, as a person would.
+fn type_the_challenge_back(fixture: &Fixture, args: &[&str]) {
+    let (challenge, confirmed, output) = answer_the_challenge(fixture, args, str::to_owned);
+    assert!(confirmed, "{args:?} with {challenge:?}:\n{output}");
+}
 
 #[test]
 fn input_queued_before_the_prompt_cannot_answer_a_challenge() {
     let fixture = Fixture::new();
-    fixture.cvc_ok(&["init"]);
+    let id = captured_conversation(&fixture);
+    let share = ["share", id.as_str(), "--remote", "origin"];
+    let phrase = share_phrase_seen_earlier(&fixture, &id);
 
     // The correct answer is on the terminal before the process even starts.
     let mut session = PtySession::spawn(
-        fixture.cvc_command(&["privacy", "acknowledge-capture"]),
-        b"I UNDERSTAND LOCAL CAPTURE\n",
+        fixture.cvc_command(&share),
+        format!("{phrase}\n").as_bytes(),
     );
-    assert_eq!(session.wait_for_challenge(1), "I UNDERSTAND LOCAL CAPTURE");
+    assert_eq!(session.wait_for_challenge(1), phrase);
     session.write(b"something else entirely\n");
     let (status, output) = session.wait_exit();
     assert!(!status.success(), "{output}");
@@ -30,20 +109,15 @@ fn input_queued_before_the_prompt_cannot_answer_a_challenge() {
         output.contains("acknowledgement challenge did not match"),
         "{output}"
     );
-    let status = fixture.cvc_ok(&["privacy", "status"]);
-    assert!(status.contains("capture_acknowledged: false"), "{status}");
+    assert_eq!(listed_state(&fixture, &id), "[private]");
 
     // Control: the same answer typed after the prompt is accepted.
-    let mut session = PtySession::spawn(
-        fixture.cvc_command(&["privacy", "acknowledge-capture"]),
-        b"",
-    );
-    assert_eq!(session.wait_for_challenge(1), "I UNDERSTAND LOCAL CAPTURE");
-    session.write(b"I UNDERSTAND LOCAL CAPTURE\n");
+    let mut session = PtySession::spawn(fixture.cvc_command(&share), b"");
+    assert_eq!(session.wait_for_challenge(1), phrase);
+    session.write(format!("{phrase}\n").as_bytes());
     let (status, output) = session.wait_exit();
     assert!(status.success(), "{output}");
-    let status = fixture.cvc_ok(&["privacy", "status"]);
-    assert!(status.contains("capture_acknowledged: true"), "{status}");
+    assert_eq!(listed_state(&fixture, &id), "[shared, 0/1 published]");
 }
 
 #[test]
@@ -88,14 +162,14 @@ fn a_chained_challenge_waits_for_fresh_input_instead_of_the_previous_lines_type_
 fn an_answer_that_is_not_text_does_not_confirm_a_challenge_and_reads_as_not_matching() {
     let fixture = Fixture::new();
     fixture.cvc_ok(&["init"]);
+    let acknowledge = ["privacy", "acknowledge-capture"];
 
-    // The right phrase, followed by bytes that are not UTF-8: not an answer.
-    let mut session = PtySession::spawn(
-        fixture.cvc_command(&["privacy", "acknowledge-capture"]),
-        b"",
-    );
-    assert_eq!(session.wait_for_challenge(1), "I UNDERSTAND LOCAL CAPTURE");
-    session.write(b"I UNDERSTAND LOCAL CAPTURE\xff\xfe\n");
+    // The right phrase, nonce and all, followed by bytes that are not UTF-8:
+    // not an answer.
+    let mut session = PtySession::spawn(fixture.cvc_command(&acknowledge), b"");
+    let challenge = session.wait_for_challenge(1);
+    assert_eq!(without_nonce(&challenge), "I UNDERSTAND LOCAL CAPTURE");
+    session.write(&[challenge.as_bytes(), b"\xff\xfe\n"].concat());
     let (status, output) = session.wait_exit();
     assert!(!status.success(), "{output}");
     // It reads as the phrase not matching, not as an I/O failure.
@@ -104,50 +178,101 @@ fn an_answer_that_is_not_text_does_not_confirm_a_challenge_and_reads_as_not_matc
         "{output}"
     );
     assert!(!output.contains("invalid"), "{output}");
-    let status = fixture.cvc_ok(&["privacy", "status"]);
-    assert!(status.contains("capture_acknowledged: false"), "{status}");
+    assert!(privacy_status(&fixture).contains("capture_acknowledged: false"));
 
-    // Control: the same phrase as text is accepted.
-    let mut session = PtySession::spawn(
-        fixture.cvc_command(&["privacy", "acknowledge-capture"]),
-        b"",
-    );
-    assert_eq!(session.wait_for_challenge(1), "I UNDERSTAND LOCAL CAPTURE");
-    session.write(b"I UNDERSTAND LOCAL CAPTURE\n");
+    // Control: the phrase its prompt shows, as text, is accepted.
+    type_the_challenge_back(&fixture, &acknowledge);
+    assert!(privacy_status(&fixture).contains("capture_acknowledged: true"));
+}
+
+/// The line `cvc privacy status` adds when an acknowledgement is on record that
+/// was not given for this checkout and user.
+const ELSEWHERE_NOTE: &str = "note: capture was acknowledged for another checkout or user, or by an older cvc; run `cvc privacy acknowledge-capture` here";
+
+/// Answers `cvc privacy acknowledge-capture` in `dir` on a terminal, as a
+/// person would.
+fn acknowledge_capture_in(fixture: &Fixture, dir: &std::path::Path) {
+    let mut command = fixture.cvc_command(&["privacy", "acknowledge-capture"]);
+    command.current_dir(dir);
+    let mut session = PtySession::spawn(command, b"");
+    // The phrase ends with a nonce drawn for this prompt, which is typed back with it.
+    let challenge = session.wait_for_challenge(1);
+    assert_eq!(split_nonce(&challenge).0, "I UNDERSTAND LOCAL CAPTURE");
+    session.write(format!("{challenge}\n").as_bytes());
     let (status, output) = session.wait_exit();
     assert!(status.success(), "{output}");
-    let status = fixture.cvc_ok(&["privacy", "status"]);
-    assert!(status.contains("capture_acknowledged: true"), "{status}");
 }
 
-/// What `cvc privacy acknowledge-sharing --remote origin` shows right before it
-/// asks for its phrase. The phrase itself, `I AUTHORIZE SHARING <fingerprint>`,
-/// can be worked out from the remote before the command is even started.
-const ABOUT_TO_ASK: &str = "Acknowledging immutable publication to remote 'origin'";
-
-fn precomputed_phrase(fixture: &Fixture) -> String {
-    let destination =
-        cvc_core::privacy::remote_destination(&fixture.open_repo(), "origin").unwrap();
-    format!("I AUTHORIZE SHARING {}", destination.fingerprint)
+fn privacy_status_in(fixture: &Fixture, dir: &std::path::Path) -> String {
+    let output = fixture
+        .cvc_command(&["privacy", "status"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn sharing_is_consented(fixture: &Fixture) -> bool {
-    fixture
-        .cvc_ok(&["privacy", "status", "--remote", "origin"])
-        .contains("sharing_consented: true")
+/// The acknowledgement is bound to the checkout it was typed in. A copy of the
+/// repository, `.git` included, carries the privacy state but is asked again,
+/// and `cvc privacy status` says why; answering in the copy binds it there and
+/// leaves the original's alone.
+#[test]
+fn a_copied_repository_is_asked_again_and_the_answer_binds_the_copy() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    let status = privacy_status_in(&fixture, &fixture.repo);
+    assert!(status.contains("capture_acknowledged: false"), "{status}");
+    // Never acknowledged is not "acknowledged elsewhere".
+    assert!(!status.contains("note:"), "{status}");
+    acknowledge_capture_in(&fixture, &fixture.repo);
+
+    let copy = fixture.copy_repo("copy");
+    let status = privacy_status_in(&fixture, &copy);
+    assert!(
+        status.starts_with(&format!(
+            "capture_acknowledged: false\n{ELSEWHERE_NOTE}\nsharing_consented: false\n"
+        )),
+        "{status}"
+    );
+    let status = privacy_status_in(&fixture, &fixture.repo);
+    assert!(
+        status.starts_with("capture_acknowledged: true\nsharing_consented: false\n"),
+        "{status}"
+    );
+
+    acknowledge_capture_in(&fixture, &copy);
+    for dir in [&copy, &fixture.repo] {
+        let status = privacy_status_in(&fixture, dir);
+        assert!(
+            status.starts_with("capture_acknowledged: true\nsharing_consented: false\n"),
+            "{status}"
+        );
+    }
 }
+
+/// What `cvc share <id> --remote origin` shows right before it asks for its
+/// phrase.
+const ABOUT_TO_ASK_SHARE: &str = "Sharing conversation for remote 'origin':";
 
 #[test]
 fn a_phrase_sent_before_the_prompt_but_delivered_after_a_flush_cannot_answer_it() {
     let fixture = Fixture::new();
-    fixture.cvc_ok(&["init"]);
-    let phrase = precomputed_phrase(&fixture);
+    let id = captured_conversation(&fixture);
+    // A share's phrase has no nonce, so the one seen at an earlier prompt for
+    // the same snapshot is the right answer: only the wait for quiet input
+    // keeps it from answering a prompt it was sent before.
+    let phrase = share_phrase_seen_earlier(&fixture, &id);
 
     let mut session = PtySession::spawn(
-        fixture.cvc_command(&["privacy", "acknowledge-sharing", "--remote", "origin"]),
+        fixture.cvc_command(&["share", &id, "--remote", "origin"]),
         b"",
     );
-    session.wait_for_text(ABOUT_TO_ASK);
+    session.wait_for_text(ABOUT_TO_ASK_SHARE);
     // Input that was sent before the prompt, and reaches the terminal after the
     // flush that precedes it (a terminal emulator whose write was blocked, a slow
     // link): filler, then a line-kill (^U) that erases the filler from the line
@@ -171,13 +296,28 @@ fn a_phrase_sent_before_the_prompt_but_delivered_after_a_flush_cannot_answer_it(
         "the phrase that was already on its way answered the challenge:\n{}",
         session.output()
     );
-    assert!(!sharing_is_consented(&fixture));
+    assert_eq!(listed_state(&fixture, &id), "[private]");
 
     // Typed after the prompt, the same phrase is accepted.
     session.write(format!("{phrase}\n").as_bytes());
     let (status, output) = session.wait_exit();
     assert!(status.success(), "{output}");
-    assert!(sharing_is_consented(&fixture));
+    assert_eq!(listed_state(&fixture, &id), "[shared, 0/1 published]");
+}
+
+/// What `cvc privacy acknowledge-sharing --remote origin` shows right before it
+/// asks for its phrase.
+const ABOUT_TO_ASK_AUTHORIZATION: &str = "Acknowledging immutable publication to remote 'origin'";
+
+/// The phrase `cvc privacy acknowledge-sharing --remote origin` asks, without
+/// the nonce of its prompt: `I AUTHORIZE SHARING <fingerprint>`, which can be
+/// worked out from the remote before the command is even started.
+fn precomputed_phrase(fixture: &Fixture) -> String {
+    format!("I AUTHORIZE SHARING {}", fingerprint(fixture))
+}
+
+fn sharing_is_consented(fixture: &Fixture) -> bool {
+    privacy_status(fixture).contains("sharing_consented: true")
 }
 
 #[test]
@@ -190,7 +330,7 @@ fn input_that_never_goes_quiet_gets_no_prompt_and_confirms_nothing() {
         fixture.cvc_command(&["privacy", "acknowledge-sharing", "--remote", "origin"]),
         b"",
     );
-    session.wait_for_text(ABOUT_TO_ASK);
+    session.wait_for_text(ABOUT_TO_ASK_AUTHORIZATION);
     // Longer than the prompt waits: the phrase is in the stream, over and over.
     session.flood(
         format!("\x15{phrase}\n").as_bytes(),
@@ -209,4 +349,267 @@ fn input_that_never_goes_quiet_gets_no_prompt_and_confirms_nothing() {
     );
     assert!(!output.contains("Type exactly"), "{output}");
     assert!(!sharing_is_consented(&fixture));
+}
+
+// ---------------------------------------------------------------------------
+// The nonce of a phrase that can be worked out in advance
+// ---------------------------------------------------------------------------
+
+/// `cvc <args>` asks `phrase` followed by a nonce, and only the nonce its own
+/// prompt shows answers it. Each wrong answer is typed after the prompt is
+/// shown, as input sent at the right moment by something that cannot see the
+/// screen would be: the phrase alone (everything that could be worked out in
+/// advance), the phrase with a nonce that is not this prompt's, and the whole
+/// challenge of an earlier prompt. Each is refused and leaves `done` false. The
+/// challenge the prompt shows is accepted and makes it true.
+fn only_the_nonce_of_its_own_prompt_answers(
+    fixture: &Fixture,
+    args: &[&str],
+    phrase: &str,
+    done: impl Fn() -> bool,
+) {
+    assert!(!done(), "{args:?} is done before it was asked");
+    let spawn = || PtySession::spawn(fixture.cvc_command(args), b"");
+    let asked = |session: &mut PtySession| {
+        let challenge = session.wait_for_challenge(1);
+        assert_eq!(split_nonce(&challenge).0, phrase, "{args:?}");
+        challenge
+    };
+    let refused = |mut session: PtySession, answer: &str, what: &str| {
+        session.write(format!("{answer}\n").as_bytes());
+        let (status, output) = session.wait_exit();
+        assert!(!status.success(), "{what} answered {args:?}:\n{output}");
+        assert!(
+            output.contains("acknowledgement challenge did not match"),
+            "{what}, {args:?}:\n{output}"
+        );
+        assert!(!done(), "{what} confirmed {args:?}:\n{output}");
+    };
+
+    let mut session = spawn();
+    let earlier = asked(&mut session);
+    refused(session, phrase, "the phrase without its nonce");
+
+    let mut session = spawn();
+    let challenge = asked(&mut session);
+    refused(
+        session,
+        &with_another_nonce(&challenge),
+        "the phrase with another nonce",
+    );
+
+    // Should this prompt draw the very nonce the earlier one did (one chance in
+    // 2^25), it is asked again, so that the earlier answer is wrong for certain.
+    // Four draws in a row that match it are not chance.
+    let mut session = spawn();
+    let mut challenge = asked(&mut session);
+    for _ in 0..3 {
+        if challenge != earlier {
+            break;
+        }
+        session = spawn();
+        challenge = asked(&mut session);
+    }
+    assert_ne!(
+        challenge, earlier,
+        "every prompt of {args:?} drew one nonce"
+    );
+    refused(session, &earlier, "the challenge of an earlier prompt");
+
+    let mut session = spawn();
+    let challenge = asked(&mut session);
+    session.write(format!("{challenge}\n").as_bytes());
+    let (status, output) = session.wait_exit();
+    assert!(status.success(), "{args:?} with {challenge:?}:\n{output}");
+    assert!(done(), "{args:?} recorded nothing:\n{output}");
+}
+
+#[test]
+fn the_capture_acknowledgement_needs_the_nonce_of_its_own_prompt() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    only_the_nonce_of_its_own_prompt_answers(
+        &fixture,
+        &["privacy", "acknowledge-capture"],
+        "I UNDERSTAND LOCAL CAPTURE",
+        || privacy_status(&fixture).contains("capture_acknowledged: true"),
+    );
+}
+
+#[test]
+fn the_sharing_authorization_needs_the_nonce_of_its_own_prompt() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    only_the_nonce_of_its_own_prompt_answers(
+        &fixture,
+        &["privacy", "acknowledge-sharing", "--remote", "origin"],
+        &precomputed_phrase(&fixture),
+        || sharing_is_consented(&fixture),
+    );
+}
+
+#[test]
+fn turning_auto_push_on_and_off_needs_the_nonce_of_its_own_prompt() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.consent_to_sharing();
+    let fp = fingerprint(&fixture);
+    only_the_nonce_of_its_own_prompt_answers(
+        &fixture,
+        &["privacy", "set-auto-push", "on", "--remote", "origin"],
+        &format!("I AUTHORIZE AUTO PUSH ON {fp}"),
+        || privacy_status(&fixture).contains("auto_push: true"),
+    );
+    only_the_nonce_of_its_own_prompt_answers(
+        &fixture,
+        &["privacy", "set-auto-push", "off", "--remote", "origin"],
+        &format!("I AUTHORIZE AUTO PUSH OFF {fp}"),
+        || privacy_status(&fixture).contains("auto_push: false"),
+    );
+}
+
+#[test]
+fn an_unshare_needs_the_nonce_of_its_own_prompt() {
+    let fixture = Fixture::new();
+    let id = captured_conversation(&fixture);
+    type_the_challenge_back(&fixture, &["share", &id, "--remote", "origin"]);
+    assert_eq!(listed_state(&fixture, &id), "[shared, 0/1 published]");
+    only_the_nonce_of_its_own_prompt_answers(
+        &fixture,
+        &["unshare", &id, "--remote", "origin"],
+        &format!("I UNSHARE {id} {}", fingerprint(&fixture)),
+        || listed_state(&fixture, &id) == "[private]",
+    );
+}
+
+#[test]
+fn authorizing_a_range_for_a_remote_needs_the_nonce_of_its_own_prompt() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    std::fs::write(fixture.repo.join("second"), "second\n").unwrap();
+    fixture.git(&["add", "second"]);
+    fixture.git(&["commit", "-q", "-m", "second"]);
+    let repository = fixture.open_repo();
+    let base = repository
+        .revparse_single("HEAD~1")
+        .unwrap()
+        .id()
+        .to_string();
+    let tip = repository.revparse_single("HEAD").unwrap().id().to_string();
+    only_the_nonce_of_its_own_prompt_answers(
+        &fixture,
+        &["relink", "observe-range", &base, &tip, "--remote", "origin"],
+        &format!("I AUTHORIZE RANGE {base} {tip} {}", fingerprint(&fixture)),
+        || count(&fixture, "SELECT COUNT(*) FROM range_authorizations") > 0,
+    );
+}
+
+#[test]
+fn a_remote_redaction_needs_the_nonce_of_its_own_prompt() {
+    let fixture = Fixture::new();
+    let id = captured_conversation(&fixture);
+    fixture.consent_to_sharing();
+    // Redacting for a remote needs that remote's baseline: share, then publish.
+    type_the_challenge_back(&fixture, &["share", &id, "--remote", "origin"]);
+    type_the_challenge_back(&fixture, &["push", "--manual", "--remote", "origin"]);
+    let interaction: String = rusqlite::Connection::open(fixture.index_db_path())
+        .unwrap()
+        .query_row("SELECT id FROM interactions", [], |row| row.get(0))
+        .unwrap();
+    let plan = fixture.temp.path().join("redaction-plan.json");
+    only_the_nonce_of_its_own_prompt_answers(
+        &fixture,
+        &[
+            "redact",
+            &interaction,
+            "--remote",
+            "origin",
+            "--rewrite-plan",
+            plan.to_str().unwrap(),
+        ],
+        &format!("I REDACT {interaction} {}", fingerprint(&fixture)),
+        || {
+            count(
+                &fixture,
+                "SELECT COUNT(*) FROM tombstones WHERE scope_kind = 'remote'",
+            ) > 0
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The phrase of a share says whether future thoughts are shared
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_future_share_is_confirmed_only_by_the_phrase_that_says_future() {
+    let fixture = Fixture::new();
+    let id = captured_conversation(&fixture);
+    let fp = fingerprint(&fixture);
+    let future = ["share", id.as_str(), "--remote", "origin", "--future"];
+
+    // The phrase of a snapshot share does not confirm a share of later thoughts.
+    let (asked, confirmed, output) = answer_the_challenge(&fixture, &future, |challenge| {
+        challenge.replacen("I SHARE FUTURE ", "I SHARE ", 1)
+    });
+    assert!(
+        asked.starts_with(&format!("I SHARE FUTURE {id} {fp} 1 ")),
+        "{asked}"
+    );
+    assert!(!confirmed, "{output}");
+    assert!(
+        output.contains("acknowledgement challenge did not match"),
+        "{output}"
+    );
+    assert_eq!(listed_state(&fixture, &id), "[private]");
+    // That is the phrase a snapshot share of the same thoughts asks, word for
+    // word: `FUTURE` is all that tells the two apart, and it has no nonce.
+    assert_eq!(
+        share_phrase_seen_earlier(&fixture, &id),
+        asked.replacen("I SHARE FUTURE ", "I SHARE ", 1)
+    );
+
+    // The phrase with FUTURE in it does.
+    let (again, confirmed, output) = answer_the_challenge(&fixture, &future, str::to_owned);
+    assert_eq!(again, asked);
+    assert!(confirmed, "{output}");
+    assert!(
+        output.contains("1 thought(s) marked shared; future thoughts are shared."),
+        "{output}"
+    );
+    assert_eq!(listed_state(&fixture, &id), "[shared, 0/1 published]");
+}
+
+#[test]
+fn a_snapshot_share_is_not_confirmed_by_the_phrase_that_says_future() {
+    let fixture = Fixture::new();
+    let id = captured_conversation(&fixture);
+    let fp = fingerprint(&fixture);
+    let snapshot = ["share", id.as_str(), "--remote", "origin"];
+
+    // The phrase of a future share does not confirm a snapshot share.
+    let (asked, confirmed, output) = answer_the_challenge(&fixture, &snapshot, |challenge| {
+        challenge.replacen("I SHARE ", "I SHARE FUTURE ", 1)
+    });
+    assert!(
+        asked.starts_with(&format!("I SHARE {id} {fp} 1 ")),
+        "{asked}"
+    );
+    assert!(!asked.contains("FUTURE"), "{asked}");
+    assert!(!confirmed, "{output}");
+    assert!(
+        output.contains("acknowledgement challenge did not match"),
+        "{output}"
+    );
+    assert_eq!(listed_state(&fixture, &id), "[private]");
+
+    // Control: its own phrase shares the snapshot, and later thoughts stay
+    // private.
+    let (again, confirmed, output) = answer_the_challenge(&fixture, &snapshot, str::to_owned);
+    assert_eq!(again, asked);
+    assert!(confirmed, "{output}");
+    assert!(
+        output.contains("1 thought(s) marked shared; future thoughts are private."),
+        "{output}"
+    );
 }

@@ -13,10 +13,27 @@
  * - `tool_executions[].arguments` is the tool input as one JSON string;
  * - `author` is the stimulus origin (`human` or `system`), never `agent`.
  *
+ * The stimulus comes in two encodings. Version 1 marks its parts with bracketed prefixes that a
+ * tool's own output can imitate, so it is split by heuristics (`parseStimulus`, `groupStimulus`,
+ * `toolResultsMatchParent`). Version 2 marks every part with a boundary token that is checked
+ * against the node's id (`stimulusV2.ts`): `readStimulus` says which one a node holds, and a
+ * stimulus that carries version 2 tokens but does not verify is shown undivided, never read as
+ * version 1. `viewStimulus` turns either reading into what the stimulus pane draws.
+ *
  * Everything in this module is pure: no React, no DOM.
  */
 import type { InteractionNode } from '../types/cvc';
-import { SERVER_PREFIX, toolOutcome, toolTitle } from './toolCalls';
+import {
+  NO_STIMULUS,
+  REDACTED_TOOL,
+  UNKNOWN_TOOL,
+  isValidToolName,
+  opensWithMarker,
+  readStimulusV2,
+  type ContentPiece,
+  type ReadPart,
+} from './stimulusV2';
+import { SERVER_PREFIX, splitOmitted, toolOutcome, toolTitle } from './toolCalls';
 
 export type NodeLayout = 'triad' | 'transcript';
 
@@ -28,7 +45,6 @@ export type NodeLayout = 'triad' | 'transcript';
  */
 const UUID_V8 = /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-const NO_STIMULUS = '[no stimulus recorded]';
 /** The exact spellings of the markers that start a `meta` and a `compaction` part. */
 const META_MARKER = '[meta] ';
 const COMPACTION_MARKER = '[compaction summary]\n';
@@ -48,7 +64,9 @@ const STIMULUS_PREFIXES = ['[tool_result ', META_MARKER, '[compaction summary]']
  * 1. `agent` author: triad. MCP and legacy agent nodes keep their rendering,
  *    even when they carry tool executions.
  * 2. A version 8 UUID: transcript.
- * 3. A `user_prompt` that starts with a harness stimulus marker: transcript.
+ * 3. A `user_prompt` that starts with a harness stimulus marker, version 1 or version 2 (see
+ *    `stimulusV2.ts`; the marker only has to be spelled right, whether it verifies is for the
+ *    reader): transcript.
  * 4. Any tool execution: transcript (only the harness writes them, and agent
  *    nodes are already excluded by rule 1).
  * 5. Otherwise triad: VS Code/LSP, `cvc run` and legacy nodes are unchanged.
@@ -65,7 +83,7 @@ export function nodeLayout(
 
 function hasStimulusMarker(prompt: string | null | undefined): boolean {
   if (typeof prompt !== 'string') return false;
-  return prompt === NO_STIMULUS || STIMULUS_PREFIXES.some((prefix) => prompt.startsWith(prefix));
+  return prompt === NO_STIMULUS || STIMULUS_PREFIXES.some((prefix) => prompt.startsWith(prefix)) || opensWithMarker(prompt);
 }
 
 /** True when the value holds something other than whitespace. */
@@ -283,10 +301,12 @@ function isPromptWithText(segment: StimulusSegment): boolean {
 
 export type StimulusOrigin =
   | 'Prompt'
+  | 'Task'
   | 'Tool results'
   | 'Compaction summary'
   | 'Context'
   | 'Unmarked text'
+  | 'Unverified stimulus'
   | 'No stimulus recorded';
 
 /**
@@ -332,8 +352,25 @@ export function promptIsEmbedded(
  */
 export type OutputSegment = { kind: 'output'; text: string };
 
-/** What a group of tool results holds, in the order it came. */
+/**
+ * A tool result of a stimulus whose markers verified (see `readStimulus`). It carries its content as
+ * pieces, text and the notes the capture left where it cut the result, instead of one string.
+ */
+export type VerifiedToolResult = {
+  kind: 'verified_tool_result';
+  /** The tool's name as the marker spells it; `unknown-tool` and `redacted-tool` stand in for a name that is not shown. */
+  tool: string;
+  isError: boolean;
+  content: readonly ContentPiece[];
+  /** The previous step is loaded, and none of its tool calls accounts for this result. */
+  unmatched: boolean;
+};
+
+/** What a group of tool results holds, in the order it came (version 1). */
 export type ToolResultsItem = ToolResultSegment | OutputSegment;
+
+/** What the pane draws as one group of tool results: the items of a version 1 stimulus, or the results of a verified one. */
+export type ResultsGroupItem = ToolResultsItem | VerifiedToolResult;
 
 /** What the stimulus pane shows: consecutive tool results are shown as one group. */
 export type StimulusBlock =
@@ -392,12 +429,12 @@ const MAX_NAMES_IN_SUMMARY = 4;
  * `Tool results · Bash ×2, Read · 1 error`. Text that is drawn as output (see
  * `groupStimulus`) is not a result and is not counted.
  */
-export function toolResultsSummary(results: readonly ToolResultsItem[]): string {
+export function toolResultsSummary(results: readonly ResultsGroupItem[]): string {
   // Names as the tool calls show them (see `toolTitle`), so a call and its result read alike.
   const counts = new Map<string, number>();
   let errors = 0;
   for (const result of results) {
-    if (result.kind !== 'tool_result') continue;
+    if (result.kind === 'output') continue;
     const name = toolTitle(result.tool);
     counts.set(name, (counts.get(name) ?? 0) + 1);
     if (result.isError) errors++;
@@ -418,6 +455,12 @@ export interface ParentToolCall {
   name: string;
   /** Recorded as anything but a success: it errored, or it never got a result. */
   failed: boolean;
+  /**
+   * Set only on an entry that is not a call: it stands for this many calls the capture left out of the
+   * previous step (see `splitOmitted`). Their names are not known, so a result that no recorded call
+   * accounts for may be the result of one of them, once each.
+   */
+  unrecorded?: number;
 }
 
 /** Slots for results are counted per name AND outcome. */
@@ -449,7 +492,12 @@ export function toolResultsMatchParent(
   parentToolCalls: readonly ParentToolCall[],
 ): boolean {
   const slots = new Map<string, number>();
+  let unrecorded = 0;
   for (const call of parentToolCalls) {
+    if (call.unrecorded !== undefined) {
+      unrecorded += call.unrecorded;
+      continue;
+    }
     if (call.name.startsWith(SERVER_PREFIX)) continue;
     const key = slotKey(call.name, call.failed);
     slots.set(key, (slots.get(key) ?? 0) + 1);
@@ -458,8 +506,14 @@ export function toolResultsMatchParent(
     if (segment.kind !== 'tool_result') continue;
     const key = slotKey(segment.tool, segment.isError);
     const left = slots.get(key) ?? 0;
-    if (left === 0) return false;
-    slots.set(key, left - 1);
+    if (left > 0) {
+      slots.set(key, left - 1);
+    } else if (unrecorded > 0 && !segment.tool.startsWith(SERVER_PREFIX)) {
+      // The capture left calls out of the previous step; this may be the answer to one of them.
+      unrecorded--;
+    } else {
+      return false;
+    }
   }
   return true;
 }
@@ -480,14 +534,20 @@ export function parentToolNamesByNode(
   for (const node of nodes) {
     const parent = typeof node.parent_id === 'string' ? byId.get(node.parent_id) : undefined;
     const tools = parent && Array.isArray(parent.tool_executions) ? parent.tool_executions : null;
+    // The capture's note that it left calls out is not a call (see `splitOmitted`); the calls it stands for are
+    // handed on as one entry that any result nothing else accounts for may answer.
+    const { calls: made, omitted } = splitOmitted(tools ?? []);
     calls.set(
       node.id,
       parent
-        ? (tools ?? []).map((tool) => ({
-            // An entry without a usable name cannot be matched by any result.
-            name: typeof tool?.tool_name === 'string' ? tool.tool_name : '',
-            failed: tool?.status !== 'success',
-          }))
+        ? [
+            ...made.map((tool) => ({
+              // An entry without a usable name cannot be matched by any result.
+              name: typeof tool?.tool_name === 'string' ? tool.tool_name : '',
+              failed: tool?.status !== 'success',
+            })),
+            ...(omitted !== null && omitted.toolCalls > 0 ? [{ name: '', failed: false, unrecorded: omitted.toolCalls }] : []),
+          ]
         : null,
     );
   }
@@ -495,12 +555,232 @@ export function parentToolNamesByNode(
 }
 
 /**
- * How many of the node's tool executions failed, interrupted calls included.
+ * How many of the node's tool calls failed, interrupted calls included.
  * A server-side call written by cvc 0.7.0 is not counted: that version recorded
  * every one as failed only because their result is never seen. One recorded with
  * the `server` protocol is, when its recorded status is a failure (see `toolOutcome`).
+ * The capture's note that it left calls out is not a call and is never counted.
  */
 export function failedToolCount(node: Pick<InteractionNode, 'tool_executions'>): number {
   if (!Array.isArray(node.tool_executions)) return 0;
-  return node.tool_executions.filter((tool) => toolOutcome(tool) === 'failure').length;
+  return splitOmitted(node.tool_executions).calls.filter((tool) => toolOutcome(tool) === 'failure').length;
+}
+
+// ---------------------------------------------------------------------------
+// Stimulus, version 2: markers verified against the node's id
+// ---------------------------------------------------------------------------
+
+/** What a node's stimulus was read as. */
+export type StimulusRead =
+  /** No version 2 token anywhere: version 1, or text no harness wrote. Split by `parseStimulus`. */
+  | { kind: 'legacy'; segments: StimulusSegment[] }
+  /** The boundary token verified: the parts are the capture's own. */
+  | { kind: 'verified'; parts: ReadPart[]; omittedParts: bigint | null }
+  /** Version 2 tokens that do not verify (damaged, or not written for this node): `text` is shown as it is, undivided. */
+  | { kind: 'unverified'; text: string };
+
+/**
+ * Reads a node's stimulus, as `readStimulusV2` does, and falls back to version 1 only for text that
+ * has no version 2 token at all. A stimulus whose tokens do not verify is NEVER split by the version 1
+ * heuristics: its markers are text, and so is everything around them.
+ *
+ * `author` matters only to version 1 (whether Claude Code's interruption line can start a person's
+ * reply); a verified stimulus says what each part is itself.
+ */
+export function readStimulus(node: Pick<InteractionNode, 'id' | 'author' | 'user_prompt'>): StimulusRead {
+  const prompt = node.user_prompt;
+  if (typeof prompt === 'string') {
+    const reading = readStimulusV2(node.id, prompt);
+    if (reading.kind === 'verified') return { kind: 'verified', parts: reading.parts, omittedParts: reading.omittedParts };
+    if (reading.kind === 'undivided') return { kind: 'unverified', text: prompt };
+  }
+  return { kind: 'legacy', segments: parseStimulus(prompt, { interruptionBoundary: node.author === 'human' }) };
+}
+
+/** What the stimulus pane draws for a verified stimulus: parts in order, consecutive tool results as one group. */
+export type VerifiedBlock =
+  /** A person's text. */
+  | { kind: 'prompt'; content: readonly ContentPiece[] }
+  /** What the agent that delegated this work told a subagent to do. No person typed it. */
+  | { kind: 'task'; content: readonly ContentPiece[] }
+  | { kind: 'meta'; content: readonly ContentPiece[] }
+  | { kind: 'compaction'; content: readonly ContentPiece[] }
+  | { kind: 'tool_results'; results: VerifiedToolResult[] };
+
+const NO_INDEXES: ReadonlySet<number> = new Set();
+
+/**
+ * Arranges the parts of a verified stimulus for the pane. Unlike version 1 (see `groupStimulus`), a
+ * `meta` or compaction part after a tool result is still drawn as context or a summary: the boundary
+ * says the capture wrote it, and tool output cannot have. `unmatched` holds the indexes of the parts
+ * (see `unmatchedResults`) whose results the previous step's calls do not account for.
+ *
+ * A part with nothing in it (the empty text of a person, a summary) draws nothing; an empty tool
+ * result is still a result, and says so.
+ */
+export function groupVerified(parts: readonly ReadPart[], unmatched: ReadonlySet<number> = NO_INDEXES): VerifiedBlock[] {
+  const blocks: VerifiedBlock[] = [];
+  parts.forEach((part, index) => {
+    if (part.kind === 'tool_result') {
+      const result: VerifiedToolResult = {
+        kind: 'verified_tool_result',
+        tool: part.name ?? UNKNOWN_TOOL,
+        isError: part.isError,
+        content: part.content,
+        unmatched: unmatched.has(index),
+      };
+      const last = blocks[blocks.length - 1];
+      if (last?.kind === 'tool_results') last.results.push(result);
+      else blocks.push({ kind: 'tool_results', results: [result] });
+      return;
+    }
+    if (part.content.length === 0) return;
+    blocks.push({ kind: part.kind === 'compaction_summary' ? 'compaction' : part.kind, content: part.content });
+  });
+  return blocks;
+}
+
+/**
+ * The label for what a verified stimulus holds. A person's words come first, since they are what the
+ * step is an answer to; a delegated task is not one, and is named for what it is.
+ */
+export function verifiedOrigin(blocks: readonly VerifiedBlock[]): StimulusOrigin {
+  if (blocks.some((block) => block.kind === 'prompt')) return 'Prompt';
+  if (blocks.some((block) => block.kind === 'task')) return 'Task';
+  if (blocks.some((block) => block.kind === 'tool_results')) return 'Tool results';
+  if (blocks.some((block) => block.kind === 'compaction')) return 'Compaction summary';
+  if (blocks.some((block) => block.kind === 'meta')) return 'Context';
+  return 'No stimulus recorded';
+}
+
+/** A privacy redaction inside a recorded name: `[CVC_REDACTED:v1:<kind>:<uuid>]`. The id is random for every redaction. */
+const REDACTION_MARKER = /\[CVC_REDACTED:v1:[a-z_]+:[0-9a-fA-F-]+\]/;
+
+/**
+ * The name a tool result carries for a call recorded under `callName`, which is what the capture's
+ * writer makes of it: a name the scrubber changed is `redacted-tool` (whatever random ids its
+ * redaction markers hold, so two recordings of one name agree), a name a marker cannot spell is
+ * `unknown-tool`, and any other name is itself. A call with no usable name (`''`) has no result.
+ */
+export function toolResultName(callName: string): string {
+  if (callName === '') return '';
+  if (REDACTION_MARKER.test(callName)) return REDACTED_TOOL;
+  return isValidToolName(callName) ? callName : UNKNOWN_TOOL;
+}
+
+/**
+ * The tool results of a verified stimulus that the PREVIOUS step's calls do not account for, as the
+ * indexes of their parts. The same rule as `toolResultsMatchParent` (a result takes a call of the same
+ * name and outcome, server-side calls have no slot) with names compared as `toolResultName` spells
+ * them, so a redacted call and its `redacted-tool` result agree.
+ *
+ * The division of a verified stimulus is not in doubt, so a result with no call does not undo it: the
+ * pane puts a note on that result and nowhere else.
+ */
+export function unmatchedResults(parts: readonly ReadPart[], parentToolCalls: readonly ParentToolCall[]): Set<number> {
+  const slots = new Map<string, number>();
+  let unrecorded = 0;
+  for (const call of parentToolCalls) {
+    if (call.unrecorded !== undefined) {
+      unrecorded += call.unrecorded;
+      continue;
+    }
+    if (call.name.startsWith(SERVER_PREFIX)) continue;
+    const key = slotKey(toolResultName(call.name), call.failed);
+    slots.set(key, (slots.get(key) ?? 0) + 1);
+  }
+  const unmatched = new Set<number>();
+  parts.forEach((part, index) => {
+    if (part.kind !== 'tool_result') return;
+    const name = part.name ?? UNKNOWN_TOOL;
+    const key = slotKey(name, part.isError);
+    const left = slots.get(key) ?? 0;
+    if (left > 0) slots.set(key, left - 1);
+    else if (unrecorded > 0 && !name.startsWith(SERVER_PREFIX)) unrecorded--; // the answer to a call the capture left out
+    else unmatched.add(index);
+  });
+  return unmatched;
+}
+
+/** What the stimulus pane draws. */
+export type StimulusView =
+  /** A version 1 stimulus split by its markers. */
+  | { kind: 'segments'; segments: StimulusSegment[]; promptIsEmbedded: boolean }
+  /** A version 1 stimulus whose tool results do not match the previous step's calls (see `toolResultsMatchParent`). */
+  | { kind: 'undivided'; text: string }
+  /** A stimulus with version 2 tokens that do not verify. */
+  | { kind: 'unverified'; text: string }
+  /** A stimulus whose markers verified. */
+  | { kind: 'verified'; blocks: VerifiedBlock[]; omittedParts: bigint | null };
+
+/**
+ * What the pane draws for a node's stimulus, and the label it goes under in the header.
+ *
+ * `parentToolCalls` is what the PREVIOUS step called, or null when that step is not loaded (see
+ * `parentToolNamesByNode`). A version 1 stimulus whose results do not match is shown undivided, since
+ * its markers are plain text. A verified one is not: it keeps its division and the results that have
+ * no call are marked one by one. Only version 1 has the interruption line and the embedded prompt.
+ */
+export function viewStimulus(
+  node: Pick<InteractionNode, 'author' | 'user_prompt'>,
+  read: StimulusRead,
+  parentToolCalls: readonly ParentToolCall[] | null,
+): { view: StimulusView; origin: StimulusOrigin } {
+  switch (read.kind) {
+    case 'legacy': {
+      const origin = stimulusOrigin(node, read.segments);
+      const undivided = parentToolCalls !== null && !toolResultsMatchParent(read.segments, parentToolCalls);
+      if (undivided && typeof node.user_prompt === 'string') return { view: { kind: 'undivided', text: node.user_prompt }, origin };
+      return {
+        view: { kind: 'segments', segments: read.segments, promptIsEmbedded: !undivided && promptIsEmbedded(node, read.segments) },
+        origin,
+      };
+    }
+    case 'unverified':
+      return { view: { kind: 'unverified', text: read.text }, origin: 'Unverified stimulus' };
+    case 'verified': {
+      const unmatched = parentToolCalls === null ? NO_INDEXES : unmatchedResults(read.parts, parentToolCalls);
+      const blocks = groupVerified(read.parts, unmatched);
+      return { view: { kind: 'verified', blocks, omittedParts: read.omittedParts }, origin: verifiedOrigin(blocks) };
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fields the capture could not scrub
+// ---------------------------------------------------------------------------
+
+const WITHHELD_FIELD = /^\[cvc: withheld (0|[1-9][0-9]{0,17}) bytes that could not be scrubbed\]$/;
+
+/** What a capture records as the response of a step it had to withhold whole (see `isWithheldResponse`). */
+export const WITHHELD_RESPONSE = '[cvc: withheld this response: it could not be scrubbed within the limits]';
+
+/**
+ * Whether the node is a STAND-IN: the capture could not store this response within its limits, so it
+ * recorded the step (its id, its place in the conversation and its stimulus) with this note in place of
+ * the response, and no reasoning, no tool calls and no context items. Rare. All of that must hold, so
+ * that a response that merely says the sentence, in a step that has calls or reasoning, is text.
+ */
+export function isWithheldResponse(
+  node: Pick<InteractionNode, 'model_response' | 'model_cot' | 'tool_executions' | 'context_items'>,
+): boolean {
+  return (
+    node.model_response === WITHHELD_RESPONSE &&
+    node.model_cot == null &&
+    Array.isArray(node.tool_executions) &&
+    node.tool_executions.length === 0 &&
+    Array.isArray(node.context_items) &&
+    node.context_items.length === 0
+  );
+}
+
+/**
+ * How many bytes the capture withheld, when `value` is exactly the note it records in place of a
+ * response or reasoning it could not scrub: `[cvc: withheld N bytes that could not be scrubbed]`.
+ * Text that merely contains the sentence is text, and `null`.
+ */
+export function withheldFieldBytes(value: string | null | undefined): bigint | null {
+  if (typeof value !== 'string') return null;
+  const match = WITHHELD_FIELD.exec(value);
+  return match === null ? null : BigInt(match[1]);
 }

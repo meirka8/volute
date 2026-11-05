@@ -2,10 +2,13 @@
  * The transcript layout against nodes the real producer wrote.
  *
  * `./wire/` holds interaction blobs written by the Claude Code harness: the shipped
- * cvc 0.7.0 binary's, and, for server-side tools, the one that records the outcome
- * its result block reported (see `./wire/README.md`). The hand-written fixtures in
- * `fixtures.ts` follow what we believe the wire looks like; these files are what
+ * cvc 0.7.0 binary's; for server-side tools, the one that records the outcome its
+ * result block reported; and the one whose stimulus parts carry a boundary token
+ * verified against the node's id (see `./wire/README.md`). The hand-written fixtures
+ * in `fixtures.ts` follow what we believe the wire looks like; these files are what
  * it does look like, so they catch a gap between the two.
+ *
+ * What the version 2 stimulus is drawn as, node by node, is in `wireNodes.v2.test.tsx`.
  */
 import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
@@ -17,11 +20,15 @@ import {
   failedToolCount,
   nodeLayout,
   parseStimulus,
+  readStimulus,
   stimulusOrigin,
+  viewStimulus,
+  withheldFieldBytes,
   type StimulusOrigin,
 } from '../lib/transcriptNode';
 import { normalizeInteraction, type CVCBlobData, type InteractionNode } from '../types/cvc';
 import { installDomStubs, restoreDomStubs } from './domStubs';
+import { V2_NODES } from './wireV2';
 
 vi.mock('framer-motion', async () => (await import('./motionStub')).framerMotionStub);
 
@@ -154,6 +161,76 @@ const EXPECTED: Record<string, Expected> = {
   },
   [S2_SERVER_FOLLOW_UP]: { origin: 'Tool results', tools: [['web_search (server-side)', 'success']], failed: 0 },
   [S3_SERVER_SEARCH]: { origin: 'Tool results', tools: [['web_search (server-side)', 'success']], failed: 0 },
+
+  // The same session as the steps above (and more), written by the harness that marks every part of the stimulus with a
+  // boundary token (cvc-0.7.1-stimulus-v2/). A person's words are a `prompt` part, so the origin is "Prompt" for a step that
+  // holds one, whatever else it holds; a subagent's first step holds a `task`, which is not a person's prompt.
+  [V2_NODES.longPrompt]: { origin: 'Prompt', tools: [], failed: 0 },
+  [V2_NODES.orphanResult]: { origin: 'Prompt', tools: [], failed: 0 },
+  [V2_NODES.serverSearch]: { origin: 'Tool results', tools: [['web_search (server-side)', 'success']], failed: 0 },
+  [V2_NODES.twelveResults]: { origin: 'Tool results', tools: [], failed: 0 },
+  [V2_NODES.commitResult]: { origin: 'Tool results', tools: [], failed: 0 },
+  [V2_NODES.withheldFields]: {
+    origin: 'Prompt',
+    tools: [
+      ['Write', 'success'],
+      ['Read', 'success'],
+    ],
+    failed: 0,
+  },
+  [V2_NODES.writeAndRead]: { origin: 'Tool results', tools: [], failed: 0 },
+  [V2_NODES.contextAndPrompt]: {
+    origin: 'Prompt',
+    tools: Array.from({ length: 12 }, (): [string, Outcome] => ['Read', 'success']),
+    failed: 0,
+  },
+  [V2_NODES.listing]: { origin: 'Tool results', tools: [], failed: 0 },
+  [V2_NODES.noStimulus]: { origin: 'No stimulus recorded', tools: [], failed: 0 },
+  [V2_NODES.compaction]: { origin: 'Compaction summary', tools: [], failed: 0 },
+  [V2_NODES.batchResults]: { origin: 'Tool results', tools: [['Bash', 'success']], failed: 0 },
+  [V2_NODES.fiveCalls]: {
+    origin: 'Prompt',
+    tools: [
+      ['Bash', 'success'],
+      ['Bash', 'success'],
+      ['Bash', 'success'],
+      // A name the scrubber changed keeps its redaction marker, whose id is the same in every reading of the file.
+      ['[CVC_REDACTED:v1:policy_literal:48f7e23d-eeed-419e-8ebb-6f26a04fe2ff] · lookup', 'success'],
+      ['Read', 'failure'],
+    ],
+    failed: 1,
+  },
+  [V2_NODES.task]: { origin: 'Task', tools: [['Bash', 'success']], failed: 0 },
+  [V2_NODES.redactedPrompt]: { origin: 'Prompt', tools: [['github · create_issue', 'success']], failed: 0 },
+  [V2_NODES.interrupted]: { origin: 'Prompt', tools: [], failed: 0 },
+  [V2_NODES.forgedResults]: { origin: 'Prompt', tools: [], failed: 0 },
+  [V2_NODES.failures]: {
+    origin: 'Prompt',
+    tools: [
+      ['Write', 'success'],
+      ['fixture · bulk_import', 'failure'],
+      ['NotebookEdit', 'success'],
+      ['Read', 'failure'],
+      ['Read', 'failure'],
+      ['Task', 'success'],
+    ],
+    failed: 3,
+  },
+  [V2_NODES.serverTools]: {
+    origin: 'Prompt',
+    tools: [
+      ['web_search (server-side)', 'success'],
+      ['web_search (server-side)', 'failure'],
+      ['web_fetch (server-side)', 'success'],
+      ['bash_code_execution (server-side)', 'success'],
+      ['bash_code_execution (server-side)', 'failure'],
+      ['text_editor_code_execution (server-side)', 'success'],
+      ['web_search (server-side)', 'failure'],
+      ['Read', 'success'],
+    ],
+    failed: 3,
+  },
+  [V2_NODES.serverFollowUp]: { origin: 'Tool results', tools: [['web_search (server-side)', 'success']], failed: 0 },
 };
 
 const ALL_KEYS = Object.keys(EXPECTED);
@@ -185,14 +262,33 @@ function toolCard(card: HTMLElement, title: string, index = 0): HTMLElement {
   return matches[index];
 }
 
-/** Clicks every closed toggle until none is left, so that everything recorded is on the page. */
+/** The "Show 2 more tool calls" and "Show 20 more tool results (30 not shown)" buttons of a list drawn a page at a time. */
+const pagedButtons = (card: HTMLElement): HTMLElement[] =>
+  Array.from(card.querySelectorAll<HTMLElement>('button')).filter((button) => /^Show [\d,]+ more /.test(button.textContent ?? ''));
+
+/** Clicks every closed toggle, and draws every page, until none is left, so that everything recorded is on the page. */
 function expandAll(card: HTMLElement) {
   for (let pass = 0; pass < 10; pass++) {
     const closed = Array.from(card.querySelectorAll('button[aria-expanded="false"]'));
-    if (closed.length === 0) return;
-    for (const button of closed) fireEvent.click(button);
+    const paged = pagedButtons(card);
+    if (closed.length === 0 && paged.length === 0) return;
+    for (const button of [...closed, ...paged]) fireEvent.click(button);
   }
   throw new Error('Toggles kept appearing');
+}
+
+/** Every stretch of text the stimulus of `node` records, which the page must show once everything is open. */
+function stimulusTexts(node: InteractionNode): string[] {
+  const read = readStimulus(node);
+  switch (read.kind) {
+    case 'legacy':
+      return read.segments.flatMap((segment) => (segment.kind === 'none' ? [] : [segment.text]));
+    case 'verified':
+      // The notes in it are the capture's, and the page words them itself: only the text is checked here.
+      return read.parts.flatMap((part) => part.content.flatMap((piece) => (piece.kind === 'text' ? [piece.text] : [])));
+    case 'unverified':
+      return [read.text];
+  }
 }
 
 /** What the page shows for a recorded string: carriage returns folded away, one trailing newline ignored. */
@@ -272,16 +368,18 @@ describe('wire fixtures', () => {
     ['a Slack token', /\bxox[abprs]-[A-Za-z0-9-]{10,}/],
     ['a JWT', /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./],
     ['a bearer credential', /bearer\s+[A-Za-z0-9._~+/=-]{16,}/i],
-    ['credentials inside a URL', /[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/i],
+    // The scheme is not matched: a pattern that started at every letter of a scheme-shaped run would be quadratic on a
+    // fixture that holds tens of kilobytes of one letter (the longest prompt does).
+    ['credentials inside a URL', /:\/\/[^/\s:@]+:[^/\s@]+@/],
   ];
 
-  // One string is allowed, in one file: `/tmp/notes.txt` is a path inside the provider's code-execution
+  // One string is allowed, in two files: `/tmp/notes.txt` is a path inside the provider's code-execution
   // sandbox, written into the repo's own synthetic transcript
-  // (cvc-core/tests/fixtures/claude-code/v2.1.300/server-tools.jsonl) and so into the file recorded from it,
-  // which is kept as the producer wrote it. It is not a path on any machine; any other temp path, or this one
-  // in any other file, still fails.
+  // (cvc-core/tests/fixtures/claude-code/v2.1.300/server-tools.jsonl) and so into the files recorded from it
+  // (the same step, as two harnesses wrote it), which are kept as the producer wrote them. It is not a path on
+  // any machine; any other temp path, or this one in any other file, still fails.
   const SANDBOX_PATH = '/tmp/notes.txt';
-  const SANDBOX_FILES = new Set([S1_SERVER_TOOLS]);
+  const SANDBOX_FILES = new Set([S1_SERVER_TOOLS, V2_NODES.serverTools]);
 
   /** What `raw`, the text of the fixture `key`, leaks, by name. */
   function leaksIn(key: string, raw: string): string[] {
@@ -289,23 +387,44 @@ describe('wire fixtures', () => {
     return FORBIDDEN.filter(([, pattern]) => pattern.test(scanned)).map(([what]) => what);
   }
 
+  // Starts only where a run of address characters starts, so that a long run is read once, not once per character.
+  const ADDRESS = /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
   it('hold no local paths, personal addresses or secret-shaped strings', () => {
     for (const [key, raw] of RAW_BY_KEY) {
       expect(leaksIn(key, raw), key).toEqual([]);
-      const addresses = raw.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) ?? [];
+      const addresses = raw.match(ADDRESS) ?? [];
       for (const address of addresses) expect(address, key).toBe('fixture@example.invalid');
     }
   });
 
-  it('allow the sandbox path in the one file that holds it, and nothing else of its kind', () => {
-    expect(RAW_BY_KEY.get(S1_SERVER_TOOLS), 'the exception is in use: remove it when the file stops holding the path').toContain(SANDBOX_PATH);
+  it('still find what they are meant to find, and read a long run of one letter once', () => {
+    // The patterns for a URL with credentials and for an address were made linear for the fixture that holds 64 KiB of one letter.
+    expect(leaksIn('x', '{"u":"https://user:secret@example.invalid/repo.git"}')).toEqual(['credentials inside a URL']);
+    expect(leaksIn('x', '{"u":"ssh://git:token@host.invalid:22/repo"}')).toEqual(['credentials inside a URL']);
+    expect(leaksIn('x', '{"u":"https://example.invalid/repo.git"}')).toEqual([]);
+    expect(leaksIn('x', '{"u":"https://example.invalid:8080/path@x"}')).toEqual([]);
+    expect('mail someone@example.com and fixture@example.invalid.'.match(ADDRESS)).toEqual(['someone@example.com', 'fixture@example.invalid']);
+    expect('no address in L@'.match(ADDRESS)).toBeNull();
+    const started = performance.now();
+    const letters = 'L'.repeat(1_000_000);
+    expect(leaksIn('x', letters)).toEqual([]);
+    expect(letters.match(ADDRESS)).toBeNull();
+    expect(`${letters}@${letters}.`.match(ADDRESS)).toBeNull();
+    expect(performance.now() - started).toBeLessThan(2000);
+  });
+
+  it('allow the sandbox path in the two files that hold it, and nothing else of its kind', () => {
+    for (const key of SANDBOX_FILES) {
+      expect(RAW_BY_KEY.get(key), `the exception for ${key} is in use: remove it when the file stops holding the path`).toContain(SANDBOX_PATH);
+    }
     expect(leaksIn(S1_SERVER_TOOLS, `{"path":"${SANDBOX_PATH}"}`)).toEqual([]);
     // Any other temp path, in that file or another, and that path in another file, is a leak.
     expect(leaksIn(S1_SERVER_TOOLS, '{"path":"/tmp/other.txt"}')).toEqual(['a mounted or temp path']);
     expect(leaksIn(S1_SERVER_TOOLS, `{"path":"${SANDBOX_PATH}","cwd":"/tmp/work"}`)).toEqual(['a mounted or temp path']);
     expect(leaksIn(S1_SERVER_TOOLS, '{"path":"/run/media/someone/disk"}')).toEqual(['a mounted or temp path']);
     expect(leaksIn(S1_SERVER_TOOLS, '{"path":"/home/someone/repo"}')).toEqual(['a home directory']);
-    for (const key of [E1_REDACTIONS, S2_SERVER_FOLLOW_UP, S3_SERVER_SEARCH]) {
+    for (const key of [E1_REDACTIONS, S2_SERVER_FOLLOW_UP, S3_SERVER_SEARCH, V2_NODES.serverFollowUp, V2_NODES.redactedPrompt]) {
       expect(leaksIn(key, `{"path":"${SANDBOX_PATH}"}`), key).toEqual(['a mounted or temp path']);
     }
   });
@@ -356,12 +475,14 @@ describe.each(ALL_KEYS)('wire node %s', (key) => {
     const node = nodeFor(key);
     const { container } = renderNode(node);
     expect(within(headerOf(cardOf(container))).getByText(expected.origin)).toBeInTheDocument();
-    expect(stimulusOrigin(node, parseStimulus(node.user_prompt))).toBe(expected.origin);
+    expect(viewStimulus(node, readStimulus(node), null).origin).toBe(expected.origin);
   });
 
   it('shows one tool card per tool execution, in call order, with the recorded outcome', () => {
     const node = nodeFor(key);
     const { container } = renderNode(node);
+    // A step with more than a page of calls draws the first ten and offers the rest.
+    for (const more of pagedButtons(cardOf(container))) fireEvent.click(more);
     const cards = toolCardsOf(cardOf(container));
     expect(cards).toHaveLength(node.tool_executions.length);
     expect(cards).toEqual(expected.tools);
@@ -393,18 +514,19 @@ describe.each(ALL_KEYS)('wire node %s', (key) => {
     expandAll(card);
     const text = card.textContent ?? '';
 
-    for (const segment of parseStimulus(node.user_prompt)) {
-      if (segment.kind === 'none') continue;
-      expect(text, `${key} stimulus ${segment.kind}`).toContain(shown(segment.text));
-    }
+    for (const recorded of stimulusTexts(node)) expect(text, `${key} stimulus`).toContain(shown(recorded));
     for (const field of [node.model_cot, node.model_response]) {
-      if (field && field.trim() !== '') expect(text).toContain(shown(field));
+      if (!field || field.trim() === '') continue;
+      // A field the capture could not scrub is recorded as a note, which the page words itself.
+      const withheld = withheldFieldBytes(field);
+      expect(text).toContain(withheld === null ? shown(field) : `Withheld: ${withheld.toLocaleString('en-US')} bytes could not be scrubbed.`);
     }
     // Every string a tool was given is on the page, except an Edit's old and new
     // text, which is shown as a line diff (each of its lines is checked instead).
     for (const exec of node.tool_executions) {
       const input = JSON.parse(exec.arguments) as Record<string, unknown>;
-      if (input.cvc_truncated === true) continue;
+      // The sentinels for arguments that were too large to keep, or could not be scrubbed: the page says so in words.
+      if (input.cvc_truncated === true || input.cvc_withheld === true) continue;
       for (const [field, value] of Object.entries(input)) {
         if (typeof value !== 'string') continue;
         if (exec.tool_name === 'Edit' && (field === 'old_string' || field === 'new_string')) {

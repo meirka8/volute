@@ -1,0 +1,17 @@
+{
+  "interaction": {
+    "id": "7ccc6fb3-c982-8d8e-b806-8063439ebc10",
+    "conversation_id": "5e0d6a42-7b1c-4d3e-9a8f-1c2b3d4e5f60",
+    "parent_id": "542d66c1-f085-8e3e-b543-7becdf6f6e97",
+    "timestamp": "2026-10-10T13:10:20Z",
+    "author": "system",
+    "user_prompt": "[tool_result Write ~cvc-ca287dd1831a53f9] File created successfully\n\n[tool_result Read ~cvc-ca287dd1831a53f9] fn main() {}",
+    "model_name": "claude-fixture-edge",
+    "model_cot": null,
+    "model_response": "Everything is summarized.",
+    "source_request_id": "req_E16"
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": []
+}

@@ -23,6 +23,17 @@
 //!    challenge never over-reads into the line meant for the next one.
 //!
 //! Roughly one syscall per typed character is immaterial for a prompt.
+//!
+//! Those layers keep what was sent *before* the prompt from answering it. A
+//! phrase that can be worked out in advance (a constant, a destination
+//! fingerprint, ids) could still be answered by input that another program
+//! sends to the terminal, unseen, at the right moment after the prompt appears.
+//! Such a phrase therefore ends with a nonce, [`challenge_nonce`], drawn for its
+//! prompt alone once the input has gone quiet, right before the prompt is
+//! written: no input prepared before the prompt can contain it. A program that
+//! can read the screen can still read the nonce and type it; that stays
+//! possible by design, since the challenges are a confirmation step, not a
+//! security boundary.
 
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
@@ -49,6 +60,48 @@ const QUIET_BEFORE_PROMPT: Duration = Duration::from_millis(250);
 /// How long input may keep arriving before the prompt is refused instead.
 #[cfg(unix)]
 const QUIET_WAIT_LIMIT: Duration = Duration::from_secs(3);
+
+/// The characters a challenge nonce is drawn from: the capital letters and the
+/// digits, without `0`, `O`, `1` and `I`, which are easily read as one another.
+pub const NONCE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// How many characters a challenge nonce has: 25 bits, one chance in about 33
+/// million of being guessed.
+pub const NONCE_LENGTH: usize = 5;
+
+// Each character of a nonce is one random byte reduced modulo the size of the
+// alphabet, which picks every character equally often only because 256 is a
+// multiple of that size.
+const _: () = assert!(256 % NONCE_ALPHABET.len() == 0);
+
+/// A fresh nonce for one prompt of a phrase that could otherwise be worked out
+/// in advance: [`NONCE_LENGTH`] characters of [`NONCE_ALPHABET`], drawn from the
+/// operating system's cryptographically secure random number generator.
+///
+/// The one place nonces come from. Draw it after
+/// [`Terminal::discard_pending_input`] has returned and right before the prompt
+/// that shows it is written, so that nothing sent before the prompt can contain
+/// it, and draw a new one for every prompt.
+///
+/// If the generator cannot be read this panics (inside `uuid`), so no phrase is
+/// asked and nothing is confirmed.
+pub fn challenge_nonce() -> String {
+    // A version 4 UUID is 16 bytes from the operating system's generator
+    // (`getrandom`; `uuid` is built without its `fast-rng` and `rng-rand`
+    // features), with only the version (the high half of byte 6) and the
+    // variant (the top two bits of byte 8) fixed. The first five bytes are all
+    // random.
+    let random = uuid::Uuid::new_v4();
+    nonce_from(&random.as_bytes()[..NONCE_LENGTH])
+}
+
+/// The nonce that `random` stands for, one character per byte.
+fn nonce_from(random: &[u8]) -> String {
+    random
+        .iter()
+        .map(|&byte| char::from(NONCE_ALPHABET[usize::from(byte) % NONCE_ALPHABET.len()]))
+        .collect()
+}
 
 /// What was typed at a prompt cannot be taken as an answer at all: it is not
 /// UTF-8 text, it is longer than any acknowledgement, or input would not stop
@@ -234,10 +287,12 @@ impl Terminal {
     /// A flush alone leaves a gap: input that was sent before the prompt and
     /// reaches the terminal after the flush (a terminal emulator whose write was
     /// blocked on a full buffer, a slow remote link) would be read as the
-    /// answer to a prompt that had only just been shown, and a phrase that can
-    /// be computed in advance would pass. A control character in such a stream
-    /// can make it worse: the line-kill character erases a partial line, so
-    /// filler followed by it and then the phrase leaves nothing but the phrase.
+    /// answer to a prompt that had only just been shown, and a phrase known
+    /// before the prompt would pass (one without a nonce, such as the phrase of
+    /// a share seen at an earlier prompt for the same snapshot). A control
+    /// character in such a stream can make it worse: the line-kill character
+    /// erases a partial line, so filler followed by it and then the phrase
+    /// leaves nothing but the phrase.
     ///
     /// The wait is done with line editing and echo off, because in canonical
     /// mode the terminal shows a reader only complete lines: a partial line is
@@ -1057,5 +1112,59 @@ mod tests {
         assert!(!is_unreadable_answer(&io::Error::from(
             io::ErrorKind::InvalidData
         )));
+    }
+}
+
+#[cfg(test)]
+mod nonce_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn a_nonce_is_five_characters_of_the_alphabet_without_look_alike_characters() {
+        assert_eq!(NONCE_ALPHABET, b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789");
+        assert_eq!(NONCE_LENGTH, 5);
+        // Every character once, all of them capital letters or digits ...
+        let distinct: BTreeSet<u8> = NONCE_ALPHABET.iter().copied().collect();
+        assert_eq!(distinct.len(), NONCE_ALPHABET.len());
+        assert!(NONCE_ALPHABET
+            .iter()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
+        // ... except the ones that are read as one another.
+        for confusable in *b"0O1I" {
+            assert!(
+                !NONCE_ALPHABET.contains(&confusable),
+                "{}",
+                char::from(confusable)
+            );
+        }
+        for _ in 0..1000 {
+            let nonce = challenge_nonce();
+            assert_eq!(nonce.len(), NONCE_LENGTH, "{nonce}");
+            assert!(
+                nonce.bytes().all(|c| NONCE_ALPHABET.contains(&c)),
+                "{nonce}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_random_byte_picks_one_character_and_every_character_can_be_picked() {
+        assert_eq!(nonce_from(&[0, 1, 31, 32, 255]), "AB9A9");
+        // `I` and `O` are skipped: H J, N P.
+        assert_eq!(nonce_from(&[7, 8, 12, 13, 23]), "HJNPZ");
+        let all: Vec<u8> = (0..=255).collect();
+        let picked: BTreeSet<char> = nonce_from(&all).chars().collect();
+        assert_eq!(picked.len(), NONCE_ALPHABET.len());
+    }
+
+    #[test]
+    fn nonces_are_drawn_afresh_and_cover_the_whole_alphabet() {
+        // Ten thousand characters: the chance that one of the 32 never turns up
+        // is below 10^-130, so a generator that is not drawing would show here.
+        let seen: BTreeSet<u8> = (0..2000)
+            .flat_map(|_| challenge_nonce().into_bytes())
+            .collect();
+        assert_eq!(seen.len(), NONCE_ALPHABET.len());
     }
 }

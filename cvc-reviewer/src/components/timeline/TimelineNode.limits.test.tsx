@@ -60,6 +60,7 @@ describe('the limits', () => {
   it('are the ones in the specification', () => {
     expect(RENDER_LIMITS).toEqual({
       stimulusBlocks: 100,
+      contentPieces: 3,
       toolResultsPerGroup: 20,
       todos: 100,
       fieldRows: 25,

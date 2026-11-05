@@ -156,6 +156,32 @@ impl Fixture {
     pub fn index_db_path(&self) -> PathBuf {
         self.open_repo().commondir().join("cvc").join("index.db")
     }
+
+    /// A copy of the repository, `.git` and all, at `<temp>/<name>`: what an
+    /// archive, `cp -a` or a backup restore at another path produces.
+    pub fn copy_repo(&self, name: &str) -> PathBuf {
+        let copy = self.temp.path().join(name);
+        copy_tree(&self.repo, &copy);
+        copy
+    }
+}
+
+/// Copies the tree at `from` to `to`, file and directory permissions included.
+pub fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    fs::create_dir(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &target).unwrap();
+        } else {
+            std::os::unix::fs::symlink(fs::read_link(entry.path()).unwrap(), &target).unwrap();
+        }
+    }
+    fs::set_permissions(to, fs::metadata(from).unwrap().permissions()).unwrap();
 }
 
 /// A child process whose stdin, stdout, and stderr are the slave side of a
@@ -444,6 +470,45 @@ impl Drop for PtySession {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The characters a nonce is drawn from, and how many it has: what `cvc`
+/// defines as `tty::NONCE_ALPHABET` and `tty::NONCE_LENGTH`, which a test of the
+/// binary cannot import. A unit test there pins the same values.
+pub const NONCE_ALPHABET: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+pub const NONCE_LENGTH: usize = 5;
+
+/// A challenge that can be worked out in advance, split into that phrase and the
+/// nonce its prompt appended. Panics if it does not end with a nonce.
+pub fn split_nonce(challenge: &str) -> (&str, &str) {
+    let (phrase, nonce) = challenge
+        .rsplit_once(' ')
+        .unwrap_or_else(|| panic!("no nonce in {challenge:?}"));
+    assert!(
+        nonce.len() == NONCE_LENGTH && nonce.chars().all(|c| NONCE_ALPHABET.contains(c)),
+        "{challenge:?} does not end with a nonce"
+    );
+    (phrase, nonce)
+}
+
+/// `challenge` without the nonce its prompt appended: what can be worked out
+/// before the prompt is shown.
+pub fn without_nonce(challenge: &str) -> String {
+    split_nonce(challenge).0.to_owned()
+}
+
+/// `challenge` with another nonce in place of its own: every character moved one
+/// place along the alphabet, so it looks like a nonce and is not this one.
+pub fn with_another_nonce(challenge: &str) -> String {
+    let (phrase, nonce) = split_nonce(challenge);
+    let other: String = nonce
+        .chars()
+        .map(|c| {
+            let at = NONCE_ALPHABET.find(c).unwrap();
+            char::from(NONCE_ALPHABET.as_bytes()[(at + 1) % NONCE_ALPHABET.len()])
+        })
+        .collect();
+    format!("{phrase} {other}")
 }
 
 /// Every challenge string prompted so far, in display order.
