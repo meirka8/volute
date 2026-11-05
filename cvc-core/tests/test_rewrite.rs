@@ -249,7 +249,7 @@ fn v5_rewrite_events_project_import_and_remain_remote_assertions() -> anyhow::Re
         &repo,
         &imported,
         "refs/cvc/rewrite-v5",
-        Some(DESTINATION),
+        DESTINATION,
         sync::SyncReadLimits::default(),
     )?;
     let imported_events: u64 = rusqlite::Connection::open(temp.path().join("imported.db"))?

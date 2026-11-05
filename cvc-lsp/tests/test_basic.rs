@@ -403,3 +403,222 @@ fn cross_repository_reinitialize_is_rejected_without_creating_a_store() {
     let second_layout = cvc_core::repository::RepositoryLayout::discover(&second.root).unwrap();
     assert!(!second_layout.cvc_dir().exists());
 }
+
+/// Waits for the server's log line that ends one capture: `saved` on success,
+/// `failure` otherwise.
+fn wait_for_capture(rx: &mpsc::Receiver<Value>, saved: &str, failure: &str) {
+    let completion = wait_for(rx, Duration::from_secs(5), |m| {
+        m.get("method") == Some(&json!("window/logMessage"))
+            && m["params"]["message"]
+                .as_str()
+                .is_some_and(|s| s.contains(saved) || s.contains(failure))
+    });
+    let message = completion["params"]["message"].as_str().unwrap();
+    assert!(message.contains(saved), "{message}");
+}
+
+#[test]
+fn future_sharing_still_extends_to_the_editor_watcher_and_turn_notifications() {
+    let repo = test_repo("future");
+    let mut child = ChildGuard(lsp_command(&repo, &repo.root).spawn().unwrap());
+    let mut stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Some(msg) = read_message(&mut reader) {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+    send(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "capabilities":{}, "rootUri": Url::from_directory_path(&repo.root).unwrap(), "processId":null
+        }}),
+    );
+    let initialized = wait_for(&rx, Duration::from_secs(5), |m| {
+        m.get("id") == Some(&json!(1))
+    });
+    assert!(initialized.get("result").is_some(), "{initialized:?}");
+    send(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+    );
+    // The watcher records only after the capture acknowledgement, which the
+    // CLI's typed challenge would record.
+    cvc_core::privacy::acknowledge_capture(&git2::Repository::open(&repo.root).unwrap()).unwrap();
+
+    let mut capture_both = |round: u32| {
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"$/cvc/turn/batch","params":{
+                "sourceRequestId": format!("request-{round}"),
+                "sessionId": "copilot-session",
+                "model": "test",
+                "interactions": [{
+                    "author": "human",
+                    "userPrompt": format!("watched prompt {round}"),
+                    "response": format!("watched response {round}")
+                }]
+            }}),
+        );
+        wait_for_capture(&rx, "Batch saved", "Failed to save batch");
+        let turn = format!("turn-{round}");
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"$/cvc/turn/start","params":{
+                "id": turn, "prompt": format!("explicit prompt {round}"), "author": "human"
+            }}),
+        );
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"$/cvc/turn/end","params":{
+                "id": turn, "response": format!("explicit response {round}"), "model": "test"
+            }}),
+        );
+        wait_for_capture(&rx, "Interaction saved to DB", "Failed to save interaction");
+    };
+
+    // Both editor conversations are shared with their future thoughts, as
+    // `cvc share <id> --future` records it, after a first thought in each.
+    capture_both(1);
+    let layout = cvc_core::repository::RepositoryLayout::discover(&repo.root).unwrap();
+    let destination = "7".repeat(64);
+    {
+        let store = cvc_core::db::CvcStore::open(layout.db_path()).unwrap();
+        for conversation in ["copilot-session", "default-session"] {
+            let snapshot = store.share_snapshot(conversation).unwrap();
+            assert_eq!(snapshot.len(), 1, "{conversation}");
+            store
+                .share_exact_snapshot(
+                    conversation,
+                    &destination,
+                    &snapshot,
+                    cvc_core::models::FutureSharePolicy::Shared,
+                )
+                .unwrap();
+        }
+    }
+
+    // The editor's later thoughts join the share as they are captured.
+    capture_both(2);
+    let store = cvc_core::db::CvcStore::open(layout.db_path()).unwrap();
+    let mut captured = std::collections::HashSet::new();
+    for conversation in ["copilot-session", "default-session"] {
+        let thoughts = store
+            .get_recent_interactions_for_conversation(conversation, 10)
+            .unwrap();
+        assert_eq!(thoughts.len(), 2, "{conversation}");
+        captured.extend(thoughts.into_iter().map(|thought| thought.id));
+    }
+    let shared: std::collections::HashSet<_> = store
+        .projection_interaction_ids(&destination)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(shared, captured);
+}
+
+/// Copies the tree at `from` to `to`, permissions included, as an archive,
+/// `cp -a` or a backup restore at another path does.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &target).unwrap();
+        } else {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(entry.path()).unwrap(), &target).unwrap();
+            #[cfg(not(unix))]
+            panic!("unexpected entry {}", entry.path().display());
+        }
+    }
+    std::fs::set_permissions(to, std::fs::metadata(from).unwrap().permissions()).unwrap();
+}
+
+/// Binds an LSP to `root`, asks it for the privacy status, then sends it one
+/// passive-capture batch, as the VS Code watcher would. Returns the status and
+/// the line the server logged about the batch.
+fn privacy_status_and_batch(repo: &TestRepo, root: &Path) -> (Value, String) {
+    let mut child = ChildGuard(lsp_command(repo, root).spawn().unwrap());
+    let mut stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Some(msg) = read_message(&mut reader) {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+    send(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "capabilities":{}, "rootUri": Url::from_directory_path(root).unwrap(), "processId":null
+        }}),
+    );
+    let initialized = wait_for(&rx, Duration::from_secs(5), |m| {
+        m.get("id") == Some(&json!(1))
+    });
+    assert!(initialized.get("result").is_some(), "{initialized:?}");
+    send(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":2,"method":"cvc/privacy/status","params":{}}),
+    );
+    let status = wait_for(&rx, Duration::from_secs(5), |m| {
+        m.get("id") == Some(&json!(2))
+    })["result"]
+        .clone();
+    send(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","method":"$/cvc/turn/batch","params":{
+            "sourceRequestId":"request-1", "sessionId":"session-1", "model":"test",
+            "interactions":[{"author":"human","userPrompt":"a passive prompt"}]
+        }}),
+    );
+    let logged = wait_for(&rx, Duration::from_secs(5), |m| {
+        m.get("method") == Some(&json!("window/logMessage"))
+            && m["params"]["message"]
+                .as_str()
+                .is_some_and(|s| s.contains("Batch saved") || s.contains("Failed to save batch"))
+    });
+    (
+        status,
+        logged["params"]["message"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// The VS Code extension starts its watcher only when the LSP reports
+/// `passiveCaptureAllowed`. A repository copied with its `.git` carries the
+/// original's capture acknowledgement, which was given for the original's
+/// path: there the LSP reports capture as not acknowledged (so the extension
+/// shows its acknowledgement notice again) and refuses passive batches. The
+/// original is unaffected.
+#[test]
+fn a_copied_capture_acknowledgement_allows_no_passive_capture_in_the_copy() {
+    let repo = test_repo("original");
+    cvc_core::privacy::acknowledge_capture(&git2::Repository::open(&repo.root).unwrap()).unwrap();
+    let copy = repo.root.parent().unwrap().join("copy");
+    copy_tree(&repo.root, &copy);
+
+    let (status, logged) = privacy_status_and_batch(&repo, &copy);
+    assert_eq!(status["captureAcknowledged"], false, "{status}");
+    assert_eq!(status["passiveCaptureAllowed"], false, "{status}");
+    assert!(logged.contains("Failed to save batch"), "{logged}");
+    assert!(logged.contains("consent-required"), "{logged}");
+    let copied = cvc_core::db::CvcStore::open(copy.join(".git/cvc/index.db")).unwrap();
+    assert!(copied.get_floating_interactions().unwrap().is_empty());
+
+    let (status, logged) = privacy_status_and_batch(&repo, &repo.root);
+    assert_eq!(status["captureAcknowledged"], true, "{status}");
+    assert_eq!(status["passiveCaptureAllowed"], true, "{status}");
+    assert!(logged.contains("Batch saved"), "{logged}");
+}

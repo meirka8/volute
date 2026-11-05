@@ -12,14 +12,29 @@
 //! symlink or a file), the settings file is never written through a link, and
 //! a settings file that Git tracks is left alone.
 //!
+//! The file is kept out of commits by an entry in the repository's
+//! `info/exclude`, which [`install`] and [`create`] both add (when that exact
+//! line is missing) before they write anything. A `.gitignore` rule in the
+//! checkout overrides that file, so with the entry in place `git check-ignore`
+//! is asked, once, whether the path is now ignored. The unattended [`create`]
+//! goes on only when Git says it is: when Git says it is not
+//! ([`SettingsNotIgnored`]) or gives no verdict ([`SettingsIgnoreUnknown`]) it
+//! creates nothing, neither the `.claude` directory nor the file, and the entry
+//! stays. [`install`], which a person runs in a checkout they chose, writes the
+//! file all the same and reports [`ExcludeAction::NotIgnored`] so they can be
+//! told; when `git` gives no verdict it falls back on libgit2's answer, which is
+//! not used unattended.
+//!
 //! Like the Git hooks installer, this module never prints: it returns what it
 //! did so callers can report it in whichever way suits their stdout.
 use crate::repository::RepositoryLayout;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// Settings file relative to the worktree root.
 pub const SETTINGS_RELATIVE_PATH: &str = ".claude/settings.local.json";
@@ -49,8 +64,16 @@ pub enum InstallAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExcludeAction {
+    /// The entry was already in `info/exclude`, so nothing was added. It says
+    /// nothing about what Git ignores; see [`ExcludeAction::NotIgnored`].
     AlreadyIgnored,
+    /// The entry was added to `info/exclude`.
     AddedToInfoExclude,
+    /// The entry is in `info/exclude` (added now or earlier), but the settings
+    /// file is still not ignored: Git says so, usually because a `.gitignore`
+    /// rule in the checkout overrides `info/exclude`, or libgit2 does when
+    /// `git` could not be asked.
+    NotIgnored,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +139,25 @@ pub struct TrackedSettings;
 #[derive(Debug, thiserror::Error)]
 #[error("`.claude/settings.local.json` already exists in this worktree; CVC only creates it in a new worktree (run `cvc harness install claude-code` here to add the hooks)")]
 pub struct SettingsExist;
+
+/// Returned (inside an [`anyhow::Error`]) by [`create`] when Git would not
+/// ignore the settings file even with CVC's entry in `info/exclude`, because a
+/// `.gitignore` rule in the checkout overrides that file. The file holds a
+/// machine-specific path, so nothing is created: no `.claude` directory and no
+/// settings file. The entry stays in `info/exclude`.
+#[derive(Debug, thiserror::Error)]
+#[error("`.claude/settings.local.json` would not be ignored by Git in this worktree: a `.gitignore` rule overrides the entry CVC adds to `.git/info/exclude`; CVC writes a machine-specific path there and will not create a file that a commit could carry (fix the rule, then run `cvc harness install claude-code` here)")]
+pub struct SettingsNotIgnored;
+
+/// Returned (inside an [`anyhow::Error`]) by [`create`] when Git gave no
+/// verdict on the settings file: `git` could not be run in the worktree, or
+/// ran and declined to answer (a `.claude` that is a submodule, a directory it
+/// refused). The file holds a machine-specific path and nothing is created
+/// that Git is not known to ignore, so no `.claude` directory and no settings
+/// file exist afterwards. The entry stays in `info/exclude`.
+#[derive(Debug, thiserror::Error)]
+#[error("could not ask Git whether `.claude/settings.local.json` is ignored in this worktree; CVC writes a machine-specific path there and creates nothing it cannot confirm Git ignores (run `cvc harness install claude-code` here)")]
+pub struct SettingsIgnoreUnknown;
 
 /// Why `binary` cannot be the program a hook runs, if it cannot. The text
 /// starts with the path, so callers can put their own words before it.
@@ -263,6 +305,14 @@ fn refuse_if_tracked(layout: &RepositoryLayout) -> Result<()> {
 /// hooks are preserved byte-for-byte in meaning; only entries carrying the CVC
 /// signature are touched. Idempotent. Refuses a `.claude` that is not a real
 /// directory, and a tracked settings file ([`TrackedSettings`]).
+///
+/// The `info/exclude` entry goes in first and Git is then asked, once, whether
+/// the file is ignored. When it is not (a `.gitignore` rule overrides the
+/// entry) the file is written all the same and the outcome says so
+/// ([`ExcludeAction::NotIgnored`]), so the person who ran this can be told.
+/// When `git` cannot be run or gives no verdict, libgit2's answer stands as a
+/// last resort: it drops a lone `!` rule of a `.gitignore`, so it can call a
+/// path ignored that Git lists.
 pub fn install(layout: &RepositoryLayout, binary: &Path) -> Result<InstallOutcome> {
     install_with(layout, binary, false)
 }
@@ -273,6 +323,14 @@ pub fn install(layout: &RepositoryLayout, binary: &Path) -> Result<InstallOutcom
 /// instead of merging into it. Merging belongs to the person running
 /// `cvc harness install` in a checkout they chose; the `post-checkout`
 /// propagation runs unattended, inside Git, on whatever a branch put there.
+///
+/// For the same reason it creates the file only when Git is known to ignore
+/// it. The `info/exclude` entry goes in first and Git is then asked, once; if
+/// Git says the file is not ignored (a `.gitignore` rule overrides the entry,
+/// [`SettingsNotIgnored`]) or gives no verdict ([`SettingsIgnoreUnknown`];
+/// libgit2 is not consulted in its place), it refuses before the `.claude`
+/// directory or the file exists. Nobody is there to be warned, and the file
+/// holds a machine-specific path that must not be committed.
 pub fn create(layout: &RepositoryLayout, binary: &Path) -> Result<InstallOutcome> {
     install_with(layout, binary, true)
 }
@@ -296,6 +354,25 @@ fn install_with(
                     .with_context(|| format!("failed to inspect {}", settings_path.display()))
             }
         }
+    }
+    // The entry goes into `info/exclude` before the `.claude` directory or the
+    // file is touched, and Git is then asked, once, whether it ignores the
+    // file: a `.gitignore` rule in the checkout overrides `info/exclude`, so
+    // the entry alone does not say. An unattended create goes on only when Git
+    // says yes, and stops here, before `.claude` or the file exist, when it
+    // says no or gives no verdict. An install the person chose to run writes
+    // the file in any case and reports a "no"; when `git` gave no verdict,
+    // libgit2's answer stands in for it.
+    let mut exclude = ensure_excluded(layout)?;
+    let verdict = ask_git_if_ignored(layout);
+    if create_only {
+        match verdict {
+            Some(true) => {}
+            Some(false) => return Err(SettingsNotIgnored.into()),
+            None => return Err(SettingsIgnoreUnknown.into()),
+        }
+    } else if !verdict.unwrap_or_else(|| libgit2_ignores_settings(layout)) {
+        exclude = ExcludeAction::NotIgnored;
     }
     let mut settings = read_settings(&settings_path)?;
     let hooks = settings
@@ -362,7 +439,6 @@ fn install_with(
         let dir = ensure_claude_dir(root)?;
         write_settings(&dir, &settings_path, &settings)?;
     }
-    let exclude = ensure_excluded(layout)?;
     Ok(InstallOutcome {
         settings_path,
         command,
@@ -653,18 +729,143 @@ fn write_settings(dir: &Path, path: &Path, settings: &Map<String, Value>) -> Res
     Ok(())
 }
 
+/// Whether Git ignores the settings file in this checkout, by every source it
+/// reads: `.gitignore` files (including those a sparse checkout keeps only in
+/// the index), `info/exclude`, the user's global excludes. `Some` is the answer
+/// of `git check-ignore` run in this checkout (exit status 0 is ignored, 1 is
+/// not ignored); `None` is no answer at all: `git` not found, killed, or ending
+/// with any other status (128 when it refuses the directory or cannot judge the
+/// path, as when `.claude` is a submodule).
+///
+/// `git` itself is asked, since it decides what a commit carries. libgit2 is
+/// not consulted here: it drops a lone `!` rule from a `.gitignore`, although
+/// that rule still overrides `info/exclude` and the global excludes, so it can
+/// report "ignored" where `git` reports "not ignored" (see
+/// [`libgit2_ignores_settings`]).
+///
+/// In a partial clone the check may fetch an ignore file the sparse checkout
+/// left out, as `git status` would. Terminal prompts are off, so a fetch that
+/// needs credentials fails rather than waiting for them: Git exits 128, which
+/// is no answer.
+///
+/// Nothing is printed, and the variables a surrounding Git command exports to
+/// point at a repository, to change how pathspecs are read or to turn off lazy
+/// fetching are removed from the environment, so the answer is about this
+/// checkout.
+fn ask_git_if_ignored(layout: &RepositoryLayout) -> Option<bool> {
+    let root = layout.worktree_root().ok()?;
+    // `fs::canonicalize` gives a Windows path the `\\?\` prefix; `git -C` is
+    // handed the plain spelling (`C:\x`, `\\server\share\x`).
+    let root = match root.to_str() {
+        Some(text) if cfg!(windows) => PathBuf::from(without_verbatim_prefix(text).into_owned()),
+        _ => root.to_path_buf(),
+    };
+    let mut command = Command::new("git");
+    // No `--no-index`: the index is what `git add` and `git status` consult,
+    // including ignore files that a sparse checkout keeps only in the index. A
+    // tracked path answers "not ignored", which `refuse_if_tracked` has handled
+    // before this point; a `.claude` that is a gitlink makes Git give no
+    // verdict (exit 128), which the unattended path declines.
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "--quiet", "--", SETTINGS_RELATIVE_PATH]);
+    // These name a repository, a work tree or an index for a Git command; the
+    // ones of a surrounding command would make the answer about that
+    // repository, not this checkout.
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+    ] {
+        command.env_remove(name);
+    }
+    // Git exports these to hooks when the caller passed `--literal-pathspecs`
+    // and friends, and `check-ignore` refuses to run with them (exit 128); the
+    // path here is a constant with no glob characters, so they cannot change
+    // the answer.
+    for name in [
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    ] {
+        command.env_remove(name);
+    }
+    // Git exports this to hooks when the caller passed `--no-lazy-fetch`. In a
+    // partial clone whose sparse checkout leaves `.claude/` out, an ignore
+    // file kept only in the index may have no local blob; with lazy fetching
+    // off, Git treats that file as absent and answers "ignored" from the other
+    // sources, though a rule in the file may say otherwise. With the variable
+    // gone, Git either fetches the blob, as `git status` would, or exits 128,
+    // which the unattended path declines.
+    command.env_remove("GIT_NO_LAZY_FETCH");
+    // With terminal prompts off, a fetch that needs credentials fails, and the
+    // unattended path declines, instead of stopping at a prompt in the middle
+    // of `git worktree add`.
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    match status.code()? {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    }
+}
+
+/// libgit2's answer for the settings file, for an install a person runs when
+/// `git` gave no verdict. A last resort and for that interactive path only:
+/// libgit2 drops a lone `!` rule from a `.gitignore` (one that undoes no
+/// earlier rule of the same file), although that rule still overrides
+/// `info/exclude` and the global excludes, so it can call a path ignored that
+/// `git` lists. A lookup that fails counts as not ignored.
+fn libgit2_ignores_settings(layout: &RepositoryLayout) -> bool {
+    layout
+        .repository()
+        .is_path_ignored(Path::new(SETTINGS_RELATIVE_PATH))
+        .unwrap_or(false)
+}
+
+/// `path` without the `\\?\` prefix that `fs::canonicalize` gives a Windows
+/// path: `\\?\C:\x` is `C:\x` and `\\?\UNC\server\share\x` is
+/// `\\server\share\x`. Any other spelling comes back unchanged, including a
+/// verbatim one that has no plain equivalent here (`\\?\Volume{...}\x`).
+fn without_verbatim_prefix(path: &str) -> Cow<'_, str> {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        if !unc.is_empty() && !unc.starts_with('\\') {
+            return Cow::Owned(format!(r"\\{unc}"));
+        }
+    } else if let Some(drive) = path.strip_prefix(r"\\?\") {
+        let bytes = drive.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\'
+        {
+            return Cow::Borrowed(drive);
+        }
+    }
+    Cow::Borrowed(path)
+}
+
 /// Keeps the machine-specific settings file out of commits. Claude Code adds
 /// a global exclude only when it creates the file itself, so an installer that
 /// creates it must do the equivalent. The repository-local `info/exclude` is
 /// shared by every linked worktree and is not a tracked file.
+///
+/// Appends the entry whenever that exact line is missing, whatever else
+/// currently ignores the path: an entry that is to last must not depend on a
+/// `.gitignore` rule or a global excludes file that may change later.
+/// [`ExcludeAction::AlreadyIgnored`] means only that the line was already
+/// there. The entry being there does not mean Git ignores the file -- a
+/// `.gitignore` rule in the checkout takes precedence over `info/exclude` --
+/// so the caller asks Git afterwards ([`ask_git_if_ignored`]), once.
 fn ensure_excluded(layout: &RepositoryLayout) -> Result<ExcludeAction> {
-    if layout
-        .repository()
-        .is_path_ignored(Path::new(SETTINGS_RELATIVE_PATH))
-        .unwrap_or(false)
-    {
-        return Ok(ExcludeAction::AlreadyIgnored);
-    }
     let info_dir = layout.common_git_dir().join("info");
     fs::create_dir_all(&info_dir)?;
     let exclude_path = info_dir.join("exclude");
@@ -694,4 +895,57 @@ fn ensure_excluded(layout: &RepositoryLayout) -> Result<ExcludeAction> {
             .as_bytes(),
     )?;
     Ok(ExcludeAction::AddedToInfoExclude)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_verbatim_prefix;
+    use std::borrow::Cow;
+
+    #[test]
+    fn a_verbatim_drive_path_loses_its_prefix() {
+        assert_eq!(without_verbatim_prefix(r"\\?\C:\x"), r"C:\x");
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\d:\work\tree\x"),
+            r"d:\work\tree\x"
+        );
+        assert_eq!(without_verbatim_prefix(r"\\?\C:\"), r"C:\");
+    }
+
+    #[test]
+    fn a_verbatim_unc_path_becomes_a_plain_unc_path() {
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\UNC\server\share\x"),
+            r"\\server\share\x"
+        );
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\UNC\server\share"),
+            r"\\server\share"
+        );
+    }
+
+    #[test]
+    fn any_other_spelling_is_returned_unchanged() {
+        for path in [
+            r"C:\x",
+            r"\\server\share\x",
+            "/home/user/tree",
+            "relative/tree",
+            "",
+            // Verbatim spellings with no plain equivalent here.
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\x",
+            r"\\?\C:",
+            r"\\?\C:x",
+            r"\\?\1:\x",
+            r"\\?\UNC\",
+            r"\\?\UNC\\x",
+            r"\\?\unc\server\share\x",
+            // Device paths are not verbatim paths.
+            r"\\.\C:\x",
+        ] {
+            let spelled = without_verbatim_prefix(path);
+            assert_eq!(spelled, path);
+            assert!(matches!(spelled, Cow::Borrowed(_)), "{path}");
+        }
+    }
 }

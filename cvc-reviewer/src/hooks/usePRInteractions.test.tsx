@@ -44,9 +44,10 @@ const TEMPORAL_COMMIT_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const idWith = (version: string, variant: string) => `123e4567-e89b-${version}2d3-${variant}456-426614174000`;
 
 /**
- * Every real node id the shipped harness wrote (see src/test/wire/README.md), each once: the
- * edge-case step that holds a server-side search was recorded twice, by the 0.7.0 harness and
- * again by the one that records server-side outcomes, and is one interaction.
+ * Every real node id the harness wrote (see src/test/wire/README.md), each once: a step recorded
+ * again by a later harness (the server-side search by the one that records server-side outcomes,
+ * and several steps of the edge-case session by the one that marks the parts of a stimulus) is one
+ * interaction, however many files hold it.
  */
 const REAL_WIRE_IDS = [
   ...new Set(

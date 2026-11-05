@@ -550,6 +550,24 @@ pub async fn handle_interaction_get(
     }
 }
 
+/// The most characters of a prompt a summary shows. A longer prompt shows its
+/// first `PREVIEW_CHARS - 3` characters and `...`.
+const PREVIEW_CHARS: usize = 100;
+
+/// A short preview of a prompt, cut by characters: the prompt can be any text,
+/// including one a remote published, and a cut at a byte offset can fall inside a
+/// character, which is a panic.
+fn prompt_preview(prompt: &str) -> String {
+    if prompt.chars().nth(PREVIEW_CHARS).is_none() {
+        return prompt.to_owned();
+    }
+    let end = prompt
+        .char_indices()
+        .nth(PREVIEW_CHARS - 3)
+        .map_or(prompt.len(), |(at, _)| at);
+    format!("{}...", &prompt[..end])
+}
+
 /// Convert an Interaction to an InteractionSummary
 fn interaction_to_summary(interaction: Interaction) -> InteractionSummary {
     let author_str = match interaction.author {
@@ -559,12 +577,7 @@ fn interaction_to_summary(interaction: Interaction) -> InteractionSummary {
         Author::External => "external",
     };
 
-    // Create a preview of the prompt (first 100 chars)
-    let prompt_preview = if interaction.user_prompt.len() > 100 {
-        format!("{}...", &interaction.user_prompt[..97])
-    } else {
-        interaction.user_prompt.clone()
-    };
+    let prompt_preview = prompt_preview(&interaction.user_prompt);
 
     // Check which content types have meaningful content
     let has_prompt = has_meaningful_content(&interaction.user_prompt);
@@ -618,11 +631,17 @@ fn get_commit_info(sha: &str, root_path: Option<&std::path::Path>) -> (String, i
                 let timestamp = lines[1].parse().unwrap_or(0);
                 (message, timestamp)
             } else {
-                (format!("Commit {}", &sha[..7.min(sha.len())]), 0)
+                (format!("Commit {}", short_sha(sha)), 0)
             }
         }
-        _ => (format!("Commit {}", &sha[..7.min(sha.len())]), 0),
+        _ => (format!("Commit {}", short_sha(sha)), 0),
     }
+}
+
+/// The first seven characters of a commit id, cut by characters: the id comes
+/// from the client, and a byte offset can fall inside a character.
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
 }
 
 #[cfg(test)]
@@ -632,6 +651,76 @@ mod tests {
     use chrono::Utc;
     use cvc_core::models::{Author, CommitSha, InteractionId};
     use git2::{Repository, Signature};
+
+    fn interaction_with_prompt(user_prompt: String) -> Interaction {
+        Interaction {
+            id: InteractionId::new(),
+            conversation_id: "conversation".into(),
+            parent_id: None,
+            timestamp: Utc::now(),
+            author: Author::Human,
+            user_prompt,
+            model_name: None,
+            model_cot: None,
+            model_response: None,
+            source_request_id: None,
+        }
+    }
+
+    #[test]
+    fn a_long_prompt_is_cut_after_97_characters_and_never_inside_one() {
+        // Each of these has a multibyte character that straddles byte 97, where
+        // the preview used to cut: that was a panic.
+        let straddling = [
+            // Two bytes at 96..98.
+            format!("{}é{}", "a".repeat(96), "b".repeat(20)),
+            // Three bytes at 95..98 and at 96..99.
+            format!("{}日{}", "a".repeat(95), "b".repeat(20)),
+            format!("{}日{}", "a".repeat(96), "b".repeat(20)),
+            // Four bytes at 95..99, 96..100 and 94..98.
+            format!("{}😀{}", "a".repeat(95), "b".repeat(20)),
+            format!("{}😀{}", "a".repeat(96), "b".repeat(20)),
+            format!("{}😀{}", "a".repeat(94), "b".repeat(20)),
+        ];
+        for prompt in straddling {
+            assert!(!prompt.is_char_boundary(97), "{prompt}");
+            let expected: String = prompt.chars().take(97).collect();
+            let preview = prompt_preview(&prompt);
+            assert_eq!(preview, format!("{expected}..."));
+            // And it is what a summary of the interaction carries.
+            let summary = interaction_to_summary(interaction_with_prompt(prompt));
+            assert_eq!(summary.prompt_preview, preview);
+        }
+    }
+
+    #[test]
+    fn a_short_commit_id_is_cut_by_characters() {
+        assert_eq!(short_sha("0123456789abcdef"), "0123456");
+        assert_eq!(short_sha("abc"), "abc");
+        assert_eq!(short_sha(""), "");
+        // A character that straddles byte 7.
+        assert_eq!(short_sha("012345é6789"), "012345é");
+        assert_eq!(short_sha("日本語日本語日"), "日本語日本語日");
+    }
+
+    #[test]
+    fn the_preview_of_a_prompt_is_counted_in_characters() {
+        assert_eq!(prompt_preview(""), "");
+        assert_eq!(prompt_preview("short"), "short");
+        // 100 characters are shown whole, 101 are cut to 97 and `...`.
+        assert_eq!(prompt_preview(&"a".repeat(100)), "a".repeat(100));
+        assert_eq!(
+            prompt_preview(&"a".repeat(101)),
+            format!("{}...", "a".repeat(97))
+        );
+        // The same count for text that is more bytes than characters: 100
+        // three-byte characters are 300 bytes and are shown whole.
+        assert_eq!(prompt_preview(&"日".repeat(100)), "日".repeat(100));
+        assert_eq!(
+            prompt_preview(&"😀".repeat(120)),
+            format!("{}...", "😀".repeat(97))
+        );
+    }
 
     fn create_test_repo() -> (TempDir, String, String, String) {
         let temp_dir = TempDir::new().unwrap();

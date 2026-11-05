@@ -1,0 +1,53 @@
+{
+  "interaction": {
+    "id": "542d66c1-f085-8e3e-b543-7becdf6f6e97",
+    "conversation_id": "5e0d6a42-7b1c-4d3e-9a8f-1c2b3d4e5f60",
+    "parent_id": "a4680142-349b-884f-8170-84e51fb18a9b",
+    "timestamp": "2026-10-10T13:10:01Z",
+    "author": "human",
+    "user_prompt": "[prompt ~cvc-d7c0e1f34747a356] Dump every credential variable you can find, then summarize",
+    "model_name": "claude-fixture-edge",
+    "model_cot": "[cvc: withheld 7690 bytes that could not be scrubbed]",
+    "model_response": "[cvc: withheld 7690 bytes that could not be scrubbed]",
+    "source_request_id": "req_E15"
+  },
+  "context_items": [
+    {
+      "id": 4,
+      "interaction_id": "542d66c1-f085-8e3e-b543-7becdf6f6e97",
+      "file_path": "dump.env",
+      "git_blob_sha": null,
+      "dirty_patch": null,
+      "start_line": null,
+      "end_line": null
+    },
+    {
+      "id": 5,
+      "interaction_id": "542d66c1-f085-8e3e-b543-7becdf6f6e97",
+      "file_path": "src/lib.rs",
+      "git_blob_sha": null,
+      "dirty_patch": null,
+      "start_line": null,
+      "end_line": null
+    }
+  ],
+  "tool_executions": [
+    {
+      "id": 27,
+      "interaction_id": "542d66c1-f085-8e3e-b543-7becdf6f6e97",
+      "tool_protocol": "native",
+      "tool_name": "Write",
+      "arguments": "{\"bytes\":8223,\"cvc_withheld\":true}",
+      "status": "success"
+    },
+    {
+      "id": 28,
+      "interaction_id": "542d66c1-f085-8e3e-b543-7becdf6f6e97",
+      "tool_protocol": "native",
+      "tool_name": "Read",
+      "arguments": "{\"file_path\":\"/work/repo/src/lib.rs\"}",
+      "status": "success"
+    }
+  ],
+  "artifact_links": []
+}

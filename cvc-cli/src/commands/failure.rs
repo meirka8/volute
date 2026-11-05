@@ -10,8 +10,9 @@
 //! also stands for refusals unrelated to migrations), the classifier matches the
 //! exact message, and a unit test pins each against the real code.
 
+use crate::terminal_text::without_url_userinfo;
 use cvc_core::db::DbError;
-use cvc_core::privacy::PrivacyError;
+use cvc_core::sync::SyncError;
 use std::error::Error;
 use std::fmt;
 
@@ -223,14 +224,19 @@ pub(crate) enum FlowFailure {
     /// it. The text is the failure's plain message. `cvc privacy reconcile`
     /// settles it. See [`PublicationOutcomeUnknown`].
     OutcomeUnknown(String),
+    /// Refused before any connection to the destination was opened: the remote
+    /// no longer resolves to the destination the flow was bound to (see
+    /// [`SyncError::refused_before_transport`]). Nothing was sent. The text is
+    /// the refusal's plain message, which says why and what to change.
+    DestinationMismatch(String),
     /// `cvc share --push`: the share was recorded and the publication that
     /// followed it in the same command did not complete, for the reason inside.
     /// The share stands whatever the reason is; a reason that would mean
     /// "nothing was recorded" on its own, as [`FlowFailure::NotConfirmed`] does,
     /// only describes the publication here.
     SharedButNotPublished(Box<FlowFailure>),
-    /// Anything else, as one line of text with the misleading prefixes
-    /// (`Migration error:`, `invalid .thoughtignore:`) removed.
+    /// Anything else, as one line of text with the misleading `Migration error:`
+    /// prefix removed.
     Other(String),
 }
 
@@ -240,13 +246,19 @@ pub(crate) enum FlowFailure {
 /// The order matters. A bundled publication's failure is looked for first: the
 /// share before it is recorded, so what failed inside is classified as what
 /// happened to the publication, not to the flow. Then an unsettled publication,
-/// and only then the typed refusals.
+/// then a refusal before transport, and only then the typed refusals.
 pub(crate) fn classify_failure(error: &anyhow::Error) -> FlowFailure {
     if let Some(bundled) = error.downcast_ref::<BundledPublishFailed>() {
         return FlowFailure::SharedButNotPublished(Box::new(classify_failure(&bundled.cause)));
     }
     if error.downcast_ref::<PublicationOutcomeUnknown>().is_some() {
         return FlowFailure::OutcomeUnknown(plain_message(error));
+    }
+    if error
+        .downcast_ref::<SyncError>()
+        .is_some_and(SyncError::refused_before_transport)
+    {
+        return FlowFailure::DestinationMismatch(plain_message(error));
     }
     if let Some(not_confirmed) = error.downcast_ref::<ChallengeNotConfirmed>() {
         return match not_confirmed {
@@ -273,25 +285,30 @@ pub(crate) fn classify_failure(error: &anyhow::Error) -> FlowFailure {
     FlowFailure::Other(plain_message(error))
 }
 
-/// The error chain as the commands print it (`outer: inner`), except that the
-/// two variants whose `Display` adds a prefix that is wrong for the user
-/// (`Migration error:` on a refusal, `invalid .thoughtignore:` on any policy
-/// problem) contribute their bare message.
+/// The error chain as the commands print it (`outer: inner`), except that
+/// `DbError::Migration`, whose `Display` adds a `Migration error:` prefix that
+/// is wrong for the user on a refusal, contributes its bare message. A privacy
+/// error needs no such help: each kind of problem has its own variant, and only
+/// a `.thoughtignore` problem says `invalid .thoughtignore:`.
+///
+/// As on the command line, a URL in it is without its user information
+/// ([`without_url_userinfo`]): a transport's error can quote the URL it was
+/// given, as libgit2 does for a `file://` URL it cannot resolve. Control and
+/// format characters are left to the view, which replaces them where it shows
+/// the text.
 fn plain_message(error: &anyhow::Error) -> String {
-    error
+    let message = error
         .chain()
         .map(|cause| {
             if let Some(DbError::Migration(message)) = cause.downcast_ref::<DbError>() {
-                message.clone()
-            } else if let Some(PrivacyError::Policy(message)) = cause.downcast_ref::<PrivacyError>()
-            {
                 message.clone()
             } else {
                 cause.to_string()
             }
         })
         .collect::<Vec<_>>()
-        .join(": ")
+        .join(": ");
+    without_url_userinfo(&message).into_owned()
 }
 
 #[cfg(test)]
@@ -303,7 +320,7 @@ mod tests {
     use cvc_core::models::{
         Author, Conversation, FutureSharePolicy, Interaction, InteractionId, PublicationState,
     };
-    use cvc_core::privacy::{McpCapture, PreparedPolicy};
+    use cvc_core::privacy::{McpCapture, PreparedPolicy, PrivacyError};
 
     fn capture(store: &CvcStore, conversation: &str) -> InteractionId {
         let id = InteractionId::new();
@@ -397,6 +414,33 @@ mod tests {
             classify_failure(&BundledPublishFailed::wrap(said_why)),
             FlowFailure::SharedButNotPublished(Box::new(FlowFailure::InputKeptArriving))
         );
+    }
+
+    #[test]
+    fn a_refusal_before_transport_keeps_its_text_and_classifies_as_a_destination_mismatch() {
+        let refusal = cvc_core::sync::SyncError::DestinationChanged {
+            remote: "origin".into(),
+        };
+        let text = refusal.to_string();
+        assert!(text.contains("nothing was sent"), "{text}");
+        assert_eq!(
+            classify(refusal),
+            FlowFailure::DestinationMismatch(text.clone())
+        );
+        // Through added context too, with the chain as the commands print it.
+        let wrapped = anyhow::Error::from(cvc_core::sync::SyncError::DestinationChanged {
+            remote: "origin".into(),
+        })
+        .context("publishing to 'origin'");
+        assert_eq!(
+            classify_failure(&wrapped),
+            FlowFailure::DestinationMismatch(format!("publishing to 'origin': {text}"))
+        );
+        // Any other sync error is not one: it may come from a started transport.
+        assert!(matches!(
+            classify(cvc_core::sync::SyncError::Ref("transport boom".into())),
+            FlowFailure::Other(_)
+        ));
     }
 
     #[test]
@@ -597,6 +641,24 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_names_no_user_information_of_a_url_it_quotes() {
+        let quoted = "failed to resolve path 'file://deploy:s3cret@localhost/srv/x.git': No such file or directory";
+        let shown =
+            "failed to resolve path 'file://localhost/srv/x.git': No such file or directory";
+        assert_eq!(
+            classify_failure(&anyhow::anyhow!(quoted).context("while publishing")),
+            FlowFailure::Other(format!("while publishing: {shown}"))
+        );
+        let unsettled = anyhow::Error::from(PublicationOutcomeUnknown::new(
+            cvc_core::sync::SyncError::Ref(quoted.into()),
+        ));
+        assert_eq!(
+            classify_failure(&unsettled),
+            FlowFailure::OutcomeUnknown(format!("Reference error: {shown}"))
+        );
+    }
+
+    #[test]
     fn a_publication_that_stops_after_a_recorded_share_is_never_read_as_nothing_recorded() {
         let bundled = |cause: anyhow::Error| classify_failure(&BundledPublishFailed::wrap(cause));
         let after_share = |inner| FlowFailure::SharedButNotPublished(Box::new(inner));
@@ -657,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn other_failures_lose_the_misleading_prefixes_but_keep_their_context() {
+    fn other_failures_lose_the_misleading_prefix_but_keep_their_context() {
         let migration = DbError::Migration("something else went wrong".into());
         assert!(migration.to_string().starts_with("Migration error:"));
         assert_eq!(
@@ -665,9 +727,13 @@ mod tests {
             FlowFailure::Other("something else went wrong".into())
         );
 
-        let policy = PrivacyError::Policy("privacy state permissions are insecure".into());
-        assert!(policy.to_string().starts_with("invalid .thoughtignore:"));
-        let wrapped = Err::<(), _>(policy)
+        // A consent-state problem reads as one, as it is, through the context.
+        let consent = PrivacyError::ConsentState("privacy state permissions are insecure".into());
+        assert_eq!(
+            consent.to_string(),
+            "privacy state permissions are insecure"
+        );
+        let wrapped = Err::<(), _>(consent)
             .context("cannot read consent")
             .unwrap_err();
         assert_eq!(
@@ -676,6 +742,10 @@ mod tests {
                 "cannot read consent: privacy state permissions are insecure".into()
             )
         );
+        assert_eq!(
+            format!("{wrapped:#}"),
+            "cannot read consent: privacy state permissions are insecure"
+        );
 
         // The terminal check is not a typed failure; it keeps its text.
         assert_eq!(
@@ -683,6 +753,53 @@ mod tests {
                 "acknowledgement requires an interactive TTY"
             )),
             FlowFailure::Other("acknowledgement requires an interactive TTY".into())
+        );
+    }
+
+    /// What the flows print for a remote that cannot be a destination, from the
+    /// real code: the remote problem, with no `.thoughtignore` in it, and the
+    /// same text whether the command prints it or a caller classifies it.
+    #[test]
+    fn a_remote_problem_reads_as_one() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(directory.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("remote.blank.url", "  ")
+            .unwrap();
+        for (name, expected) in [
+            ("typo", "remote is not configured"),
+            ("blank", "remote has an empty push URL"),
+        ] {
+            let error = cvc_core::privacy::remote_destination(&repo, name).unwrap_err();
+            assert!(matches!(error, PrivacyError::Remote(_)), "{error:?}");
+            let error = anyhow::Error::from(error);
+            assert_eq!(format!("{error:#}"), expected);
+            assert_eq!(
+                classify_failure(&error),
+                FlowFailure::Other(expected.into())
+            );
+        }
+    }
+
+    /// A `.thoughtignore` problem is the one privacy error that says so.
+    #[test]
+    fn a_thoughtignore_problem_keeps_its_prefix() {
+        let directory = tempfile::TempDir::new().unwrap();
+        std::fs::write(directory.path().join(".thoughtignore"), "nonsense").unwrap();
+        let error = match PreparedPolicy::load(directory.path()) {
+            Ok(_) => panic!("an unknown directive is refused"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, PrivacyError::Policy(_)), "{error:?}");
+        let error = anyhow::Error::from(error);
+        assert_eq!(
+            format!("{error:#}"),
+            "invalid .thoughtignore: unknown directive"
+        );
+        assert_eq!(
+            classify_failure(&error),
+            FlowFailure::Other("invalid .thoughtignore: unknown directive".into())
         );
     }
 }
