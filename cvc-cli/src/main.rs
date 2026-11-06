@@ -172,6 +172,9 @@ enum IngestCommands {
         /// Read the hook payload Claude Code delivers on stdin
         #[arg(long)]
         hook: bool,
+        /// Read the session and its subagents from the start, ignoring saved cursors: recorded thoughts are kept and commit links are derived again
+        #[arg(long, requires = "transcript", conflicts_with = "hook")]
+        rescan: bool,
     },
 }
 
@@ -288,7 +291,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 transcript,
                 session,
                 hook,
-            } => commands::ingest::claude_code(transcript, session, hook).await?,
+                rescan,
+            } => commands::ingest::claude_code(transcript, session, hook, rescan).await?,
         },
         Commands::Hook { command } => match command {
             HookCommands::PostCommit => {
@@ -447,6 +451,24 @@ mod hook_cli_tests {
                 "--session",
                 "s",
             ],
+            vec![
+                "cvc",
+                "ingest",
+                "claude-code",
+                "--transcript",
+                "s.jsonl",
+                "--rescan",
+            ],
+            vec![
+                "cvc",
+                "ingest",
+                "claude-code",
+                "--rescan",
+                "--transcript",
+                "s.jsonl",
+                "--session",
+                "s",
+            ],
         ] {
             assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
         }
@@ -460,6 +482,44 @@ mod hook_cli_tests {
             "s.jsonl"
         ])
         .is_err());
+        // A rescan re-reads a named transcript: it needs one, and the hook,
+        // which reads from the cursor, never rescans.
+        for args in [
+            vec!["cvc", "ingest", "claude-code", "--rescan"],
+            vec!["cvc", "ingest", "claude-code", "--hook", "--rescan"],
+            vec![
+                "cvc",
+                "ingest",
+                "claude-code",
+                "--hook",
+                "--rescan",
+                "--transcript",
+                "s.jsonl",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+        let rescan_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Commands::Ingest {
+                command: IngestCommands::ClaudeCode { rescan, .. },
+            } => rescan,
+            _ => panic!("not the ingest command: {args:?}"),
+        };
+        assert!(rescan_of(&[
+            "cvc",
+            "ingest",
+            "claude-code",
+            "--transcript",
+            "s.jsonl",
+            "--rescan"
+        ]));
+        assert!(!rescan_of(&[
+            "cvc",
+            "ingest",
+            "claude-code",
+            "--transcript",
+            "s.jsonl"
+        ]));
         assert!(Cli::try_parse_from(["cvc", "harness", "install", "cursor"]).is_err());
     }
 

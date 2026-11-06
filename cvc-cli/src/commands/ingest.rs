@@ -4,7 +4,7 @@
 //! machine's already-shared projection: this is first-party local capture.
 use crate::terminal_text::sanitize_for_terminal;
 use anyhow::{anyhow, bail, Context, Result};
-use cvc_core::claude_code::{ingest, IngestError, IngestMode, IngestReport};
+use cvc_core::claude_code::{ingest_with, IngestError, IngestMode, IngestOptions, IngestReport};
 use cvc_core::db::CvcStore;
 use cvc_core::privacy::PreparedPolicy;
 use cvc_core::repository::{RepositoryLayout, RepositoryLayoutError};
@@ -39,6 +39,7 @@ pub async fn claude_code(
     transcript: Option<PathBuf>,
     session: Option<String>,
     hook: bool,
+    rescan: bool,
 ) -> Result<()> {
     if hook {
         return run_hook();
@@ -55,6 +56,7 @@ pub async fn claude_code(
         &transcript,
         session.as_deref(),
         IngestMode::Final,
+        rescan,
     )?;
     for line in report_lines(&report) {
         println!("{line}");
@@ -215,7 +217,8 @@ fn run_hook() -> Result<()> {
         Some("Stop") | Some("SessionEnd") => IngestMode::Final,
         _ => IngestMode::Incremental,
     };
-    match ingest_into(&layout, &transcript, Some(&session), mode) {
+    // The hook reads from the cursor, always: only an operator rescans.
+    match ingest_into(&layout, &transcript, Some(&session), mode, false) {
         Ok(_) => Ok(()),
         // Another run holds this session's lock and has held it for the whole
         // wait. It is making progress, and whatever it does not reach, the next
@@ -411,9 +414,10 @@ fn run(
     transcript: &Path,
     session: Option<&str>,
     mode: IngestMode,
+    rescan: bool,
 ) -> Result<IngestReport> {
     let layout = super::harness::discover_initialized_at(repository_path)?;
-    ingest_into(&layout, transcript, session, mode)
+    ingest_into(&layout, transcript, session, mode, rescan)
 }
 
 fn ingest_into(
@@ -421,12 +425,24 @@ fn ingest_into(
     transcript: &Path,
     session: Option<&str>,
     mode: IngestMode,
+    rescan: bool,
 ) -> Result<IngestReport> {
     super::harness::require_capture_acknowledged(layout)?;
     let policy = PreparedPolicy::load(layout.policy_root()?)
         .map_err(|error| anyhow!("CVC capture blocked by .thoughtignore: {error}"))?;
     let store = CvcStore::open_initialized(layout.db_path())?;
-    Ok(ingest(layout, &store, &policy, transcript, session, mode)?)
+    Ok(ingest_with(
+        layout,
+        &store,
+        &policy,
+        transcript,
+        session,
+        mode,
+        IngestOptions {
+            rescan,
+            ..IngestOptions::default()
+        },
+    )?)
 }
 
 #[cfg(test)]
@@ -628,6 +644,28 @@ mod tests {
             omitted_tool_calls: 0,
             omitted_context_items: 0,
         }
+    }
+
+    /// The family rescue links the session's own responses and its subagents'
+    /// apart, and a rescan that records nothing new still says what it linked.
+    #[test]
+    fn links_to_the_session_and_to_its_subagents_are_reported_apart() {
+        let lines = report_lines(&IngestReport {
+            inserted: 0,
+            already_present: 12,
+            linked_from_commits: 2,
+            subagent_sessions: 3,
+            subagent_inserted: 0,
+            subagent_linked: 7,
+            ..clean_report()
+        });
+        assert_eq!(
+            lines,
+            [
+                "CVC: Claude Code session s: 0 new thought(s), 12 already recorded, 0 pending, 2 linked to session commits; cursor at byte 10 of 10",
+                "  plus 3 subagent session(s): 0 new thought(s), 7 linked to commits",
+            ]
+        );
     }
 
     #[test]
