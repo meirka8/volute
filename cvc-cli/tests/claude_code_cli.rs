@@ -604,6 +604,46 @@ fn ingest_transcript_records_the_session_once() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("belongs to session"));
 }
 
+/// Public issue 183: `--rescan` re-reads the session from the start. Thoughts
+/// already recorded are kept, so it records nothing and leaves the cursor where
+/// a normal run left it; and it is an operator's option, never the hook's.
+#[test]
+fn ingest_rescan_rereads_the_session_and_changes_nothing_already_recorded() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let transcript = fixture.write_transcript(BASIC);
+    let path = transcript.to_str().unwrap();
+
+    let stdout = fixture.cvc_ok(&["ingest", "claude-code", "--transcript", path]);
+    assert!(stdout.contains("7 new thought(s)"), "{stdout}");
+    let cursor = fixture.cursor();
+    assert!(cursor.is_some());
+
+    for _ in 0..2 {
+        let stdout = fixture.cvc_ok(&["ingest", "claude-code", "--transcript", path, "--rescan"]);
+        assert!(stdout.contains("0 new thought(s)"), "{stdout}");
+        assert!(stdout.contains("7 already recorded"), "{stdout}");
+        assert_eq!(fixture.interaction_count(), 7);
+        assert_eq!(fixture.cursor(), cursor);
+    }
+
+    // It names a transcript to re-read, and the hook never rescans.
+    for args in [
+        vec!["ingest", "claude-code", "--rescan"],
+        vec!["ingest", "claude-code", "--hook", "--rescan"],
+    ] {
+        let output = fixture.cvc(&args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--rescan"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fixture.interaction_count(), 7);
+    }
+}
+
 #[test]
 fn hook_mode_is_quiet_incremental_and_never_blocking() {
     let fixture = Fixture::new();

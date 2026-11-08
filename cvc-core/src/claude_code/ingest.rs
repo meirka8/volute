@@ -4,6 +4,11 @@
 //! closed responses in that window, skips the ones already recorded (by their
 //! deterministic ids), and commits the new captures together with the advanced
 //! cursor in one transaction. A run that fails changes nothing.
+//!
+//! A session and its subagents are one family: each transcript is ingested into
+//! its own conversation, and once all of them are, one rescue links the
+//! family's floating responses to the commits any of them created (see
+//! [`links`]).
 use super::fields;
 use super::links;
 use super::session_lock::{SessionLock, SESSION_LOCK_WAIT};
@@ -34,6 +39,29 @@ pub enum IngestMode {
     Incremental,
     /// Stop/SessionEnd or operator-driven read: every response is complete.
     Final,
+}
+
+/// How one ingest run differs from the default hook-driven read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestOptions {
+    /// Ignore the saved cursors of the session and its subagents and read every
+    /// transcript from byte 0. Recorded responses are skipped by their
+    /// deterministic ids (a locally deleted one stays deleted), and the commit
+    /// links of every commit in the transcripts are derived again, which repairs
+    /// a session captured before its subagents' responses were linked. A rescan
+    /// never moves a cursor backwards.
+    pub rescan: bool,
+    /// How long to wait for the session's lock.
+    pub lock_wait: Duration,
+}
+
+impl Default for IngestOptions {
+    fn default() -> Self {
+        Self {
+            rescan: false,
+            lock_wait: SESSION_LOCK_WAIT,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -74,13 +102,15 @@ pub struct IngestReport {
     pub inserted: usize,
     pub already_present: usize,
     pub pending_responses: usize,
-    /// Floating responses linked to a commit the session created, by exact
-    /// transcript evidence rather than the time-window linker.
+    /// Floating responses of the session's own conversation linked to a commit
+    /// the session family created, by exact transcript evidence rather than the
+    /// time-window linker.
     pub linked_from_commits: usize,
     pub cursor: u64,
     pub transcript_len: u64,
     /// Subagent (Agent tool) transcripts ingested alongside this session, each
-    /// its own conversation. Their inserts and links are summed here.
+    /// its own conversation. Their inserts are summed here, and `subagent_linked`
+    /// counts the links made to their responses by the family's commit rescue.
     pub subagent_sessions: usize,
     pub subagent_inserted: usize,
     pub subagent_linked: usize,
@@ -123,6 +153,24 @@ struct Target<'a> {
     title_override: Option<String>,
 }
 
+/// What stays the same for every transcript of one run.
+struct Run<'a> {
+    layout: &'a RepositoryLayout,
+    store: &'a CvcStore,
+    policy: &'a PreparedPolicy,
+    mode: IngestMode,
+    rescan: bool,
+}
+
+/// One ingested transcript: what it recorded, and the responses in the window
+/// it read that reported creating a commit. Those are rescued once for the
+/// whole session family, not per transcript, so none is linked before every
+/// transcript of the family is in the store.
+struct Ingested {
+    report: IngestReport,
+    commit_bearing: Vec<links::CommitBearingResponse>,
+}
+
 /// Ingests `transcript_path` for the worktree described by `layout`, then any
 /// subagent transcripts stored beside it.
 ///
@@ -143,14 +191,14 @@ pub fn ingest(
     session_id: Option<&str>,
     mode: IngestMode,
 ) -> Result<IngestReport, IngestError> {
-    ingest_waiting(
+    ingest_with(
         layout,
         store,
         policy,
         transcript_path,
         session_id,
         mode,
-        SESSION_LOCK_WAIT,
+        IngestOptions::default(),
     )
 }
 
@@ -163,6 +211,38 @@ pub fn ingest_waiting(
     session_id: Option<&str>,
     mode: IngestMode,
     lock_wait: Duration,
+) -> Result<IngestReport, IngestError> {
+    ingest_with(
+        layout,
+        store,
+        policy,
+        transcript_path,
+        session_id,
+        mode,
+        IngestOptions {
+            lock_wait,
+            ..IngestOptions::default()
+        },
+    )
+}
+
+/// [`ingest`] with [`IngestOptions`].
+///
+/// The session and its subagents are ingested first, the session before the
+/// subagents, each into its own conversation. Then one rescue links the family's
+/// floating responses to the commits that any of those transcripts created (see
+/// [`links::link_transcript_commits`]). If a subagent fails, the rescue still
+/// runs over what was ingested, the session included, because the session's
+/// cursor is already past its committing response and that response would
+/// never be read again; the subagent's error is then returned.
+pub fn ingest_with(
+    layout: &RepositoryLayout,
+    store: &CvcStore,
+    policy: &PreparedPolicy,
+    transcript_path: &Path,
+    session_id: Option<&str>,
+    mode: IngestMode,
+    options: IngestOptions,
 ) -> Result<IngestReport, IngestError> {
     let session = session_id
         .map(str::to_owned)
@@ -179,6 +259,7 @@ pub fn ingest_waiting(
 
     // Held until this function returns: the cursors of the session and of its
     // subagents are read and advanced under it.
+    let lock_wait = options.lock_wait;
     let _lock = match SessionLock::acquire(&layout.cvc_dir(), HARNESS, &session, lock_wait) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
@@ -190,10 +271,15 @@ pub fn ingest_waiting(
         Err(source) => return Err(IngestError::SessionLock { session, source }),
     };
 
-    let mut report = ingest_target(
+    let run = Run {
         layout,
         store,
         policy,
+        mode,
+        rescan: options.rescan,
+    };
+    let parent = ingest_target(
+        &run,
         &Target {
             transcript_path,
             file_session: &session,
@@ -201,34 +287,71 @@ pub fn ingest_waiting(
             include_sidechain: false,
             title_override: None,
         },
-        mode,
     )?;
+    let mut report = parent.report;
+    let mut commit_bearing = parent.commit_bearing;
+    let mut family = links::SessionFamily::new(&session);
 
-    // Subagents run inside the same session and worktree; Claude Code stores
-    // each in `<session>/subagents/agent-<id>.jsonl` beside the main file. Each
-    // becomes its own conversation, keyed off the parent session so it never
-    // collides with the parent or another agent.
-    for subagent in discover_subagents(transcript_path, policy)? {
+    // Whatever happens to the subagents, the session is in the store now, so
+    // the family is rescued before the outcome is returned.
+    let subagents = ingest_subagents(
+        &run,
+        transcript_path,
+        &session,
+        &mut family,
+        &mut report,
+        &mut commit_bearing,
+    );
+    let linked = rescue_family(&run, &family, &commit_bearing);
+    subagents?;
+    let linked = linked?;
+    report.linked_from_commits = linked.parent;
+    report.subagent_linked = linked.subagents;
+    Ok(report)
+}
+
+/// Ingests the subagent transcripts stored beside `transcript_path`. Subagents
+/// run inside the same session and worktree; Claude Code stores each in
+/// `<session>/subagents/agent-<id>.jsonl` beside the main file. Each becomes its
+/// own conversation, keyed off the parent session so it never collides with the
+/// parent or another agent.
+///
+/// Every subagent conversation found is added to `family` before any is
+/// ingested, so one that fails (or that is not reached) is still part of the
+/// family whose responses a commit claims; only the ones found beside this
+/// session's transcript are, never another session's.
+fn ingest_subagents(
+    run: &Run<'_>,
+    transcript_path: &Path,
+    session: &str,
+    family: &mut links::SessionFamily,
+    report: &mut IngestReport,
+    commit_bearing: &mut Vec<links::CommitBearingResponse>,
+) -> Result<(), IngestError> {
+    let mut found = Vec::new();
+    for subagent in discover_subagents(transcript_path, run.policy)? {
         let conversation_id = format!("{session}:{}", subagent.agent_stem);
         if !privacy::is_safe_identifier(&conversation_id) {
             continue;
         }
-        let target_report = ingest_target(
-            layout,
-            store,
-            policy,
+        family.add_subagent(&conversation_id);
+        found.push((subagent, conversation_id));
+    }
+    for (subagent, conversation_id) in found {
+        let target = ingest_target(
+            run,
             &Target {
                 transcript_path: &subagent.path,
-                file_session: &session,
+                file_session: session,
                 conversation_id: &conversation_id,
                 include_sidechain: true,
                 title_override: subagent.title,
             },
-            mode,
         )?;
+        let target_report = target.report;
+        commit_bearing.extend(target.commit_bearing);
         report.subagent_sessions += 1;
         report.subagent_inserted += target_report.inserted;
-        report.subagent_linked += target_report.linked_from_commits;
         report.unrecorded_blocks += target_report.unrecorded_blocks;
         for kind in target_report.unrecorded_block_types {
             if !report.unrecorded_block_types.contains(&kind) {
@@ -248,18 +371,47 @@ pub fn ingest_waiting(
         report.omitted_tool_calls += target_report.omitted_tool_calls;
         report.omitted_context_items += target_report.omitted_context_items;
     }
-
-    Ok(report)
+    Ok(())
 }
 
-/// Ingests one transcript file into one conversation.
-fn ingest_target(
-    layout: &RepositoryLayout,
-    store: &CvcStore,
-    policy: &PreparedPolicy,
-    target: &Target<'_>,
-    mode: IngestMode,
-) -> Result<IngestReport, IngestError> {
+/// Rescues the responses the time-window linker cannot reach: those that
+/// created a commit, and the family's reasoning before them. Attribution
+/// records who linked, matching the linker, not the historical commit author.
+fn rescue_family(
+    run: &Run<'_>,
+    family: &links::SessionFamily,
+    commit_bearing: &[links::CommitBearingResponse],
+) -> Result<links::FamilyLinks, IngestError> {
+    if commit_bearing.is_empty() {
+        return Ok(links::FamilyLinks::default());
+    }
+    let capture_worktree = run.layout.worktree_origin()?;
+    let linked_by = run
+        .layout
+        .repository()
+        .signature()
+        .ok()
+        .and_then(|signature| signature.email().map(str::to_owned));
+    Ok(links::link_transcript_commits(
+        run.layout.repository(),
+        run.store,
+        family,
+        &capture_worktree,
+        commit_bearing,
+        linked_by.as_deref(),
+    )?)
+}
+
+/// Ingests one transcript file into one conversation. The commit links of its
+/// responses are left to [`rescue_family`].
+fn ingest_target(run: &Run<'_>, target: &Target<'_>) -> Result<Ingested, IngestError> {
+    let Run {
+        layout,
+        store,
+        policy,
+        mode,
+        rescan,
+    } = *run;
     let metadata = fs::symlink_metadata(target.transcript_path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(IngestError::NotRegularFile(
@@ -270,15 +422,20 @@ fn ingest_target(
     let capture_worktree = layout.worktree_origin()?;
 
     let mut file = fs::File::open(target.transcript_path)?;
-    let mut offset = store
+    let saved = store
         .harness_ingest_cursor(HARNESS, target.conversation_id)?
         .map(|cursor| cursor.byte_offset)
         .unwrap_or(0);
-    if !cursor_is_consistent(&mut file, offset, metadata.len())? {
-        // A rewritten or truncated transcript invalidates the cursor; the
-        // deterministic ids make a full re-read harmless.
-        offset = 0;
-    }
+    // A rewritten or truncated transcript invalidates the cursor; the
+    // deterministic ids make a full re-read harmless.
+    let trusted = if cursor_is_consistent(&mut file, saved, metadata.len())? {
+        saved
+    } else {
+        0
+    };
+    // A rescan reads it all again regardless: the recorded responses are
+    // skipped by id, and the commits they reported are collected again.
+    let offset = if rescan { 0 } else { trusted };
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = Vec::new();
     file.by_ref()
@@ -419,51 +576,45 @@ fn ingest_target(
         ));
     }
 
+    // A rescan reads from the start, so the plan may end earlier than where an
+    // earlier run (a final one, say, after an incremental rescan) left the
+    // cursor; it is never moved back, because everything before it is recorded.
+    let cursor_offset = if rescan {
+        plan.cursor_offset.max(trusted)
+    } else {
+        plan.cursor_offset
+    };
     let outcome = store.capture_claude_code_batch(
         captures,
         HarnessCursorUpdate {
             harness: HARNESS,
             session_id: target.conversation_id,
             transcript_path: &target.transcript_path.to_string_lossy(),
-            byte_offset: plan.cursor_offset,
+            byte_offset: cursor_offset,
         },
     )?;
 
-    // Rescue the responses the time-window linker cannot reach: those that
-    // created a commit and the reasoning before them. Attribution records who
-    // linked, matching the linker, not the historical commit author.
-    let linked_by = layout
-        .repository()
-        .signature()
-        .ok()
-        .and_then(|signature| signature.email().map(str::to_owned));
-    let linked_from_commits = links::link_transcript_commits(
-        layout.repository(),
-        store,
-        target.conversation_id,
-        &capture_worktree,
-        &commit_bearing,
-        linked_by.as_deref(),
-    )?;
-
-    Ok(IngestReport {
-        session_id: target.conversation_id.to_owned(),
-        inserted: outcome.inserted,
-        already_present: already_present + outcome.suppressed,
-        pending_responses: plan.pending_responses,
-        linked_from_commits,
-        cursor: plan.cursor_offset,
-        transcript_len,
-        subagent_sessions: 0,
-        subagent_inserted: 0,
-        subagent_linked: 0,
-        unrecorded_blocks,
-        unrecorded_block_types: unrecorded_block_types.into_iter().collect(),
-        withheld: outcome.withheld,
-        lost: outcome.lost,
-        withheld_reasons: outcome.reasons,
-        omitted_tool_calls,
-        omitted_context_items,
+    Ok(Ingested {
+        report: IngestReport {
+            session_id: target.conversation_id.to_owned(),
+            inserted: outcome.inserted,
+            already_present: already_present + outcome.suppressed,
+            pending_responses: plan.pending_responses,
+            linked_from_commits: 0,
+            cursor: cursor_offset,
+            transcript_len,
+            subagent_sessions: 0,
+            subagent_inserted: 0,
+            subagent_linked: 0,
+            unrecorded_blocks,
+            unrecorded_block_types: unrecorded_block_types.into_iter().collect(),
+            withheld: outcome.withheld,
+            lost: outcome.lost,
+            withheld_reasons: outcome.reasons,
+            omitted_tool_calls,
+            omitted_context_items,
+        },
+        commit_bearing,
     })
 }
 
