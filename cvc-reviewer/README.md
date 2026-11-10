@@ -11,6 +11,24 @@ below. Hosted reviewer integration is optional and is enabled only when a
 deployment explicitly sets `VITE_HOSTED_MODE=true` and provides
 `VITE_PLATFORM_API_URL`.
 
+### Link previews (hosted mode)
+
+Slack, X and LinkedIn build a link's preview from the Open Graph and Twitter
+card tags in the HTML the server sends, and do not run JavaScript. On a hosted
+deployment, `middleware.ts` (Vercel Routing Middleware) therefore adds those
+tags to a pull request link, `/pr/:owner/:repo/:pr`, on the server. It does so
+only when `VITE_HOSTED_MODE=true` and `VITE_PLATFORM_API_URL` are set, and only
+for an owner, repository and number GitHub could have; every other request, and
+every request to a local or self-hosted deployment, gets the page unchanged.
+
+A preview says only what the link already says: the repository, the pull
+request number, and a `thoughtCount` the link carries
+(`/pr/acme/api/42?thoughtCount=7`). Its image is the platform's `/api/og`
+card, which looks the pull request up on GitHub anonymously, so the card of a
+private repository shows only its name and the number. No CVC content
+(prompts, reasoning, code) goes into a preview: once a service has cached a
+preview, a tombstone cannot recall it.
+
 ## Setup
 
 ### Prerequisites
