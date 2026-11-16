@@ -10,6 +10,8 @@
 // (prompts, reasoning, code) never goes into a preview: once a service has cached a preview, a
 // tombstone cannot recall it.
 
+import { readHostedConfig } from '../src/lib/hostedConfig'
+
 export const SITE_NAME = 'Volute CVC Reviewer'
 
 // The size the platform renders the card at.
@@ -64,39 +66,15 @@ export function escapeHtml(value: string): string {
 
 /**
  * The platform to take the card from, or null when previews are off. They are a hosted
- * integration, so they follow the rule the rest of the app does: on only when the deployment
- * sets VITE_HOSTED_MODE=true and provides VITE_PLATFORM_API_URL. A self-hosted or local PAT
- * deployment sets neither and serves its pages unchanged, and so does a deployment whose URL is
- * not a plain http(s) address.
+ * integration, so they are on exactly when the app's hosted mode is (src/lib/hostedConfig.ts):
+ * the deployment sets VITE_HOSTED_MODE=true and VITE_PLATFORM_API_URL is a plain http(s)
+ * address. A self-hosted or local PAT deployment sets neither and serves its pages unchanged, and
+ * so does a hosted deployment whose URL is not a plain http(s) address, which has no platform to
+ * take a card from.
  */
 export function readUnfurlConfig(env: Env): UnfurlConfig | null {
-  if (env.VITE_HOSTED_MODE !== 'true') {
-    return null
-  }
-
-  const raw = env.VITE_PLATFORM_API_URL?.trim()
-  if (!raw) {
-    return null
-  }
-
-  let url: URL
-  try {
-    url = new URL(raw)
-  } catch {
-    return null
-  }
-
-  if (
-    (url.protocol !== 'https:' && url.protocol !== 'http:') ||
-    url.username !== '' ||
-    url.password !== '' ||
-    url.search !== '' ||
-    url.hash !== ''
-  ) {
-    return null
-  }
-
-  return { platformBase: `${url.origin}${url.pathname.replace(/\/+$/, '')}` }
+  const hosted = readHostedConfig(env)
+  return hosted.mode === 'hosted' ? { platformBase: hosted.platformBase } : null
 }
 
 export function isPrRef(owner: string, repo: string, pr: string): boolean {
