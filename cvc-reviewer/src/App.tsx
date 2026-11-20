@@ -111,8 +111,29 @@ function Dashboard() {
   );
 }
 
+// Every page of a hosted build that does not say where its platform is (lib/hostedConfig.ts).
+function PlatformNotConfigured() {
+  return (
+    <div className="flex min-h-screen items-center justify-center p-4 text-ink">
+      <div className="rr-panel max-w-lg rounded-[2rem] px-8 py-10 text-center">
+        <h1 className="mb-3 font-serif text-2xl font-semibold">Reviewer not configured</h1>
+        <p className="text-sm leading-relaxed text-muted">
+          This deployment runs in hosted mode but does not say where its platform is:{" "}
+          <code>VITE_PLATFORM_API_URL</code> is missing or is not an http(s) URL. Set it and rebuild, or leave{" "}
+          <code>VITE_HOSTED_MODE</code> unset to sign in with a GitHub token.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function Routes() {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, hostedConfig } = useAuth();
+
+  // Without its platform a hosted build can neither sign anyone in nor get a token, and it guesses no address.
+  if (hostedConfig.mode === "misconfigured") {
+    return <PlatformNotConfigured />;
+  }
 
   return (
     <Switch>

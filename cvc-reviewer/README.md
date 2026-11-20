@@ -11,6 +11,13 @@ below. Hosted reviewer integration is optional and is enabled only when a
 deployment explicitly sets `VITE_HOSTED_MODE=true` and provides
 `VITE_PLATFORM_API_URL`.
 
+`VITE_PLATFORM_API_URL` is the platform's http(s) address, without
+credentials, a query string or a fragment; a trailing slash is dropped. Both
+variables are read at build time, so a change needs a rebuild. A build that
+sets `VITE_HOSTED_MODE=true` without such an address does not fall back to any
+other one: it calls no platform, and every page says the deployment is not
+configured.
+
 ### Link previews (hosted mode)
 
 Slack, X and LinkedIn build a link's preview from the Open Graph and Twitter
