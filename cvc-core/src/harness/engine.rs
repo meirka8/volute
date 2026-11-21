@@ -438,7 +438,7 @@ fn ingest_target<A: HarnessAdapter>(
             worktree_root: run.worktree_root,
             finality: run.options.finality,
             role: located.role,
-            own_history_start: None,
+            own_history_start: read.own_history_start.as_ref(),
         },
     );
 
@@ -535,19 +535,32 @@ fn ingest_target<A: HarnessAdapter>(
         }
     }
 
+    // Relations are checked here against what the store accepts, so that one
+    // the store would refuse is left out and counted rather than refusing
+    // the batch: both ids must be the harness's conversation ids the store
+    // can hold, and different; a spawn call id the store cannot hold is
+    // dropped and the relation kept.
     let mut relations_skipped = 0usize;
     let mut relations = Vec::new();
     let mut relate =
         |child: Option<String>, parent: Option<String>, relation: Relation| match (child, parent) {
-            (Some(child_id), Some(parent_id)) => relations.push(ConversationRelation {
-                child_id,
-                parent_id,
-                kind: relation.kind,
-                harness: A::ID,
-                spawn_interaction_id: relation.spawn_interaction_id,
-                spawn_call_id: relation.spawn_call_id,
-                evidence: relation.evidence,
-            }),
+            (Some(child_id), Some(parent_id))
+                if child_id != parent_id
+                    && db::is_storable_identifier(&child_id)
+                    && db::is_storable_identifier(&parent_id) =>
+            {
+                relations.push(ConversationRelation {
+                    child_id,
+                    parent_id,
+                    kind: relation.kind,
+                    harness: A::ID,
+                    spawn_interaction_id: relation.spawn_interaction_id,
+                    spawn_call_id: relation
+                        .spawn_call_id
+                        .filter(|id| db::is_storable_identifier(id)),
+                    evidence: relation.evidence,
+                })
+            }
             _ => relations_skipped += 1,
         };
     for child in &plan.children {

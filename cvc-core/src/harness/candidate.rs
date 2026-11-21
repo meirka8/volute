@@ -213,6 +213,9 @@ pub struct ParentRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TitleHint {
     pub text: String,
+    /// Who chose it. Used from PR 4 of #187 (the batched ingest of #149),
+    /// which keeps a title the person set from being replaced by a generated
+    /// one in a later window; this version takes the text alone.
     pub rank: TitleRank,
 }
 
@@ -272,7 +275,8 @@ pub struct PlanInput<'a> {
     pub finality: Finality,
     pub role: ConversationRole,
     /// Forks and reverts: records before this position are inherited from
-    /// another conversation and are skipped.
+    /// another conversation and are skipped. The reader finds it
+    /// ([`crate::harness::adapter::Read::own_history_start`]).
     pub own_history_start: Option<&'a SourcePosition>,
 }
 

@@ -189,6 +189,7 @@ impl RecordSource for Fake {
         fs::File::open(&*source)?.read_to_end(&mut bytes)?;
         let start = if context.rescan { 0 } else { from.byte_offset };
         let mut lines = Vec::new();
+        let mut own_history_start = None;
         let mut offset = start as usize;
         while let Some(newline) = bytes[offset..].iter().position(|b| *b == b'\n') {
             let line = &bytes[offset..offset + newline];
@@ -202,6 +203,14 @@ impl RecordSource for Fake {
                     offset: offset as u64,
                     error,
                 })?;
+            // `{"type":"history_base","inherited":N}`: the record begins with
+            // N responses of another conversation's history.
+            if value.get("type").and_then(Value::as_str) == Some("history_base") {
+                own_history_start = value
+                    .get("inherited")
+                    .and_then(Value::as_u64)
+                    .map(SourcePosition::Ordinal);
+            }
             lines.push((offset as u64, value));
             offset += newline + 1;
         }
@@ -214,6 +223,7 @@ impl RecordSource for Fake {
             trusted: from.clone(),
             replaced: None,
             record_len: Some(bytes.len() as u64),
+            own_history_start,
         })
     }
 }
@@ -229,10 +239,19 @@ impl Planner for Fake {
         let mut title = None;
         let mut first_prompt = None;
         let mut previous = None;
+        let mut ordinal = 0u64;
         for (offset, line) in &window.lines {
             let text = |key: &str| line.get(key).and_then(Value::as_str).map(str::to_owned);
             match line.get("type").and_then(Value::as_str) {
-                Some("response") => {}
+                Some("response") => {
+                    ordinal += 1;
+                    // Inherited from another conversation: not this one's.
+                    if let Some(SourcePosition::Ordinal(inherited)) = input.own_history_start {
+                        if ordinal <= *inherited {
+                            continue;
+                        }
+                    }
+                }
                 Some("title") => {
                     title = text("text").map(|text| TitleHint {
                         text,
@@ -909,4 +928,71 @@ fn the_rescue_runs_only_while_the_channel_is_covered() {
     assert!(!report.rescue_skipped);
     assert_eq!(report.linked.root, 1);
     assert!(covered.linked("codex:r1", "resp:r"));
+}
+
+/// Relations the store would refuse are checked before the batch: a child
+/// that is the conversation itself, or whose id the store cannot hold, is
+/// left out and counted, a spawn call id it cannot hold is dropped, and the
+/// batch with its other relations commits.
+#[test]
+fn relations_the_store_would_refuse_are_left_out_not_the_batch() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let mut myself = response("resp:1", 10);
+    myself["child"] = json!("r1");
+    let mut unsafe_child = response("resp:2", 20);
+    unsafe_child["child"] = json!("a b");
+    let mut odd_call = response("resp:3", 30);
+    odd_call["child"] = json!("c1");
+    odd_call["spawn_call"] = json!("call with spaces");
+    let root = fixture.record("r1", &[myself, unsafe_child, odd_call]);
+
+    let report = fixture.ingest(&root, "r1").unwrap();
+    assert_eq!(report.root.inserted, 3);
+    assert_eq!(
+        (
+            report.root.relations_recorded,
+            report.root.relations_skipped
+        ),
+        (1, 2)
+    );
+    let relation = fixture
+        .store
+        .conversation_relation("codex:c1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(relation.parent_id, "codex:r1");
+    assert_eq!(relation.spawn_call_id, None);
+    assert!(fixture
+        .store
+        .conversation_relation("codex:r1")
+        .unwrap()
+        .is_none());
+}
+
+/// The reader finds where the conversation's own history begins, and the
+/// planner gets it: responses inherited from another conversation (a fork,
+/// a revert file) are not recorded as this one's.
+#[test]
+fn inherited_history_is_skipped_from_where_the_reader_says_it_ends() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let fork = fixture.record(
+        "f1",
+        &[
+            json!({"v": "1.0", "type": "history_base", "inherited": 2}),
+            response("resp:inherited-1", 10),
+            response("resp:inherited-2", 20),
+            response("resp:own", 30),
+        ],
+    );
+    let report = fixture.ingest(&fork, "f1").unwrap();
+    assert_eq!(report.root.inserted, 1);
+    let keys: Vec<String> = fixture
+        .conn()
+        .prepare("SELECT source_request_id FROM interactions")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(keys, ["resp:own"]);
 }

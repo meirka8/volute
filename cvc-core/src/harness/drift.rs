@@ -33,6 +33,12 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// The record format an adapter's parser is pinned to.
+///
+/// It checks the major version only. A format whose major version stays at
+/// 0 while its shape changes (Codex's rollouts are 0.x) cannot be gated by
+/// it: such an adapter gates older and newer formats by their shape (the
+/// record types and fields it requires) or by a version its payload carries,
+/// and fails loudly, as here, on a shape it does not read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatPin {
     pub harness: HarnessId,

@@ -63,6 +63,9 @@ pub enum EpochReason {
     Reverted,
     /// The agent migrated the record to a new layout.
     Migrated,
+    /// The record was created again under the same key, and its numbering
+    /// started over (a Cursor spool deleted and begun anew).
+    Recreated,
 }
 
 /// One kind of cursor. See the module docs.
@@ -119,7 +122,9 @@ pub struct FileId {
 #[serde(deny_unknown_fields)]
 pub struct Carry {
     /// The rank of the title the conversation holds, so a title the person
-    /// set is never replaced by a generated one from a later window.
+    /// set is never replaced by a generated one from a later window. Used
+    /// from PR 4 of #187 (the batched ingest of #149); written by nothing
+    /// yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_rank: Option<crate::harness::candidate::TitleRank>,
     /// A final event ran out of time before it reached the end.
@@ -365,10 +370,43 @@ impl CursorCodec for SeqCursor {
 }
 
 /// How far a spool of hook payloads has been assembled (Cursor).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// A spool is numbered from its creation, so the number orders rows of one
+/// spool only. `spool_id` names the spool the number counts in; a spool
+/// created again under the same key has a new id and numbers from the start,
+/// and its reader opens the next epoch ([`EpochReason::Recreated`]) rather
+/// than have the new spool's rows read as behind the old one's.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpoolCursor {
+    /// The spool's identity, fixed when it is created.
+    pub spool_id: String,
     pub assembled_through: u64,
+    pub epoch: u64,
+    /// Why `epoch` was opened; `None` in epoch 0.
+    pub epoch_reason: Option<EpochReason>,
+}
+
+impl SpoolCursor {
+    /// Rows of the spool `spool_id` assembled through `assembled_through`,
+    /// in epoch 0.
+    pub fn new(spool_id: impl Into<String>, assembled_through: u64) -> Self {
+        Self {
+            spool_id: spool_id.into(),
+            assembled_through,
+            epoch: 0,
+            epoch_reason: None,
+        }
+    }
+}
+
+/// The stored state of a [`SpoolCursor`], version 1.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpoolStateV1 {
+    spool_id: String,
+    assembled_through: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch_reason: Option<EpochReason>,
 }
 
 impl CursorCodec for SpoolCursor {
@@ -376,19 +414,50 @@ impl CursorCodec for SpoolCursor {
     const VERSION: u32 = 1;
 
     fn encode(&self) -> serde_json::Value {
-        encode_state(self)
+        encode_state(SpoolStateV1 {
+            spool_id: self.spool_id.clone(),
+            assembled_through: self.assembled_through,
+            epoch_reason: self.epoch_reason,
+        })
     }
-    fn decode(version: u32, _epoch: u64, state: &serde_json::Value) -> Result<Self, CursorError> {
+    fn decode(version: u32, epoch: u64, state: &serde_json::Value) -> Result<Self, CursorError> {
         if version != 1 {
             return Err(CursorError::Version(version));
         }
-        decode_state(state)
+        let state: SpoolStateV1 = decode_state(state)?;
+        Ok(Self {
+            spool_id: state.spool_id,
+            assembled_through: state.assembled_through,
+            epoch,
+            epoch_reason: state.epoch_reason,
+        })
     }
+    /// The epoch first. Within one epoch, rows of two different spools
+    /// cannot be ordered, so that is backwards (the stored cursor is kept
+    /// until the reader opens the next epoch); within one spool, the number.
     fn progress(&self, previous: &Self) -> Progress {
+        match self.epoch.cmp(&previous.epoch) {
+            std::cmp::Ordering::Greater => return Progress::NewEpoch,
+            std::cmp::Ordering::Less => return Progress::Backward,
+            std::cmp::Ordering::Equal => {}
+        }
+        if self.spool_id != previous.spool_id {
+            return Progress::Backward;
+        }
         ordered(self.assembled_through, previous.assembled_through)
     }
     fn describe(&self) -> String {
         format!("spool row {}", self.assembled_through)
+    }
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    fn in_epoch(self, epoch: u64, reason: EpochReason) -> Option<Self> {
+        Some(Self {
+            epoch,
+            epoch_reason: Some(reason),
+            ..self
+        })
     }
 }
 
@@ -468,10 +537,38 @@ mod tests {
             seq: 41,
         };
         assert_eq!(SeqCursor::decode(1, 0, &seq.encode()).unwrap(), seq);
-        let spool = SpoolCursor {
-            assembled_through: 8,
-        };
+        let spool = SpoolCursor::new("spool-1", 8);
         assert_eq!(SpoolCursor::decode(1, 0, &spool.encode()).unwrap(), spool);
+        let recreated = SpoolCursor::new("spool-2", 3)
+            .in_epoch(1, EpochReason::Recreated)
+            .unwrap();
+        assert_eq!(
+            SpoolCursor::decode(1, 1, &recreated.encode()).unwrap(),
+            recreated
+        );
+    }
+
+    /// A recreated spool numbers from the start: in the same epoch it cannot
+    /// be ordered against the old one, and in the next it is ahead.
+    #[test]
+    fn a_recreated_spool_opens_the_next_epoch_rather_than_reading_as_behind() {
+        let old = SpoolCursor::new("spool-1", 40);
+        assert_eq!(
+            SpoolCursor::new("spool-1", 41).progress(&old),
+            Progress::Forward
+        );
+        assert_eq!(
+            SpoolCursor::new("spool-1", 39).progress(&old),
+            Progress::Backward
+        );
+        let restarted = SpoolCursor::new("spool-2", 2);
+        assert_eq!(restarted.progress(&old), Progress::Backward);
+        let reopened = restarted.in_epoch(1, EpochReason::Recreated).unwrap();
+        assert_eq!(reopened.progress(&old), Progress::NewEpoch);
+        assert_eq!(
+            reopened.encode(),
+            serde_json::json!({"spool_id": "spool-2", "assembled_through": 2, "epoch_reason": "recreated"})
+        );
     }
 
     #[test]
@@ -536,11 +633,17 @@ mod tests {
             JsonlCursor::decode_stored(&stored),
             Err(CursorError::Kind { .. })
         ));
+        assert!(matches!(
+            SpoolCursor::decode_stored(&stored),
+            Err(CursorError::State(_))
+        ));
+        let stored = crate::db::StoredHarnessCursor {
+            state: json!({"spool_id": "s", "assembled_through": 1}),
+            ..stored
+        };
         assert_eq!(
             SpoolCursor::decode_stored(&stored).unwrap(),
-            SpoolCursor {
-                assembled_through: 1
-            }
+            SpoolCursor::new("s", 1)
         );
     }
 

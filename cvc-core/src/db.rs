@@ -599,7 +599,7 @@ pub(crate) fn is_storable_cursor(cursor_key: &str, state: &serde_json::Value) ->
 
 /// Whether `value` is an identifier a harness batch may store in a side
 /// table: a safe identifier the built-in scrubber would not change.
-fn is_storable_identifier(value: &str) -> bool {
+pub(crate) fn is_storable_identifier(value: &str) -> bool {
     privacy::is_safe_identifier(value) && privacy::scrub(value).is_ok_and(|s| s == value)
 }
 

@@ -9,10 +9,15 @@
 //! * The cursor is a [`JsonlCursor`]. Claude Code reads where to resume from
 //!   its 0.7.x row (`harness_ingest_cursors`), exactly as 0.7.x does, and
 //!   writes that row in every batch; the typed row is its copy, which never
-//!   moves backwards within an epoch. When the 0.7.x row is behind its typed
-//!   copy, or no longer lands on a line boundary, the transcript was
-//!   rewritten: the cursor opens the next epoch, and the transcript is read
-//!   again from its start (the deterministic ids make that harmless).
+//!   moves backwards within an epoch. Two things mean the transcript was
+//!   rewritten, and the cursor that commits opens the next epoch: the 0.7.x
+//!   row is behind its typed copy (reading resumes from the 0.7.x offset,
+//!   as 0.7.x would), or the 0.7.x offset no longer lands on a line
+//!   boundary (the transcript is then read again from its start; the
+//!   deterministic ids make that harmless).
+//! * A typed row of another codec kind or version (a newer cvc wrote it) is
+//!   left as it is: the batch writes the 0.7.x row alone, so the session's
+//!   cursor keeps advancing.
 //! * The family is the session and the subagent transcripts beside it,
 //!   `<session>/subagents/agent-<id>.jsonl`, each in the conversation
 //!   `<session>:agent-<id>`. No relation rows are written: the relation is
@@ -421,6 +426,8 @@ impl RecordSource for Adapter {
             trusted: from.at(trusted),
             replaced: (trusted != saved).then_some(EpochReason::Rewritten),
             record_len: Some(record_len),
+            // A Claude Code transcript holds the session's own history only.
+            own_history_start: None,
         })
     }
 

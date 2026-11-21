@@ -147,6 +147,7 @@ impl<const CLAUDE: bool> RecordSource for Outsider<CLAUDE> {
             trusted: from.clone(),
             replaced: None,
             record_len: None,
+            own_history_start: None,
         })
     }
 }
@@ -402,9 +403,7 @@ fn every_cursor_codec_round_trips() {
         seq: 4,
     };
     assert_eq!(SeqCursor::decode(1, 0, &seq.encode()).unwrap(), seq);
-    let spool = SpoolCursor {
-        assembled_through: 2,
-    };
+    let spool = SpoolCursor::new("spool-1", 2);
     assert_eq!(SpoolCursor::decode(1, 0, &spool.encode()).unwrap(), spool);
     assert_eq!(spool.progress(&spool), Progress::Same);
     // What another codec wrote is not read.

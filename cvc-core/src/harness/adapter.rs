@@ -23,7 +23,7 @@
 //!
 //! [`CaptureCandidate`]: crate::harness::candidate::CaptureCandidate
 use crate::db::{CvcStore, DbError, StoredHarnessCursor};
-use crate::harness::candidate::{ConversationRole, Finality, Plan, PlanInput};
+use crate::harness::candidate::{ConversationRole, Finality, Plan, PlanInput, SourcePosition};
 use crate::harness::cursor::{CursorCodec, EpochReason};
 use crate::harness::drift::DriftRule;
 use crate::harness::family::Family;
@@ -213,6 +213,11 @@ pub struct Read<W, C> {
     pub replaced: Option<EpochReason>,
     /// How long the record is, as far as this read saw, for reports.
     pub record_len: Option<u64>,
+    /// Where the conversation's own history begins in the record, when the
+    /// reader found that the record starts with history inherited from
+    /// another conversation (Codex `history_base` or `forked_from_id`, a
+    /// revert file): the planner skips what lies before it.
+    pub own_history_start: Option<SourcePosition>,
 }
 
 /// What a record's start says about who wrote it.
