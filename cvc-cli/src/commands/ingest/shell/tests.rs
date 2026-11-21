@@ -56,6 +56,8 @@ impl HookCaller for Fake {
             event: text("event")?,
             session: text("session")?,
             subagent: text("subagent")?,
+            record: text("record")?.map(PathBuf::from),
+            cwd: text("cwd")?.map(PathBuf::from),
             // Never kept by `request`: `hook_request` fills it.
             extra: payload,
             ..HookRequest::default()
@@ -69,7 +71,12 @@ impl HookCaller for Fake {
         }
     }
 
-    fn start(&self, _request: &HookRequest, _env: &dyn HookEnv) -> StartLocation {
+    /// A payload naming a record starts where its first line says, like
+    /// Codex's; any other starts at `start`.
+    fn start(&self, request: &HookRequest, _env: &dyn HookEnv) -> StartLocation {
+        if let Some(record) = &request.record {
+            return StartLocation::FromRecordStart(record.clone());
+        }
         match &self.start {
             Some(directory) => StartLocation::Directory(directory.clone()),
             None => StartLocation::NotNameable,
@@ -78,6 +85,19 @@ impl HookCaller for Fake {
 
     fn wants(&self, request: &HookRequest) -> bool {
         request.subagent.is_none()
+    }
+
+    fn start_from_first_entry(&self, first_line: &[u8]) -> StartLocation {
+        if self.panics_in == Some("first-entry") {
+            panic!("the stand-in's first entry");
+        }
+        match serde_json::from_slice::<Value>(first_line)
+            .ok()
+            .and_then(|line| line.get("cwd")?.as_str().map(PathBuf::from))
+        {
+            Some(cwd) => StartLocation::Directory(cwd),
+            None => StartLocation::Unknown,
+        }
     }
 
     fn finality(&self, event: Option<&str>) -> Finality {
@@ -280,19 +300,19 @@ fn paths() -> Vec<Scenario> {
             then: Then::Panic,
             captured: true,
             succeeds: false,
-            message: Some("cvc stopped on an internal error (the stand-in's ingest)"),
+            message: Some("cvc stopped on an internal error at "),
             ..path("the ingest panicked", &ok)
         },
         Scenario {
             panics_in: Some("classify"),
             succeeds: false,
-            message: Some("cvc stopped on an internal error (the stand-in's classify)"),
+            message: Some("cvc stopped on an internal error at "),
             ..path("the caller's classification panicked", &ok)
         },
         Scenario {
             panics_in: Some("request"),
             succeeds: false,
-            message: Some("cvc stopped on an internal error (the stand-in's request)"),
+            message: Some("cvc stopped on an internal error at "),
             ..path("reading the payload panicked, before the contract", &ok)
         },
         path("another agent's payload", br#"{"session":"s1","foreign":1}"#),
@@ -302,7 +322,7 @@ fn paths() -> Vec<Scenario> {
         },
         Scenario {
             succeeds: false,
-            message: Some("hook payload is not the JSON Codex delivers on stdin"),
+            message: Some("hook payload is not the JSON Codex delivers on stdin: it is not JSON (line 1, column "),
             harness: HarnessId::Codex,
             ..path("not JSON", b"not json")
         },
@@ -342,7 +362,7 @@ fn paths() -> Vec<Scenario> {
         Scenario {
             harness: HarnessId::Codex,
             succeeds: false,
-            message: Some("consent-required: the capture acknowledgement here was given before cvc could capture Codex; run `cvc privacy acknowledge-capture` again (or stop the stand-in's hooks)"),
+            message: Some("consent-required: the capture acknowledgement here does not cover Codex: it was given by a cvc that could not capture Codex, or an older cvc has rewritten it since; run `cvc privacy acknowledge-capture` again (or stop the stand-in's hooks)"),
             ..path("an acknowledgement that does not cover the channel", &ok)
         },
     ]
@@ -436,7 +456,7 @@ fn an_acknowledgement_that_does_not_cover_the_channel_stops_the_run() {
     );
     assert_eq!(
         format!("{:#}", result.unwrap_err()),
-        "consent-required: the capture acknowledgement here was given before cvc could capture Codex; run `cvc privacy acknowledge-capture` again (or stop the stand-in's hooks)"
+        "consent-required: the capture acknowledgement here does not cover Codex: it was given by a cvc that could not capture Codex, or an older cvc has rewritten it since; run `cvc privacy acknowledge-capture` again (or stop the stand-in's hooks)"
     );
     assert!(capture.seen.borrow().is_empty());
 
@@ -853,5 +873,192 @@ fn claude_codes_contract_is_an_empty_stdout() {
     assert_eq!(adapter.contract(None), OutputContract::Silent);
     for event in ["PostToolUse", "Stop", "SessionEnd"] {
         assert_eq!(adapter.contract(Some(event)), OutputContract::Silent);
+    }
+}
+
+// ---- round 2: panics, harnesses without an adapter, starts in the record ----
+
+/// A step after consent that panics with a message carrying `MARKER`, the
+/// way a panic carries what was being worked on.
+struct PanicsWithText {
+    slice: bool,
+}
+
+const MARKER: &str = "secret-marker-\u{e9}";
+
+impl Capture<Fake> for PanicsWithText {
+    fn capture(&self, _caller: &Fake, _run: CaptureRun<'_>) -> Result<Captured> {
+        if self.slice {
+            // A slice off a character boundary: its message quotes the text.
+            let text = String::from(MARKER);
+            let cut = text.len() - 1;
+            let _ = &text[..cut];
+        }
+        panic!("captured text: {MARKER}");
+    }
+}
+
+/// A hook run that stops on an internal error reports only cvc's source
+/// location, never the panic's message, and still writes the contract.
+#[test]
+fn a_panic_is_reported_by_cvcs_source_location_only() {
+    let repo = repository(true);
+    for slice in [false, true] {
+        let fake = Fake {
+            contract: OutputContract::EmptyObject,
+            start: Some(repo.path().to_path_buf()),
+            panics_in: None,
+        };
+        let mut stdin = &br#"{"session":"s1"}"#[..];
+        let mut stdout = Vec::new();
+        let error = run_hook_with(
+            &fake,
+            HarnessId::ClaudeCode,
+            &PanicsWithText { slice },
+            HookIo {
+                stdin: &mut stdin,
+                stdout: &mut stdout,
+            },
+            &env(&[]),
+            Instant::now(),
+        )
+        .unwrap_err();
+        let printed = format!("{error:#}");
+        assert!(
+            printed.starts_with("cvc stopped on an internal error at ")
+                && printed.contains("shell/tests.rs:")
+                && printed.ends_with("; this hook run recorded nothing more"),
+            "{printed}"
+        );
+        assert!(!printed.contains("secret-marker"), "{printed}");
+        assert_eq!(stdout, b"{}");
+    }
+    // Outside a hook run the panic hook stays out of the way.
+    assert!(!CATCHING.with(Cell::get));
+}
+
+/// A harness this build has no adapter for still gets the output its agent
+/// requires, and its payload is read off the pipe with the usual bound.
+#[test]
+fn a_harness_without_an_adapter_gets_its_contract_and_its_payload_drained() {
+    let length = 8 * 1024 * 1024;
+    for (harness, expected) in [
+        (HarnessId::Codex, &b""[..]),
+        (HarnessId::OpenCode, b""),
+        (HarnessId::Cursor, b"{}"),
+        (HarnessId::Antigravity, b"{}"),
+    ] {
+        let mut source = spaces(length);
+        let mut stdout = Vec::new();
+        let error = refuse_unavailable(
+            harness,
+            HookIo {
+                stdin: &mut source,
+                stdout: &mut stdout,
+            },
+        );
+        assert_eq!(stdout, expected, "{harness}");
+        assert_eq!(source.taken, length, "{harness}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "cvc {} cannot capture {} yet",
+                env!("CARGO_PKG_VERSION"),
+                harness.display()
+            )
+        );
+    }
+}
+
+/// A start in the record's first entry (Codex's) is read from that one line
+/// only, bounded, and only from a regular file; anything else is an unknown
+/// start, which falls back to the payload's working directory.
+#[test]
+fn a_start_in_the_record_is_read_from_its_first_line_only() {
+    let repo = repository(true);
+    let records = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    let fake = Fake {
+        contract: OutputContract::Silent,
+        start: None,
+        panics_in: None,
+    };
+    let first = format!(
+        "{}\n",
+        serde_json::json!({"cwd": repo.path().to_str().unwrap()})
+    );
+    let write = |name: &str, content: &[u8]| {
+        let path = records.path().join(name);
+        fs::write(&path, content).unwrap();
+        path
+    };
+    let complete = write(
+        "complete.jsonl",
+        format!("{first}{{\"more\":1}}\n").as_bytes(),
+    );
+    let unfinished = write("unfinished.jsonl", first.trim_end().as_bytes());
+    let mut long = first.trim_end().as_bytes().to_vec();
+    long.extend(std::iter::repeat_n(b' ', MAX_FIRST_LINE_BYTES as usize));
+    long.push(b'\n');
+    let too_long = write("long.jsonl", &long);
+    let link = records.path().join("link.jsonl");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&complete, &link).unwrap();
+    let payload = |record: &Path| {
+        serde_json::json!({
+            "session": "s1",
+            "record": record.to_str().unwrap(),
+            "cwd": elsewhere.path().to_str().unwrap(),
+        })
+        .to_string()
+    };
+
+    let capture = FakeCapture::new(Then::Record);
+    let (result, _) = run(
+        &fake,
+        HarnessId::ClaudeCode,
+        &capture,
+        payload(&complete).as_bytes(),
+        &[],
+        Instant::now(),
+    );
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(capture.seen.borrow().len(), 1, "started in the repository");
+
+    let mut unreadable = vec![
+        unfinished,
+        too_long,
+        records.path().join("absent.jsonl"),
+        records.path().to_path_buf(),
+    ];
+    if cfg!(unix) {
+        unreadable.push(link);
+    }
+    for record in unreadable {
+        let capture = FakeCapture::new(Then::Record);
+        let (result, _) = run(
+            &fake,
+            HarnessId::ClaudeCode,
+            &capture,
+            payload(&record).as_bytes(),
+            &[],
+            Instant::now(),
+        );
+        assert!(result.is_ok(), "{record:?}: {result:?}");
+        assert!(capture.seen.borrow().is_empty(), "{record:?}");
+    }
+    assert_eq!(first_line_of(&complete).as_deref(), Some(first.as_bytes()));
+
+    // Claude Code's start is never in its record, so none of it is read
+    // before the repository is known.
+    let request = HookRequest {
+        record: Some(complete.clone()),
+        ..HookRequest::default()
+    };
+    for environment in [env(&[]), env(&[("CLAUDE_PROJECT_DIR", "/x")])] {
+        assert!(!matches!(
+            claude_code::Adapter.start(&request, &environment),
+            StartLocation::FromRecordStart(_)
+        ));
     }
 }

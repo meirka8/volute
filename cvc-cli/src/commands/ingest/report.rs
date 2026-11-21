@@ -85,11 +85,15 @@ impl Summary {
 /// What a run prints. The session id passed the capture policy's identifier
 /// rule, but the block types are whatever the record's `type` fields say, so
 /// both are shown with every control and format character replaced by `?`,
-/// each on the line it belongs to.
+/// each on the line it belongs to; so is the cursor's description, which an
+/// adapter words.
 pub(crate) fn lines(summary: &Summary) -> Vec<String> {
     let cursor = match summary.record_len {
-        Some(len) => format!("cursor at {} of {len}", summary.cursor),
-        None => format!("cursor at {}", summary.cursor),
+        Some(len) => format!(
+            "cursor at {} of {len}",
+            sanitize_for_terminal(&summary.cursor)
+        ),
+        None => format!("cursor at {}", sanitize_for_terminal(&summary.cursor)),
     };
     let mut lines = vec![format!(
         "CVC: {} session {}: {} new thought(s), {} already recorded, {} pending, {} linked to session commits; {cursor}",
@@ -240,6 +244,16 @@ mod tests {
                 "  plus 3 subagent session(s): 0 new thought(s), 7 linked to commits",
             ]
         );
+    }
+
+    #[test]
+    fn the_cursor_is_shown_as_plain_text() {
+        let printed = lines(&Summary {
+            cursor: "row \u{1b}[2J1".into(),
+            record_len: None,
+            ..clean()
+        });
+        assert!(printed[0].ends_with("; cursor at row ?[2J1"), "{printed:?}");
     }
 
     #[test]

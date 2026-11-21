@@ -424,11 +424,21 @@ fn install_generic<A: HarnessAdapter>(
         AdapterInstallAction::Updated => "updated",
         AdapterInstallAction::AlreadyPresent => "already present",
     };
+    // Which scope is always said: hooks installed for the user run in every
+    // repository the user opens.
     println!(
-        "{} hooks {action} in {}",
+        "{} hooks {action} for {} in {}",
         A::ID.display(),
+        scope_name(scope),
         printable_path(&outcome.location)
     );
+    if scope == InstallScope::User {
+        println!(
+            "  they run in every repository you open with {}, and record in each one where capture is acknowledged for {}",
+            A::ID.display(),
+            A::ID.display()
+        );
+    }
     for warning in &outcome.warnings {
         eprintln!("  warning: {}", printable(warning));
     }
@@ -721,36 +731,40 @@ impl AdapterVisitor for Status {
         let layout = discover_initialized()?;
         let installed = adapter.status(&InstallContext { layout: &layout })?;
         let coverage = privacy::capture_coverage_summary(layout.repository())?;
-        Ok(status_lines(A::ID, &installed, &coverage))
+        Ok(status_lines(A::ID, adapter.scopes(), &installed, &coverage))
     }
 }
 
 /// What `cvc harness status <harness>` prints, one `key: value` per line.
 fn status_lines(
     harness: HarnessId,
+    offered: &[InstallScope],
     installed: &HarnessStatus,
     coverage: &CoverageSummary,
 ) -> Vec<String> {
-    let scopes: Vec<&str> = installed
-        .installed
-        .iter()
-        .map(|scope| match scope {
-            InstallScope::Checkout => "this checkout",
-            InstallScope::Project => "this project",
-            InstallScope::User => "this user",
-        })
-        .collect();
-    let mut lines = vec![
-        format!("harness: {}", harness.display()),
-        format!(
-            "hooks_installed: {}",
-            if scopes.is_empty() {
-                "no".to_owned()
+    let mut lines = vec![format!("harness: {}", harness.display())];
+    // One line for each scope cvc installs this harness's hooks in.
+    for scope in offered {
+        let key = match scope {
+            InstallScope::Checkout => "checkout",
+            InstallScope::Project => "project",
+            InstallScope::User => "user",
+        };
+        lines.push(format!(
+            "{key}_hooks_installed: {}",
+            if installed.installed.contains(scope) {
+                "yes"
             } else {
-                scopes.join(", ")
+                "no"
             }
-        ),
-    ];
+        ));
+    }
+    if harness == HarnessId::ClaudeCode {
+        lines.push(
+            "note: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin list)"
+                .to_owned(),
+        );
+    }
     if let Some(binary) = &installed.binary {
         lines.push(format!(
             "binary_for_new_worktrees: {}",
@@ -825,11 +839,20 @@ pub(crate) fn coverage_lines(summary: &CoverageSummary) -> Vec<String> {
     }
     if summary.acknowledgement.is_acknowledged() && !summary.lists_channels {
         lines.push(format!(
-            "note: this acknowledgement lists no agents, so it covers {} only; capturing any other agent needs a fresh `cvc privacy acknowledge-capture` (an older cvc may have rewritten the privacy file and dropped the list)",
+            "note: this acknowledgement was recorded without a list of what it covers (by cvc 0.7.2 or earlier, or rewritten by such a cvc since), so it covers {} only. An agent added by a later cvc needs `cvc privacy acknowledge-capture` run with that cvc.",
             and_list(&PassiveChannel::LEGACY_COVERED.map(PassiveChannel::display))
         ));
     }
     lines
+}
+
+/// A scope as a person reads it.
+fn scope_name(scope: InstallScope) -> &'static str {
+    match scope {
+        InstallScope::Checkout => "this checkout",
+        InstallScope::Project => "this project",
+        InstallScope::User => "this user",
+    }
 }
 
 /// `a`, `a and b`, `a, b and c`.
@@ -978,7 +1001,7 @@ pub(crate) fn coverage_refusal(
 /// Why an acknowledgement on record does not cover `agent`.
 fn not_covering(agent: &str) -> String {
     format!(
-        "the capture acknowledgement here was given before cvc could capture {agent}; run `cvc privacy acknowledge-capture` again"
+        "the capture acknowledgement here does not cover {agent}: it was given by a cvc that could not capture {agent}, or an older cvc has rewritten it since; run `cvc privacy acknowledge-capture` again"
     )
 }
 

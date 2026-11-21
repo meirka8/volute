@@ -5,8 +5,10 @@
 //! never exits with status 2, which every supported agent treats as blocking
 //! (a failure is status 1, and the cvc Claude Code plugin's wrapper turns a 2
 //! into a 1 as well), and writes on stdout exactly what the harness's
-//! [`OutputContract`] says, on every path, a panic included: nothing, `{}`,
-//! or the harness's "continue" JSON. Claude Code's contract is nothing at all.
+//! [`OutputContract`] says, on every path of the shell, a panic included:
+//! nothing, `{}`, or the harness's "continue" JSON. Claude Code's contract is
+//! nothing at all. A panic is reported by cvc's source location only, never
+//! by its message, which can carry what was being worked on.
 //!
 //! The same command is run by a checkout's own hook entries and by user-scoped
 //! hooks and plugins, which fire in every project the user opens,
@@ -32,7 +34,12 @@
 //!    repository's worktrees a run is attributed to. When the harness does
 //!    not say where the session started, the working directory, else the
 //!    process's own directory, is the one in question; when it says the
-//!    session started nowhere that can be named, nothing is recorded.
+//!    session started nowhere that can be named, nothing is recorded. For a
+//!    harness whose start is in its record's first entry
+//!    ([`StartLocation::FromRecordStart`]; Claude Code's never is), the
+//!    shell reads that one line, at most 4 MiB of a regular file, in memory,
+//!    for the adapter to read the start from, and drops it: the only read of
+//!    a record before the repository is known.
 //! 5. Unless that repository can be established as CVC-initialized, the hook
 //!    does nothing: exit 0 with nothing on stderr, whatever the payload held
 //!    (see [`initialized_repository_at`]).
@@ -61,8 +68,8 @@ use super::{explain, load_policy};
 use anyhow::{anyhow, bail, Context, Result};
 use cvc_core::db::CvcStore;
 use cvc_core::harness::adapter::{
-    hook_request, Admission, CallerVerdict, HarnessAdapter, HookCaller, HookEnv, HookEvent,
-    HookRequest, OutputContract, ProcessEnv, StartLocation,
+    hook_request, json_type, Admission, CallerVerdict, HarnessAdapter, HookCaller, HookEnv,
+    HookEvent, HookRequest, OutputContract, PayloadError, ProcessEnv, StartLocation,
 };
 use cvc_core::harness::candidate::Finality;
 use cvc_core::harness::engine::{self, EngineError, EngineOptions};
@@ -71,11 +78,13 @@ use cvc_core::privacy::CoverageGrant;
 use cvc_core::repository::{RepositoryLayout, RepositoryLayoutError};
 use git2::ErrorCode;
 use serde_json::{Map, Value};
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::fs;
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, BufRead, ErrorKind, Read, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::time::Instant;
 
 const MAX_HOOK_PAYLOAD_BYTES: u64 = 1024 * 1024;
@@ -87,8 +96,30 @@ const MAX_DRAINED_HOOK_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// `cvc ingest <harness> --hook`, for a harness this build has an adapter for.
 pub(crate) fn run_hook(harness: HarnessId) -> Result<()> {
     let started = crate::started();
-    harness::with_adapter(harness, Hook { started })
-        .unwrap_or_else(|| Err(super::super::harness::not_available(harness)))
+    harness::with_adapter(harness, Hook { started }).unwrap_or_else(|| {
+        Err(refuse_unavailable(
+            harness,
+            HookIo {
+                stdin: &mut io::stdin().lock(),
+                stdout: &mut io::stdout(),
+            },
+        ))
+    })
+}
+
+/// `cvc ingest <harness> --hook` for a harness this build has no adapter
+/// for: the payload is read off the pipe with the usual bound, the harness's
+/// static contract ([`HarnessId::hook_contract`]) is written, and the
+/// refusal is returned, for exit status 1.
+pub(crate) fn refuse_unavailable(harness: HarnessId, io: HookIo<'_>) -> anyhow::Error {
+    let HookIo { stdin, stdout } = io;
+    drop(read_payload(stdin));
+    ContractOut {
+        out: stdout,
+        written: false,
+    }
+    .emit(harness.hook_contract());
+    super::super::harness::not_available(harness)
 }
 
 struct Hook {
@@ -133,7 +164,8 @@ pub(crate) struct CaptureRun<'a> {
     pub(crate) request: &'a HookRequest,
     pub(crate) layout: &'a RepositoryLayout,
     /// The coverage the shell found, held through the adapter's own write
-    /// ([`cvc_core::harness::adapter::RecordSource::record_event`]). The engine asks for its own.
+    /// ([`cvc_core::harness::adapter::RecordSource::record_event`]). The
+    /// engine asks for its own.
     pub(crate) grant: CoverageGrant,
     pub(crate) foreign_env: Option<HarnessId>,
     pub(crate) finality: Finality,
@@ -156,6 +188,12 @@ pub(crate) struct EngineCapture;
 
 impl<A: HarnessAdapter> Capture<A> for EngineCapture {
     fn capture(&self, adapter: &A, run: CaptureRun<'_>) -> Result<Captured> {
+        // The adapter's one write before the engine is made only under a
+        // grant for its own channel.
+        anyhow::ensure!(
+            run.harness == A::ID && run.grant.channel() == A::ID.channel(),
+            "the capture acknowledgement was checked for another channel; nothing was recorded"
+        );
         let located = match adapter.admit_hook(run.request, run.layout, run.foreign_env)? {
             Admission::Ingest(located) => located,
             Admission::PassOver => return Ok(Captured::PassedOver),
@@ -225,10 +263,60 @@ impl ContractOut<'_> {
     }
 }
 
+thread_local! {
+    /// This thread is inside a hook run's catch: a panic is recorded by its
+    /// location only, and printed by no one.
+    static CATCHING: Cell<bool> = const { Cell::new(false) };
+    /// Where the last panic caught by a hook run on this thread was raised.
+    static PANICKED_AT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Installs, once per process, the panic hook of hook mode. A panic's message
+/// can carry what was being worked on (a slice of captured text, a transcript
+/// path in a `Debug` value), and an agent shows a hook's stderr to its user.
+/// Inside a hook run the hook records only cvc's source location of the
+/// panic and prints nothing; elsewhere it hands the panic to the hook it
+/// replaced.
+fn install_panic_hook() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if CATCHING.with(Cell::get) {
+                let at = info
+                    .location()
+                    .map(|location| format!("{}:{}", location.file(), location.line()));
+                PANICKED_AT.with(|panicked| *panicked.borrow_mut() = at);
+            } else {
+                previous(info);
+            }
+        }));
+    });
+}
+
+/// Marks this thread as catching for as long as it lives.
+struct Catching;
+
+impl Catching {
+    fn start() -> Self {
+        install_panic_hook();
+        PANICKED_AT.with(|panicked| panicked.borrow_mut().take());
+        CATCHING.with(|catching| catching.set(true));
+        Catching
+    }
+}
+
+impl Drop for Catching {
+    fn drop(&mut self) {
+        CATCHING.with(|catching| catching.set(false));
+    }
+}
+
 /// One hook run with `caller` (the adapter of `harness`) and `capture`, from
 /// `started`. `Ok` is exit status 0 and `Err` is 1: there is no other
 /// outcome, so the run never exits 2. A panic anywhere in the run is caught,
-/// the contract is still written, and the run fails with status 1.
+/// the contract is still written, and the run fails with status 1, saying
+/// only where in cvc's source it stopped.
 pub(crate) fn run_hook_with<C, K>(
     caller: &C,
     harness: HarnessId,
@@ -246,6 +334,7 @@ where
         out: stdout,
         written: false,
     };
+    let catching = Catching::start();
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         decide(caller, harness, capture, stdin, &mut out, env, started)
     }));
@@ -256,19 +345,33 @@ where
             .unwrap_or(OutputContract::Silent);
         out.emit(contract);
     }
+    let panicked_at = PANICKED_AT.with(|panicked| panicked.borrow_mut().take());
+    drop(catching);
     match outcome {
         Ok(result) => result,
-        Err(payload) => {
-            let what = payload
-                .downcast_ref::<&str>()
-                .map(|text| (*text).to_owned())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "no message".to_owned());
-            Err(anyhow!(
-                "cvc stopped on an internal error ({what}); this hook run recorded nothing more"
-            ))
-        }
+        Err(_) => Err(anyhow!(
+            "cvc stopped on an internal error at {}; this hook run recorded nothing more",
+            panicked_at.as_deref().unwrap_or("an unknown place")
+        )),
     }
+}
+
+/// The payload's top level, which must be a JSON object. What is wrong with
+/// it is said without quoting any of it.
+fn top_level(harness: HarnessId, raw: &[u8]) -> Result<Map<String, Value>, PayloadError> {
+    let detail = match serde_json::from_slice::<Value>(raw) {
+        Ok(Value::Object(object)) => return Ok(object),
+        Ok(other) => format!("it is {}, not an object", json_type(&other)),
+        Err(error) => format!(
+            "it is not JSON (line {}, column {})",
+            error.line(),
+            error.column()
+        ),
+    };
+    Err(PayloadError::Malformed {
+        harness: harness.display(),
+        detail,
+    })
 }
 
 fn decide<C, K>(
@@ -286,29 +389,38 @@ where
 {
     let input = read_payload(stdin);
     // Parsed leniently here: a payload that is not usable is reported below,
-    // once the repository is known to be CVC's.
-    let object = (input.read.is_ok() && !input.oversize)
-        .then(|| serde_json::from_slice::<Map<String, Value>>(&input.raw));
-    let request = match &object {
-        Some(Ok(object)) => Some(hook_request(caller, object.clone())),
-        _ => None,
+    // once the repository is known to be CVC's. A payload that could not be
+    // read or parsed is classified by the environment alone, so that it is
+    // covered too (see step 6). The caller is classified before the payload
+    // is handed to the request, which keeps it.
+    let parsed = (input.read.is_ok() && !input.oversize).then(|| top_level(harness, &input.raw));
+    let (verdict, request) = match parsed {
+        Some(Ok(object)) => {
+            let verdict = caller.classify(&object, env);
+            (verdict, Some(hook_request(caller, object)))
+        }
+        Some(Err(error)) => (caller.classify(&Map::new(), env), Some(Err(error))),
+        None => (caller.classify(&Map::new(), env), None),
     };
     let readable = request.as_ref().and_then(|request| request.as_ref().ok());
     out.emit(caller.contract(readable.and_then(|request| request.event.as_deref())));
-
-    // A payload that could not be read or parsed is classified by the
-    // environment alone, so that it is covered too (see step 6).
-    let verdict = match &object {
-        Some(Ok(object)) => caller.classify(object, env),
-        _ => caller.classify(&Map::new(), env),
-    };
     let foreign_env = match verdict {
         CallerVerdict::Foreign(_) => return Ok(()),
         CallerVerdict::Ours { foreign_env } => foreign_env,
     };
 
     let unknown = HookRequest::default();
-    let start = caller.start(readable.unwrap_or(&unknown), env);
+    let start = match caller.start(readable.unwrap_or(&unknown), env) {
+        // Read from the record only for an adapter whose start is there.
+        StartLocation::FromRecordStart(record) => match first_line_of(&record) {
+            Some(line) => match caller.start_from_first_entry(&line) {
+                StartLocation::FromRecordStart(_) => StartLocation::Unknown,
+                start => start,
+            },
+            None => StartLocation::Unknown,
+        },
+        start => start,
+    };
     let cwd = readable.and_then(|request| request.cwd.clone());
     let Some(layout) = recording_repository(start, cwd)? else {
         return Ok(());
@@ -327,16 +439,10 @@ where
     if input.oversize {
         bail!("hook payload exceeds 1 MiB");
     }
-    let request = match (object, request) {
-        (Some(Err(error)), _) => {
-            return Err(anyhow::Error::new(error).context(format!(
-                "hook payload is not the JSON {} delivers on stdin",
-                harness.display()
-            )))
-        }
-        (_, Some(Ok(request))) => request,
-        (_, Some(Err(error))) => return Err(error.into()),
-        (None, None) | (Some(Ok(_)), None) => bail!("hook payload was not read"),
+    let request = match request {
+        Some(Ok(request)) => request,
+        Some(Err(error)) => return Err(error.into()),
+        None => bail!("hook payload was not read"),
     };
     if !caller.wants(&request) {
         return Ok(());
@@ -366,6 +472,50 @@ where
         },
     )?;
     Ok(())
+}
+
+/// The most of a record's first line a start is read from.
+const MAX_FIRST_LINE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The first complete line of the record at `path`, for
+/// [`HookCaller::start_from_first_entry`], or `None` when there is none to
+/// read: the path is not a regular file (a link, a FIFO, a directory), it
+/// cannot be read, or its first line is longer than
+/// [`MAX_FIRST_LINE_BYTES`] or not finished yet. This is the one read of a
+/// record before the repository is known: bounded, kept in memory, and
+/// dropped by the caller as soon as the start is known.
+fn first_line_of(path: &Path) -> Option<Vec<u8>> {
+    let file = open_record(path)?;
+    let mut line = Vec::new();
+    io::BufReader::new(file.take(MAX_FIRST_LINE_BYTES))
+        .read_until(b'\n', &mut line)
+        .ok()?;
+    line.ends_with(b"\n").then_some(line)
+}
+
+/// `path` opened for reading if it is a regular file: on Unix without
+/// following a link, without blocking (a FIFO opens at once instead of
+/// waiting for a writer) and without becoming a controlling terminal, and
+/// checked on the handle opened.
+#[cfg(unix)]
+fn open_record(path: &Path) -> Option<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+#[cfg(not(unix))]
+fn open_record(path: &Path) -> Option<fs::File> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
 }
 
 /// What was read of a hook's stdin.

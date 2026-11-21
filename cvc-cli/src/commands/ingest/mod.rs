@@ -66,6 +66,17 @@ enum Target {
 
 pub(crate) async fn run(harness: HarnessId, args: IngestArgs) -> Result<()> {
     if !harness.available() {
+        if args.hook {
+            // The agent still gets the output it requires and its payload
+            // is read off the pipe.
+            return Err(shell::refuse_unavailable(
+                harness,
+                shell::HookIo {
+                    stdin: &mut std::io::stdin().lock(),
+                    stdout: &mut std::io::stdout(),
+                },
+            ));
+        }
         return Err(super::harness::not_available(harness));
     }
     if args.hook {
@@ -107,6 +118,21 @@ impl AdapterVisitor for Operator {
     type Output = Result<Vec<String>>;
 
     fn visit<A: HarnessAdapter>(self, adapter: &A) -> Result<Vec<String>> {
+        // A way of finding sessions the adapter does not offer is refused
+        // first, wherever this runs.
+        let unsupported = match &self.target {
+            Target::Session(_) if !adapter.locates_sessions() => {
+                Some("--session without --transcript")
+            }
+            Target::Scan if !adapter.scans() => Some("--scan"),
+            _ => None,
+        };
+        if let Some(what) = unsupported {
+            bail!(
+                "{what} is not supported for {}; pass --transcript",
+                A::ID.name()
+            );
+        }
         let layout = super::harness::discover_initialized_at(&self.directory)?;
         // The engine asks again before it reads; this is where the person is
         // told what is missing.
@@ -115,8 +141,11 @@ impl AdapterVisitor for Operator {
             A::ID,
             adapter.stop_hint(),
         )?);
-        // Located and screened before the store is opened: a record that is
-        // not this harness's, or not a regular file, leaves nothing behind.
+        // A record file is located and screened before the store is opened
+        // (`admit_file`): one that is not this harness's, or not a regular
+        // file, leaves nothing behind. An adapter that finds sessions by id
+        // or by scanning screens what it finds itself (see
+        // `RecordSource::locate_session` and `RecordSource::scan`).
         let located: Vec<Located<A::Source>> = match self.target {
             Target::File(path, id) => vec![adapter.admit_file(&path, id.as_deref())?],
             Target::Session(id) => vec![adapter.locate_session(&id, &layout)?],
