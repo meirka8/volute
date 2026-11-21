@@ -253,7 +253,7 @@ pub trait RecordSource {
     type Cursor: CursorCodec;
     /// What [`Planner::plan`] consumes.
     type Window;
-    type Error: std::error::Error + From<DbError>;
+    type Error: std::error::Error + From<DbError> + Send + Sync + 'static;
 
     /// The record a hook payload names.
     fn locate_hook(

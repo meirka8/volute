@@ -190,8 +190,23 @@ pub struct Plan<C> {
     pub first_prompt: Option<String>,
     /// Subagents and forks the window names, from exact evidence only.
     pub children: Vec<ChildRef>,
+    /// The parent this conversation's own record names (Codex
+    /// `session_meta.parent_thread_id`, OpenCode `session.parent_id`), from
+    /// exact evidence only.
+    pub parent: Option<ParentRef>,
     /// What the window held that this version does not record in full.
     pub drift: Drift,
+}
+
+/// The parent a conversation's own record names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentRef {
+    /// The agent's own id for the parent (not yet namespaced).
+    pub agent_id: String,
+    pub kind: RelationKind,
+    /// The agent's id for the call that spawned this conversation.
+    pub spawn_call_id: Option<String>,
+    pub evidence: RelationEvidence,
 }
 
 /// A title the agent's record gives its session.

@@ -152,6 +152,23 @@ pub(crate) fn capture_text(text: String, policy: &PreparedPolicy) -> CapturedTex
     }
 }
 
+/// How much of a prompt's first line a title derived from it keeps.
+pub(crate) const MAX_DERIVED_TITLE_BYTES: usize = 80;
+
+/// A title from the first non-blank line of `text` (a prompt, or what a
+/// record says a subagent is for). The line is scrubbed in full before it is
+/// cut, so a secret is redacted whole rather than cut in half; a line that
+/// cannot be scrubbed yields no title.
+pub(crate) fn derived_title(text: &str, policy: &PreparedPolicy) -> Option<String> {
+    let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
+    let line = policy.scrub(line).ok()?;
+    if line.len() <= MAX_DERIVED_TITLE_BYTES {
+        return Some(line);
+    }
+    let end = stimulus::head_len(&line, MAX_DERIVED_TITLE_BYTES);
+    Some(format!("{}…", &line[..end]))
+}
+
 /// A title from the transcript as it is captured, or `None` when it cannot be
 /// scrubbed.
 pub(crate) fn captured_title(title: &str, policy: &PreparedPolicy) -> Option<String> {

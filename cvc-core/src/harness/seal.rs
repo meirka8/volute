@@ -1,7 +1,7 @@
 //! Scrub, then bound, then mark: the one way a [`CaptureCandidate`] becomes a
 //! capture, for every harness.
 //!
-//! A planner hands everything over raw. [`seal`] runs each field through the
+//! A planner hands everything over raw. `seal` runs each field through the
 //! capture's own policy in full and only then bounds it (see
 //! [`crate::harness::fields`] for the bounds and the notes that stand in for
 //! what cannot be scrubbed), so a size limit never cuts a secret in half and
@@ -60,7 +60,6 @@ pub(crate) struct Sealed {
     /// that could not be scrubbed.
     pub omitted_context_items: usize,
     /// The text fields stored as the withheld note.
-    #[allow(dead_code)] // the engine's report counts them
     pub withheld: Vec<WithheldField>,
 }
 

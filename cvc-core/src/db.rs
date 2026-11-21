@@ -589,6 +589,14 @@ fn is_storable_cursor_state(state: &serde_json::Value, encoded: &str) -> bool {
     state.is_object() && encoded.len() <= MAX_CURSOR_STATE_BYTES && storable(state, 0)
 }
 
+/// Whether a typed cursor keyed `cursor_key` with `state` is within the
+/// limits a harness batch stores (see [`HarnessCursorWrite::state`]).
+pub(crate) fn is_storable_cursor(cursor_key: &str, state: &serde_json::Value) -> bool {
+    is_storable_identifier(cursor_key)
+        && serde_json::to_string(state)
+            .is_ok_and(|encoded| is_storable_cursor_state(state, &encoded))
+}
+
 /// Whether `value` is an identifier a harness batch may store in a side
 /// table: a safe identifier the built-in scrubber would not change.
 fn is_storable_identifier(value: &str) -> bool {
@@ -746,11 +754,18 @@ pub struct ConversationRelation {
 /// Everything one harness ingest batch commits for one conversation, in one
 /// immediate transaction: all of it or none of it.
 ///
-/// A batch is made only by [`HarnessBatch::new`], which requires a
-/// [`privacy::CoverageGrant`] for the harness's own channel; the store also
-/// checks that the grant was given for the repository it belongs to.
+/// A batch is made by [`HarnessBatch::new`], which takes a
+/// [`privacy::CoverageGrant`] for the harness's own channel and consumes it:
+/// a grant covers exactly one batch, and the store also checks that it was
+/// given for the repository it belongs to. Every harness other than Claude
+/// Code can write only this way.
+///
+/// The one other way is crate-private and Claude Code's alone: the batches of
+/// its 0.7.x-compatible entry points (`claude_code::ingest` and its
+/// variants), whose callers make the capture decision as they did in 0.7.x
+/// (cvc's CLI requires the acknowledgement before it calls them).
 pub struct HarnessBatch<'a> {
-    grant: &'a privacy::CoverageGrant,
+    grant: Option<privacy::CoverageGrant>,
     harness: HarnessId,
     conversation_id: &'a str,
     policy: &'a privacy::PreparedPolicy,
@@ -762,13 +777,13 @@ pub struct HarnessBatch<'a> {
 }
 
 impl<'a> HarnessBatch<'a> {
-    /// An empty batch of `harness` for `conversation_id`, under `grant`.
-    /// `policy` is the repository's capture policy, which the batch's
-    /// evidence must also pass. Refused when the grant covers another
-    /// channel than the harness's, or when the conversation id is not an
-    /// identifier the built-in scrubber would leave as it is.
+    /// An empty batch of `harness` for `conversation_id`, under `grant`,
+    /// which the batch consumes. `policy` is the repository's capture policy,
+    /// which the batch's evidence must also pass. Refused when the grant
+    /// covers another channel than the harness's, or when the conversation id
+    /// is not an identifier the built-in scrubber would leave as it is.
     pub fn new(
-        grant: &'a privacy::CoverageGrant,
+        grant: privacy::CoverageGrant,
         harness: HarnessId,
         conversation_id: &'a str,
         policy: &'a privacy::PreparedPolicy,
@@ -793,7 +808,7 @@ impl<'a> HarnessBatch<'a> {
                 )
             })?;
         Ok(Self {
-            grant,
+            grant: Some(grant),
             harness,
             conversation_id,
             policy,
@@ -803,6 +818,28 @@ impl<'a> HarnessBatch<'a> {
             evidence: Vec::new(),
             relations: Vec::new(),
         })
+    }
+
+    /// An empty Claude Code batch for the session conversation
+    /// `conversation_id`, without a grant: only for the 0.7.x-compatible
+    /// Claude Code entry points, whose callers decide capture as they did in
+    /// 0.7.x. Each capture still passes the capture boundary, which refuses
+    /// an unsafe conversation id, exactly as 0.7.x's batch did.
+    pub(crate) fn claude_code_caller_decided(
+        conversation_id: &'a str,
+        policy: &'a privacy::PreparedPolicy,
+    ) -> Self {
+        Self {
+            grant: None,
+            harness: HarnessId::ClaudeCode,
+            conversation_id,
+            policy,
+            captures: Vec::new(),
+            cursor: None,
+            legacy_cursor: None,
+            evidence: Vec::new(),
+            relations: Vec::new(),
+        }
     }
 
     /// The captures to store, each into the batch's conversation.
@@ -819,7 +856,8 @@ impl<'a> HarnessBatch<'a> {
 
     /// Claude Code only: the 0.7.x cursor row, kept written for older
     /// binaries that share this database. It is written exactly when the
-    /// typed cursor is (or when the batch has no typed cursor).
+    /// typed cursor is. A batch with no typed cursor writes it, and keeps the
+    /// typed copy of it as [`CvcStore::capture_claude_code_batch`] does.
     pub fn with_legacy_cursor(mut self, cursor: HarnessCursorUpdate<'a>) -> Self {
         self.legacy_cursor = Some(cursor);
         self
@@ -1160,8 +1198,14 @@ const HARNESS_TABLES_SQL: &str = "CREATE TABLE IF NOT EXISTS harness_cursors (ha
 const UPSERT_LEGACY_CURSOR_SQL: &str = "INSERT INTO harness_ingest_cursors(harness,session_id,transcript_path,byte_offset,updated_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(harness,session_id) DO UPDATE SET transcript_path=excluded.transcript_path, byte_offset=excluded.byte_offset, updated_at=excluded.updated_at";
 
 /// The typed copy of a Claude Code cursor that [`UPSERT_LEGACY_CURSOR_SQL`]
-/// wrote: the path and offset change, everything else the row holds stays.
+/// wrote, made or moved forward in its epoch: the path and offset change,
+/// everything else the row holds stays. Run only on no row or a `jsonl`
+/// version 1 row at or before the offset (see `mirror_claude_code_cursor_tx`).
 const MIRROR_CLAUDE_CODE_CURSOR_SQL: &str = "INSERT INTO harness_cursors(harness,cursor_key,kind,version,epoch,state,updated_at) VALUES (?1,?2,'jsonl',1,0,json_object('path',?3,'byte_offset',?4),?5) ON CONFLICT(harness,cursor_key) DO UPDATE SET state=json_set(harness_cursors.state,'$.path',?3,'$.byte_offset',?4), updated_at=?5";
+
+/// The typed copy of a Claude Code cursor row that went back: the next epoch
+/// of a `jsonl` version 1 row ahead of it (see `mirror_claude_code_cursor_tx`).
+const MIRROR_CLAUDE_CODE_CURSOR_NEXT_EPOCH_SQL: &str = "UPDATE harness_cursors SET epoch=epoch+1, state=json_object('path',?3,'byte_offset',?4,'epoch_reason','rewritten'), updated_at=?5 WHERE harness=?1 AND cursor_key=?2 AND kind='jsonl' AND version=1";
 
 impl CvcStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -2085,28 +2129,26 @@ impl CvcStore {
     /// skipped, never replaced: replacing would drop the commit links an earlier
     /// ingest has earned.
     ///
-    /// The cursor is written to the 0.7.x table exactly as 0.7.x writes it, and
-    /// mirrored into the typed `harness_cursors` row of the same session in the
-    /// same transaction (its path and offset; whatever else the row holds
-    /// stays).
+    /// The cursor is written to the 0.7.x table exactly as 0.7.x writes it,
+    /// and its typed copy in `harness_cursors` is kept in the same
+    /// transaction by the mirror rule (see `mirror_claude_code_cursor_tx`):
+    /// the copy never moves backwards within an epoch (an offset behind it
+    /// opens the next epoch, because only a rewritten transcript moves the
+    /// 0.7.x row back), and a typed row of another codec kind or version is
+    /// never spliced into.
+    ///
+    /// Like 0.7.x's, this batch carries no coverage grant: its caller makes
+    /// the capture decision. Claude Code ingestion itself goes through
+    /// [`Self::capture_harness_batch`].
     pub fn capture_claude_code_batch(
         &self,
         captures: Vec<crate::privacy::ClaudeCodeCapture>,
         cursor: HarnessCursorUpdate<'_>,
     ) -> Result<HarnessBatchOutcome> {
-        self.capture_claude_code_inputs(captures.into_iter().map(Into::into).collect(), cursor)
-    }
-
-    /// [`Self::capture_claude_code_batch`] of captures the seal made.
-    pub(crate) fn capture_claude_code_inputs(
-        &self,
-        captures: Vec<crate::privacy::HarnessCaptureInput>,
-        cursor: HarnessCursorUpdate<'_>,
-    ) -> Result<HarnessBatchOutcome> {
         let batch = PreparedHarnessBatch::prepare(
             captures
                 .into_iter()
-                .map(crate::privacy::HarnessCaptureInput::into_capture),
+                .map(crate::privacy::ClaudeCodeCapture::into_capture),
         );
         let byte_offset = i64::try_from(cursor.byte_offset)
             .map_err(|_| DbError::Migration("harness cursor offset overflows".into()))?;
@@ -2144,25 +2186,57 @@ impl CvcStore {
         Ok(())
     }
 
-    /// The typed copy of a Claude Code cursor. A cursor whose state would
-    /// not be within the typed table's limits (a session id or path that is
-    /// not storable) is not copied, and any earlier copy of it is removed: the
-    /// 0.7.x row stays the one that is read.
+    /// The typed copy of a Claude Code cursor row, kept by one rule:
+    ///
+    /// * no typed row yet: one is made, `jsonl` version 1 in epoch 0, holding
+    ///   `{path, byte_offset}`;
+    /// * a `jsonl` version 1 row whose offset is at or before this one: its
+    ///   path and offset follow, in its epoch, and whatever else it holds
+    ///   stays;
+    /// * a `jsonl` version 1 row ahead of this offset: the copy never moves
+    ///   backwards within an epoch, so it moves to the next epoch, holding
+    ///   `{path, byte_offset, epoch_reason: "rewritten"}` (Claude Code moves
+    ///   its 0.7.x row back only for a transcript rewritten or cut short);
+    /// * a row of another codec kind or version: left as it is, never spliced
+    ///   into.
+    ///
+    /// A cursor whose state would not be within the typed table's limits (a
+    /// session id or path that is not storable) is not copied, and an earlier
+    /// `jsonl` version 1 copy of it is removed: the 0.7.x row stays the one
+    /// that is read.
     fn mirror_claude_code_cursor_tx(
         tx: &Transaction<'_>,
         cursor: &HarnessCursorUpdate<'_>,
         byte_offset: i64,
         now: i64,
     ) -> Result<()> {
-        if !Self::is_mirrorable_cursor(cursor.session_id, cursor.transcript_path, byte_offset) {
-            tx.execute(
-                "DELETE FROM harness_cursors WHERE harness=?1 AND cursor_key=?2",
+        let stored: Option<(String, i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT kind, version, json_extract(state,'$.byte_offset') FROM harness_cursors WHERE harness=?1 AND cursor_key=?2",
                 params![cursor.harness, cursor.session_id],
-            )?;
+                |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<i64>>(2).ok().flatten())),
+            )
+            .optional()?;
+        let ours = |kind: &str, version: i64| kind == "jsonl" && version == 1;
+        if !Self::is_mirrorable_cursor(cursor.session_id, cursor.transcript_path, byte_offset) {
+            if matches!(&stored, Some((kind, version, _)) if ours(kind, *version)) {
+                tx.execute(
+                    "DELETE FROM harness_cursors WHERE harness=?1 AND cursor_key=?2",
+                    params![cursor.harness, cursor.session_id],
+                )?;
+            }
             return Ok(());
         }
+        let sql = match &stored {
+            None => MIRROR_CLAUDE_CODE_CURSOR_SQL,
+            Some((kind, version, offset)) if ours(kind, *version) => match offset {
+                Some(offset) if byte_offset >= *offset => MIRROR_CLAUDE_CODE_CURSOR_SQL,
+                _ => MIRROR_CLAUDE_CODE_CURSOR_NEXT_EPOCH_SQL,
+            },
+            Some(_) => return Ok(()),
+        };
         tx.execute(
-            MIRROR_CLAUDE_CODE_CURSOR_SQL,
+            sql,
             params![
                 cursor.harness,
                 cursor.session_id,
@@ -2395,7 +2469,14 @@ impl CvcStore {
     /// stand-ins included, exactly as [`Self::capture_claude_code_batch`]
     /// does), the typed cursor (never moved backwards), the Claude Code legacy
     /// cursor, conversation relations and durable commit evidence, in one
-    /// immediate transaction.
+    /// immediate transaction. The batch's coverage grant is consumed with it.
+    ///
+    /// The Claude Code legacy cursor is written exactly when the typed cursor
+    /// is; a batch that carries only the legacy cursor writes it and keeps
+    /// its typed copy by the mirror rule of
+    /// [`Self::capture_claude_code_batch`], so the typed copy never moves
+    /// backwards within an epoch and never splices into a row of another
+    /// codec kind or version.
     ///
     /// Refused as a whole, before anything is stored, when the batch is not
     /// consistent: a coverage grant for another repository, a capture of
@@ -2426,9 +2507,17 @@ impl CvcStore {
             relations,
         } = batch;
         let refuse = |rule: &str| Err(DbError::HarnessBatch(rule.into()));
-        if grant.channel() != harness.channel() || !grant.binds_store(&self.path) {
-            return refuse("the coverage grant is not for this harness and repository");
+        match &grant {
+            Some(grant) => {
+                if grant.channel() != harness.channel() || !grant.binds_store(&self.path) {
+                    return refuse("the coverage grant is not for this harness and repository");
+                }
+            }
+            // Only `HarnessBatch::claude_code_caller_decided` makes one.
+            None if harness == HarnessId::ClaudeCode => {}
+            None => return refuse("a batch without a coverage grant records nothing"),
         }
+        drop(grant);
         if captures
             .iter()
             .any(|c| c.harness() != harness || c.conversation_id() != conversation_id)
@@ -2519,6 +2608,9 @@ impl CvcStore {
                 (&legacy_cursor, legacy_offset, cursor_written)
             {
                 Self::write_legacy_cursor_tx(tx, legacy, offset, now)?;
+                if cursor.is_none() {
+                    Self::mirror_claude_code_cursor_tx(tx, legacy, offset, now)?;
+                }
             }
             // Relations first: the family an evidence row names may be the
             // one a relation of this batch records.
@@ -3309,7 +3401,26 @@ impl CvcStore {
         self.floating_interactions(Some(capture_worktree))
     }
 
+    /// [`Self::get_floating_interactions_for_worktree`], of one capture
+    /// source only when `capture_source` names one (a harness family rescue
+    /// claims only its own harness's rows).
+    pub(crate) fn floating_interactions_of_source(
+        &self,
+        capture_worktree: &str,
+        capture_source: Option<&str>,
+    ) -> Result<Vec<Interaction>> {
+        self.floating_interactions_where(Some(capture_worktree), capture_source)
+    }
+
     fn floating_interactions(&self, capture_worktree: Option<&str>) -> Result<Vec<Interaction>> {
+        self.floating_interactions_where(capture_worktree, None)
+    }
+
+    fn floating_interactions_where(
+        &self,
+        capture_worktree: Option<&str>,
+        capture_source: Option<&str>,
+    ) -> Result<Vec<Interaction>> {
         // Interactions that are NOT in artifact_links
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.conversation_id, i.parent_id, i.timestamp, i.author, i.user_prompt,
@@ -3317,10 +3428,11 @@ impl CvcStore {
              FROM interactions i
              LEFT JOIN artifact_links al ON i.id = al.interaction_id
              WHERE al.interaction_id IS NULL
-               AND (?1 IS NULL OR i.capture_worktree IS NULL OR i.capture_worktree = ?1)",
+               AND (?1 IS NULL OR i.capture_worktree IS NULL OR i.capture_worktree = ?1)
+               AND (?2 IS NULL OR i.capture_source = ?2)",
         )?;
 
-        let rows = stmt.query_map(params![capture_worktree], |row| {
+        let rows = stmt.query_map(params![capture_worktree, capture_source], |row| {
             let parent_id_str: Option<String> = row.get(2)?;
             let timestamp: i64 = row.get(3)?;
             let author_str: String = row.get(4)?;
@@ -5133,8 +5245,8 @@ mod harness_batch_tests {
     const WORKTREE: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     /// A grant for `harness`'s channel that binds no repository (tests only).
-    fn grant(harness: HarnessId) -> &'static CoverageGrant {
-        Box::leak(Box::new(CoverageGrant::for_tests(harness.channel())))
+    fn grant(harness: HarnessId) -> CoverageGrant {
+        CoverageGrant::for_tests(harness.channel())
     }
 
     fn policy() -> &'static PreparedPolicy {
@@ -5251,17 +5363,31 @@ mod harness_batch_tests {
 
     #[test]
     fn harness_batches_require_a_grant_for_the_harness_channel() {
-        let codex = grant(HarnessId::Codex);
+        let codex = || grant(HarnessId::Codex);
         assert!(matches!(
-            HarnessBatch::new(codex, HarnessId::OpenCode, "opencode:s", policy()),
+            HarnessBatch::new(codex(), HarnessId::OpenCode, "opencode:s", policy()),
             Err(DbError::HarnessBatch(_))
         ));
-        let vscode: &'static CoverageGrant =
-            Box::leak(Box::new(CoverageGrant::for_tests(PassiveChannel::Vscode)));
+        let vscode = CoverageGrant::for_tests(PassiveChannel::Vscode);
         assert!(HarnessBatch::new(vscode, HarnessId::ClaudeCode, "s1", policy()).is_err());
-        assert!(HarnessBatch::new(codex, HarnessId::Codex, "codex:t", policy()).is_ok());
+        assert!(HarnessBatch::new(codex(), HarnessId::Codex, "codex:t", policy()).is_ok());
         // The conversation id must be one the built-in scrubber leaves as it is.
-        assert!(HarnessBatch::new(codex, HarnessId::Codex, "codex:a b", policy()).is_err());
+        assert!(HarnessBatch::new(codex(), HarnessId::Codex, "codex:a b", policy()).is_err());
+    }
+
+    /// Without a grant only Claude Code's caller-decided batch records, and
+    /// only through its own constructor; any other harness's batch is refused.
+    #[test]
+    fn a_batch_without_a_grant_is_claude_code_caller_decided_only() {
+        let store = CvcStore::open(":memory:").unwrap();
+        let b = HarnessBatch::claude_code_caller_decided("s1", policy())
+            .with_captures(vec![capture(HarnessId::ClaudeCode, "s1", "req_1")]);
+        assert_eq!(store.capture_harness_batch(b).unwrap().inserted, 1);
+        let mut forged = HarnessBatch::claude_code_caller_decided("codex:t", policy())
+            .with_captures(vec![capture(HarnessId::Codex, "codex:t", "resp:a")]);
+        forged.harness = HarnessId::Codex;
+        refused(store.capture_harness_batch(forged));
+        assert!(store.get_conversation("codex:t").unwrap().is_none());
     }
 
     /// A grant given for one repository records nothing into another's store.
@@ -5270,24 +5396,24 @@ mod harness_batch_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
         privacy::acknowledge_capture(&repo).unwrap();
-        let claude = privacy::require_coverage(&repo, HarnessId::ClaudeCode.channel()).unwrap();
+        let claude = || privacy::require_coverage(&repo, HarnessId::ClaudeCode.channel()).unwrap();
 
         let own_path = dir.path().join(".git").join("cvc").join("index.db");
         let own = CvcStore::open(&own_path).unwrap();
-        let b = HarnessBatch::new(&claude, HarnessId::ClaudeCode, "s1", policy())
+        let b = HarnessBatch::new(claude(), HarnessId::ClaudeCode, "s1", policy())
             .unwrap()
             .with_captures(vec![capture(HarnessId::ClaudeCode, "s1", "req_1")]);
         assert_eq!(own.capture_harness_batch(b).unwrap().inserted, 1);
 
         let other = tempfile::TempDir::new().unwrap();
         let other_store = CvcStore::open(other.path().join("cvc").join("index.db")).unwrap();
-        let b = HarnessBatch::new(&claude, HarnessId::ClaudeCode, "s1", policy())
+        let b = HarnessBatch::new(claude(), HarnessId::ClaudeCode, "s1", policy())
             .unwrap()
             .with_captures(vec![capture(HarnessId::ClaudeCode, "s1", "req_2")]);
         refused(other_store.capture_harness_batch(b));
         assert!(other_store.get_conversation("s1").unwrap().is_none());
         let memory = CvcStore::open(":memory:").unwrap();
-        let b = HarnessBatch::new(&claude, HarnessId::ClaudeCode, "s1", policy()).unwrap();
+        let b = HarnessBatch::new(claude(), HarnessId::ClaudeCode, "s1", policy()).unwrap();
         refused(memory.capture_harness_batch(b));
     }
 
@@ -5613,15 +5739,28 @@ mod harness_batch_tests {
             .unwrap()
             .unwrap();
         assert_eq!(typed.updated_at, legacy.updated_at);
-        // What else a later codec keeps in the row stays; the offset follows
-        // the legacy row, even when it goes back (a rewritten transcript).
+        // Forward in its epoch, what else the row holds stays.
         store
             .conn
             .execute(
-                "UPDATE harness_cursors SET state=json_set(state,'$.carry','kept') WHERE cursor_key='s1'",
+                "UPDATE harness_cursors SET state=json_set(state,'$.last_ordinal',7) WHERE cursor_key='s1'",
                 [],
             )
             .unwrap();
+        store
+            .capture_claude_code_batch(Vec::new(), update("/t.jsonl", 12))
+            .unwrap();
+        let typed = store
+            .harness_cursor(HarnessId::ClaudeCode, "s1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (typed.epoch, typed.state["byte_offset"].clone()),
+            (0, 12.into())
+        );
+        assert_eq!(typed.state["last_ordinal"], 7);
+        // Back (a rewritten transcript): never within the epoch; the next
+        // epoch holds the new offset and says why.
         store
             .capture_claude_code_batch(Vec::new(), update("/t.jsonl", 3))
             .unwrap();
@@ -5629,8 +5768,19 @@ mod harness_batch_tests {
             .harness_cursor(HarnessId::ClaudeCode, "s1")
             .unwrap()
             .unwrap();
-        assert_eq!(typed.state["byte_offset"], 3);
-        assert_eq!(typed.state["carry"], "kept");
+        assert_eq!(typed.epoch, 1);
+        assert_eq!(
+            typed.state,
+            serde_json::json!({"path": "/t.jsonl", "byte_offset": 3, "epoch_reason": "rewritten"})
+        );
+        assert_eq!(
+            store
+                .harness_ingest_cursor("claude-code", "s1")
+                .unwrap()
+                .unwrap()
+                .byte_offset,
+            3
+        );
         // A path outside the typed limits is kept in the 0.7.x row only.
         let long = format!("/{}", "p".repeat(MAX_CURSOR_STRING_BYTES));
         store
@@ -5644,7 +5794,76 @@ mod harness_batch_tests {
             .harness_ingest_cursor("claude-code", "s1")
             .unwrap()
             .unwrap();
-        assert_eq!((legacy.transcript_path, legacy.byte_offset), (long, 4));
+        assert_eq!(
+            (legacy.transcript_path.as_str(), legacy.byte_offset),
+            (long.as_str(), 4)
+        );
+
+        // A typed row of another codec kind or version is never spliced into
+        // (nor removed); the 0.7.x row is written as always.
+        for (kind, version) in [("spool", 1), ("jsonl", 2)] {
+            store
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO harness_cursors(harness,cursor_key,kind,version,epoch,state,updated_at) VALUES ('claude-code','s2',?1,?2,0,'{\"assembled_through\":9}',1)",
+                    params![kind, version],
+                )
+                .unwrap();
+            for offset in [50, 1] {
+                store
+                    .capture_claude_code_batch(
+                        Vec::new(),
+                        HarnessCursorUpdate {
+                            session_id: "s2",
+                            ..update("/t.jsonl", offset)
+                        },
+                    )
+                    .unwrap();
+                let typed = store
+                    .harness_cursor(HarnessId::ClaudeCode, "s2")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    (typed.kind.as_str(), typed.version, typed.epoch),
+                    (kind, version, 0)
+                );
+                assert_eq!(typed.state, serde_json::json!({"assembled_through": 9}));
+                assert_eq!(
+                    store
+                        .harness_ingest_cursor("claude-code", "s2")
+                        .unwrap()
+                        .unwrap()
+                        .byte_offset,
+                    offset
+                );
+            }
+        }
+    }
+
+    /// A harness batch that carries only the Claude Code legacy cursor keeps
+    /// the typed copy by the same rule.
+    #[test]
+    fn a_legacy_only_harness_batch_keeps_the_typed_copy() {
+        let store = CvcStore::open(":memory:").unwrap();
+        let legacy = |offset| HarnessCursorUpdate {
+            harness: "claude-code",
+            session_id: "s1",
+            transcript_path: "/t.jsonl",
+            byte_offset: offset,
+        };
+        for (offset, epoch) in [(10, 0), (20, 0), (5, 1)] {
+            let b = HarnessBatch::claude_code_caller_decided("s1", policy())
+                .with_legacy_cursor(legacy(offset));
+            store.capture_harness_batch(b).unwrap();
+            let typed = store
+                .harness_cursor(HarnessId::ClaudeCode, "s1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (typed.epoch, typed.state["byte_offset"].as_u64()),
+                (epoch, Some(offset))
+            );
+        }
     }
 
     #[test]

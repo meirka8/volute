@@ -937,7 +937,11 @@ pub fn capture_covers(repo: &git2::Repository, channel: PassiveChannel) -> Resul
 /// harness batches require it ([`crate::db::HarnessBatch::new`]): a store
 /// records a harness batch only for the channel and the repository the
 /// grant names.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A grant is neither `Clone` nor `Copy`: a batch consumes the one it is
+/// given, so every batch asks again, and a withdrawn acknowledgement stops
+/// the very next batch.
+#[derive(Debug)]
 pub struct CoverageGrant {
     channel: PassiveChannel,
     /// The canonical common Git directory of the repository it was given
