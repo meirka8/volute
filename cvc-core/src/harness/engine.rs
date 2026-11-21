@@ -74,7 +74,7 @@ use crate::repository::{RepositoryLayout, RepositoryLayoutError};
 use chrono::Utc;
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// How one run reads.
@@ -206,6 +206,27 @@ pub fn ingest<A: HarnessAdapter>(
     located: Located<A::Source>,
     options: EngineOptions,
 ) -> Result<EngineReport<A::Cursor>, EngineError<A::Error>> {
+    ingest_until(adapter, layout, store, policy, located, options, None)
+}
+
+/// [`ingest`] for a run that must end by `deadline`: a hook's start plus its
+/// harness's budget ([`HookCaller::budget`](crate::harness::adapter::HookCaller::budget)).
+/// `None` is an operator's run, which has no limit.
+///
+/// The deadline is not enforced yet: every run reads to the end of its
+/// records in one batch per conversation, exactly as [`ingest`] does. The
+/// batched ingest of #149 stops between batches once it is near.
+pub fn ingest_until<A: HarnessAdapter>(
+    adapter: &A,
+    layout: &RepositoryLayout,
+    store: &CvcStore,
+    policy: &PreparedPolicy,
+    located: Located<A::Source>,
+    options: EngineOptions,
+    deadline: Option<Instant>,
+) -> Result<EngineReport<A::Cursor>, EngineError<A::Error>> {
+    // Accepted, not acted on, until the batched ingest of #149.
+    let _ = deadline;
     run(
         adapter,
         layout,

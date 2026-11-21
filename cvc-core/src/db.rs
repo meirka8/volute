@@ -1271,6 +1271,23 @@ impl CvcStore {
         Ok(!done)
     }
 
+    /// Whether the one-time `capture_source` rebuild still has to run here
+    /// and never will in this version: the `interactions` table has columns
+    /// this version does not know, so it is left as it is (nothing in it can
+    /// be lost) and its own constraint keeps refusing the newer harnesses'
+    /// captures. Only a later cvc can upgrade such a store.
+    pub fn capture_source_upgrade_blocked(&self) -> Result<bool> {
+        if !self.needs_capture_source_upgrade()? {
+            return Ok(false);
+        }
+        let columns: Vec<String> = self
+            .conn
+            .prepare("PRAGMA table_info(interactions)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(columns != INTERACTION_COLUMNS)
+    }
+
     /// Atomically consumes the exact per-destination share/publication authority,
     /// creates a pending suppression record, and deletes the local projection.
     /// Repeating an already-created matching tombstone is intentionally harmless.
@@ -4937,6 +4954,31 @@ mod trusted_api_tests {
     use super::*;
     use crate::models::{CaptureSource, Evidence};
     use crate::privacy::{McpCapture, PreparedPolicy};
+
+    /// An upgrade still to run is blocked only when this version will never
+    /// run it: the table has a column it does not know.
+    #[test]
+    fn an_upgrade_is_blocked_only_by_columns_this_version_does_not_know() {
+        let store = CvcStore::open(":memory:").unwrap();
+        assert!(!store.needs_capture_source_upgrade().unwrap());
+        assert!(!store.capture_source_upgrade_blocked().unwrap());
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM cvc_internal_migrations WHERE name=?1",
+                params![CAPTURE_SOURCE_TRIGGERS_MARKER],
+            )
+            .unwrap();
+        assert!(store.needs_capture_source_upgrade().unwrap());
+        assert!(!store.capture_source_upgrade_blocked().unwrap());
+
+        store
+            .conn
+            .execute_batch("ALTER TABLE interactions ADD COLUMN future_column TEXT")
+            .unwrap();
+        assert!(store.capture_source_upgrade_blocked().unwrap());
+    }
 
     /// One thought from `source` into `conversation_id`, carrying `title` for
     /// its conversation, as the source's front would hand it to the store.

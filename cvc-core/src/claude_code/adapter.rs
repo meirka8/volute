@@ -29,10 +29,10 @@ use super::settings;
 use super::transcript::{self, FirstEntry, ParsedLine, TitleSource, HARNESS};
 use crate::db::{CvcStore, DbError, StoredHarnessCursor};
 use crate::harness::adapter::{
-    CallerVerdict, FamilyRead, HarnessStatus, HookCaller, HookEnv, HookRequest, InstallAction,
-    InstallContext, InstallOutcome, InstallScope, Installer, LegacyCursor, Located, OutputContract,
-    PayloadError, Planner, Read, ReadContext, RecordSource, Resume, Sniff, StartLocation,
-    UninstallOutcome,
+    Admission, CallerVerdict, FamilyRead, HarnessStatus, HookCaller, HookEnv, HookEvent,
+    HookRequest, InstallAction, InstallContext, InstallOutcome, InstallScope, Installer,
+    LegacyCursor, Located, OutputContract, PayloadError, Planner, Read, ReadContext, RecordSource,
+    Resume, Sniff, StartLocation, UninstallOutcome,
 };
 use crate::harness::candidate::{
     CaptureCandidate, ConversationRole, Finality, Plan, PlanInput, TitleHint, TitleRank,
@@ -134,6 +134,18 @@ impl Source {
         &self.path
     }
 
+    /// A path that holds something other than a regular file (a link, a
+    /// FIFO, a directory) is refused when it is opened, before anything else
+    /// is decided about it: the error the open recorded is returned here
+    /// rather than by the first read. Any other failure to open is still
+    /// left to the read.
+    fn refuse_non_regular(&mut self) -> Result<(), IngestError> {
+        if let Handle::Failed(error @ Some(IngestError::NotRegularFile(_))) = &mut self.handle {
+            return Err(error.take().expect("matched above"));
+        }
+        Ok(())
+    }
+
     fn file(&mut self) -> Result<&mut fs::File, IngestError> {
         if matches!(self.handle, Handle::Unopened) {
             self.handle = match open_transcript_start(&self.path) {
@@ -233,8 +245,13 @@ impl HookCaller for Adapter {
     }
 
     fn request(&self, payload: Map<String, Value>) -> Result<HookRequest, PayloadError> {
-        let payload: HookPayload = serde_json::from_value(Value::Object(payload))
-            .map_err(|_| PayloadError::NotTheShape("Claude Code"))?;
+        let payload: HookPayload =
+            serde_json::from_value(Value::Object(payload)).map_err(|error| {
+                PayloadError::Malformed {
+                    harness: "Claude Code",
+                    detail: error.to_string(),
+                }
+            })?;
         let non_empty = |value: Option<String>| value.filter(|value| !value.is_empty());
         Ok(HookRequest {
             event: payload.hook_event_name,
@@ -243,7 +260,20 @@ impl HookCaller for Adapter {
             cwd: non_empty(payload.cwd).map(PathBuf::from),
             subagent: payload.agent_id,
             roots: Vec::new(),
+            extra: Map::new(),
         })
+    }
+
+    /// Claude Code always sends both; the session's id first, as 0.7.x
+    /// reported it.
+    fn check_complete(&self, request: &HookRequest) -> Result<(), PayloadError> {
+        if request.session.is_none() {
+            return Err(PayloadError::Missing("session_id"));
+        }
+        if request.record.is_none() {
+            return Err(PayloadError::Missing("transcript_path"));
+        }
+        Ok(())
     }
 
     /// The directory the session was started in. Unset (an older Claude
@@ -339,6 +369,57 @@ impl RecordSource for Adapter {
             Ok(FirstEntry::NoCompleteEntry) => Sniff::NotYet,
             Ok(FirstEntry::Undetermined) | Err(_) => Sniff::Undetermined,
         }
+    }
+
+    /// The transcript is opened once, here: what is not a regular file is
+    /// refused, then its first complete entry decides (see [`hook_verdict`]),
+    /// and only then is the session id checked. The same handle is read by
+    /// the engine.
+    fn admit_hook(
+        &self,
+        request: &HookRequest,
+        _layout: &RepositoryLayout,
+        foreign_env: Option<HarnessId>,
+    ) -> Result<Admission<Source>, IngestError> {
+        let session = request
+            .session
+            .as_deref()
+            .ok_or(PayloadError::Missing("session_id"))?;
+        let record = request
+            .record
+            .as_deref()
+            .ok_or(PayloadError::Missing("transcript_path"))?;
+        let mut source = Source::open(record);
+        source.refuse_non_regular()?;
+        match hook_verdict(self.sniff(&source), foreign_env.is_some(), record, session) {
+            HookVerdict::Ingest => {}
+            HookVerdict::PassOver => return Ok(Admission::PassOver),
+            HookVerdict::Refuse => return Err(IngestError::NotClaudeCode(record.to_path_buf())),
+        }
+        Ok(Admission::Ingest(
+            self.locate_opened(source, Some(session))?,
+        ))
+    }
+
+    /// As [`Self::admit_hook`], for an operator: another agent's transcript
+    /// is always refused, and nothing is passed over.
+    fn admit_file(&self, path: &Path, id: Option<&str>) -> Result<Located<Source>, IngestError> {
+        let mut source = Source::open(path);
+        source.refuse_non_regular()?;
+        if self.sniff(&source) == Sniff::NotOurs {
+            return Err(IngestError::NotClaudeCode(path.to_path_buf()));
+        }
+        self.locate_opened(source, id)
+    }
+
+    /// Claude Code's own transcript is the record: a hook event adds nothing
+    /// to it, so nothing is written before the engine.
+    fn record_event(
+        &self,
+        _request: &HookRequest,
+        _event: &HookEvent<'_>,
+    ) -> Result<(), IngestError> {
+        Ok(())
     }
 
     fn initial_cursor(&self, located: &Located<Source>) -> JsonlCursor {
@@ -597,6 +678,47 @@ impl Installer for Adapter {
     }
 }
 
+/// What a hook run does with a transcript, given how it begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookVerdict {
+    /// Ingest it: the parser's own checks report whatever they find.
+    Ingest,
+    /// Do nothing, in silence, without opening the store.
+    PassOver,
+    /// Fail with [`IngestError::NotClaudeCode`], without opening the store.
+    Refuse,
+}
+
+/// What a hook run does with `transcript`, for `session`, given that it
+/// begins as `first` says (#189).
+///
+/// A hook passes another agent's transcript over in silence only when
+/// something besides its first line says the run is not Claude Code's own:
+/// `CURSOR_VERSION` is set (`cursor_env`), or the file is not named for the
+/// session, as Claude Code names its transcripts `<session_id>.jsonl`.
+/// Otherwise it refuses it, visibly, so that a foreign-shaped line put at the
+/// top of a session's own transcript cannot silence that session. Under
+/// Cursor, a hook also passes over a transcript with no complete entry yet,
+/// which the next event reads. Everything else is ingested, so that the
+/// parser's own checks (the version pinning among them) report what they
+/// find.
+fn hook_verdict(first: Sniff, cursor_env: bool, transcript: &Path, session: &str) -> HookVerdict {
+    match first {
+        Sniff::NotOurs if cursor_env || !named_for_session(transcript, session) => {
+            HookVerdict::PassOver
+        }
+        Sniff::NotOurs => HookVerdict::Refuse,
+        Sniff::NotYet if cursor_env => HookVerdict::PassOver,
+        Sniff::Ours | Sniff::NotYet | Sniff::Undetermined => HookVerdict::Ingest,
+    }
+}
+
+/// Whether `transcript` is named `<session>.<extension>`, as Claude Code names
+/// a session's transcript.
+fn named_for_session(transcript: &Path, session: &str) -> bool {
+    transcript.file_stem() == Some(std::ffi::OsStr::new(session))
+}
+
 fn only_checkout(scope: InstallScope) -> anyhow::Result<()> {
     if scope != InstallScope::Checkout {
         anyhow::bail!("Claude Code's hooks are installed per checkout only");
@@ -828,9 +950,21 @@ mod tests {
             ))
             .unwrap();
         assert!(!adapter.wants(&subagent));
+        // What the decoder said is kept, as 0.7.x printed it after the
+        // context.
         assert_eq!(
             adapter.request(payload(r#"{"session_id":7}"#)),
-            Err(PayloadError::NotTheShape("Claude Code"))
+            Err(PayloadError::Malformed {
+                harness: "Claude Code",
+                detail: "invalid type: integer `7`, expected a string".into()
+            })
+        );
+        assert_eq!(
+            adapter
+                .request(payload(r#"{"session_id":7}"#))
+                .unwrap_err()
+                .to_string(),
+            "hook payload is not the JSON Claude Code delivers on stdin: invalid type: integer `7`, expected a string"
         );
         assert_eq!(
             PayloadError::NotTheShape("Claude Code").to_string(),
@@ -840,6 +974,160 @@ mod tests {
             PayloadError::Missing("session_id").to_string(),
             "hook payload has no session_id"
         );
+    }
+
+    /// A session id and a transcript path, in that order, as 0.7.x reported
+    /// their absence; and no payload key reaches `extra`, since Claude Code
+    /// allow-lists none.
+    #[test]
+    fn a_hook_request_needs_a_session_and_a_transcript_and_keeps_no_other_key() {
+        let adapter = Adapter;
+        let complete = |json: &str| {
+            let request = crate::harness::adapter::hook_request(&adapter, payload(json)).unwrap();
+            assert!(request.extra.is_empty(), "{json}");
+            adapter.check_complete(&request)
+        };
+        assert_eq!(
+            complete(r#"{"session_id":"s","transcript_path":"/t","user_email":"x"}"#),
+            Ok(())
+        );
+        for (json, missing) in [
+            (r#"{"transcript_path":"/t"}"#, "session_id"),
+            (r#"{"session_id":"","transcript_path":"/t"}"#, "session_id"),
+            (r#"{}"#, "session_id"),
+            (r#"{"session_id":"s"}"#, "transcript_path"),
+            (
+                r#"{"session_id":"s","transcript_path":""}"#,
+                "transcript_path",
+            ),
+        ] {
+            assert_eq!(
+                complete(json),
+                Err(PayloadError::Missing(missing)),
+                "{json}"
+            );
+        }
+    }
+
+    /// #189's rule, moved here from the CLI with its vectors.
+    #[test]
+    fn a_hook_passes_another_agents_transcript_over_only_when_corroborated() {
+        const SESSION_ID: &str = "00000000-0000-4000-8000-0000000000a1";
+        let own = Path::new("/x/00000000-0000-4000-8000-0000000000a1.jsonl");
+        let elsewhere =
+            Path::new("/x/agent-transcripts/00000000-0000-4000-8000-0000000000c1.jsonl");
+        let verdict = |cursor_env, first, path| hook_verdict(first, cursor_env, path, SESSION_ID);
+
+        // Corroborated: the variable, or a file not named for the session.
+        assert_eq!(
+            verdict(false, Sniff::NotOurs, elsewhere),
+            HookVerdict::PassOver
+        );
+        assert_eq!(
+            verdict(true, Sniff::NotOurs, elsewhere),
+            HookVerdict::PassOver
+        );
+        assert_eq!(verdict(true, Sniff::NotOurs, own), HookVerdict::PassOver);
+        // The session's own file, with nothing else to go by: visible.
+        assert_eq!(verdict(false, Sniff::NotOurs, own), HookVerdict::Refuse);
+        assert_eq!(
+            verdict(
+                false,
+                Sniff::NotOurs,
+                Path::new("/x/00000000-0000-4000-8000-0000000000a1")
+            ),
+            HookVerdict::Refuse,
+            "a stem with no extension"
+        );
+        for cursor_env in [false, true] {
+            for path in [own, elsewhere] {
+                // A Claude Code transcript, and one only the parser can judge,
+                // reach the parser, whose version pinning must stay loud.
+                assert_eq!(verdict(cursor_env, Sniff::Ours, path), HookVerdict::Ingest);
+                assert_eq!(
+                    verdict(cursor_env, Sniff::Undetermined, path),
+                    HookVerdict::Ingest
+                );
+            }
+        }
+        assert_eq!(verdict(false, Sniff::NotYet, own), HookVerdict::Ingest);
+        assert_eq!(verdict(true, Sniff::NotYet, own), HookVerdict::PassOver);
+    }
+
+    /// The transcript is opened once and screened before anything is read
+    /// past its first entry: a path that is not a regular file is refused,
+    /// another agent's transcript is refused for an operator and, for a
+    /// hook, passed over only when corroborated; the session id is checked
+    /// last.
+    #[cfg(unix)]
+    #[test]
+    fn records_are_screened_before_the_store_is_opened() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let session = "00000000-0000-4000-8000-0000000000a1";
+        let own = temp.path().join(format!("{session}.jsonl"));
+        let cursor_line = "{\"role\":\"user\",\"message\":{\"content\":\"hi\"}}\n";
+        fs::write(&own, cursor_line).unwrap();
+        let adapter = Adapter;
+        let layout_dir = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(layout_dir.path()).unwrap();
+        let layout = RepositoryLayout::discover(layout_dir.path()).unwrap();
+        let request = |record: &Path, session: &str| HookRequest {
+            session: Some(session.into()),
+            record: Some(record.to_path_buf()),
+            ..HookRequest::default()
+        };
+
+        assert!(matches!(
+            adapter.admit_file(&own, None),
+            Err(IngestError::NotClaudeCode(path)) if path == own
+        ));
+        assert!(matches!(
+            adapter.admit_hook(&request(&own, session), &layout, None),
+            Err(IngestError::NotClaudeCode(_))
+        ));
+        assert!(matches!(
+            adapter.admit_hook(&request(&own, session), &layout, Some(HarnessId::Cursor)),
+            Ok(Admission::PassOver)
+        ));
+        // Passed over before the session id is looked at.
+        assert!(matches!(
+            adapter.admit_hook(&request(&own, "not safe"), &layout, Some(HarnessId::Cursor)),
+            Ok(Admission::PassOver)
+        ));
+
+        let link = temp.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&own, &link).unwrap();
+        for result in [
+            adapter.admit_file(&link, None).map(drop),
+            adapter
+                .admit_hook(&request(&link, session), &layout, Some(HarnessId::Cursor))
+                .map(drop),
+        ] {
+            assert!(
+                matches!(&result, Err(IngestError::NotRegularFile(path)) if *path == link),
+                "{result:?}"
+            );
+        }
+
+        // A Claude Code transcript is located, with its session checked.
+        let claude = temp.path().join("claude.jsonl");
+        fs::write(&claude, "{\"type\":\"ai-title\"}\n").unwrap();
+        assert!(matches!(
+            adapter.admit_hook(&request(&claude, "not safe"), &layout, None),
+            Err(IngestError::InvalidSession(_))
+        ));
+        match adapter.admit_hook(&request(&claude, session), &layout, None) {
+            Ok(Admission::Ingest(located)) => assert_eq!(located.conversation_id, session),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            adapter.admit_file(&claude, None).unwrap().conversation_id,
+            "claude"
+        );
+        // A missing transcript is left to the read, which reports it.
+        assert!(adapter
+            .admit_file(&temp.path().join("absent.jsonl"), None)
+            .is_ok());
     }
 
     #[test]
