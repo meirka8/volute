@@ -9,15 +9,18 @@
 //! its own conversation, and once all of them are, one rescue links the
 //! family's floating responses to the commits any of them created (see
 //! [`links`]).
-use super::fields;
 use super::links;
 use super::session_lock::{SessionLock, SESSION_LOCK_WAIT};
 use super::transcript::{
     self, FirstEntry, ParsedLine, PlanInput, TranscriptError, FIRST_ENTRY_BYTES, HARNESS,
 };
 use crate::db::{CvcStore, DbError, HarnessCursorUpdate, HARNESS_REASONS_SHOWN};
-use crate::models::{Conversation, Interaction, InteractionId};
-use crate::privacy::{self, ClaudeCodeCapture, PreparedPolicy};
+use crate::harness::candidate::CaptureCandidate;
+use crate::harness::fields;
+use crate::harness::seal::{seal, SealContext};
+use crate::harness::HarnessId;
+use crate::models::{Conversation, InteractionId};
+use crate::privacy::{self, PreparedPolicy};
 use crate::repository::{RepositoryLayout, RepositoryLayoutError};
 use crate::stimulus;
 use chrono::Utc;
@@ -591,6 +594,12 @@ fn ingest_target(run: &Run<'_>, target: &Target<'_>) -> Result<Ingested, IngestE
     let mut omitted_tool_calls = 0usize;
     let mut omitted_context_items = 0usize;
     let mut commit_bearing: Vec<links::CommitBearingResponse> = Vec::new();
+    let seal_context = SealContext {
+        harness: HarnessId::ClaudeCode,
+        conversation: &conversation,
+        policy,
+        capture_worktree: &capture_worktree,
+    };
     for planned in plan.interactions {
         if !planned.commit_candidates.is_empty() {
             commit_bearing.push(links::CommitBearingResponse {
@@ -605,61 +614,24 @@ fn ingest_target(run: &Run<'_>, target: &Target<'_>) -> Result<Ingested, IngestE
         }
         unrecorded_blocks += planned.unrecorded_blocks.len();
         unrecorded_block_types.extend(planned.unrecorded_blocks.iter().cloned());
-        // Scrubbed part by part with this capture's policy, then bounded and
-        // marked: see `crate::stimulus`.
-        let user_prompt = planned.user_prompt(policy);
         // A parent outside this batch and outside the store (suppressed, or
         // never recorded) breaks the chain rather than failing the batch.
-        let parent_id = match planned.parent_id {
+        let parent_id = match planned.parent_id.clone() {
             Some(parent) if batch_ids.contains(&parent) || store.interaction_exists(&parent)? => {
                 Some(parent)
             }
             _ => None,
         };
-        // The model's text, its reasoning and the tool arguments are scrubbed
-        // in full here, with the capture's policy, and only then bounded; one
-        // the scrubber cannot process is recorded as a note instead of failing
-        // the batch and holding the cursor back: see `fields`.
-        let model_cot = planned
-            .model_cot
-            .map(|text| fields::captured_text(text, policy));
-        let model_response = planned
-            .model_response
-            .map(|text| fields::captured_text(text, policy));
-        // The same for the paths and the calls, which are also capped at what the
-        // capture boundary takes (a response with more would otherwise keep the
-        // cursor from moving): see `fields`.
-        let (context_items, left_out_context_items) =
-            fields::captured_context_items(planned.context_items, policy);
-        let (tool_executions, left_out_tool_calls) = fields::captured_tool_executions(
-            planned.tool_executions,
-            left_out_context_items,
-            &planned.id,
-            policy,
-        );
-        omitted_tool_calls += left_out_tool_calls;
-        omitted_context_items += left_out_context_items;
-        let interaction = Interaction {
-            id: planned.id.clone(),
-            conversation_id: target.conversation_id.to_owned(),
-            parent_id,
-            timestamp: planned.timestamp,
-            author: planned.author,
-            user_prompt,
-            model_name: planned.model_name,
-            model_cot,
-            model_response,
-            source_request_id: Some(planned.response_key),
-        };
-        batch_ids.insert(planned.id);
-        captures.push(ClaudeCodeCapture::new(
-            conversation.clone(),
-            interaction,
-            context_items,
-            tool_executions,
-            policy.clone(),
-            capture_worktree.clone(),
-        ));
+        // Every field is scrubbed in full with this capture's policy, then
+        // bounded; one the scrubber cannot process is recorded as a note
+        // instead of failing the batch and holding the cursor back: see
+        // `crate::harness::seal`.
+        let id = planned.id.clone();
+        let sealed = seal(CaptureCandidate::from(planned), parent_id, &seal_context);
+        omitted_tool_calls += sealed.omitted_tool_calls;
+        omitted_context_items += sealed.omitted_context_items;
+        batch_ids.insert(id);
+        captures.push(sealed.capture);
     }
 
     // A rescan reads from the start, so the plan may end earlier than where an
@@ -670,7 +642,7 @@ fn ingest_target(run: &Run<'_>, target: &Target<'_>) -> Result<Ingested, IngestE
     } else {
         plan.cursor_offset
     };
-    let outcome = store.capture_claude_code_batch(
+    let outcome = store.capture_claude_code_inputs(
         captures,
         HarnessCursorUpdate {
             harness: HARNESS,

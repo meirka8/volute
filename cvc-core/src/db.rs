@@ -2094,10 +2094,19 @@ impl CvcStore {
         captures: Vec<crate::privacy::ClaudeCodeCapture>,
         cursor: HarnessCursorUpdate<'_>,
     ) -> Result<HarnessBatchOutcome> {
+        self.capture_claude_code_inputs(captures.into_iter().map(Into::into).collect(), cursor)
+    }
+
+    /// [`Self::capture_claude_code_batch`] of captures the seal made.
+    pub(crate) fn capture_claude_code_inputs(
+        &self,
+        captures: Vec<crate::privacy::HarnessCaptureInput>,
+        cursor: HarnessCursorUpdate<'_>,
+    ) -> Result<HarnessBatchOutcome> {
         let batch = PreparedHarnessBatch::prepare(
             captures
                 .into_iter()
-                .map(crate::privacy::ClaudeCodeCapture::into_capture),
+                .map(crate::privacy::HarnessCaptureInput::into_capture),
         );
         let byte_offset = i64::try_from(cursor.byte_offset)
             .map_err(|_| DbError::Migration("harness cursor offset overflows".into()))?;

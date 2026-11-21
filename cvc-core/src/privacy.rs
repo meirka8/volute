@@ -2575,7 +2575,6 @@ capture_type!(
 /// chosen by a front.
 pub struct HarnessCaptureInput(Capture);
 impl HarnessCaptureInput {
-    #[allow(dead_code)] // the first adapter on the generic path arrives with the harness registry
     pub(crate) fn new(
         harness: HarnessId,
         conversation: Conversation,
@@ -3364,7 +3363,7 @@ mod tests {
     /// a provider summary's marker, whatever the repository's rules match.
     #[test]
     fn reasoning_markers_survive_the_capture_boundary_and_the_final_scrub() {
-        use crate::reasoning::{mark, read, ReasoningKind};
+        use crate::reasoning::{mark, read, ReasoningKind, SealedText};
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
             dir.path().join(".thoughtignore"),
@@ -3376,7 +3375,7 @@ mod tests {
         let marked = mark(
             &id,
             ReasoningKind::ProviderSummary,
-            "a summary of cvc work".into(),
+            SealedText::for_tests("a summary of cvc work"),
         );
         let capture = Capture {
             conversation: Conversation {
