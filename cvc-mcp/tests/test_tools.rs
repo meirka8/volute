@@ -500,6 +500,47 @@ async fn test_an_ordinary_conversation_id_is_still_recorded() {
     }
 }
 
+/// What the client is told when the id it chose is under a prefix reserved
+/// for an agent harness's own capture.
+const RESERVED_PREFIX_ERROR: &str = "Invalid 'conversation_id': the prefixes 'claude-code:', 'codex:', 'opencode:', 'cursor:', 'antigravity:' (in any letter case) are reserved for the capture of those agent harnesses; choose an id that does not start with one.";
+
+#[tokio::test]
+async fn test_a_conversation_id_under_a_reserved_harness_prefix_is_refused_early() {
+    let (dir, state) = make_state();
+    start_session(&state, "test-client").unwrap();
+
+    // Only a harness's own capture (and a pull) may create a conversation
+    // under its prefix, so an MCP client cannot pass one off as a Codex or
+    // Cursor session; look-alikes in another letter case are reserved too.
+    for id in [
+        "codex:thread-1",
+        "opencode:ses_1",
+        "cursor:c1",
+        "antigravity:a1",
+        "claude-code:s1",
+        "Codex:thread-1",
+        "CURSOR:c1",
+        "codex:",
+    ] {
+        let error = call_tool(commit_thought_in(id), state.clone())
+            .await
+            .expect_err(&format!("{id:?} was accepted"));
+        assert_eq!(error.code, -32602, "{id:?}");
+        assert_eq!(error.message, RESERVED_PREFIX_ERROR, "{id:?}");
+    }
+    assert!(fixture_store(dir.path())
+        .get_floating_interactions()
+        .unwrap()
+        .is_empty());
+
+    // A harness's name elsewhere in an id reserves nothing.
+    for id in ["my-codex:1", "codex-session", "session:cursor:1"] {
+        call_tool(commit_thought_in(id), state.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{id:?} was refused: {}", error.message));
+    }
+}
+
 #[tokio::test]
 async fn test_spaces_and_other_characters_outside_the_capture_rule_are_refused() {
     let (dir, state) = make_state();
