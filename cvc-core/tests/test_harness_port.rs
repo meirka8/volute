@@ -606,3 +606,56 @@ fn claude_codes_typed_cursor_opens_an_epoch_instead_of_moving_back() {
     );
     assert_eq!(fourth.inserted, 0, "nothing is recorded twice");
 }
+
+/// A typed row of another codec kind or version for a Claude Code session (a
+/// newer cvc wrote it, then the user went back to this one) is left as it
+/// is, and the session's 0.7.x row advances exactly as without it: Claude
+/// Code reads where to resume from that row, so its cursor keeps moving.
+#[test]
+fn claude_codes_cursor_advances_beside_a_typed_row_it_cannot_read() {
+    let clean = Fixture::new(Ack::None);
+    let expected = clean.ingest_claude_code(&clean.basic_transcript());
+
+    for (kind, version) in [("spool", 1), ("jsonl", 2)] {
+        let fixture = Fixture::new(Ack::None);
+        let foreign = r#"{"assembled_through":9}"#;
+        fixture
+            .conn()
+            .execute(
+                "INSERT INTO harness_cursors(harness,cursor_key,kind,version,epoch,state,updated_at) VALUES ('claude-code',?1,?2,?3,4,?4,1)",
+                params![BASIC_SESSION, kind, version, foreign],
+            )
+            .unwrap();
+        let typed_row = || -> (String, i64, i64, String, i64) {
+            fixture
+                .conn()
+                .query_row(
+                    "SELECT kind, version, epoch, state, updated_at FROM harness_cursors WHERE cursor_key=?1",
+                    params![BASIC_SESSION],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .unwrap()
+        };
+        let before = typed_row();
+
+        let path = fixture.basic_transcript();
+        let report = fixture.ingest_claude_code(&path);
+        assert_eq!(report, expected, "{kind} {version}");
+        let legacy = fixture
+            .store
+            .harness_ingest_cursor("claude-code", BASIC_SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.byte_offset, expected.cursor, "{kind} {version}");
+        assert_eq!(typed_row(), before, "{kind} {version}: never spliced into");
+
+        // The next run resumes from the 0.7.x row: nothing again.
+        let again = fixture.ingest_claude_code(&path);
+        assert_eq!(
+            (again.inserted, again.cursor),
+            (0, expected.cursor),
+            "{kind} {version}"
+        );
+        assert_eq!(typed_row(), before, "{kind} {version}");
+    }
+}

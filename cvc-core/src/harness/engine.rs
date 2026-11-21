@@ -6,20 +6,28 @@
 //! 1. Coverage first. Unless the run is one of Claude Code's 0.7.x-compatible
 //!    entry points (see below), the repository's capture acknowledgement must
 //!    cover the harness's own channel ([`privacy::require_coverage`]) before
-//!    any record is read; a channel it does not cover reads nothing, records
-//!    nothing and moves no cursor.
+//!    the lock is taken, and again before each conversation's record is
+//!    read; a channel it does not cover reads nothing, records nothing and
+//!    moves no cursor.
 //! 2. The family's lock ([`crate::harness::lock`]), on the family root, held
 //!    until the run returns.
 //! 3. The root's record, then each member the adapter's
-//!    [`RecordSource::family`](crate::harness::adapter::RecordSource::family) names, each into its own conversation, each in
-//!    one immediate transaction ([`CvcStore::capture_harness_batch`]): its new
-//!    captures, its cursor, and the relations its record names. Every batch
-//!    asks for a fresh [`privacy::CoverageGrant`] and consumes it.
+//!    [`RecordSource::family`](crate::harness::adapter::RecordSource::family)
+//!    names, each into its own conversation, each in one immediate
+//!    transaction ([`CvcStore::capture_harness_batch`]): its new captures, its
+//!    cursor, and the relations its record names. Each conversation obtains
+//!    its own [`privacy::CoverageGrant`] before its record is read, and its
+//!    batch consumes it.
 //! 4. One commit rescue over the whole family
-//!    ([`crate::harness::family::link_family_commits`]). If a member fails,
-//!    the rescue still runs over what was ingested (the root's cursor is
-//!    already past its committing response, which would never be read
-//!    again), and the member's error is returned.
+//!    ([`crate::harness::family::link_family_commits`]), from the commits
+//!    named by the conversations whose batches committed: a member that
+//!    failed contributes no evidence. If a member fails, the rescue still runs
+//!    over what was ingested (the root's cursor is already past its
+//!    committing response, which would never be read again), and the
+//!    member's error is returned. The rescue writes links, so on the gated
+//!    path it runs only while the acknowledgement still covers the channel:
+//!    it is skipped when coverage no longer holds, or when a member failed
+//!    because it did not.
 //!
 //! # Cursors
 //!
@@ -29,6 +37,14 @@
 //! evidence that the record was replaced ([`Resume::replaced`](crate::harness::adapter::Resume::replaced),
 //! [`Read::replaced`](crate::harness::adapter::Read::replaced)), the cursor opens the next epoch of the one stored;
 //! otherwise the store keeps a stored cursor that is ahead.
+//!
+//! # A typed cursor of another codec
+//!
+//! A stored typed row that the adapter's codec cannot read (another kind, a
+//! later version) is never overwritten in its epoch. For Claude Code, whose
+//! 0.7.x row is the cursor it resumes from, such a row is left alone and the
+//! batch writes the 0.7.x row as 0.7.x does, so the session's cursor keeps
+//! advancing beside a typed row a newer cvc wrote.
 //!
 //! # Claude Code
 //!
@@ -82,9 +98,12 @@ pub struct TargetReport<C> {
     pub already_present: usize,
     /// Responses still open.
     pub pending: usize,
-    /// The cursor the batch committed, or offered when the store kept the
-    /// stored one ([`Self::cursor_held`]).
+    /// Where the next read of this conversation resumes: the cursor the
+    /// batch committed, or the stored one when the store kept it
+    /// ([`Self::cursor_held`]).
     pub cursor: C,
+    /// The store kept a stored cursor that is ahead of the one this run
+    /// offered, so the cursor did not move.
     pub cursor_held: bool,
     /// How long the record was, as far as the read saw.
     pub record_len: Option<u64>,
@@ -117,6 +136,9 @@ pub struct EngineReport<C> {
     pub members: Vec<TargetReport<C>>,
     /// The links the family's commit rescue made.
     pub linked: FamilyLinks,
+    /// The rescue did not run: the acknowledgement no longer covered the
+    /// harness's channel when it was due.
+    pub rescue_skipped: bool,
 }
 
 /// Why a run failed. Nothing of the conversation whose batch failed was
@@ -245,7 +267,8 @@ fn run<A: HarnessAdapter>(
         return Err(EngineError::Unregistered(A::ID));
     }
     if consent == Consent::Covered {
-        // Before anything is read; each batch asks again.
+        // Before the lock is waited for; each conversation asks again before
+        // its record is read.
         drop(privacy::require_coverage(
             layout.repository(),
             A::ID.channel(),
@@ -285,8 +308,11 @@ fn run<A: HarnessAdapter>(
         capture_worktree: &capture_worktree,
     };
 
+    // Only the evidence of conversations whose batches committed.
     let mut commit_bearing = Vec::new();
-    let root = ingest_target(adapter, &run, &mut located, &mut commit_bearing)?;
+    let root = ingest_target(adapter, &run, &mut located)?;
+    commit_bearing.extend(root.commit_bearing);
+    let root = root.report;
     // Whatever happens to the members, the root is in the store now, so the
     // family is rescued before the outcome is returned.
     let (family, members, mut failure) = match adapter.family(&located, store) {
@@ -299,15 +325,29 @@ fn run<A: HarnessAdapter>(
     };
     let mut reports = Vec::new();
     for mut member in members {
-        match ingest_target(adapter, &run, &mut member, &mut commit_bearing) {
-            Ok(report) => reports.push(report),
+        match ingest_target(adapter, &run, &mut member) {
+            Ok(target) => {
+                commit_bearing.extend(target.commit_bearing);
+                reports.push(target.report);
+            }
             Err(error) => {
                 failure = Some(error);
                 break;
             }
         }
     }
-    let linked = rescue(&run, &family, &commit_bearing);
+    // The rescue writes links: on the gated path, only while the channel is
+    // still covered.
+    let rescue_skipped = consent == Consent::Covered
+        && (matches!(
+            failure,
+            Some(EngineError::Privacy(PrivacyError::NotCovered(_)))
+        ) || !privacy::capture_covers(layout.repository(), A::ID.channel()).unwrap_or(false));
+    let linked = if rescue_skipped {
+        Ok(FamilyLinks::default())
+    } else {
+        rescue(&run, &family, &commit_bearing)
+    };
     if let Some(error) = failure {
         return Err(error);
     }
@@ -315,7 +355,15 @@ fn run<A: HarnessAdapter>(
         root,
         members: reports,
         linked: linked?,
+        rescue_skipped,
     })
+}
+
+/// One conversation's committed batch: its report, and the responses of the
+/// batch that reported creating commits.
+struct Target<C> {
+    report: TargetReport<C>,
+    commit_bearing: Vec<CommitBearingResponse>,
 }
 
 /// Rescues the responses the time-window linker cannot reach: those that
@@ -347,20 +395,30 @@ fn rescue<E: std::error::Error + Send + Sync + 'static>(
 }
 
 /// Ingests one conversation's record in one batch. The commit links of its
-/// responses are left to [`rescue`].
+/// responses are left to [`rescue`], which gets them only once the batch has
+/// committed.
 fn ingest_target<A: HarnessAdapter>(
     adapter: &A,
     run: &Run<'_>,
     located: &mut Located<A::Source>,
-    commit_bearing: &mut Vec<CommitBearingResponse>,
-) -> Result<TargetReport<A::Cursor>, EngineError<A::Error>> {
+) -> Result<Target<A::Cursor>, EngineError<A::Error>> {
     let Run { store, policy, .. } = *run;
+    // Before anything of the conversation is read.
+    let grant = match run.consent {
+        Consent::Covered => Some(privacy::require_coverage(
+            run.layout.repository(),
+            A::ID.channel(),
+        )?),
+        Consent::CallerDecided => None,
+    };
     let key = located.conversation_id.clone();
     let stored = store.harness_cursor(A::ID, &key)?;
     let resume = adapter.resume(located, stored.as_ref(), store)?;
     let previous = stored
         .as_ref()
         .and_then(|stored| A::Cursor::decode_stored(stored).ok());
+    // A typed row this codec cannot read: another kind, or a later version.
+    let foreign = stored.is_some() && previous.is_none();
     let read = adapter
         .read(
             &mut located.source,
@@ -430,6 +488,7 @@ fn ingest_target<A: HarnessAdapter>(
     let mut withheld_fields = 0usize;
     let mut omitted_tool_calls = 0usize;
     let mut omitted_context_items = 0usize;
+    let mut commit_bearing = Vec::new();
     for candidate in plan.candidates {
         if !candidate.commit_candidates.is_empty() {
             commit_bearing.push(CommitBearingResponse {
@@ -521,11 +580,17 @@ fn ingest_target<A: HarnessAdapter>(
 
     let state = cursor.encode();
     let legacy = adapter.legacy_cursor(&cursor);
-    // Claude Code keeps 0.7.x's row whatever the typed table can hold; a typed
-    // cursor outside the table's limits is then left to the store's mirror
-    // rule, as 0.7.x's batch left it. Any other harness's cursor goes to the
-    // store, which refuses one outside its limits.
-    let typed = legacy.is_none() || db::is_storable_cursor(&key, &state);
+    // An adapter with a 0.7.x row (Claude Code) resumes from that row, so it
+    // writes it whatever the typed table holds: when the typed row is another
+    // codec's, or the typed cursor is outside the table's limits, the batch
+    // carries the 0.7.x row alone, and the store's mirror rule leaves another
+    // codec's row as it is. Any other harness's cursor goes to the store,
+    // which keeps a stored cursor it cannot read and refuses one outside its
+    // limits.
+    let typed = match &legacy {
+        None => true,
+        Some(_) => !foreign && db::is_storable_cursor(&key, &state),
+    };
     let offered = cursor.clone();
     let progress = |stored: &StoredHarnessCursor| match A::Cursor::decode_stored(stored) {
         Ok(stored) => match offered.progress(&stored) {
@@ -536,15 +601,11 @@ fn ingest_target<A: HarnessAdapter>(
         // A cursor this codec cannot read is never overwritten in its epoch.
         Err(_) => CursorProgress::Backward,
     };
-    let batch = match run.consent {
-        Consent::Covered => HarnessBatch::new(
-            privacy::require_coverage(run.layout.repository(), A::ID.channel())?,
-            A::ID,
-            &key,
-            policy,
-        )?,
-        // The store refuses captures of any other harness in this batch.
-        Consent::CallerDecided => HarnessBatch::claude_code_caller_decided(&key, policy),
+    let batch = match grant {
+        Some(grant) => HarnessBatch::new(grant, A::ID, &key, policy)?,
+        // Claude Code's 0.7.x-compatible entry points only; the store refuses
+        // captures of any other harness in this batch.
+        None => HarnessBatch::claude_code_caller_decided(&key, policy),
     };
     let mut batch = batch.with_captures(captures).with_relations(relations);
     if typed {
@@ -566,14 +627,24 @@ fn ingest_target<A: HarnessAdapter>(
         });
     }
     let outcome = store.capture_harness_batch(batch)?;
+    // A batch that carried a typed cursor and had it kept did not move the
+    // cursor this harness resumes from: report the one the next read resumes
+    // from. (A batch with the 0.7.x row alone always writes that row.)
+    let cursor_held = typed && outcome.cursor_held;
+    let cursor = if cursor_held {
+        let stored = store.harness_cursor(A::ID, &key)?;
+        adapter.resume(located, stored.as_ref(), store)?.from
+    } else {
+        cursor
+    };
 
-    Ok(TargetReport {
+    let report = TargetReport {
         conversation_id: key,
         inserted: outcome.inserted,
         already_present: already_present + outcome.suppressed,
         pending: plan.pending,
         cursor,
-        cursor_held: outcome.cursor_held,
+        cursor_held,
         record_len: read.record_len,
         unrecorded,
         drift: plan.drift,
@@ -585,6 +656,10 @@ fn ingest_target<A: HarnessAdapter>(
         omitted_context_items,
         relations_recorded: outcome.relations_recorded,
         relations_skipped,
+    };
+    Ok(Target {
+        report,
+        commit_bearing,
     })
 }
 

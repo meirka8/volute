@@ -13,9 +13,9 @@
 //! as an acknowledgement given by a build that can capture Codex would.
 use crate::db::{CvcStore, DbError, RelationEvidence, RelationKind, StoredHarnessCursor};
 use crate::harness::adapter::{
-    CallerVerdict, HarnessStatus, HookCaller, HookEnv, HookRequest, InstallContext, InstallOutcome,
-    InstallScope, Installer, Located, OutputContract, PayloadError, Planner, Read, ReadContext,
-    RecordSource, Sniff, StartLocation, UninstallOutcome,
+    CallerVerdict, FamilyRead, HarnessStatus, HookCaller, HookEnv, HookRequest, InstallContext,
+    InstallOutcome, InstallScope, Installer, Located, OutputContract, PayloadError, Planner, Read,
+    ReadContext, RecordSource, Sniff, StartLocation, UninstallOutcome,
 };
 use crate::harness::candidate::{
     CaptureCandidate, ChildRef, ConversationRole, Finality, Plan, PlanInput, Reasoning,
@@ -26,6 +26,7 @@ use crate::harness::drift::{
     Drift, DriftError, DriftRule, FormatPin, MalformedLine, PlaceholderStyle,
 };
 use crate::harness::engine::{self, EngineError, EngineOptions, EngineReport};
+use crate::harness::family::Family;
 use crate::harness::{derived_interaction_id, test_registry, HarnessId, PassiveChannel};
 use crate::models::Author;
 use crate::privacy::{self, CaptureCoverage, PreparedPolicy, PrivacyError};
@@ -146,6 +147,37 @@ impl RecordSource for Fake {
     }
     fn initial_cursor(&self, located: &Located<PathBuf>) -> JsonlCursor {
         JsonlCursor::start(located.source.to_string_lossy())
+    }
+    /// The recorded family, and as members to read in this run the ones
+    /// whose `<agent id>.member.jsonl` is beside the root's record. A
+    /// `withdraw-coverage` file there names a `privacy.json` whose Codex
+    /// coverage is withdrawn now: a test's hook between the root's batch and
+    /// the rest of the run.
+    fn family(
+        &self,
+        root: &Located<PathBuf>,
+        store: &CvcStore,
+    ) -> Result<FamilyRead<PathBuf>, FakeError> {
+        let family = Family::from_relations(store, Self::ID, &root.family_root)?;
+        let directory = root.source.parent().unwrap();
+        if let Ok(privacy_json) = fs::read_to_string(directory.join("withdraw-coverage")) {
+            withdraw_codex(Path::new(privacy_json.trim()));
+        }
+        let members = family
+            .members()
+            .filter_map(|id| {
+                let agent = id.strip_prefix("codex:")?;
+                let source = directory.join(format!("{agent}.member.jsonl"));
+                source.exists().then(|| Located {
+                    conversation_id: id.to_owned(),
+                    family_root: root.family_root.clone(),
+                    role: ConversationRole::Subagent,
+                    source,
+                    title_seed: None,
+                })
+            })
+            .collect();
+        Ok(FamilyRead { family, members })
     }
     fn read(
         &self,
@@ -317,6 +349,17 @@ fn at(seconds: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// Removes Codex from the channels the acknowledgement in `privacy_json`
+/// covers.
+fn withdraw_codex(privacy_json: &Path) {
+    let mut state: Value = serde_json::from_slice(&fs::read(privacy_json).unwrap()).unwrap();
+    state["capture_acknowledged_channels"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|channel| channel != "codex");
+    fs::write(privacy_json, serde_json::to_vec(&state).unwrap()).unwrap();
+}
+
 /// How much of the capture acknowledgement a fixture has.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ack {
@@ -469,6 +512,36 @@ impl Fixture {
         self.count(&format!(
             "SELECT COUNT(*) FROM artifact_links WHERE interaction_id='{id}'"
         )) > 0
+    }
+
+    /// Codex coverage is withdrawn once the root's batch has committed.
+    fn withdraw_after_the_root(&self) {
+        fs::write(
+            self.root.join("withdraw-coverage"),
+            self.layout
+                .cvc_dir()
+                .join("privacy.json")
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .unwrap();
+    }
+
+    /// A row another source recorded in `conversation`, which keeps the fake
+    /// from recording into it.
+    fn foreign_row(&self, conversation: &str, id: &str, seconds: i64) {
+        let worktree = self.layout.worktree_origin().unwrap();
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR IGNORE INTO conversations(id,title,created_at) VALUES (?1,'t',?2)",
+            params![conversation, T0],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO interactions(id,conversation_id,timestamp,author,user_prompt,capture_source,scrubber_version,capture_worktree) VALUES (?1,?2,?3,'agent','an mcp thought','mcp',1,?4)",
+            params![id, conversation, T0 + seconds, worktree],
+        )
+        .unwrap();
     }
 }
 
@@ -652,15 +725,8 @@ fn the_family_rescue_claims_only_its_own_harness_rows() {
     fixture.ingest(&child, "c1").unwrap();
     // A row another source recorded in the subagent's conversation (as a
     // 0.7.x MCP client could), floating, in this worktree, before the commit.
-    let worktree = fixture.layout.worktree_origin().unwrap();
     let mcp = "6b1f0c0e-1111-4aaa-8bbb-000000000042";
-    fixture
-        .conn()
-        .execute(
-            "INSERT INTO interactions(id,conversation_id,timestamp,author,user_prompt,capture_source,scrubber_version,capture_worktree) VALUES (?1,'codex:c1',?2,'agent','an mcp thought','mcp',1,?3)",
-            params![mcp, T0 + 15, worktree],
-        )
-        .unwrap();
+    fixture.foreign_row("codex:c1", mcp, 15);
     // The root names the subagent and the commit it made.
     let sha = fixture.commit(100);
     let mut committing = response("resp:r", 30);
@@ -730,4 +796,117 @@ fn an_uncovered_channel_captures_nothing_and_moves_no_cursor() {
 fn a_registered_harness_cannot_be_registered_again() {
     assert!(crate::harness::registered_adapter(HarnessId::ClaudeCode).is_some());
     test_registry::register::<crate::claude_code::Adapter>();
+}
+
+/// A member whose batch fails contributes no commit evidence: its commit
+/// links nothing, not even the root's floating reasoning before it.
+#[test]
+fn a_failing_members_commit_links_nothing() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let sha = fixture.commit(100);
+    let mut root = response("resp:r", 30);
+    root["child"] = json!("c1");
+    let root = fixture.record("r1", &[root]);
+    let mut committing = response("resp:c", 40);
+    committing["commit"] = json!(sha);
+    fixture.record("c1.member", &[committing]);
+    // The member's conversation holds another source's row, so its batch is
+    // refused.
+    fixture.foreign_row("codex:c1", "6b1f0c0e-1111-4aaa-8bbb-000000000043", 5);
+
+    let error = fixture.ingest(&root, "r1").unwrap_err();
+    assert!(
+        matches!(error, EngineError::Db(DbError::HarnessBatch(_))),
+        "{error:?}"
+    );
+    assert!(fixture
+        .store
+        .interaction_exists(&derived_interaction_id(
+            HarnessId::Codex,
+            "codex:r1",
+            "resp:r"
+        ))
+        .unwrap());
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM artifact_links"), 0);
+}
+
+/// Each conversation obtains its grant before its record is read: an
+/// uncovered channel reads nothing, so a record that cannot be read is never
+/// even tried.
+#[test]
+fn an_uncovered_channel_reads_nothing() {
+    let missing = |fixture: &Fixture| fixture.root.join("absent.jsonl");
+    let uncovered = Fixture::new(Ack::Legacy);
+    assert!(matches!(
+        uncovered.ingest(&missing(&uncovered), "t1"),
+        Err(EngineError::Privacy(PrivacyError::NotCovered(_)))
+    ));
+    // Covered, the same record is read, and its absence is what fails.
+    let covered = Fixture::new(Ack::WithCodex);
+    assert!(matches!(
+        covered.ingest(&missing(&covered), "t1"),
+        Err(EngineError::Adapter(FakeError::Io(_)))
+    ));
+}
+
+/// Coverage withdrawn after the root's batch: the next member reads nothing
+/// (its record is a directory, which a read would fail on), the run fails
+/// with the coverage it found, and the rescue, which writes links, does not
+/// run: the root's commit links nothing.
+#[test]
+fn a_member_after_coverage_is_withdrawn_reads_nothing_and_nothing_is_linked() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let sha = fixture.commit(100);
+    let mut root = response("resp:r", 30);
+    root["child"] = json!("c1");
+    root["commit"] = json!(sha);
+    let root = fixture.record("r1", &[root]);
+    fs::create_dir(fixture.root.join("c1.member.jsonl")).unwrap();
+    fixture.withdraw_after_the_root();
+
+    match fixture.ingest(&root, "r1") {
+        Err(EngineError::Privacy(PrivacyError::NotCovered(coverage))) => assert_eq!(
+            coverage,
+            CaptureCoverage::NotCovering {
+                channel: PassiveChannel::Harness(HarnessId::Codex)
+            }
+        ),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    assert!(!fixture.linked("codex:r1", "resp:r"));
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM artifact_links"), 0);
+    assert!(fixture
+        .store
+        .harness_cursor(HarnessId::Codex, "codex:c1")
+        .unwrap()
+        .is_none());
+}
+
+/// Coverage that no longer holds when the rescue is due skips the rescue:
+/// the root's batch stands, and its commit links nothing. Covered, the same
+/// run links it.
+#[test]
+fn the_rescue_runs_only_while_the_channel_is_covered() {
+    let run = |withdraw: bool| {
+        let fixture = Fixture::new(Ack::WithCodex);
+        let sha = fixture.commit(100);
+        let mut root = response("resp:r", 30);
+        root["commit"] = json!(sha);
+        let root = fixture.record("r1", &[root]);
+        if withdraw {
+            fixture.withdraw_after_the_root();
+        }
+        let report = fixture.ingest(&root, "r1").unwrap();
+        (fixture, report)
+    };
+    let (withdrawn, report) = run(true);
+    assert!(report.rescue_skipped);
+    assert_eq!(report.root.inserted, 1);
+    assert_eq!((report.linked.root, report.linked.members), (0, 0));
+    assert!(!withdrawn.linked("codex:r1", "resp:r"));
+
+    let (covered, report) = run(false);
+    assert!(!report.rescue_skipped);
+    assert_eq!(report.linked.root, 1);
+    assert!(covered.linked("codex:r1", "resp:r"));
 }
