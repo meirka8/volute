@@ -224,6 +224,13 @@ impl HarnessId {
     }
 }
 
+impl std::fmt::Display for HarnessId {
+    /// The harness's name for people ([`HarnessId::display`]).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display())
+    }
+}
+
 /// The interaction id of the response `response_key` in `conversation_id`
 /// captured by `harness`: the first 16 bytes of
 /// `SHA-256("cvc.<name>.interaction/v1" 0x00 conversation_id 0x00 response_key)`,

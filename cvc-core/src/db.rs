@@ -44,6 +44,13 @@ pub enum DbError {
     /// overwritten, so the child's ingestion fails instead.
     #[error("conversation relation conflict: {0}")]
     RelationConflict(String),
+    /// A capture by a harness this database cannot record yet: the one-time
+    /// `capture_source` upgrade has not run here
+    /// ([`CvcStore::needs_capture_source_upgrade`]). Nothing was stored. An
+    /// operator command that opens with
+    /// [`CvcStore::open_initialized_upgrading`] finishes the upgrade.
+    #[error("the CVC database has not finished upgrading for {harness} capture")]
+    CaptureSourceUpgradeRequired { harness: HarnessId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +71,8 @@ impl DbError {
             | Self::InvalidLink(_)
             | Self::ResidualStorageWarning
             | Self::HarnessBatch(_)
-            | Self::RelationConflict(_) => RetryDisposition::Permanent,
+            | Self::RelationConflict(_)
+            | Self::CaptureSourceUpgradeRequired { .. } => RetryDisposition::Permanent,
         }
     }
 }
@@ -861,6 +869,17 @@ const HARNESS_WRITE_RETRY_BUDGET: Duration = Duration::from_secs(5);
 // Every value an older binary writes is in the triggers' list, so 0.6 and 0.7
 // keep writing to the rebuilt table.
 
+/// How much of the `capture_source` move an open does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureSourceUpgrade {
+    /// Only what is cheap or what cvc 0.7.x would do in the same open: the
+    /// rebuild of an empty table, of one that cannot hold `claude_code` yet,
+    /// and the triggers of a table already rebuilt.
+    IfCheap,
+    /// The rebuild, however long it takes.
+    Always,
+}
+
 /// The marker of the move to triggers.
 const CAPTURE_SOURCE_TRIGGERS_MARKER: &str = "capture-source/v2";
 /// cvc 0.7.x's marker; see above for why it is always recorded.
@@ -930,10 +949,25 @@ impl CvcStore {
         Self::open_initialized(path)
     }
 
-    /// Open a store and apply every idempotent schema migration before it can
-    /// be read or written. `open` delegates here for legacy callers.
+    /// Open a store and apply every idempotent schema migration that is cheap
+    /// before it can be read or written. `open` delegates here for legacy
+    /// callers. This is the open for hooks, the editor and MCP: it never
+    /// rebuilds a populated `interactions` table that cvc 0.7.x already
+    /// widened (see [`Self::open_initialized_upgrading`] and
+    /// [`Self::needs_capture_source_upgrade`]).
     pub fn open_initialized<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
+        Self::open_with(path.as_ref(), CaptureSourceUpgrade::IfCheap)
+    }
+
+    /// [`Self::open_initialized`], and also the one-time rebuild that moves
+    /// the `capture_source` values into triggers, however long it takes. For
+    /// commands a person runs and waits for, never for a hook: on a large
+    /// store the rebuild holds the write lock for many seconds.
+    pub fn open_initialized_upgrading<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with(path.as_ref(), CaptureSourceUpgrade::Always)
+    }
+
+    fn open_with(path: &Path, upgrade: CaptureSourceUpgrade) -> Result<Self> {
         prepare_store_path(path)?;
         let conn = Connection::open(path)?;
 
@@ -953,9 +987,25 @@ impl CvcStore {
             conn,
             path: path.to_path_buf(),
         };
-        store.init()?;
+        store.init_with(upgrade)?;
         enforce_store_permissions(&store.path)?;
         Ok(store)
+    }
+
+    /// Whether the one-time `capture_source` rebuild has still to run here.
+    /// Until it has, captures by the harnesses after Claude Code fail closed
+    /// with [`DbError::CaptureSourceUpgradeRequired`]; Claude Code and every
+    /// older source keep working on the old constraint. An operator command
+    /// that opens with [`Self::open_initialized_upgrading`] finishes it. It
+    /// stays `true` for a table this version will not rebuild (one with
+    /// columns it does not know).
+    pub fn needs_capture_source_upgrade(&self) -> Result<bool> {
+        let done: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cvc_internal_migrations WHERE name=?1)",
+            params![CAPTURE_SOURCE_TRIGGERS_MARKER],
+            |row| row.get(0),
+        )?;
+        Ok(!done)
     }
 
     /// Atomically consumes the exact per-destination share/publication authority,
@@ -1039,7 +1089,12 @@ impl CvcStore {
         })
     }
 
+    /// Applies the migrations [`Self::open_initialized`] applies.
     pub fn init(&self) -> Result<()> {
+        self.init_with(CaptureSourceUpgrade::IfCheap)
+    }
+
+    fn init_with(&self, upgrade: CaptureSourceUpgrade) -> Result<()> {
         self.conn
             .execute_batch(include_str!("../migrations/0001_initial_schema.sql"))?;
 
@@ -1172,24 +1227,25 @@ impl CvcStore {
             }
         }
 
-        self.converge_capture_source()?;
+        self.converge_capture_source(upgrade)?;
         self.normalize_artifact_links_schema()?;
 
         Ok(())
     }
 
     /// Moves the `capture_source` value list from the column CHECK into
-    /// triggers, once (see [`CAPTURE_SOURCE_TRIGGERS_MARKER`]). Everything is
-    /// decided and done inside one immediate transaction, so a process that
-    /// waited for another one's rebuild finds it done and does nothing.
-    fn converge_capture_source(&self) -> Result<()> {
+    /// triggers, once (see [`CAPTURE_SOURCE_TRIGGERS_MARKER`]), when `upgrade`
+    /// allows it. Everything is decided and done inside one immediate
+    /// transaction, so a process that waited for another one's rebuild finds
+    /// it done and does nothing.
+    fn converge_capture_source(&self, upgrade: CaptureSourceUpgrade) -> Result<()> {
         // Foreign-key enforcement must be off around a table rebuild (setting
         // it is a no-op inside a transaction), and it is restored whatever
         // happens.
         self.conn.pragma_update(None, "foreign_keys", "OFF")?;
         let converged = (|| -> Result<()> {
             let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-            Self::converge_capture_source_tx(&tx)?;
+            Self::converge_capture_source_tx(&tx, upgrade)?;
             tx.commit()?;
             Ok(())
         })();
@@ -1199,7 +1255,10 @@ impl CvcStore {
         Ok(())
     }
 
-    fn converge_capture_source_tx(tx: &Transaction<'_>) -> Result<()> {
+    fn converge_capture_source_tx(
+        tx: &Transaction<'_>,
+        upgrade: CaptureSourceUpgrade,
+    ) -> Result<()> {
         let marked = |name: &str| -> Result<bool> {
             Ok(tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM cvc_internal_migrations WHERE name=?1)",
@@ -1232,7 +1291,23 @@ impl CvcStore {
             [],
             |row| row.get(0),
         )?;
-        if !table_sql.contains(CAPTURE_SOURCE_SHAPE_CHECK) {
+        let converted = table_sql.contains(CAPTURE_SOURCE_SHAPE_CHECK);
+        if upgrade == CaptureSourceUpgrade::IfCheap && !converted {
+            // The default open rebuilds only what costs nothing (an empty
+            // table) or what cvc 0.7.x would rebuild in the same open (a table
+            // that cannot hold `claude_code` yet, so that Claude Code capture
+            // keeps working there). A populated 0.7.x table waits for an
+            // operator command.
+            let empty: bool =
+                tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM interactions)", [], |row| {
+                    row.get(0)
+                })?;
+            if !empty && table_sql.contains("'claude_code'") {
+                // What cvc 0.7.x records for such a table.
+                return mark(CAPTURE_SOURCE_CLAUDE_CODE_MARKER);
+            }
+        }
+        if !converted {
             // Every index and trigger the table has is created again on the
             // copy (our own triggers are created below).
             let dependents: Vec<String> = tx
@@ -1993,6 +2068,18 @@ impl CvcStore {
         let prepared =
             PreparedHarnessBatch::prepare(captures.into_iter().map(|c| c.into_capture()));
         let mut outcome = self.with_immediate_write_retry(|tx| {
+            // Claude Code's value is in every constraint this version leaves
+            // in place; the other harnesses' values only in the triggers.
+            if harness != HarnessId::ClaudeCode {
+                let upgraded: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cvc_internal_migrations WHERE name=?1)",
+                    params![CAPTURE_SOURCE_TRIGGERS_MARKER],
+                    |row| row.get(0),
+                )?;
+                if !upgraded {
+                    return Err(DbError::CaptureSourceUpgradeRequired { harness });
+                }
+            }
             if harness.conversation_prefix().is_some() {
                 let foreign: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM interactions WHERE conversation_id=?1 AND capture_source NOT IN (?2,'sync_import'))",
@@ -5059,5 +5146,67 @@ mod harness_batch_tests {
             .unwrap()
             .unwrap();
         assert_eq!(details.summary.parent.as_deref(), Some("codex:p"));
+    }
+
+    /// A populated 0.7.2 store as a hook would open it: not rebuilt, Claude
+    /// Code capture works, a new harness fails closed with the typed error
+    /// until an operator open finishes the upgrade.
+    #[test]
+    fn a_new_harness_waits_for_the_upgrade_and_claude_code_does_not() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("cvc");
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = dir.join("index.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!("../tests/fixtures/db/0.7.2.sql"))
+                .unwrap();
+            conn.execute_batch(
+                "INSERT INTO conversations VALUES('old','t',1);
+                 INSERT INTO interactions(id,conversation_id,timestamp,author,user_prompt,capture_source,scrubber_version) VALUES('6b1f0c0e-1111-4aaa-8bbb-000000000001','old',1,'agent','x','mcp',1);",
+            )
+            .unwrap();
+        }
+        let store = CvcStore::open_initialized(&path).unwrap();
+        assert!(store.needs_capture_source_upgrade().unwrap());
+
+        let mut claude = batch("s1");
+        claude.harness = HarnessId::ClaudeCode;
+        claude.captures = vec![capture(HarnessId::ClaudeCode, "s1", "req_1")];
+        assert_eq!(store.capture_harness_batch(claude).unwrap().inserted, 1);
+
+        let mut codex = batch("codex:t1");
+        codex.captures = vec![capture(HarnessId::Codex, "codex:t1", "resp:a")];
+        codex.cursor = Some(cursor("codex:t1", 0, 1, &forward));
+        let refused = store.capture_harness_batch(codex).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                DbError::CaptureSourceUpgradeRequired {
+                    harness: HarnessId::Codex
+                }
+            ),
+            "{refused}"
+        );
+        assert_eq!(refused.retry_disposition(), RetryDisposition::Permanent);
+        assert!(store.get_conversation("codex:t1").unwrap().is_none());
+        assert!(store
+            .harness_cursor(HarnessId::Codex, "codex:t1")
+            .unwrap()
+            .is_none());
+        drop(store);
+
+        let store = CvcStore::open_initialized_upgrading(&path).unwrap();
+        assert!(!store.needs_capture_source_upgrade().unwrap());
+        let mut codex = batch("codex:t1");
+        codex.captures = vec![capture(HarnessId::Codex, "codex:t1", "resp:a")];
+        assert_eq!(store.capture_harness_batch(codex).unwrap().inserted, 1);
+        assert_eq!(store.conversation_interaction_count("old").unwrap(), 1);
+        assert_eq!(store.conversation_interaction_count("s1").unwrap(), 1);
     }
 }

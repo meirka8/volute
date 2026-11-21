@@ -36,7 +36,8 @@ pub async fn run() -> Result<()> {
     if !cvc_dir.exists() {
         fs::create_dir_all(&cvc_dir).context("Failed to create .git/cvc directory")?;
     }
-    let _store = CvcStore::open_initialized(&db_path).context("Failed to open CVC database")?;
+    let _store =
+        CvcStore::open_initialized_upgrading(&db_path).context("Failed to open CVC database")?;
     for outcome in outcomes {
         match outcome.action {
             HookAction::Created => println!(

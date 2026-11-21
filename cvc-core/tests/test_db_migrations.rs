@@ -9,8 +9,10 @@
 //! of every existing table byte for byte, copy the 0.7.x Claude Code cursors
 //! losslessly, be idempotent and safe with concurrent openers, and leave a
 //! database that cvc 0.7.x keeps using without rebuilding anything.
-use cvc_core::db::CvcStore;
+use cvc_core::db::{CvcStore, HarnessCursorUpdate};
 use cvc_core::harness::HarnessId;
+use cvc_core::models::{Author, Conversation, Interaction, InteractionId};
+use cvc_core::privacy::{ClaudeCodeCapture, PreparedPolicy};
 use rusqlite::types::Value;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -272,16 +274,38 @@ fn rootpage(conn: &Connection) -> i64 {
     .unwrap()
 }
 
+/// The open of an operator command: every migration, the one-time
+/// `capture_source` rebuild included.
 fn open(path: &Path) {
-    CvcStore::open(path).unwrap();
+    CvcStore::open_initialized_upgrading(path).unwrap();
 }
 
-/// The schema this version gives a new database.
+/// The open of a hook, the editor and MCP: never the rebuild of a populated
+/// table that cvc 0.7.x already widened.
+fn open_default(path: &Path) {
+    CvcStore::open_initialized(path).unwrap();
+}
+
+/// The schema this version gives a new database, with either open: the
+/// rebuild of an empty table costs nothing, so the default open does it too.
 fn current_schema() -> Schema {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("cvc").join("index.db");
+    open_default(&path);
+    let fresh = schema(&Connection::open(&path).unwrap());
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("cvc").join("index.db");
     open(&path);
-    schema(&Connection::open(&path).unwrap())
+    assert_eq!(schema(&Connection::open(&path).unwrap()), fresh);
+    fresh
+}
+
+/// Whether the populated schema `dump` can hold `claude_code` once the cheap
+/// migrations ran: cvc 0.7.x widened it, or it has no `capture_source` column
+/// yet, which the convergence adds with the 0.7.x constraint. The default
+/// open then leaves the rebuild to an operator command.
+fn widened_by_07x(dump: &str) -> bool {
+    dump.contains("'claude_code'") || !dump.contains("capture_source")
 }
 
 const CURRENT_MARKERS: [&str; 4] = [
@@ -295,7 +319,13 @@ const CURRENT_MARKERS: [&str; 4] = [
 fn a_new_database_has_the_current_schema_and_every_marker() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("cvc").join("index.db");
-    open(&path);
+    // A hook can be the first to open a store; it still gets the current
+    // schema, and the store needs no upgrade.
+    open_default(&path);
+    assert!(!CvcStore::open_initialized(&path)
+        .unwrap()
+        .needs_capture_source_upgrade()
+        .unwrap());
     let conn = Connection::open(&path).unwrap();
     assert_eq!(markers(&conn), CURRENT_MARKERS);
     let triggers: Vec<String> = schema(&conn)
@@ -424,6 +454,125 @@ fn every_earlier_schema_migrates_to_the_current_one_without_changing_a_row() {
     }
 }
 
+fn claude_code_capture(session: &str, n: usize) -> ClaudeCodeCapture {
+    let at = chrono::DateTime::from_timestamp(1_700_000_100, 0).unwrap();
+    ClaudeCodeCapture::new(
+        Conversation {
+            id: session.into(),
+            title: "a session".into(),
+            created_at: at,
+        },
+        Interaction {
+            id: interaction_id(500 + n).parse::<InteractionId>().unwrap(),
+            conversation_id: session.into(),
+            parent_id: None,
+            timestamp: at,
+            author: Author::Human,
+            user_prompt: "prompt".into(),
+            model_name: None,
+            model_cot: None,
+            model_response: Some("response".into()),
+            source_request_id: Some(format!("req_{n}")),
+        },
+        Vec::new(),
+        Vec::new(),
+        PreparedPolicy::built_ins_only(),
+        "ab".repeat(32),
+    )
+}
+
+/// What a hook (the default open) does to a store an older version made: a
+/// populated table that cvc 0.7.x widened is not rebuilt, the cheap
+/// migrations still run, Claude Code keeps capturing, and the old constraint
+/// keeps refusing the new harnesses' values until an operator command
+/// finishes the upgrade. A table that cannot hold `claude_code` yet is
+/// rebuilt in the same open, as cvc 0.7.x would.
+#[test]
+fn a_hook_style_open_leaves_a_populated_07x_store_for_an_operator_command() {
+    for (version, dump) in every_earlier_schema() {
+        let (_temp, path) = database_from(dump);
+        populate(&Connection::open(&path).unwrap());
+        let root = rootpage(&Connection::open(&path).unwrap());
+        let store = CvcStore::open_initialized(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        if !widened_by_07x(dump) {
+            assert!(!store.needs_capture_source_upgrade().unwrap(), "{version}");
+            assert_eq!(markers(&conn), CURRENT_MARKERS, "{version}");
+            continue;
+        }
+        assert!(store.needs_capture_source_upgrade().unwrap(), "{version}");
+        assert_eq!(
+            rootpage(&conn),
+            root,
+            "{version}: rebuilt by a default open"
+        );
+        assert_eq!(
+            markers(&conn),
+            [
+                "capture-source-claude-code/v1",
+                "harness-cursors/v1",
+                "legacy-link-observations/v1"
+            ],
+            "{version}"
+        );
+        for table in [
+            "harness_cursors",
+            "conversation_relations",
+            "harness_commit_evidence",
+        ] {
+            assert!(table_exists(&conn, table), "{version}: {table}");
+        }
+        // Claude Code capture works on the old constraint.
+        let outcome = store
+            .capture_claude_code_batch(
+                vec![claude_code_capture("s1", 1)],
+                HarnessCursorUpdate {
+                    harness: "claude-code",
+                    session_id: "s1",
+                    transcript_path: "/p/s1.jsonl",
+                    byte_offset: 200_000,
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.inserted, 1, "{version}");
+        let source: String = conn
+            .query_row(
+                "SELECT capture_source FROM interactions WHERE id=?1",
+                params![interaction_id(501)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "claude_code");
+        assert_eq!(
+            store
+                .harness_cursor(HarnessId::ClaudeCode, "s1")
+                .unwrap()
+                .unwrap()
+                .state["byte_offset"],
+            200_000
+        );
+        // The new harnesses' values are still refused.
+        assert!(conn
+            .execute(
+                "INSERT INTO interactions(id,conversation_id,timestamp,author,user_prompt,capture_source) VALUES (?1,'conv-1',1,'agent','x','codex')",
+                params![interaction_id(600)],
+            )
+            .is_err());
+        drop((store, conn));
+
+        // An operator command finishes it, once; cvc 0.7.x would not undo it.
+        open(&path);
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(markers(&conn), CURRENT_MARKERS, "{version}");
+        assert_ne!(rootpage(&conn), root, "{version}");
+        assert_eq!(what_07x_would_do(&conn), "nothing", "{version}");
+        assert!(!CvcStore::open_initialized(&path)
+            .unwrap()
+            .needs_capture_source_upgrade()
+            .unwrap());
+    }
+}
+
 #[test]
 fn reopening_changes_nothing_and_rebuilds_nothing() {
     for (version, dump) in every_earlier_schema() {
@@ -435,6 +584,7 @@ fn reopening_changes_nothing_and_rebuilds_nothing() {
             (schema(&conn), contents(&conn), rootpage(&conn));
         drop(conn);
         open(&path);
+        open_default(&path);
         open(&path);
         let conn = Connection::open(&path).unwrap();
         assert_eq!(schema(&conn), schema_once, "{version}");
@@ -444,6 +594,8 @@ fn reopening_changes_nothing_and_rebuilds_nothing() {
     }
 }
 
+/// Upgrading openers and hook-style default openers at once: every one
+/// opens, the rebuild happens once, and no row changes.
 #[test]
 fn concurrent_openers_migrate_once() {
     for (version, dump) in RELEASED {
@@ -451,9 +603,15 @@ fn concurrent_openers_migrate_once() {
         populate(&Connection::open(&path).unwrap());
         let before = contents(&Connection::open(&path).unwrap());
         let openers: Vec<_> = (0..8)
-            .map(|_| {
+            .map(|n| {
                 let path = path.clone();
-                std::thread::spawn(move || CvcStore::open(&path).map(|_| ()))
+                std::thread::spawn(move || {
+                    if n % 2 == 0 {
+                        CvcStore::open_initialized_upgrading(&path).map(|_| ())
+                    } else {
+                        CvcStore::open_initialized(&path).map(|_| ())
+                    }
+                })
             })
             .collect();
         for opener in openers {
@@ -713,6 +871,12 @@ fn the_one_time_rebuild_on_a_large_store_is_timed() {
             .unwrap();
     }
     let bytes = std::fs::metadata(&path).unwrap().len();
+    let started = std::time::Instant::now();
+    open_default(&path);
+    println!(
+        "a hook-style open of the same store before the upgrade took {:?}",
+        started.elapsed()
+    );
     let started = std::time::Instant::now();
     open(&path);
     let took = started.elapsed();
