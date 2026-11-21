@@ -3,6 +3,7 @@ use crate::commands::failure::{
 };
 use crate::terminal_text::sanitize_for_terminal;
 use anyhow::{bail, Context, Result};
+use cvc_core::harness::PassiveChannel;
 use cvc_core::repository::RepositoryLayout;
 use cvc_core::{
     db::CvcStore,
@@ -58,14 +59,56 @@ pub async fn privacy_status(requested: Option<&str>) -> Result<()> {
     sync::adopt_legacy_records(&repo, &store, &destination)?;
     let s = privacy::privacy_status_for_fingerprint(&repo, &destination.fingerprint)?;
     println!("{}", privacy_status_report(&s, &name));
+    // Channel by channel, once an acknowledgement stands here; before that
+    // there is nothing it covers to list.
+    if s.capture_acknowledgement.is_acknowledged() {
+        let coverage = privacy::capture_coverage_summary(&repo)?;
+        for line in super::harness::coverage_lines(&coverage) {
+            println!("{line}");
+        }
+    }
     Ok(())
 }
 pub async fn acknowledge_capture() -> Result<()> {
     let (repo, _) = open_upgrading(&env::current_dir()?)?;
-    typed_acknowledgement(capture_challenge())?;
-    privacy::acknowledge_capture(&repo)?;
+    // What is shown and what is recorded come from one list: every channel
+    // this build can capture through, each with its own notice.
+    let channels = capturable_channels();
+    typed_acknowledgement_after(&capture_notice(&channels), capture_challenge())?;
+    privacy::acknowledge_capture_channels(&repo, &channels)?;
     println!("Capture acknowledgement saved locally; it is never synced.");
     Ok(())
+}
+
+/// The passive channels this build can capture through: those with a notice.
+fn capturable_channels() -> Vec<PassiveChannel> {
+    PassiveChannel::ALL
+        .into_iter()
+        .filter(|channel| channel.notice().is_some())
+        .collect()
+}
+
+/// What `cvc privacy acknowledge-capture` shows before its phrase: what each
+/// of `channels` reads and records, and what the acknowledgement covers.
+fn capture_notice(channels: &[PassiveChannel]) -> String {
+    let mut notice = vec![
+        "With this acknowledgement, CVC records passively, privately, in this repository's local store, through:".to_owned(),
+    ];
+    notice.extend(
+        channels
+            .iter()
+            .filter_map(|channel| channel.notice())
+            .map(|text| format!("  {text}")),
+    );
+    let names: Vec<&str> = channels.iter().map(|channel| channel.display()).collect();
+    notice.push(format!(
+        "This acknowledgement covers {}, in this repository, for this checkout and user. It covers no agent added by a later version of cvc.",
+        super::harness::and_list(&names)
+    ));
+    notice.push(
+        "Covering an agent starts nothing: its hooks must be installed separately.".to_owned(),
+    );
+    notice.join("\n")
 }
 pub async fn acknowledge_sharing(requested: Option<&str>) -> Result<()> {
     let (repo, store) = open(&env::current_dir()?)?;
@@ -300,8 +343,22 @@ fn range_challenge(base: git2::Oid, tip: git2::Oid, fingerprint: &str) -> Challe
 /// an earlier prompt, holds it. The answer is compared with the whole text
 /// exactly.
 fn typed_acknowledgement(challenge: Challenge) -> Result<()> {
+    typed_acknowledgement_with(None, challenge)
+}
+
+/// [`typed_acknowledgement`] that shows `notice` first, once it is known that
+/// the phrase can be asked at all.
+fn typed_acknowledgement_after(notice: &str, challenge: Challenge) -> Result<()> {
+    typed_acknowledgement_with(Some(notice), challenge)
+}
+
+fn typed_acknowledgement_with(notice: Option<&str>, challenge: Challenge) -> Result<()> {
     if !crate::tty::stdio_is_terminal() {
         bail!("acknowledgement requires an interactive TTY");
+    }
+    if let Some(notice) = notice {
+        println!("{notice}");
+        std::io::stdout().flush()?;
     }
     // A nonce is made of capital letters and digits, so the phrase is what
     // decides whether the prompt can be shown.
@@ -2202,5 +2259,49 @@ mod challenge_tests {
         assert!(nonce
             .bytes()
             .all(|c| crate::tty::NONCE_ALPHABET.contains(&c)));
+    }
+}
+
+#[cfg(test)]
+mod capture_notice_tests {
+    use super::{capturable_channels, capture_notice};
+    use cvc_core::harness::{HarnessId, PassiveChannel};
+
+    /// What is shown before the phrase, and what is recorded, come from one
+    /// list: the channels this build has a notice for.
+    #[test]
+    fn the_notice_lists_every_channel_this_build_records_and_what_it_covers() {
+        let channels = capturable_channels();
+        assert_eq!(
+            channels,
+            [
+                PassiveChannel::Vscode,
+                PassiveChannel::Harness(HarnessId::ClaudeCode)
+            ]
+        );
+        assert!(channels.iter().all(|channel| channel.notice().is_some()));
+        assert_eq!(
+            capture_notice(&channels),
+            format!(
+                "With this acknowledgement, CVC records passively, privately, in this repository's local store, through:\n  {}\n  {}\nThis acknowledgement covers VS Code and Claude Code, in this repository, for this checkout and user. It covers no agent added by a later version of cvc.\nCovering an agent starts nothing: its hooks must be installed separately.",
+                PassiveChannel::Vscode.notice().unwrap(),
+                PassiveChannel::Harness(HarnessId::ClaudeCode).notice().unwrap(),
+            )
+        );
+    }
+
+    #[test]
+    fn the_notice_names_every_channel_it_covers() {
+        let notice = capture_notice(&[
+            PassiveChannel::Vscode,
+            PassiveChannel::Harness(HarnessId::ClaudeCode),
+            PassiveChannel::Harness(HarnessId::Codex),
+        ]);
+        assert!(
+            notice.contains(
+                "This acknowledgement covers VS Code, Claude Code and Codex, in this repository"
+            ),
+            "{notice}"
+        );
     }
 }

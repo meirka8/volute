@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::Fixture;
+use common::{split_nonce, Fixture, PtySession};
 use std::io::Write;
 use std::process::Stdio;
 
@@ -186,4 +186,76 @@ fn harness_status_shows_the_installation_and_the_coverage_by_channel() {
     assert!(fixture
         .cvc_ok(&["harness", "status", "claude-code"])
         .starts_with("harness: Claude Code\nhooks_installed: no\ncapture_covered: true\n"));
+}
+
+/// `cvc privacy status` adds the coverage, channel by channel, once an
+/// acknowledgement stands here, after everything it printed before.
+#[test]
+fn privacy_status_lists_the_channels_covered_once_acknowledged() {
+    let fixture = initialized();
+    let before = fixture.cvc_ok(&["privacy", "status", "--remote", "origin"]);
+    assert!(
+        before.starts_with("capture_acknowledged: false\n"),
+        "{before}"
+    );
+    assert!(!before.contains("capture_covers"), "{before}");
+
+    cvc_core::privacy::acknowledge_capture(&fixture.open_repo()).unwrap();
+    let status = fixture.cvc_ok(&["privacy", "status", "--remote", "origin"]);
+    let (head, coverage) = status
+        .split_once("capture_covers: ")
+        .unwrap_or_else(|| panic!("{status}"));
+    assert!(head.starts_with("capture_acknowledged: true\nsharing_consented: false\n"));
+    assert!(head.contains("\ndestination_fingerprint: "), "{head}");
+    assert_eq!(
+        coverage,
+        "VS Code, Claude Code\ncapture_unavailable_in_this_cvc: Codex, OpenCode, Cursor, Antigravity\n"
+    );
+
+    drop_the_channel_list(&fixture);
+    let status = fixture.cvc_ok(&["privacy", "status", "--remote", "origin"]);
+    assert!(status.ends_with(NO_LIST_NOTE), "{status}");
+}
+
+/// Before its phrase, `cvc privacy acknowledge-capture` shows what each
+/// channel it covers reads, and what it covers; the acknowledgement it
+/// records lists exactly those channels.
+#[test]
+fn the_capture_acknowledgement_shows_what_it_covers_and_records_exactly_that() {
+    let fixture = initialized();
+    let mut session = PtySession::spawn(
+        fixture.cvc_command(&["privacy", "acknowledge-capture"]),
+        b"",
+    );
+    let challenge = session.wait_for_challenge(1);
+    assert_eq!(split_nonce(&challenge).0, "I UNDERSTAND LOCAL CAPTURE");
+    let shown = session.plain_output();
+    for expected in [
+        "With this acknowledgement, CVC records passively, privately, in this repository's local store, through:",
+        cvc_core::harness::PassiveChannel::Vscode.notice().unwrap(),
+        cvc_core::harness::HarnessId::ClaudeCode.channel().notice().unwrap(),
+        "This acknowledgement covers VS Code and Claude Code, in this repository, for this checkout and user. It covers no agent added by a later version of cvc.",
+        "Covering an agent starts nothing: its hooks must be installed separately.",
+    ] {
+        assert!(shown.contains(expected), "{expected:?} in {shown}");
+    }
+    let notice_at = shown.find("With this acknowledgement").unwrap();
+    let prompt_at = shown.find("Type exactly '").unwrap();
+    assert!(notice_at < prompt_at, "{shown}");
+
+    session.write(format!("{challenge}\n").as_bytes());
+    let (status, output) = session.wait_exit();
+    assert!(status.success(), "{output}");
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fixture.repo.join(".git").join("cvc").join("privacy.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["capture_acknowledged_channels"],
+        serde_json::json!(["vscode", "claude-code"])
+    );
+    assert_eq!(
+        fixture.cvc_ok(&["harness", "status", "claude-code"]),
+        ACKNOWLEDGED_STATUS
+    );
 }
