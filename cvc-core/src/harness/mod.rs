@@ -134,3 +134,44 @@ pub(crate) mod test_registry {
 
 #[cfg(test)]
 mod port_tests;
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use crate::harness::adapter::OutputContract;
+
+    /// A harness's adapter and its channel's notice come together: an adapter
+    /// without a notice could never be acknowledged, and its users would be
+    /// told to acknowledge again for ever; a notice without an adapter would
+    /// let people consent to capture that does not exist.
+    #[test]
+    fn a_harness_is_available_exactly_when_its_channel_has_a_notice() {
+        for harness in HarnessId::ALL {
+            assert_eq!(
+                harness.available(),
+                harness.channel().notice().is_some(),
+                "{harness}"
+            );
+        }
+    }
+
+    struct Contract;
+
+    impl AdapterVisitor for Contract {
+        type Output = OutputContract;
+        fn visit<A: HarnessAdapter>(self, adapter: &A) -> OutputContract {
+            adapter.contract(None)
+        }
+    }
+
+    /// What a hook refused before its adapter runs prints is what the
+    /// adapter itself prints.
+    #[test]
+    fn the_static_hook_contract_is_the_adapters_own() {
+        for harness in HarnessId::ALL {
+            if let Some(contract) = with_adapter(harness, Contract) {
+                assert_eq!(contract, harness.hook_contract(), "{harness}");
+            }
+        }
+    }
+}

@@ -104,9 +104,11 @@ pub struct HookRequest {
 pub enum PayloadError {
     #[error("hook payload is not the JSON {0} delivers on stdin")]
     NotTheShape(&'static str),
-    /// [`PayloadError::NotTheShape`] with what the JSON decoder said about
-    /// the payload (the type it found where it expected another), as cvc
-    /// 0.7.x printed it.
+    /// [`PayloadError::NotTheShape`] with what is wrong with it, such as
+    /// ``"`session_id` is an integer, not a string"``. Hook errors reach the
+    /// agent's user, so `detail` is built from the payload's key names and
+    /// JSON types only ([`json_type`]) and must never contain a payload
+    /// value.
     #[error("hook payload is not the JSON {harness} delivers on stdin: {detail}")]
     Malformed {
         harness: &'static str,
@@ -114,6 +116,20 @@ pub enum PayloadError {
     },
     #[error("hook payload has no {0}")]
     Missing(&'static str),
+}
+
+/// The JSON type of `value`, as an error names it ("an integer", "a
+/// string"), never the value itself.
+pub fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "an integer",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// The request `payload` makes of `caller`: [`HookCaller::request`], with
@@ -150,7 +166,12 @@ pub enum StartLocation {
     /// The harness does not say: the payload's working directory, else the
     /// process's own.
     Unknown,
-    /// The start is in the record's first entry (Codex `session_meta.cwd`).
+    /// The start is in the first entry of the record at this path (Codex:
+    /// `session_meta.cwd` in the rollout's first line). The shell reads that
+    /// line, bounded (at most 4 MiB, from a regular file opened without
+    /// following a link), in memory, before the repository is known, and
+    /// hands it to [`HookCaller::start_from_first_entry`]; the bytes are then
+    /// discarded. Only an adapter whose start is there returns this.
     FromRecordStart(PathBuf),
 }
 
@@ -201,6 +222,13 @@ pub trait HookCaller {
     fn contract(&self, event: Option<&str>) -> OutputContract;
     /// What follows a `consent-required` message: how to stop the hooks.
     fn stop_hint(&self) -> &'static str;
+    /// Where the session started, read from the record's first complete
+    /// line, for an adapter whose [`Self::start`] is
+    /// [`StartLocation::FromRecordStart`]. Pure: `first_line` is all it may
+    /// use. The default does not know.
+    fn start_from_first_entry(&self, _first_line: &[u8]) -> StartLocation {
+        StartLocation::Unknown
+    }
 }
 
 // ---- the record ---------------------------------------------------------------------
@@ -350,14 +378,32 @@ pub trait RecordSource {
         path: &Path,
         id: Option<&str>,
     ) -> Result<Located<Self::Source>, Self::Error>;
-    /// A session by the agent's id, where the adapter can find one.
+    /// A session by the agent's id, where the adapter can find one
+    /// ([`Self::locates_sessions`]). Nothing screens what this returns
+    /// before the store opens, so an adapter that offers it screens here as
+    /// [`Self::admit_file`] does.
     fn locate_session(
         &self,
         id: &str,
         layout: &RepositoryLayout,
     ) -> Result<Located<Self::Source>, Self::Error>;
-    /// Every session the adapter can find for this repository.
+    /// Every session the adapter can find for this repository, where it
+    /// can ([`Self::scans`]). As for [`Self::locate_session`], an adapter
+    /// that offers it screens what it returns here.
     fn scan(&self, layout: &RepositoryLayout) -> Result<Vec<Located<Self::Source>>, Self::Error>;
+
+    /// Whether [`Self::locate_session`] can find a session by its id, so
+    /// that `--session` alone is refused before anything is looked at when
+    /// it cannot. The default can.
+    fn locates_sessions(&self) -> bool {
+        true
+    }
+
+    /// Whether [`Self::scan`] can find sessions, as for
+    /// [`Self::locates_sessions`].
+    fn scans(&self) -> bool {
+        true
+    }
 
     /// Is this record this harness's? Bounded and cheap. Runs before the
     /// store is opened.

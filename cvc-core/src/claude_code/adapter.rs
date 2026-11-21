@@ -29,7 +29,7 @@ use super::settings;
 use super::transcript::{self, FirstEntry, ParsedLine, TitleSource, HARNESS};
 use crate::db::{CvcStore, DbError, StoredHarnessCursor};
 use crate::harness::adapter::{
-    Admission, CallerVerdict, FamilyRead, HarnessStatus, HookCaller, HookEnv, HookEvent,
+    json_type, Admission, CallerVerdict, FamilyRead, HarnessStatus, HookCaller, HookEnv, HookEvent,
     HookRequest, InstallAction, InstallContext, InstallOutcome, InstallScope, Installer,
     LegacyCursor, Located, OutputContract, PayloadError, Planner, Read, ReadContext, RecordSource,
     Resume, Sniff, StartLocation, UninstallOutcome,
@@ -43,7 +43,6 @@ use crate::harness::family::Family;
 use crate::harness::HarnessId;
 use crate::privacy;
 use crate::repository::RepositoryLayout;
-use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::fs;
@@ -208,15 +207,15 @@ impl Adapter {
     }
 }
 
-/// The subset of Claude Code's hook payload the adapter relies on.
-#[derive(Deserialize)]
-struct HookPayload {
-    session_id: Option<String>,
-    transcript_path: Option<String>,
-    cwd: Option<String>,
-    hook_event_name: Option<String>,
-    agent_id: Option<String>,
-}
+/// The keys of Claude Code's hook payload the adapter reads, each a string
+/// or null when present, in the order a wrong one is reported.
+const HOOK_PAYLOAD_KEYS: [&str; 5] = [
+    "session_id",
+    "transcript_path",
+    "cwd",
+    "hook_event_name",
+    "agent_id",
+];
 
 impl HookCaller for Adapter {
     /// `cursor_version` alone means Cursor. `conversation_id` means Cursor only
@@ -244,21 +243,31 @@ impl HookCaller for Adapter {
         }
     }
 
-    fn request(&self, payload: Map<String, Value>) -> Result<HookRequest, PayloadError> {
-        let payload: HookPayload =
-            serde_json::from_value(Value::Object(payload)).map_err(|error| {
-                PayloadError::Malformed {
-                    harness: "Claude Code",
-                    detail: error.to_string(),
+    /// Every key it reads must be a string or null where present. A wrong
+    /// one is reported by its name and its JSON type, never its value.
+    fn request(&self, mut payload: Map<String, Value>) -> Result<HookRequest, PayloadError> {
+        let mut text = Vec::with_capacity(HOOK_PAYLOAD_KEYS.len());
+        for key in HOOK_PAYLOAD_KEYS {
+            text.push(match payload.remove(key) {
+                None | Some(Value::Null) => None,
+                Some(Value::String(text)) => Some(text),
+                Some(other) => {
+                    return Err(PayloadError::Malformed {
+                        harness: "Claude Code",
+                        detail: format!("`{key}` is {}, not a string", json_type(&other)),
+                    })
                 }
-            })?;
+            });
+        }
+        let [session, record, cwd, event, subagent]: [Option<String>; 5] =
+            text.try_into().expect("one value per key");
         let non_empty = |value: Option<String>| value.filter(|value| !value.is_empty());
         Ok(HookRequest {
-            event: payload.hook_event_name,
-            session: non_empty(payload.session_id),
-            record: non_empty(payload.transcript_path).map(PathBuf::from),
-            cwd: non_empty(payload.cwd).map(PathBuf::from),
-            subagent: payload.agent_id,
+            event,
+            session: non_empty(session),
+            record: non_empty(record).map(PathBuf::from),
+            cwd: non_empty(cwd).map(PathBuf::from),
+            subagent,
             roots: Vec::new(),
             extra: Map::new(),
         })
@@ -350,6 +359,15 @@ impl RecordSource for Adapter {
 
     fn scan(&self, _layout: &RepositoryLayout) -> Result<Vec<Located<Source>>, IngestError> {
         Err(IngestError::Unsupported("--scan"))
+    }
+
+    /// A session is found by its transcript only.
+    fn locates_sessions(&self) -> bool {
+        false
+    }
+
+    fn scans(&self) -> bool {
+        false
     }
 
     /// The first complete entry of the opened transcript (see
@@ -956,7 +974,7 @@ mod tests {
             adapter.request(payload(r#"{"session_id":7}"#)),
             Err(PayloadError::Malformed {
                 harness: "Claude Code",
-                detail: "invalid type: integer `7`, expected a string".into()
+                detail: "`session_id` is an integer, not a string".into()
             })
         );
         assert_eq!(
@@ -964,8 +982,31 @@ mod tests {
                 .request(payload(r#"{"session_id":7}"#))
                 .unwrap_err()
                 .to_string(),
-            "hook payload is not the JSON Claude Code delivers on stdin: invalid type: integer `7`, expected a string"
+            "hook payload is not the JSON Claude Code delivers on stdin: `session_id` is an integer, not a string"
         );
+        // The value itself never reaches the message, whatever its type.
+        for (json, kind) in [
+            (r#"{"cwd":{"secret-marker":1}}"#, "`cwd` is an object"),
+            (
+                r#"{"transcript_path":["secret-marker"]}"#,
+                "`transcript_path` is an array",
+            ),
+            (
+                r#"{"hook_event_name":true}"#,
+                "`hook_event_name` is a boolean",
+            ),
+            (r#"{"agent_id":1.5}"#, "`agent_id` is a number"),
+        ] {
+            let text = adapter.request(payload(json)).unwrap_err().to_string();
+            assert!(text.ends_with(&format!("{kind}, not a string")), "{text}");
+            assert!(!text.contains("secret-marker"), "{text}");
+        }
+        // Null is an absent value, as serde read it.
+        let request = adapter
+            .request(payload(r#"{"session_id":null,"agent_id":null}"#))
+            .unwrap();
+        assert_eq!(request.session, None);
+        assert!(adapter.wants(&request));
         assert_eq!(
             PayloadError::NotTheShape("Claude Code").to_string(),
             "hook payload is not the JSON Claude Code delivers on stdin"
