@@ -587,7 +587,7 @@ fn ingest_into(
     rescan: bool,
     caller: Caller,
 ) -> Result<Option<IngestReport>> {
-    super::harness::require_capture_acknowledged(layout)?;
+    super::harness::require_claude_code_capture_covered(layout)?;
     // Before the store is opened. What is not a regular file (a link, a FIFO,
     // a directory) is refused here, with the error ingestion gives it; a
     // transcript that cannot be opened or read is left to the ingest below,

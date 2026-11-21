@@ -319,6 +319,32 @@ impl PassiveChannel {
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|c| c.name() == name)
     }
+
+    /// What capture through this channel reads and records, as the capture
+    /// acknowledgement shows it before the typed phrase. `None` when this
+    /// build cannot capture through the channel; such a channel cannot be
+    /// acknowledged ([`crate::privacy::acknowledge_capture_channels`]
+    /// refuses it), so an acknowledgement never covers an adapter that did
+    /// not exist when it was given.
+    ///
+    /// A channel name stands for exactly the scope its notice describes. A
+    /// later version that reads more through a channel (another record, other
+    /// fields) gives it a new name, such as `codex/2`, with a notice of its
+    /// own, so that acknowledgements of the old scope do not cover the new
+    /// one. Each harness's lane adds its notice together with its adapter.
+    pub const fn notice(self) -> Option<&'static str> {
+        match self {
+            PassiveChannel::Vscode => Some(
+                "VS Code: the CVC extension reads the GitHub Copilot chat sessions that VS Code stores for this workspace, and records each turn (prompts, responses, reasoning the chat exposes, tool calls and context file paths) privately in this repository's CVC store.",
+            ),
+            PassiveChannel::Harness(HarnessId::ClaudeCode) => Some(
+                "Claude Code: CVC's hooks read the Claude Code session transcripts of sessions working in this repository, and record each response (prompts, responses, reasoning the transcript exposes, tool calls and context file paths) privately in this repository's CVC store.",
+            ),
+            PassiveChannel::Harness(
+                HarnessId::Codex | HarnessId::OpenCode | HarnessId::Cursor | HarnessId::Antigravity,
+            ) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -447,7 +473,7 @@ mod tests {
         );
         assert_eq!(is_reserved_conversation_id("codex"), None);
         assert_eq!(is_reserved_conversation_id("codexx:1"), None);
-        assert_eq!(is_reserved_conversation_id("remote:ab:codex:1"), None);
+        assert_eq!(is_reserved_conversation_id("session-codex:1"), None);
         assert_eq!(is_reserved_conversation_id(""), None);
         assert_eq!(is_reserved_conversation_id("é"), None);
 
@@ -482,5 +508,18 @@ mod tests {
         let mut sorted = PassiveChannel::ALL;
         sorted.sort();
         assert_eq!(sorted, PassiveChannel::ALL);
+    }
+
+    #[test]
+    fn only_channels_this_build_captures_through_have_a_notice() {
+        let noticed: Vec<_> = PassiveChannel::ALL
+            .into_iter()
+            .filter(|c| c.notice().is_some())
+            .collect();
+        assert_eq!(noticed, PassiveChannel::LEGACY_COVERED);
+        for channel in noticed {
+            let notice = channel.notice().unwrap();
+            assert!(notice.starts_with(channel.display()), "{notice}");
+        }
     }
 }

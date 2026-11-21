@@ -364,7 +364,8 @@ pub struct ConversationSummary {
     /// held for certain: every held interaction is still unconfirmed.
     pub held_published: i64,
     /// The agent harness the conversation came from: the harness that
-    /// captured its interactions here (when they all name one), or, for a
+    /// captured every interaction recorded here (imports aside; a Claude Code
+    /// session that also holds MCP thoughts gets no label), or, for a
     /// conversation imported from a remote, the harness its id's prefix names
     /// after `remote:<fingerprint>:`. The second is the publisher's claim, not
     /// provenance. `None` when neither says (Claude Code conversations imported
@@ -529,9 +530,58 @@ pub const HARNESS_REASONS_SHOWN: usize = 8;
 /// subagent ... at most this many levels below its root.
 pub const MAX_RELATION_DEPTH: usize = 8;
 
-/// The largest encoded cursor state [`CvcStore::capture_harness_batch`]
-/// stores.
-pub const MAX_CURSOR_STATE_BYTES: usize = 64 * 1024;
+/// The largest encoded cursor state a harness batch stores. A cursor holds
+/// positions, not content (see [`HarnessCursorWrite::state`]); the largest
+/// legitimate state is one record path plus a handful of numbers, ids and
+/// digests, well under this.
+pub const MAX_CURSOR_STATE_BYTES: usize = 4 * 1024;
+
+/// The longest string value in a cursor state. It must fit a record path:
+/// agents keep their records under the home directory, a few directory
+/// levels deep, so 1 KiB leaves room to spare while keeping a state from
+/// carrying text.
+pub const MAX_CURSOR_STRING_BYTES: usize = 1024;
+
+/// The longest key in a cursor state.
+const MAX_CURSOR_KEY_BYTES: usize = 64;
+
+/// Whether `state` is a cursor state a harness batch may store: a JSON object
+/// of at most [`MAX_CURSOR_STATE_BYTES`] encoded bytes, at most 4 levels
+/// deep, whose keys are short and whose string values are at most
+/// [`MAX_CURSOR_STRING_BYTES`] bytes, and none of whose keys or strings the
+/// built-in scrubber would change.
+fn is_storable_cursor_state(state: &serde_json::Value, encoded: &str) -> bool {
+    fn storable(value: &serde_json::Value, depth: usize) -> bool {
+        let stable = |text: &str| privacy::scrub(text).is_ok_and(|scrubbed| scrubbed == text);
+        match value {
+            serde_json::Value::String(text) => {
+                text.len() <= MAX_CURSOR_STRING_BYTES && stable(text)
+            }
+            serde_json::Value::Array(items) => {
+                depth < 4 && items.iter().all(|item| storable(item, depth + 1))
+            }
+            serde_json::Value::Object(map) => {
+                depth < 4
+                    && map.iter().all(|(key, item)| {
+                        !key.is_empty()
+                            && key.len() <= MAX_CURSOR_KEY_BYTES
+                            && stable(key)
+                            && storable(item, depth + 1)
+                    })
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                true
+            }
+        }
+    }
+    state.is_object() && encoded.len() <= MAX_CURSOR_STATE_BYTES && storable(state, 0)
+}
+
+/// Whether `value` is an identifier a harness batch may store in a side
+/// table: a safe identifier the built-in scrubber would not change.
+fn is_storable_identifier(value: &str) -> bool {
+    privacy::is_safe_identifier(value) && privacy::scrub(value).is_ok_and(|s| s == value)
+}
 
 /// A typed ingest cursor as stored in `harness_cursors`. The state's meaning
 /// belongs to the harness's cursor codec, which reads it by `kind` and
@@ -565,32 +615,44 @@ pub enum CursorProgress {
 /// record was replaced, and the codec says why in `state`); any later epoch is
 /// refused. A cursor is never moved backwards.
 pub struct HarnessCursorWrite<'a> {
-    /// The conversation id, or `scan:<db id>` for a scan watermark. A safe
-    /// identifier.
+    /// The batch's conversation id, or `scan:<id>` for a scan watermark. An
+    /// identifier the built-in scrubber would not change.
     pub cursor_key: &'a str,
     /// The codec's kind: 1 to 32 bytes of `[a-z0-9-]`.
     pub kind: &'a str,
     /// The codec's version, at least 1.
     pub version: u32,
     pub epoch: u64,
-    /// The codec's encoding: a JSON object of at most
-    /// [`MAX_CURSOR_STATE_BYTES`] bytes.
+    /// The codec's encoding. It holds where the agent's record was read up
+    /// to, never what the record says: byte offsets, ordinals, sequence
+    /// numbers and timestamps, the agent's own ids, content digests, the
+    /// record's path, flags and the reason for an epoch. It is a JSON
+    /// object within the limits of [`MAX_CURSOR_STATE_BYTES`] and
+    /// [`MAX_CURSOR_STRING_BYTES`], and no key or string in it may be one the
+    /// built-in scrubber would change.
     pub state: serde_json::Value,
     /// Compares this cursor with the stored one of the same epoch and kind.
     pub progress: &'a dyn Fn(&StoredHarnessCursor) -> CursorProgress,
 }
 
-/// One commit a response reported, as a raw hex token from the session's own
-/// Git output. It is evidence to check, not a link: the family rescue verifies
-/// every candidate against the repository again before it links anything.
+/// One commit a response reported, after the adapter resolved it against the
+/// repository. It is evidence to check, not a link: the family rescue
+/// verifies every commit again before it links anything.
+///
+/// Only a full commit id is stored: 40 (SHA-1) or 64 (SHA-256) lowercase hex
+/// digits that neither the built-in scrubber nor the batch's policy would
+/// change. An abbreviated or unresolved token from the session's output is
+/// never stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HarnessCommitEvidence {
-    /// The conversation whose family the evidence belongs to.
+    /// The conversation whose family the evidence belongs to: the batch's
+    /// conversation itself, or the root its recorded subagent relations lead
+    /// to (for Claude Code, the session a `<session>:agent-<id>` id names).
     pub family_root: String,
     /// The response that reported the commit.
     pub interaction_id: InteractionId,
-    /// 4 to 64 lowercase hex digits.
-    pub candidate: String,
+    /// The resolved commit id.
+    pub commit: CommitSha,
     /// When the response was made, in seconds.
     pub response_at: i64,
 }
@@ -671,21 +733,89 @@ pub struct ConversationRelation {
 
 /// Everything one harness ingest batch commits for one conversation, in one
 /// immediate transaction: all of it or none of it.
+///
+/// A batch is made only by [`HarnessBatch::new`], which requires a
+/// [`privacy::CoverageGrant`] for the harness's own channel; the store also
+/// checks that the grant was given for the repository it belongs to.
 pub struct HarnessBatch<'a> {
-    pub harness: HarnessId,
-    /// The conversation every capture of the batch records into.
-    pub conversation_id: &'a str,
-    pub captures: Vec<crate::privacy::HarnessCaptureInput>,
-    /// The typed cursor to advance, if the batch moves one.
-    pub cursor: Option<HarnessCursorWrite<'a>>,
-    /// Claude Code only: the 0.7.x cursor row, kept written for older binaries
-    /// that share this database. It is written exactly when the typed cursor
-    /// is (or when the batch has no typed cursor).
-    pub legacy_cursor: Option<HarnessCursorUpdate<'a>>,
-    pub evidence: Vec<HarnessCommitEvidence>,
-    /// Relations in which this batch's conversation is the child or the
+    grant: &'a privacy::CoverageGrant,
+    harness: HarnessId,
+    conversation_id: &'a str,
+    policy: &'a privacy::PreparedPolicy,
+    captures: Vec<crate::privacy::HarnessCaptureInput>,
+    cursor: Option<HarnessCursorWrite<'a>>,
+    legacy_cursor: Option<HarnessCursorUpdate<'a>>,
+    evidence: Vec<HarnessCommitEvidence>,
+    relations: Vec<ConversationRelation>,
+}
+
+impl<'a> HarnessBatch<'a> {
+    /// An empty batch of `harness` for `conversation_id`, under `grant`.
+    /// `policy` is the repository's capture policy, which the batch's
+    /// evidence must also pass. Refused when the grant covers another
+    /// channel than the harness's, or when the conversation id is not an
+    /// identifier the built-in scrubber would leave as it is.
+    pub fn new(
+        grant: &'a privacy::CoverageGrant,
+        harness: HarnessId,
+        conversation_id: &'a str,
+        policy: &'a privacy::PreparedPolicy,
+    ) -> Result<Self> {
+        if grant.channel() != harness.channel() {
+            return Err(DbError::HarnessBatch(
+                "the coverage grant is for another channel".into(),
+            ));
+        }
+        if !is_storable_identifier(conversation_id) {
+            return Err(DbError::HarnessBatch(
+                "the conversation id is not a storable identifier".into(),
+            ));
+        }
+        Ok(Self {
+            grant,
+            harness,
+            conversation_id,
+            policy,
+            captures: Vec::new(),
+            cursor: None,
+            legacy_cursor: None,
+            evidence: Vec::new(),
+            relations: Vec::new(),
+        })
+    }
+
+    /// The captures to store, each into the batch's conversation.
+    pub fn with_captures(mut self, captures: Vec<crate::privacy::HarnessCaptureInput>) -> Self {
+        self.captures = captures;
+        self
+    }
+
+    /// The typed cursor to advance.
+    pub fn with_cursor(mut self, cursor: HarnessCursorWrite<'a>) -> Self {
+        self.cursor = Some(cursor);
+        self
+    }
+
+    /// Claude Code only: the 0.7.x cursor row, kept written for older
+    /// binaries that share this database. It is written exactly when the
+    /// typed cursor is (or when the batch has no typed cursor).
+    pub fn with_legacy_cursor(mut self, cursor: HarnessCursorUpdate<'a>) -> Self {
+        self.legacy_cursor = Some(cursor);
+        self
+    }
+
+    /// The commits the batch's responses reported.
+    pub fn with_evidence(mut self, evidence: Vec<HarnessCommitEvidence>) -> Self {
+        self.evidence = evidence;
+        self
+    }
+
+    /// Relations in which the batch's conversation is the child or the
     /// parent. Never for Claude Code, whose relation is its id convention.
-    pub relations: Vec<ConversationRelation>,
+    pub fn with_relations(mut self, relations: Vec<ConversationRelation>) -> Self {
+        self.relations = relations;
+        self
+    }
 }
 
 /// A harness batch's captures after the capture boundary, before SQLite is
@@ -777,11 +907,6 @@ const ADOPT_DESTINATION_ROWS: [&str; 8] = [
 /// summaries goes through this one statement, so no two of them can disagree
 /// about what "shared" or "published" means.
 fn conversation_summary_sql(tail: &str) -> String {
-    let harness_sources = HarnessId::ALL
-        .iter()
-        .map(|harness| format!("'{}'", harness.capture_source_str()))
-        .collect::<Vec<_>>()
-        .join(",");
     format!(
         "SELECT c.id, c.title,
                 COUNT(i.id),
@@ -795,7 +920,7 @@ fn conversation_summary_sql(tail: &str) -> String {
                 (COUNT(i.id) > 0 AND COUNT(i.id) = COALESCE(SUM(i.capture_source = 'sync_import'), 0)),
                 COALESCE(SUM(EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state IN ('published', 'pending', 'unknown'))), 0),
                 COALESCE(SUM(EXISTS(SELECT 1 FROM publications p WHERE p.interaction_id = i.id AND p.remote_fingerprint = ?1 AND p.state = 'published')), 0),
-                (SELECT CASE WHEN COUNT(DISTINCT h.capture_source) = 1 THEN MIN(h.capture_source) END FROM interactions h WHERE h.conversation_id = c.id AND h.capture_source IN ({harness_sources})),
+                (SELECT CASE WHEN COUNT(DISTINCT h.capture_source) = 1 THEN MIN(h.capture_source) END FROM interactions h WHERE h.conversation_id = c.id AND h.capture_source <> 'sync_import'),
                 (SELECT r.parent_id FROM conversation_relations r WHERE r.child_id = c.id)
          FROM conversations c
          LEFT JOIN interactions i ON i.conversation_id = c.id
@@ -880,6 +1005,28 @@ enum CaptureSourceUpgrade {
     Always,
 }
 
+/// What the `capture_source` convergence has to do on one open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureSourceWork {
+    Nothing,
+    /// Only markers: drop a triggers marker the table does not bear out, or
+    /// record 0.7.x's marker for a table left as it is.
+    Settle {
+        unmark_triggers: bool,
+        mark_claude_code: bool,
+    },
+    /// The table is rebuilt already: (re)create the triggers and markers.
+    Triggers,
+    /// Rebuild the table, then the triggers and markers.
+    Rebuild,
+}
+
+/// Recorded at the end of the table convergence of this schema generation.
+/// While it is there (and the tables it stands for are), an open skips the
+/// convergence and takes no write lock for it. A version that adds to the
+/// convergence must name a new generation here.
+const CONVERGED_TABLES_MARKER: &str = "converged-tables/0.8-1";
+
 /// The marker of the move to triggers.
 const CAPTURE_SOURCE_TRIGGERS_MARKER: &str = "capture-source/v2";
 /// cvc 0.7.x's marker; see above for why it is always recorded.
@@ -931,11 +1078,7 @@ fn capture_source_triggers_sql() -> String {
 
 /// The harness tables of this version. Additive: older binaries never read
 /// them, and no row of theirs is changed.
-const HARNESS_TABLES_SQL: &str = "CREATE TABLE IF NOT EXISTS harness_cursors (harness TEXT NOT NULL CHECK(harness <> ''), cursor_key TEXT NOT NULL CHECK(cursor_key <> ''), kind TEXT NOT NULL CHECK(kind <> ''), version INTEGER NOT NULL CHECK(version >= 1), epoch INTEGER NOT NULL DEFAULT 0 CHECK(epoch >= 0), state TEXT NOT NULL CHECK(json_valid(state)), updated_at INTEGER NOT NULL, PRIMARY KEY(harness, cursor_key)); CREATE TABLE IF NOT EXISTS conversation_relations (child_id TEXT PRIMARY KEY, parent_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('subagent','fork')), harness TEXT NOT NULL, spawn_interaction_id TEXT, spawn_call_id TEXT, evidence TEXT NOT NULL CHECK(evidence IN ('child_record','parent_record','hook_payload','store_index')), recorded_at INTEGER NOT NULL, CHECK(child_id <> parent_id)); CREATE INDEX IF NOT EXISTS idx_conversation_relations_parent ON conversation_relations(parent_id); CREATE TABLE IF NOT EXISTS harness_commit_evidence (harness TEXT NOT NULL, family_root TEXT NOT NULL, interaction_id TEXT NOT NULL, candidate TEXT NOT NULL CHECK(length(candidate) BETWEEN 4 AND 64 AND candidate NOT GLOB '*[^0-9a-f]*'), response_at INTEGER NOT NULL, PRIMARY KEY(harness, family_root, interaction_id, candidate)); CREATE INDEX IF NOT EXISTS idx_harness_commit_evidence_interaction ON harness_commit_evidence(interaction_id);";
-
-/// The one-time lossless copy of the 0.7.x Claude Code cursors into the typed
-/// table, behind its marker. Rows already there are kept (`OR IGNORE`).
-const COPY_LEGACY_CURSORS_SQL: &str = "INSERT OR IGNORE INTO harness_cursors(harness,cursor_key,kind,version,epoch,state,updated_at) SELECT harness, session_id, 'jsonl', 1, 0, json_object('path', transcript_path, 'byte_offset', byte_offset), updated_at FROM harness_ingest_cursors WHERE harness = 'claude-code'; INSERT INTO cvc_internal_migrations(name) VALUES('harness-cursors/v1');";
+const HARNESS_TABLES_SQL: &str = "CREATE TABLE IF NOT EXISTS harness_cursors (harness TEXT NOT NULL CHECK(harness <> ''), cursor_key TEXT NOT NULL CHECK(cursor_key <> ''), kind TEXT NOT NULL CHECK(kind <> ''), version INTEGER NOT NULL CHECK(version >= 1), epoch INTEGER NOT NULL DEFAULT 0 CHECK(epoch >= 0), state TEXT NOT NULL CHECK(json_valid(state)), updated_at INTEGER NOT NULL, PRIMARY KEY(harness, cursor_key)); CREATE TABLE IF NOT EXISTS conversation_relations (child_id TEXT PRIMARY KEY, parent_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('subagent','fork')), harness TEXT NOT NULL, spawn_interaction_id TEXT, spawn_call_id TEXT, evidence TEXT NOT NULL CHECK(evidence IN ('child_record','parent_record','hook_payload','store_index')), recorded_at INTEGER NOT NULL, CHECK(child_id <> parent_id)); CREATE INDEX IF NOT EXISTS idx_conversation_relations_parent ON conversation_relations(parent_id); CREATE TABLE IF NOT EXISTS harness_commit_evidence (harness TEXT NOT NULL, family_root TEXT NOT NULL, interaction_id TEXT NOT NULL REFERENCES interactions(id) ON DELETE CASCADE, commit_oid TEXT NOT NULL CHECK(length(commit_oid) IN (40,64) AND commit_oid NOT GLOB '*[^0-9a-f]*'), response_at INTEGER NOT NULL, PRIMARY KEY(harness, family_root, interaction_id, commit_oid)); CREATE INDEX IF NOT EXISTS idx_harness_commit_evidence_interaction ON harness_commit_evidence(interaction_id);";
 
 /// The 0.7.x cursor row, written as 0.7.x writes it.
 const UPSERT_LEGACY_CURSOR_SQL: &str = "INSERT INTO harness_ingest_cursors(harness,session_id,transcript_path,byte_offset,updated_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(harness,session_id) DO UPDATE SET transcript_path=excluded.transcript_path, byte_offset=excluded.byte_offset, updated_at=excluded.updated_at";
@@ -1095,6 +1238,37 @@ impl CvcStore {
     }
 
     fn init_with(&self, upgrade: CaptureSourceUpgrade) -> Result<()> {
+        // Each step reads first and takes the write lock only when it has
+        // work, so an open of a current store takes no write lock at all.
+        if !self.tables_converged()? {
+            self.converge_tables()?;
+        }
+        self.converge_capture_source(upgrade)?;
+        self.normalize_artifact_links_schema()?;
+        Ok(())
+    }
+
+    /// Whether the table convergence of this schema generation has run here
+    /// ([`CONVERGED_TABLES_MARKER`]) and what it creates is present. Reads
+    /// only.
+    fn tables_converged(&self) -> Result<bool> {
+        let has_markers: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cvc_internal_migrations')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_markers {
+            return Ok(false);
+        }
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cvc_internal_migrations WHERE name=?1)
+                AND (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('interactions','harness_cursors','conversation_relations','harness_commit_evidence','harness_ingest_cursors','tombstones','derivation_events')) = 7",
+            params![CONVERGED_TABLES_MARKER],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn converge_tables(&self) -> Result<()> {
         self.conn
             .execute_batch(include_str!("../migrations/0001_initial_schema.sql"))?;
 
@@ -1215,8 +1389,12 @@ impl CvcStore {
             self.conn.execute_batch(HARNESS_TABLES_SQL)?;
             let cursors_copied: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM cvc_internal_migrations WHERE name='harness-cursors/v1')", [], |row| row.get(0))?;
             if !cursors_copied {
-                self.conn.execute_batch(COPY_LEGACY_CURSORS_SQL)?;
+                self.copy_legacy_cursors()?;
             }
+            self.conn.execute(
+                "INSERT OR IGNORE INTO cvc_internal_migrations(name) VALUES(?1)",
+                params![CONVERGED_TABLES_MARKER],
+            )?;
             Ok(())
         })();
         match convergence {
@@ -1226,26 +1404,28 @@ impl CvcStore {
                 return Err(error);
             }
         }
-
-        self.converge_capture_source(upgrade)?;
-        self.normalize_artifact_links_schema()?;
-
         Ok(())
     }
 
     /// Moves the `capture_source` value list from the column CHECK into
     /// triggers, once (see [`CAPTURE_SOURCE_TRIGGERS_MARKER`]), when `upgrade`
-    /// allows it. Everything is decided and done inside one immediate
-    /// transaction, so a process that waited for another one's rebuild finds
-    /// it done and does nothing.
+    /// allows it, and recreates the triggers whenever they are missing. What
+    /// is to be done is read first without a lock; the write lock is taken
+    /// only when there is work, and everything is decided again and done
+    /// inside one immediate transaction, so a process that waited for another
+    /// one's rebuild finds it done and does nothing.
     fn converge_capture_source(&self, upgrade: CaptureSourceUpgrade) -> Result<()> {
+        if Self::capture_source_work(&self.conn, upgrade)? == CaptureSourceWork::Nothing {
+            return Ok(());
+        }
         // Foreign-key enforcement must be off around a table rebuild (setting
         // it is a no-op inside a transaction), and it is restored whatever
         // happens.
         self.conn.pragma_update(None, "foreign_keys", "OFF")?;
         let converged = (|| -> Result<()> {
             let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-            Self::converge_capture_source_tx(&tx, upgrade)?;
+            let work = Self::capture_source_work(&tx, upgrade)?;
+            Self::apply_capture_source_work_tx(&tx, work)?;
             tx.commit()?;
             Ok(())
         })();
@@ -1255,28 +1435,52 @@ impl CvcStore {
         Ok(())
     }
 
-    fn converge_capture_source_tx(
-        tx: &Transaction<'_>,
+    /// What [`Self::converge_capture_source`] has to do. Reads only.
+    fn capture_source_work(
+        conn: &Connection,
         upgrade: CaptureSourceUpgrade,
-    ) -> Result<()> {
+    ) -> Result<CaptureSourceWork> {
         let marked = |name: &str| -> Result<bool> {
-            Ok(tx.query_row(
+            Ok(conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM cvc_internal_migrations WHERE name=?1)",
                 params![name],
                 |row| row.get(0),
             )?)
         };
-        let mark = |name: &str| -> Result<()> {
-            tx.execute(
-                "INSERT OR IGNORE INTO cvc_internal_migrations(name) VALUES(?1)",
-                params![name],
+        let (marked_triggers, marked_claude_code) = (
+            marked(CAPTURE_SOURCE_TRIGGERS_MARKER)?,
+            marked(CAPTURE_SOURCE_CLAUDE_CODE_MARKER)?,
+        );
+        let table_sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='interactions'",
+            [],
+            |row| row.get(0),
+        )?;
+        if table_sql.contains(CAPTURE_SOURCE_SHAPE_CHECK) {
+            let triggers: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='interactions' AND name IN (?1,?2)",
+                params![CAPTURE_SOURCE_TRIGGERS[0], CAPTURE_SOURCE_TRIGGERS[1]],
+                |row| row.get(0),
             )?;
-            Ok(())
-        };
-        if marked(CAPTURE_SOURCE_TRIGGERS_MARKER)? {
-            return mark(CAPTURE_SOURCE_CLAUDE_CODE_MARKER);
+            return Ok(if marked_triggers && marked_claude_code && triggers == 2 {
+                CaptureSourceWork::Nothing
+            } else {
+                CaptureSourceWork::Triggers
+            });
         }
-        let columns: Vec<String> = tx
+        // The table still has an enumerated CHECK. A triggers marker without
+        // the rebuilt table it stands for is not true any more, and goes.
+        let settle = |mark_claude_code: bool| {
+            if marked_triggers || mark_claude_code {
+                CaptureSourceWork::Settle {
+                    unmark_triggers: marked_triggers,
+                    mark_claude_code,
+                }
+            } else {
+                CaptureSourceWork::Nothing
+            }
+        };
+        let columns: Vec<String> = conn
             .prepare("PRAGMA table_info(interactions)")?
             .query_map([], |row| row.get(1))?
             .collect::<std::result::Result<_, _>>()?;
@@ -1284,58 +1488,78 @@ impl CvcStore {
             // A table this version does not know column for column is left as
             // it is: its own CHECK keeps refusing the values it does not list,
             // so captures of new sources fail closed, and nothing is lost.
-            return Ok(());
+            return Ok(settle(false));
         }
-        let table_sql: String = tx.query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='interactions'",
-            [],
-            |row| row.get(0),
-        )?;
-        let converted = table_sql.contains(CAPTURE_SOURCE_SHAPE_CHECK);
-        if upgrade == CaptureSourceUpgrade::IfCheap && !converted {
+        let holds_claude_code = table_sql.contains("'claude_code'");
+        if upgrade == CaptureSourceUpgrade::IfCheap && holds_claude_code {
             // The default open rebuilds only what costs nothing (an empty
             // table) or what cvc 0.7.x would rebuild in the same open (a table
             // that cannot hold `claude_code` yet, so that Claude Code capture
             // keeps working there). A populated 0.7.x table waits for an
-            // operator command.
+            // operator command; it gets the marker 0.7.x records for it.
             let empty: bool =
-                tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM interactions)", [], |row| {
+                conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM interactions)", [], |row| {
                     row.get(0)
                 })?;
-            if !empty && table_sql.contains("'claude_code'") {
-                // What cvc 0.7.x records for such a table.
-                return mark(CAPTURE_SOURCE_CLAUDE_CODE_MARKER);
+            if !empty {
+                return Ok(settle(!marked_claude_code));
             }
         }
-        if !converted {
-            // Every index and trigger the table has is created again on the
-            // copy (our own triggers are created below).
-            let dependents: Vec<String> = tx
-                .prepare("SELECT sql FROM sqlite_master WHERE tbl_name='interactions' AND type IN ('index','trigger') AND sql IS NOT NULL AND name NOT IN (?1,?2) ORDER BY rowid")?
-                .query_map(
-                    params![CAPTURE_SOURCE_TRIGGERS[0], CAPTURE_SOURCE_TRIGGERS[1]],
-                    |row| row.get(0),
-                )?
-                .collect::<std::result::Result<_, _>>()?;
-            let columns = INTERACTION_COLUMNS.join(",");
-            tx.execute_batch(INTERACTIONS_TRIGGERED_SQL)?;
-            let copied = tx.execute(
-                &format!("INSERT INTO interactions_cvc_rebuild ({columns}) SELECT {columns} FROM interactions"),
-                [],
+        Ok(CaptureSourceWork::Rebuild)
+    }
+
+    fn apply_capture_source_work_tx(tx: &Transaction<'_>, work: CaptureSourceWork) -> Result<()> {
+        let mark = |name: &str| -> Result<()> {
+            tx.execute(
+                "INSERT OR IGNORE INTO cvc_internal_migrations(name) VALUES(?1)",
+                params![name],
             )?;
-            let rows: i64 = tx.query_row("SELECT COUNT(*) FROM interactions", [], |r| r.get(0))?;
-            if i64::try_from(copied).ok() != Some(rows) {
-                return Err(DbError::Migration(
-                    "capture source rebuild did not copy every interaction".into(),
-                ));
+            Ok(())
+        };
+        match work {
+            CaptureSourceWork::Nothing => return Ok(()),
+            CaptureSourceWork::Settle {
+                unmark_triggers,
+                mark_claude_code,
+            } => {
+                if unmark_triggers {
+                    tx.execute(
+                        "DELETE FROM cvc_internal_migrations WHERE name=?1",
+                        params![CAPTURE_SOURCE_TRIGGERS_MARKER],
+                    )?;
+                }
+                if mark_claude_code {
+                    mark(CAPTURE_SOURCE_CLAUDE_CODE_MARKER)?;
+                }
+                return Ok(());
             }
-            tx.execute_batch(
-                "DROP TABLE interactions; ALTER TABLE interactions_cvc_rebuild RENAME TO interactions;",
-            )?;
-            for sql in dependents {
-                tx.execute_batch(&sql)?;
+            CaptureSourceWork::Triggers => {}
+            CaptureSourceWork::Rebuild => {
+                // Every index and trigger the table has is created again on
+                // the copy (our own triggers are created below). The rows are
+                // copied verbatim, column for column, inside this transaction:
+                // the copy commits together with the swap or not at all.
+                let dependents: Vec<String> = tx
+                    .prepare("SELECT sql FROM sqlite_master WHERE tbl_name='interactions' AND type IN ('index','trigger') AND sql IS NOT NULL AND name NOT IN (?1,?2) ORDER BY rowid")?
+                    .query_map(
+                        params![CAPTURE_SOURCE_TRIGGERS[0], CAPTURE_SOURCE_TRIGGERS[1]],
+                        |row| row.get(0),
+                    )?
+                    .collect::<std::result::Result<_, _>>()?;
+                let columns = INTERACTION_COLUMNS.join(",");
+                tx.execute_batch(INTERACTIONS_TRIGGERED_SQL)?;
+                tx.execute(
+                    &format!("INSERT INTO interactions_cvc_rebuild ({columns}) SELECT {columns} FROM interactions"),
+                    [],
+                )?;
+                tx.execute_batch(
+                    "DROP TABLE interactions; ALTER TABLE interactions_cvc_rebuild RENAME TO interactions;",
+                )?;
+                for sql in dependents {
+                    tx.execute_batch(&sql)?;
+                }
+                tx.execute_batch(INTERACTION_INDEXES_SQL)?;
             }
-            tx.execute_batch(INTERACTION_INDEXES_SQL)?;
         }
         for name in CAPTURE_SOURCE_TRIGGERS {
             tx.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))?;
@@ -1345,7 +1569,40 @@ impl CvcStore {
         mark(CAPTURE_SOURCE_CLAUDE_CODE_MARKER)
     }
 
+    /// Whether `artifact_links` already has its normalized columns and index.
+    fn artifact_links_normalized(conn: &Connection) -> Result<bool> {
+        let columns: Vec<(String, String, bool, Option<String>)> = conn
+            .prepare("PRAGMA table_info(artifact_links)")?
+            .query_map([], |row| {
+                Ok((
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let linked_by_present = columns.iter().any(|(name, _, _, _)| name == "linked_by");
+        let link_type_converged = columns.iter().any(|(name, ty, not_null, default)| {
+            name == "link_type"
+                && ty.eq_ignore_ascii_case("TEXT")
+                && *not_null
+                && default
+                    .as_deref()
+                    .is_some_and(|value| value.contains("generated"))
+        });
+        let indexed: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_artifact_links_commit_hash')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(linked_by_present && link_type_converged && indexed)
+    }
+
     fn normalize_artifact_links_schema(&self) -> Result<()> {
+        if Self::artifact_links_normalized(&self.conn)? {
+            return Ok(());
+        }
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let columns: Vec<(String, String, bool, Option<String>)> = transaction
             .prepare("PRAGMA table_info(artifact_links)")?
@@ -1455,24 +1712,25 @@ impl CvcStore {
         links: Vec<(InteractionId, CommitSha, String, Option<String>)>,
         events: Vec<DerivationEvent>,
         ranges: Vec<RangeEvidence>,
-        remote_fingerprint: Option<&str>,
+        remote: &str,
         tombstones: &[Tombstone],
         published_ids: &[InteractionId],
     ) -> Result<()> {
+        // Every import names the destination it came from, so every imported
+        // conversation id is namespaced by it below.
+        let remote_fingerprint = Some(remote);
         let mut captures: Vec<Capture> = captures
             .into_iter()
             .map(privacy::prepare)
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| DbError::Migration(e.to_string()))?;
-        if let Some(remote) = remote_fingerprint {
-            // The remote payload remains immutable in Git; local conversation
-            // grouping is namespaced so a hostile/accidental identical session
-            // id cannot acquire local share policy.
-            for capture in &mut captures {
-                capture.interaction.conversation_id =
-                    format!("remote:{remote}:{}", capture.interaction.conversation_id);
-                capture.conversation.id = capture.interaction.conversation_id.clone();
-            }
+        // The remote payload remains immutable in Git; local conversation
+        // grouping is namespaced so a hostile/accidental identical session
+        // id cannot acquire local share policy.
+        for capture in &mut captures {
+            capture.interaction.conversation_id =
+                format!("remote:{remote}:{}", capture.interaction.conversation_id);
+            capture.conversation.id = capture.interaction.conversation_id.clone();
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         // The complete, already validated pull is one commit: suppression,
@@ -1548,7 +1806,7 @@ impl CvcStore {
             if let Some(remote) = remote_fingerprint {
                 tx.execute("INSERT OR IGNORE INTO derivation_authorizations(event_id,remote_fingerprint,source_event_id) VALUES(?1,?2,?1)",params![event.event_id,remote])?;
             }
-            let key = remote_fingerprint.unwrap_or("");
+            let key = remote;
             tx.execute("INSERT OR IGNORE INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) VALUES(?1,?2,?3,'remote_sync',0)", params![event.event_id,remote_fingerprint,key])?;
         }
         if let Some(remote) = remote_fingerprint {
@@ -1785,12 +2043,23 @@ impl CvcStore {
         Ok(())
     }
 
+    /// The typed copy of a Claude Code cursor. A cursor whose state would
+    /// not be within the typed table's limits (a session id or path that is
+    /// not storable) is not copied, and any earlier copy of it is removed: the
+    /// 0.7.x row stays the one that is read.
     fn mirror_claude_code_cursor_tx(
         tx: &Transaction<'_>,
         cursor: &HarnessCursorUpdate<'_>,
         byte_offset: i64,
         now: i64,
     ) -> Result<()> {
+        if !Self::is_mirrorable_cursor(cursor.session_id, cursor.transcript_path, byte_offset) {
+            tx.execute(
+                "DELETE FROM harness_cursors WHERE harness=?1 AND cursor_key=?2",
+                params![cursor.harness, cursor.session_id],
+            )?;
+            return Ok(());
+        }
         tx.execute(
             MIRROR_CLAUDE_CODE_CURSOR_SQL,
             params![
@@ -1800,6 +2069,40 @@ impl CvcStore {
                 byte_offset,
                 now
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a 0.7.x Claude Code cursor may have a typed copy: its session
+    /// id is a storable identifier, and `{path, byte_offset}` is a storable
+    /// cursor state.
+    fn is_mirrorable_cursor(session_id: &str, path: &str, byte_offset: i64) -> bool {
+        let state = serde_json::json!({ "path": path, "byte_offset": byte_offset });
+        is_storable_identifier(session_id)
+            && serde_json::to_string(&state)
+                .is_ok_and(|encoded| is_storable_cursor_state(&state, &encoded))
+    }
+
+    /// The one-time copy of the 0.7.x Claude Code cursors into the typed
+    /// table, row by row, under the same limits as every typed cursor. A row
+    /// already in the typed table is kept.
+    fn copy_legacy_cursors(&self) -> Result<()> {
+        let rows: Vec<(String, String, i64, i64)> = self
+            .conn
+            .prepare("SELECT session_id, transcript_path, byte_offset, updated_at FROM harness_ingest_cursors WHERE harness='claude-code'")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        for (session, path, offset, updated_at) in rows {
+            if Self::is_mirrorable_cursor(&session, &path, offset) {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO harness_cursors(harness,cursor_key,kind,version,epoch,state,updated_at) VALUES ('claude-code',?1,'jsonl',1,0,json_object('path',?2,'byte_offset',?3),?4)",
+                    params![session, path, offset, updated_at],
+                )?;
+            }
+        }
+        self.conn.execute(
+            "INSERT INTO cvc_internal_migrations(name) VALUES('harness-cursors/v1')",
+            [],
         )?;
         Ok(())
     }
@@ -1963,7 +2266,7 @@ impl CvcStore {
         family_root: &str,
     ) -> Result<Vec<HarnessCommitEvidence>> {
         self.conn
-            .prepare("SELECT family_root, interaction_id, candidate, response_at FROM harness_commit_evidence WHERE harness=?1 AND family_root=?2 ORDER BY response_at, interaction_id, candidate")?
+            .prepare("SELECT family_root, interaction_id, commit_oid, response_at FROM harness_commit_evidence WHERE harness=?1 AND family_root=?2 ORDER BY response_at, interaction_id, commit_oid")?
             .query_map(params![harness.name(), family_root], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1973,13 +2276,13 @@ impl CvcStore {
                 ))
             })?
             .map(|row| {
-                let (family_root, interaction, candidate, response_at) = row?;
+                let (family_root, interaction, commit, response_at) = row?;
                 Ok(HarnessCommitEvidence {
                     family_root,
                     interaction_id: interaction.parse().map_err(|_| {
                         DbError::Migration("stored commit evidence is malformed".into())
                     })?,
-                    candidate,
+                    commit: CommitSha::new(commit),
                     response_at,
                 })
             })
@@ -1990,21 +2293,31 @@ impl CvcStore {
     /// [`HarnessBatch`]): its captures (prepared at the capture boundary first,
     /// stand-ins included, exactly as [`Self::capture_claude_code_batch`]
     /// does), the typed cursor (never moved backwards), the Claude Code legacy
-    /// cursor, durable commit evidence and conversation relations, in one
+    /// cursor, conversation relations and durable commit evidence, in one
     /// immediate transaction.
     ///
     /// Refused as a whole, before anything is stored, when the batch is not
-    /// consistent: a capture of another harness or conversation, a malformed
-    /// cursor, a legacy cursor for a harness other than Claude Code, a relation
-    /// for Claude Code or outside the harness's namespace. Refused inside the
-    /// transaction when a prefixed harness would record into a conversation
-    /// that holds interactions of another local source (a 0.7.x MCP client may
-    /// have created `codex:x`), when the cursor's epoch skips ahead, and when a
-    /// relation conflicts with the one on record.
+    /// consistent: a coverage grant for another repository, a capture of
+    /// another harness or conversation, a cursor that is malformed, outside
+    /// its limits or keyed by anything but the batch's conversation (or
+    /// `scan:<id>`), a legacy cursor for anything but this Claude Code
+    /// session, a relation for Claude Code or outside the harness's
+    /// namespace.
+    ///
+    /// Refused inside the transaction when the store has not finished its
+    /// capture-source upgrade (a harness other than Claude Code), when a
+    /// prefixed harness would record into a conversation it does not own
+    /// (one that holds interactions of another local source, or share
+    /// decisions recorded before any interaction of this harness was), when
+    /// the cursor's epoch skips ahead, and when a relation conflicts with the
+    /// one on record. Evidence rows that do not meet
+    /// [`HarnessCommitEvidence`]'s contract are passed over and counted.
     pub fn capture_harness_batch(&self, batch: HarnessBatch<'_>) -> Result<HarnessBatchOutcome> {
         let HarnessBatch {
+            grant,
             harness,
             conversation_id,
+            policy,
             captures,
             cursor,
             legacy_cursor,
@@ -2012,8 +2325,8 @@ impl CvcStore {
             relations,
         } = batch;
         let refuse = |rule: &str| Err(DbError::HarnessBatch(rule.into()));
-        if !crate::privacy::is_safe_identifier(conversation_id) {
-            return refuse("the conversation id is not a safe identifier");
+        if grant.channel() != harness.channel() || !grant.binds_store(&self.path) {
+            return refuse("the coverage grant is not for this harness and repository");
         }
         if captures
             .iter()
@@ -2023,8 +2336,15 @@ impl CvcStore {
         }
         let state = match &cursor {
             Some(cursor) => {
-                if !crate::privacy::is_safe_identifier(cursor.cursor_key)
-                    || cursor.kind.is_empty()
+                let key_bound = cursor.cursor_key == conversation_id
+                    || cursor
+                        .cursor_key
+                        .strip_prefix("scan:")
+                        .is_some_and(|id| !id.is_empty());
+                if !key_bound || !is_storable_identifier(cursor.cursor_key) {
+                    return refuse("the cursor is not keyed by the batch's conversation");
+                }
+                if cursor.kind.is_empty()
                     || cursor.kind.len() > 32
                     || !cursor
                         .kind
@@ -2032,14 +2352,13 @@ impl CvcStore {
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
                     || cursor.version == 0
                     || i64::try_from(cursor.epoch).is_err()
-                    || !cursor.state.is_object()
                 {
                     return refuse("the cursor is malformed");
                 }
                 let state = serde_json::to_string(&cursor.state)
                     .map_err(|e| DbError::HarnessBatch(e.to_string()))?;
-                if state.len() > MAX_CURSOR_STATE_BYTES {
-                    return refuse("the cursor state is too large");
+                if !is_storable_cursor_state(&cursor.state, &state) {
+                    return refuse("the cursor state is not within its limits");
                 }
                 Some(state)
             }
@@ -2050,11 +2369,12 @@ impl CvcStore {
                 Some(legacy) => {
                     if harness != HarnessId::ClaudeCode
                         || legacy.harness != harness.name()
+                        || legacy.session_id != conversation_id
                         || cursor
                             .as_ref()
                             .is_some_and(|cursor| cursor.cursor_key != legacy.session_id)
                     {
-                        return refuse("a legacy cursor is kept for Claude Code sessions only");
+                        return refuse("a legacy cursor is kept for this Claude Code session only");
                     }
                     Some(i64::try_from(legacy.byte_offset).map_err(|_| {
                         DbError::Migration("harness cursor offset overflows".into())
@@ -2081,16 +2401,7 @@ impl CvcStore {
                 }
             }
             if harness.conversation_prefix().is_some() {
-                let foreign: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM interactions WHERE conversation_id=?1 AND capture_source NOT IN (?2,'sync_import'))",
-                    params![conversation_id, harness.capture_source_str()],
-                    |row| row.get(0),
-                )?;
-                if foreign {
-                    return Err(DbError::HarnessBatch(
-                        "the conversation holds interactions another source recorded".into(),
-                    ));
-                }
+                Self::check_conversation_owner_tx(tx, harness, conversation_id)?;
             }
             let mut outcome = Self::insert_harness_captures_tx(tx, &prepared)?;
             let now = Utc::now().timestamp();
@@ -2106,16 +2417,18 @@ impl CvcStore {
             {
                 Self::write_legacy_cursor_tx(tx, legacy, offset, now)?;
             }
-            for item in &evidence {
-                if Self::write_commit_evidence_tx(tx, harness, conversation_id, item)? {
-                    outcome.evidence_recorded += 1;
-                } else {
-                    outcome.evidence_skipped += 1;
-                }
-            }
+            // Relations first: the family an evidence row names may be the
+            // one a relation of this batch records.
             for relation in &relations {
                 if Self::write_relation_tx(tx, relation, now)? {
                     outcome.relations_recorded += 1;
+                }
+            }
+            for item in &evidence {
+                if Self::write_commit_evidence_tx(tx, harness, conversation_id, policy, item)? {
+                    outcome.evidence_recorded += 1;
+                } else {
+                    outcome.evidence_skipped += 1;
                 }
             }
             Ok(outcome)
@@ -2124,6 +2437,61 @@ impl CvcStore {
         outcome.reasons = prepared.reasons;
         self.ensure_wal_visible()?;
         Ok(outcome)
+    }
+
+    /// Refuses a prefixed harness's batch for a conversation it does not
+    /// own: one that holds interactions another local source recorded, or one
+    /// that has share decisions recorded while no interaction of this harness
+    /// is in it (a share decision belongs to whoever made the conversation,
+    /// and must not pass to a harness that later records under its id).
+    fn check_conversation_owner_tx(
+        tx: &Transaction<'_>,
+        harness: HarnessId,
+        conversation_id: &str,
+    ) -> Result<()> {
+        let (foreign, own, shared): (bool, bool, bool) = tx.query_row(
+            "SELECT
+                 EXISTS(SELECT 1 FROM interactions WHERE conversation_id=?1 AND capture_source NOT IN (?2,'sync_import')),
+                 EXISTS(SELECT 1 FROM interactions WHERE conversation_id=?1 AND capture_source=?2),
+                 EXISTS(SELECT 1 FROM conversation_shares WHERE conversation_id=?1)
+                   OR EXISTS(SELECT 1 FROM conversation_share_policy WHERE conversation_id=?1)",
+            params![conversation_id, harness.capture_source_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if foreign {
+            return Err(DbError::HarnessBatch(
+                "the conversation holds interactions another source recorded".into(),
+            ));
+        }
+        if shared && !own {
+            return Err(DbError::HarnessBatch(
+                "the conversation has share decisions recorded before this harness recorded in it"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The conversation the recorded subagent relations above
+    /// `conversation_id` lead to (itself when there is none), at most
+    /// [`MAX_RELATION_DEPTH`] levels up. Forks are not followed: a fork is not
+    /// its source's family.
+    fn recorded_root_tx(tx: &Transaction<'_>, conversation_id: &str) -> Result<String> {
+        let mut root = conversation_id.to_owned();
+        for _ in 0..MAX_RELATION_DEPTH {
+            match tx
+                .query_row(
+                    "SELECT parent_id FROM conversation_relations WHERE child_id=?1 AND kind='subagent'",
+                    params![root],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                Some(parent) => root = parent,
+                None => break,
+            }
+        }
+        Ok(root)
     }
 
     /// Writes `cursor` unless the stored one is ahead of it. `Ok(false)` when
@@ -2169,40 +2537,58 @@ impl CvcStore {
         Ok(true)
     }
 
-    /// Stores one commit-evidence row. `Ok(false)` when it is passed over: a
-    /// candidate that is not 4 to 64 lowercase hex digits, a family root that
-    /// is not a safe identifier, or an interaction not stored in
-    /// `conversation_id` (lost, tombstoned, or of another conversation).
+    /// Stores one commit-evidence row of [`HarnessCommitEvidence`]'s
+    /// contract. `Ok(false)` when it is passed over: the commit is not a full
+    /// lowercase commit id, or the built-in scrubber or `policy` would change
+    /// it; the family root is neither the conversation nor its root; or the
+    /// interaction is not one this harness recorded in `conversation_id`
+    /// (lost, tombstoned, another source's or another conversation's).
     fn write_commit_evidence_tx(
         tx: &Transaction<'_>,
         harness: HarnessId,
         conversation_id: &str,
+        policy: &privacy::PreparedPolicy,
         evidence: &HarnessCommitEvidence,
     ) -> Result<bool> {
-        let candidate = &evidence.candidate;
-        if !(4..=64).contains(&candidate.len())
-            || !candidate
+        let commit = evidence.commit.as_str();
+        let full_id = matches!(commit.len(), 40 | 64)
+            && commit
                 .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || !crate::privacy::is_safe_identifier(&evidence.family_root)
-        {
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        let unchanged = privacy::scrub(commit).is_ok_and(|s| s == commit)
+            && policy.scrub(commit).is_ok_and(|s| s == commit);
+        if !full_id || !unchanged || !is_storable_identifier(&evidence.family_root) {
+            return Ok(false);
+        }
+        let family_bound = evidence.family_root == conversation_id
+            || evidence.family_root == Self::recorded_root_tx(tx, conversation_id)?
+            || (harness == HarnessId::ClaudeCode
+                && conversation_id
+                    .strip_prefix(evidence.family_root.as_str())
+                    .and_then(|rest| rest.strip_prefix(SUBAGENT_MARKER))
+                    .is_some_and(|agent| !agent.is_empty() && !agent.contains(':')));
+        if !family_bound {
             return Ok(false);
         }
         let stored: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM interactions WHERE id=?1 AND conversation_id=?2)",
-            params![evidence.interaction_id.as_str(), conversation_id],
+            "SELECT EXISTS(SELECT 1 FROM interactions WHERE id=?1 AND conversation_id=?2 AND capture_source=?3)",
+            params![
+                evidence.interaction_id.as_str(),
+                conversation_id,
+                harness.capture_source_str()
+            ],
             |row| row.get(0),
         )?;
         if !stored {
             return Ok(false);
         }
         tx.execute(
-            "INSERT OR IGNORE INTO harness_commit_evidence(harness,family_root,interaction_id,candidate,response_at) VALUES (?1,?2,?3,?4,?5)",
+            "INSERT OR IGNORE INTO harness_commit_evidence(harness,family_root,interaction_id,commit_oid,response_at) VALUES (?1,?2,?3,?4,?5)",
             params![
                 harness.name(),
                 evidence.family_root,
                 evidence.interaction_id.as_str(),
-                candidate,
+                commit,
                 evidence.response_at
             ],
         )?;
@@ -2223,7 +2609,7 @@ impl CvcStore {
             return refuse("a relation belongs to another harness");
         }
         for id in [&relation.child_id, &relation.parent_id] {
-            if !crate::privacy::is_safe_identifier(id)
+            if !is_storable_identifier(id)
                 || !id.starts_with(prefix)
                 || id.contains(SUBAGENT_MARKER)
             {
@@ -2239,9 +2625,9 @@ impl CvcStore {
         if relation
             .spawn_call_id
             .as_deref()
-            .is_some_and(|id| !crate::privacy::is_safe_identifier(id))
+            .is_some_and(|id| !is_storable_identifier(id))
         {
-            return refuse("a relation's spawn call id is not a safe identifier");
+            return refuse("a relation's spawn call id is not a storable identifier");
         }
         Ok(())
     }
@@ -4629,9 +5015,26 @@ mod trusted_api_tests {
 #[cfg(test)]
 mod harness_batch_tests {
     use super::*;
-    use crate::privacy::{HarnessCaptureInput, PreparedPolicy};
+    use crate::harness::PassiveChannel;
+    use crate::privacy::{CoverageGrant, HarnessCaptureInput, PreparedPolicy};
 
     const WORKTREE: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// A grant for `harness`'s channel that binds no repository (tests only).
+    fn grant(harness: HarnessId) -> &'static CoverageGrant {
+        Box::leak(Box::new(CoverageGrant::for_tests(harness.channel())))
+    }
+
+    fn policy() -> &'static PreparedPolicy {
+        Box::leak(Box::new(PreparedPolicy::built_ins_only()))
+    }
+
+    /// A policy built from `.thoughtignore` lines.
+    fn policy_of(rules: &str) -> &'static PreparedPolicy {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".thoughtignore"), rules).unwrap();
+        Box::leak(Box::new(PreparedPolicy::load(dir.path()).unwrap()))
+    }
 
     fn capture(harness: HarnessId, conversation: &str, key: &str) -> HarnessCaptureInput {
         let id = crate::harness::derived_interaction_id(harness, conversation, key);
@@ -4684,16 +5087,13 @@ mod harness_batch_tests {
         }
     }
 
+    /// An empty batch of `harness` for `conversation`, under its grant.
+    fn batch_of(harness: HarnessId, conversation: &str) -> HarnessBatch<'_> {
+        HarnessBatch::new(grant(harness), harness, conversation, policy()).unwrap()
+    }
+
     fn batch(conversation: &str) -> HarnessBatch<'_> {
-        HarnessBatch {
-            harness: HarnessId::Codex,
-            conversation_id: conversation,
-            captures: Vec::new(),
-            cursor: None,
-            legacy_cursor: None,
-            evidence: Vec::new(),
-            relations: Vec::new(),
-        }
+        batch_of(HarnessId::Codex, conversation)
     }
 
     fn relation(child: &str, parent: &str) -> ConversationRelation {
@@ -4708,6 +5108,19 @@ mod harness_batch_tests {
         }
     }
 
+    fn commit(n: u8) -> CommitSha {
+        CommitSha::new(format!("{n:02x}").repeat(20))
+    }
+
+    fn evidence(root: &str, id: &InteractionId, commit: CommitSha) -> HarnessCommitEvidence {
+        HarnessCommitEvidence {
+            family_root: root.into(),
+            interaction_id: id.clone(),
+            commit,
+            response_at: 1_700_000_000,
+        }
+    }
+
     fn ordinal(store: &CvcStore, key: &str) -> (u64, u64) {
         let stored = store
             .harness_cursor(HarnessId::Codex, key)
@@ -4716,13 +5129,63 @@ mod harness_batch_tests {
         (stored.epoch, stored.state["last_ordinal"].as_u64().unwrap())
     }
 
+    fn refused(result: Result<HarnessBatchOutcome>) {
+        assert!(
+            matches!(result, Err(DbError::HarnessBatch(_))),
+            "{:?}",
+            result.map(|_| ())
+        );
+    }
+
+    #[test]
+    fn harness_batches_require_a_grant_for_the_harness_channel() {
+        let codex = grant(HarnessId::Codex);
+        assert!(matches!(
+            HarnessBatch::new(codex, HarnessId::OpenCode, "opencode:s", policy()),
+            Err(DbError::HarnessBatch(_))
+        ));
+        let vscode: &'static CoverageGrant =
+            Box::leak(Box::new(CoverageGrant::for_tests(PassiveChannel::Vscode)));
+        assert!(HarnessBatch::new(vscode, HarnessId::ClaudeCode, "s1", policy()).is_err());
+        assert!(HarnessBatch::new(codex, HarnessId::Codex, "codex:t", policy()).is_ok());
+        // The conversation id must be one the built-in scrubber leaves as it is.
+        assert!(HarnessBatch::new(codex, HarnessId::Codex, "codex:a b", policy()).is_err());
+    }
+
+    /// A grant given for one repository records nothing into another's store.
+    #[test]
+    fn a_grant_for_one_repository_records_nothing_in_another() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        privacy::acknowledge_capture(&repo).unwrap();
+        let claude = privacy::require_coverage(&repo, HarnessId::ClaudeCode.channel()).unwrap();
+
+        let own_path = dir.path().join(".git").join("cvc").join("index.db");
+        let own = CvcStore::open(&own_path).unwrap();
+        let b = HarnessBatch::new(&claude, HarnessId::ClaudeCode, "s1", policy())
+            .unwrap()
+            .with_captures(vec![capture(HarnessId::ClaudeCode, "s1", "req_1")]);
+        assert_eq!(own.capture_harness_batch(b).unwrap().inserted, 1);
+
+        let other = tempfile::TempDir::new().unwrap();
+        let other_store = CvcStore::open(other.path().join("cvc").join("index.db")).unwrap();
+        let b = HarnessBatch::new(&claude, HarnessId::ClaudeCode, "s1", policy())
+            .unwrap()
+            .with_captures(vec![capture(HarnessId::ClaudeCode, "s1", "req_2")]);
+        refused(other_store.capture_harness_batch(b));
+        assert!(other_store.get_conversation("s1").unwrap().is_none());
+        let memory = CvcStore::open(":memory:").unwrap();
+        let b = HarnessBatch::new(&claude, HarnessId::ClaudeCode, "s1", policy()).unwrap();
+        refused(memory.capture_harness_batch(b));
+    }
+
     #[test]
     fn captures_and_cursor_commit_together_and_the_cursor_never_moves_back() {
         let store = CvcStore::open(":memory:").unwrap();
         let conv = "codex:t1";
-        let mut first = batch(conv);
-        first.captures = vec![capture(HarnessId::Codex, conv, "resp:a")];
-        first.cursor = Some(cursor(conv, 0, 10, &forward));
+        let first = batch(conv)
+            .with_captures(vec![capture(HarnessId::Codex, conv, "resp:a")])
+            .with_cursor(cursor(conv, 0, 10, &forward));
         let outcome = store.capture_harness_batch(first).unwrap();
         assert_eq!((outcome.inserted, outcome.cursor_held), (1, false));
         assert_eq!(ordinal(&store, conv), (0, 10));
@@ -4734,12 +5197,12 @@ mod harness_batch_tests {
 
         // The same response again is skipped; a backward cursor is held while
         // the captures still commit.
-        let mut again = batch(conv);
-        again.captures = vec![
-            capture(HarnessId::Codex, conv, "resp:a"),
-            capture(HarnessId::Codex, conv, "resp:b"),
-        ];
-        again.cursor = Some(cursor(conv, 0, 5, &backward));
+        let again = batch(conv)
+            .with_captures(vec![
+                capture(HarnessId::Codex, conv, "resp:a"),
+                capture(HarnessId::Codex, conv, "resp:b"),
+            ])
+            .with_cursor(cursor(conv, 0, 5, &backward));
         let outcome = store.capture_harness_batch(again).unwrap();
         assert_eq!((outcome.inserted, outcome.suppressed), (1, 1));
         assert!(outcome.cursor_held);
@@ -4748,35 +5211,29 @@ mod harness_batch_tests {
         // Forward in the same epoch moves; the next epoch replaces whatever
         // its codec says; an earlier epoch is held; one that skips ahead is
         // refused and stores nothing.
-        let mut ahead = batch(conv);
-        ahead.cursor = Some(cursor(conv, 0, 99, &forward));
-        store.capture_harness_batch(ahead).unwrap();
+        store
+            .capture_harness_batch(batch(conv).with_cursor(cursor(conv, 0, 99, &forward)))
+            .unwrap();
         assert_eq!(ordinal(&store, conv), (0, 99));
-        let mut next = batch(conv);
-        next.cursor = Some(cursor(conv, 1, 3, &backward));
+        let next = batch(conv).with_cursor(cursor(conv, 1, 3, &backward));
         assert!(!store.capture_harness_batch(next).unwrap().cursor_held);
         assert_eq!(ordinal(&store, conv), (1, 3));
-        let mut stale = batch(conv);
-        stale.cursor = Some(cursor(conv, 0, 500, &forward));
+        let stale = batch(conv).with_cursor(cursor(conv, 0, 500, &forward));
         assert!(store.capture_harness_batch(stale).unwrap().cursor_held);
-        let mut skip = batch(conv);
-        skip.captures = vec![capture(HarnessId::Codex, conv, "resp:c")];
-        skip.cursor = Some(cursor(conv, 3, 1, &forward));
-        assert!(matches!(
-            store.capture_harness_batch(skip),
-            Err(DbError::HarnessBatch(_))
-        ));
+        let skip = batch(conv)
+            .with_captures(vec![capture(HarnessId::Codex, conv, "resp:c")])
+            .with_cursor(cursor(conv, 3, 1, &forward));
+        refused(store.capture_harness_batch(skip));
         assert_eq!(store.conversation_interaction_count(conv).unwrap(), 2);
         assert_eq!(ordinal(&store, conv), (1, 3));
 
         // An older cursor version never overwrites a newer one.
-        let mut newer = batch(conv);
         let mut write = cursor(conv, 1, 4, &forward);
         write.version = 2;
-        newer.cursor = Some(write);
-        store.capture_harness_batch(newer).unwrap();
-        let mut older = batch(conv);
-        older.cursor = Some(cursor(conv, 1, 9, &forward));
+        store
+            .capture_harness_batch(batch(conv).with_cursor(write))
+            .unwrap();
+        let older = batch(conv).with_cursor(cursor(conv, 1, 9, &forward));
         assert!(store.capture_harness_batch(older).unwrap().cursor_held);
         assert_eq!(ordinal(&store, conv), (1, 4));
     }
@@ -4785,49 +5242,50 @@ mod harness_batch_tests {
     fn inconsistent_batches_are_refused_before_anything_is_stored() {
         let store = CvcStore::open(":memory:").unwrap();
         let conv = "codex:t1";
-        let refused = |b: HarnessBatch<'_>| {
-            assert!(matches!(
-                store.capture_harness_batch(b),
-                Err(DbError::HarnessBatch(_))
-            ));
-        };
-        let mut other_conversation = batch(conv);
-        other_conversation.captures = vec![capture(HarnessId::Codex, "codex:t2", "resp:a")];
-        refused(other_conversation);
-        let mut other_harness = batch("opencode:s");
-        other_harness.captures = vec![capture(HarnessId::OpenCode, "opencode:s", "msg:a")];
-        refused(other_harness);
-        let mut legacy = batch(conv);
-        legacy.legacy_cursor = Some(HarnessCursorUpdate {
-            harness: "codex",
-            session_id: conv,
-            transcript_path: "/r",
-            byte_offset: 1,
-        });
-        refused(legacy);
-        let mut claude_relation = batch("s1");
-        claude_relation.harness = HarnessId::ClaudeCode;
-        claude_relation.relations = vec![ConversationRelation {
-            harness: HarnessId::ClaudeCode,
-            ..relation("s1:agent-a", "s1")
-        }];
-        refused(claude_relation);
-        let mut outside = batch(conv);
-        outside.relations = vec![relation("codex:a:agent-b", conv)];
-        refused(outside);
-        let mut unrelated = batch(conv);
-        unrelated.relations = vec![relation("codex:x", "codex:y")];
-        refused(unrelated);
-        let mut bad_cursor = batch(conv);
+        refused(
+            store.capture_harness_batch(batch(conv).with_captures(vec![capture(
+                HarnessId::Codex,
+                "codex:t2",
+                "resp:a",
+            )])),
+        );
+        refused(
+            store.capture_harness_batch(batch(conv).with_legacy_cursor(HarnessCursorUpdate {
+                harness: "codex",
+                session_id: conv,
+                transcript_path: "/r",
+                byte_offset: 1,
+            })),
+        );
+        // A Claude Code legacy cursor binds the batch's own session.
+        refused(store.capture_harness_batch(
+            batch_of(HarnessId::ClaudeCode, "s1").with_legacy_cursor(HarnessCursorUpdate {
+                harness: "claude-code",
+                session_id: "s2",
+                transcript_path: "/r",
+                byte_offset: 1,
+            }),
+        ));
+        refused(
+            store.capture_harness_batch(batch_of(HarnessId::ClaudeCode, "s1").with_relations(
+                vec![ConversationRelation {
+                    harness: HarnessId::ClaudeCode,
+                    ..relation("s1:agent-a", "s1")
+                }],
+            )),
+        );
+        refused(store.capture_harness_batch(
+            batch(conv).with_relations(vec![relation("codex:a:agent-b", conv)]),
+        ));
+        refused(store.capture_harness_batch(
+            batch(conv).with_relations(vec![relation("codex:x", "codex:y")]),
+        ));
         let mut write = cursor(conv, 0, 1, &forward);
         write.kind = "JSONL";
-        bad_cursor.cursor = Some(write);
-        refused(bad_cursor);
-        let mut not_object = batch(conv);
+        refused(store.capture_harness_batch(batch(conv).with_cursor(write)));
         let mut write = cursor(conv, 0, 1, &forward);
         write.state = serde_json::json!([1]);
-        not_object.cursor = Some(write);
-        refused(not_object);
+        refused(store.capture_harness_batch(batch(conv).with_cursor(write)));
         assert!(store
             .list_conversation_summaries(None, 10)
             .unwrap()
@@ -4836,6 +5294,56 @@ mod harness_batch_tests {
             .harness_cursor(HarnessId::Codex, conv)
             .unwrap()
             .is_none());
+    }
+
+    /// A cursor is keyed by the batch's conversation or by `scan:<id>`, and
+    /// its state holds positions within the documented limits.
+    #[test]
+    fn cursors_are_bound_to_the_batch_and_kept_small() {
+        let store = CvcStore::open(":memory:").unwrap();
+        let conv = "codex:t1";
+        for key in ["codex:t2", "s1", "scan:", "scan:a b"] {
+            refused(
+                store.capture_harness_batch(batch(conv).with_cursor(cursor(key, 0, 1, &forward))),
+            );
+        }
+        store
+            .capture_harness_batch(batch(conv).with_cursor(cursor("scan:db1", 0, 1, &forward)))
+            .unwrap();
+        assert!(store
+            .harness_cursor(HarnessId::Codex, "scan:db1")
+            .unwrap()
+            .is_some());
+
+        let with_state = |state: serde_json::Value| {
+            let mut write = cursor(conv, 0, 1, &forward);
+            write.state = state;
+            store.capture_harness_batch(batch(conv).with_cursor(write))
+        };
+        let secret = ["ghp_", "abcdefghijklmnopqrstuvwxyz0123456789"].concat();
+        for state in [
+            serde_json::json!({ "path": "x".repeat(MAX_CURSOR_STRING_BYTES + 1) }),
+            serde_json::json!({ "note": secret }),
+            serde_json::json!({ secret.clone(): 1 }),
+            serde_json::json!({ "k".repeat(65): 1 }),
+            serde_json::json!({ "a": { "b": { "c": { "d": { "e": 1 } } } } }),
+            serde_json::json!({
+                "a": "x".repeat(1000), "b": "x".repeat(1000), "c": "x".repeat(1000),
+                "d": "x".repeat(1000), "e": "x".repeat(1000)
+            }),
+        ] {
+            refused(with_state(state));
+        }
+        assert!(store
+            .harness_cursor(HarnessId::Codex, conv)
+            .unwrap()
+            .is_none());
+        with_state(serde_json::json!({
+            "path": "/home/u/.codex/sessions/2026/11/21/rollout-019a.jsonl",
+            "byte_offset": 123, "last_ordinal": 88, "epoch_reason": "moved",
+            "file_id": { "sha256": "ab".repeat(32), "len": 512 }
+        }))
+        .unwrap();
     }
 
     #[test]
@@ -4850,13 +5358,72 @@ mod harness_batch_tests {
                  INSERT INTO interactions(id,conversation_id,timestamp,author,user_prompt,capture_source,scrubber_version) VALUES('6b1f0c0e-1111-4aaa-8bbb-000000000001','codex:t1',1,'agent','x','mcp',1);",
             )
             .unwrap();
-        let mut b = batch("codex:t1");
-        b.captures = vec![capture(HarnessId::Codex, "codex:t1", "resp:a")];
-        assert!(matches!(
-            store.capture_harness_batch(b),
-            Err(DbError::HarnessBatch(_))
-        ));
+        let b =
+            batch("codex:t1").with_captures(vec![capture(HarnessId::Codex, "codex:t1", "resp:a")]);
+        refused(store.capture_harness_batch(b));
         assert_eq!(store.conversation_interaction_count("codex:t1").unwrap(), 1);
+    }
+
+    /// Share decisions belong to whoever made the conversation: a harness
+    /// does not take over a conversation that has them while none of its
+    /// own interactions is in it.
+    #[test]
+    fn share_decisions_count_as_ownership() {
+        let store = CvcStore::open(":memory:").unwrap();
+        let fingerprint = "7".repeat(64);
+        for (conv, table) in [
+            ("codex:shared", "conversation_shares"),
+            ("codex:policy", "conversation_share_policy"),
+        ] {
+            store
+                .conn
+                .execute_batch(&format!(
+                    "INSERT INTO conversations(id,title,created_at) VALUES('{conv}','mcp',1);"
+                ))
+                .unwrap();
+            if table == "conversation_shares" {
+                store
+                    .share_exact_snapshot(conv, &fingerprint, &[], FutureSharePolicy::Shared)
+                    .unwrap();
+            } else {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO conversation_share_policy(conversation_id,future_shared) VALUES(?1,1)",
+                        params![conv],
+                    )
+                    .unwrap();
+            }
+            let b = batch(conv).with_captures(vec![capture(HarnessId::Codex, conv, "resp:a")]);
+            refused(store.capture_harness_batch(b));
+            assert_eq!(
+                store.conversation_interaction_count(conv).unwrap(),
+                0,
+                "{table}"
+            );
+        }
+        // A share the person recorded for a conversation the harness already
+        // records in is its own: later batches go on, and inherit it.
+        let conv = "codex:own";
+        store
+            .capture_harness_batch(batch(conv).with_captures(vec![capture(
+                HarnessId::Codex,
+                conv,
+                "resp:a",
+            )]))
+            .unwrap();
+        let snapshot = store.share_snapshot(conv).unwrap();
+        store
+            .share_exact_snapshot(conv, &fingerprint, &snapshot, FutureSharePolicy::Shared)
+            .unwrap();
+        let outcome = store
+            .capture_harness_batch(batch(conv).with_captures(vec![capture(
+                HarnessId::Codex,
+                conv,
+                "resp:b",
+            )]))
+            .unwrap();
+        assert_eq!(outcome.inserted, 1);
     }
 
     #[test]
@@ -4879,11 +5446,10 @@ mod harness_batch_tests {
             transcript_path: "/t.jsonl",
             byte_offset: offset,
         };
-        let mut b = batch("s1");
-        b.harness = HarnessId::ClaudeCode;
-        b.captures = vec![capture(HarnessId::ClaudeCode, "s1", "req_1")];
-        b.cursor = Some(typed(42, &forward));
-        b.legacy_cursor = Some(legacy(42));
+        let b = batch_of(HarnessId::ClaudeCode, "s1")
+            .with_captures(vec![capture(HarnessId::ClaudeCode, "s1", "req_1")])
+            .with_cursor(typed(42, &forward))
+            .with_legacy_cursor(legacy(42));
         store.capture_harness_batch(b).unwrap();
         let stored = store
             .harness_ingest_cursor("claude-code", "s1")
@@ -4895,10 +5461,9 @@ mod harness_batch_tests {
         );
 
         // The typed cursor held, the legacy one held with it.
-        let mut b = batch("s1");
-        b.harness = HarnessId::ClaudeCode;
-        b.cursor = Some(typed(7, &backward));
-        b.legacy_cursor = Some(legacy(7));
+        let b = batch_of(HarnessId::ClaudeCode, "s1")
+            .with_cursor(typed(7, &backward))
+            .with_legacy_cursor(legacy(7));
         assert!(store.capture_harness_batch(b).unwrap().cursor_held);
         let stored = store
             .harness_ingest_cursor("claude-code", "s1")
@@ -4910,14 +5475,14 @@ mod harness_batch_tests {
     #[test]
     fn the_claude_code_batch_mirrors_its_cursor_into_the_typed_table() {
         let store = CvcStore::open(":memory:").unwrap();
-        let update = |offset| HarnessCursorUpdate {
+        let update = |path, offset| HarnessCursorUpdate {
             harness: "claude-code",
             session_id: "s1",
-            transcript_path: "/t.jsonl",
+            transcript_path: path,
             byte_offset: offset,
         };
         store
-            .capture_claude_code_batch(Vec::new(), update(10))
+            .capture_claude_code_batch(Vec::new(), update("/t.jsonl", 10))
             .unwrap();
         let typed = store
             .harness_cursor(HarnessId::ClaudeCode, "s1")
@@ -4946,7 +5511,7 @@ mod harness_batch_tests {
             )
             .unwrap();
         store
-            .capture_claude_code_batch(Vec::new(), update(3))
+            .capture_claude_code_batch(Vec::new(), update("/t.jsonl", 3))
             .unwrap();
         let typed = store
             .harness_cursor(HarnessId::ClaudeCode, "s1")
@@ -4954,64 +5519,196 @@ mod harness_batch_tests {
             .unwrap();
         assert_eq!(typed.state["byte_offset"], 3);
         assert_eq!(typed.state["carry"], "kept");
-        assert_eq!(
-            store
-                .harness_ingest_cursor("claude-code", "s1")
-                .unwrap()
-                .unwrap()
-                .byte_offset,
-            3
-        );
+        // A path outside the typed limits is kept in the 0.7.x row only.
+        let long = format!("/{}", "p".repeat(MAX_CURSOR_STRING_BYTES));
+        store
+            .capture_claude_code_batch(Vec::new(), update(&long, 4))
+            .unwrap();
+        assert!(store
+            .harness_cursor(HarnessId::ClaudeCode, "s1")
+            .unwrap()
+            .is_none());
+        let legacy = store
+            .harness_ingest_cursor("claude-code", "s1")
+            .unwrap()
+            .unwrap();
+        assert_eq!((legacy.transcript_path, legacy.byte_offset), (long, 4));
     }
 
     #[test]
-    fn commit_evidence_is_durable_and_checked() {
+    fn only_resolved_commit_ids_of_the_harness_own_interactions_are_stored() {
         let store = CvcStore::open(":memory:").unwrap();
         let conv = "codex:t1";
         let a = capture(HarnessId::Codex, conv, "resp:a");
         let a_id = a.interaction_id().clone();
-        let evidence = |candidate: &str, id: &InteractionId| HarnessCommitEvidence {
-            family_root: conv.into(),
-            interaction_id: id.clone(),
-            candidate: candidate.into(),
-            response_at: 1_700_000_000,
-        };
-        let mut b = batch(conv);
-        b.captures = vec![a];
-        b.evidence = vec![
-            evidence("0123abcd", &a_id),
-            evidence("0123abcd", &a_id),
-            evidence("ABCD1234", &a_id),
-            evidence("abc", &a_id),
-            evidence(&"a".repeat(65), &a_id),
-            evidence("0123abcd", &InteractionId::new()),
-        ];
+        let sha256 = CommitSha::new("cd".repeat(32));
+        let b = batch(conv).with_captures(vec![a]).with_evidence(vec![
+            evidence(conv, &a_id, commit(1)),
+            evidence(conv, &a_id, commit(1)),
+            evidence(conv, &a_id, sha256.clone()),
+            evidence(conv, &a_id, CommitSha::new("0123abcd")),
+            evidence(conv, &a_id, CommitSha::new("AB".repeat(20))),
+            evidence(conv, &a_id, CommitSha::new("ab".repeat(21))),
+            evidence(conv, &a_id, CommitSha::new("g".repeat(40))),
+            evidence(conv, &InteractionId::new(), commit(2)),
+            evidence("codex:other", &a_id, commit(3)),
+        ]);
         let outcome = store.capture_harness_batch(b).unwrap();
         assert_eq!(
             (outcome.evidence_recorded, outcome.evidence_skipped),
-            (2, 4)
+            (3, 6)
         );
         let stored = store
             .harness_commit_evidence(HarnessId::Codex, conv)
             .unwrap();
-        assert_eq!(stored, vec![evidence("0123abcd", &a_id)]);
-        // A local deletion removes the interaction's evidence with it.
-        store
-            .tombstone_local(&a_id, TombstoneReasonCode::UserRequested, None)
-            .unwrap();
-        assert!(store
-            .harness_commit_evidence(HarnessId::Codex, conv)
+        assert_eq!(
+            stored
+                .iter()
+                .map(|e| e.commit.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            [commit(1).as_str().to_owned(), sha256.as_str().to_owned()]
+        );
+
+        // A commit id the batch's policy would change is not stored.
+        let strict = policy_of("regex:[0-9a-f]{40}\n");
+        let b = HarnessBatch::new(grant(HarnessId::Codex), HarnessId::Codex, conv, strict)
             .unwrap()
-            .is_empty());
+            .with_evidence(vec![evidence(conv, &a_id, commit(4))]);
+        assert_eq!(store.capture_harness_batch(b).unwrap().evidence_skipped, 1);
+    }
+
+    /// In an unprefixed Claude Code session, only Claude Code's own
+    /// interactions carry evidence; the family root is the session itself,
+    /// or the session its `<session>:agent-<id>` subagent id names.
+    #[test]
+    fn claude_code_evidence_belongs_to_its_own_interactions_and_family() {
+        let store = CvcStore::open(":memory:").unwrap();
+        let own = capture(HarnessId::ClaudeCode, "s1:agent-a1", "req_1");
+        let own_id = own.interaction_id().clone();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO conversations(id,title,created_at) VALUES('s1:agent-a1','t',1);
+                 INSERT INTO interactions(id,conversation_id,timestamp,author,user_prompt,capture_source,scrubber_version) VALUES('6b1f0c0e-1111-4aaa-8bbb-000000000009','s1:agent-a1',1,'agent','x','mcp',1);",
+            )
+            .unwrap();
+        let mcp: InteractionId = "6b1f0c0e-1111-4aaa-8bbb-000000000009".parse().unwrap();
+        let b = batch_of(HarnessId::ClaudeCode, "s1:agent-a1")
+            .with_captures(vec![own])
+            .with_evidence(vec![
+                evidence("s1", &own_id, commit(1)),
+                evidence("s1:agent-a1", &own_id, commit(2)),
+                evidence("s1", &mcp, commit(3)),
+                evidence("s", &own_id, commit(4)),
+                evidence("s1:agent", &own_id, commit(5)),
+            ]);
+        let outcome = store.capture_harness_batch(b).unwrap();
+        assert_eq!(
+            (outcome.evidence_recorded, outcome.evidence_skipped),
+            (2, 3)
+        );
+    }
+
+    /// The family root of a subagent's evidence is the root its recorded
+    /// relations lead to; forks are not family.
+    #[test]
+    fn evidence_names_the_recorded_family_root() {
+        let store = CvcStore::open(":memory:").unwrap();
+        let c = capture(HarnessId::Codex, "codex:c", "resp:a");
+        let c_id = c.interaction_id().clone();
+        let b = batch("codex:c")
+            .with_captures(vec![c])
+            .with_relations(vec![relation("codex:c", "codex:p")])
+            .with_evidence(vec![
+                evidence("codex:p", &c_id, commit(1)),
+                evidence("codex:q", &c_id, commit(2)),
+            ]);
+        let outcome = store.capture_harness_batch(b).unwrap();
+        assert_eq!(
+            (outcome.evidence_recorded, outcome.evidence_skipped),
+            (1, 1)
+        );
+        let f = capture(HarnessId::Codex, "codex:f", "resp:b");
+        let f_id = f.interaction_id().clone();
+        let b = batch("codex:f")
+            .with_captures(vec![f])
+            .with_relations(vec![ConversationRelation {
+                kind: RelationKind::Fork,
+                ..relation("codex:f", "codex:p")
+            }])
+            .with_evidence(vec![evidence("codex:p", &f_id, commit(3))]);
+        assert_eq!(store.capture_harness_batch(b).unwrap().evidence_skipped, 1);
+    }
+
+    /// Every way an interaction is deleted deletes its evidence with it.
+    #[test]
+    fn deleting_an_interaction_deletes_its_evidence() {
+        let store = CvcStore::open(":memory:").unwrap();
+        let conv = "codex:t1";
+        let record = |key: &str| {
+            let c = capture(HarnessId::Codex, conv, key);
+            let id = c.interaction_id().clone();
+            store
+                .capture_harness_batch(
+                    batch(conv)
+                        .with_captures(vec![c])
+                        .with_evidence(vec![evidence(conv, &id, commit(1))]),
+                )
+                .unwrap();
+            id
+        };
+        let count = || {
+            store
+                .harness_commit_evidence(HarnessId::Codex, conv)
+                .unwrap()
+                .len()
+        };
+        let a = record("resp:a");
+        record("resp:b");
+        record("resp:c");
+        assert_eq!(count(), 3);
+        store
+            .tombstone_local(&a, TombstoneReasonCode::UserRequested, None)
+            .unwrap();
+        assert_eq!(count(), 2);
+        store
+            .delete_interactions_by_source_request_id("resp:b")
+            .unwrap();
+        assert_eq!(count(), 1);
+        let replacement = crate::privacy::LspPassiveCapture::new(
+            Conversation {
+                id: "vscode-session".into(),
+                title: "t".into(),
+                created_at: Utc::now(),
+            },
+            Interaction {
+                id: InteractionId::new(),
+                conversation_id: "vscode-session".into(),
+                parent_id: None,
+                timestamp: Utc::now(),
+                author: Author::Human,
+                user_prompt: "p".into(),
+                model_name: None,
+                model_cot: None,
+                model_response: None,
+                source_request_id: Some("resp:c".into()),
+            },
+            Vec::new(),
+            Vec::new(),
+            PreparedPolicy::built_ins_only(),
+            WORKTREE.into(),
+        );
+        store
+            .replace_lsp_passive_capture_batch("resp:c", vec![replacement])
+            .unwrap();
+        assert_eq!(count(), 0);
     }
 
     #[test]
     fn relations_are_never_overwritten() {
         let store = CvcStore::open(":memory:").unwrap();
         let record = |child: &str, relation: ConversationRelation| {
-            let mut b = batch(child);
-            b.relations = vec![relation];
-            store.capture_harness_batch(b)
+            store.capture_harness_batch(batch(child).with_relations(vec![relation]))
         };
         let recorded = |result: Result<HarnessBatchOutcome>| result.unwrap().relations_recorded;
         assert_eq!(
@@ -5040,6 +5737,12 @@ mod harness_batch_tests {
             record("codex:c", other_spawn),
             Err(DbError::RelationConflict(_))
         ));
+        // A spawn call id must be one the built-in scrubber leaves as it is.
+        let unsafe_call = ConversationRelation {
+            spawn_call_id: Some("call 3".into()),
+            ..relation("codex:d", "codex:p")
+        };
+        refused(record("codex:d", unsafe_call));
         // Another parent, or another kind, is a conflict.
         assert!(matches!(
             record("codex:c", relation("codex:c", "codex:q")),
@@ -5079,9 +5782,7 @@ mod harness_batch_tests {
         let store = CvcStore::open(":memory:").unwrap();
         let id = |n: usize| format!("codex:n{n}");
         let record = |child: &str, parent: &str| {
-            let mut b = batch(child);
-            b.relations = vec![relation(child, parent)];
-            store.capture_harness_batch(b)
+            store.capture_harness_batch(batch(child).with_relations(vec![relation(child, parent)]))
         };
         // n0 is the root; n8 is 8 levels below it.
         for n in 1..=MAX_RELATION_DEPTH {
@@ -5101,17 +5802,31 @@ mod harness_batch_tests {
     #[test]
     fn summaries_name_the_agent_and_the_recorded_parent() {
         let store = CvcStore::open(":memory:").unwrap();
-        let mut root = batch("codex:p");
-        root.captures = vec![capture(HarnessId::Codex, "codex:p", "resp:a")];
-        store.capture_harness_batch(root).unwrap();
-        let mut child = batch("codex:c");
-        child.captures = vec![capture(HarnessId::Codex, "codex:c", "resp:b")];
-        child.relations = vec![relation("codex:c", "codex:p")];
-        store.capture_harness_batch(child).unwrap();
-        let mut claude = batch("s1");
-        claude.harness = HarnessId::ClaudeCode;
-        claude.captures = vec![capture(HarnessId::ClaudeCode, "s1", "req_1")];
-        store.capture_harness_batch(claude).unwrap();
+        store
+            .capture_harness_batch(batch("codex:p").with_captures(vec![capture(
+                HarnessId::Codex,
+                "codex:p",
+                "resp:a",
+            )]))
+            .unwrap();
+        store
+            .capture_harness_batch(
+                batch("codex:c")
+                    .with_captures(vec![capture(HarnessId::Codex, "codex:c", "resp:b")])
+                    .with_relations(vec![relation("codex:c", "codex:p")]),
+            )
+            .unwrap();
+        for session in ["s1", "s2"] {
+            store
+                .capture_harness_batch(
+                    batch_of(HarnessId::ClaudeCode, session).with_captures(vec![capture(
+                        HarnessId::ClaudeCode,
+                        session,
+                        "req_1",
+                    )]),
+                )
+                .unwrap();
+        }
         let remote = "a".repeat(64);
         store
             .conn
@@ -5120,7 +5835,8 @@ mod harness_batch_tests {
                  INSERT INTO interactions(id,conversation_id,timestamp,author,user_prompt,capture_source,scrubber_version) VALUES
                    ('6b1f0c0e-1111-4aaa-8bbb-000000000001','remote:{remote}:opencode:s',1,'agent','x','sync_import',1),
                    ('6b1f0c0e-1111-4aaa-8bbb-000000000002','remote:{remote}:u1',1,'agent','x','sync_import',1),
-                   ('6b1f0c0e-1111-4aaa-8bbb-000000000003','codex:mcp',1,'agent','x','mcp',1);"
+                   ('6b1f0c0e-1111-4aaa-8bbb-000000000003','codex:mcp',1,'agent','x','mcp',1),
+                   ('6b1f0c0e-1111-4aaa-8bbb-000000000004','s2',1,'agent','x','mcp',1);"
             ))
             .unwrap();
         let summaries = store.list_conversation_summaries(None, 10).unwrap();
@@ -5134,6 +5850,8 @@ mod harness_batch_tests {
             (Some(HarnessId::Codex), Some("codex:p".into()))
         );
         assert_eq!(of("s1"), (Some(HarnessId::ClaudeCode), None));
+        // A Claude Code session that also holds MCP thoughts gets no label.
+        assert_eq!(of("s2"), (None, None));
         assert_eq!(
             of(&format!("remote:{remote}:opencode:s")),
             (Some(HarnessId::OpenCode), None)
@@ -5175,25 +5893,27 @@ mod harness_batch_tests {
         let store = CvcStore::open_initialized(&path).unwrap();
         assert!(store.needs_capture_source_upgrade().unwrap());
 
-        let mut claude = batch("s1");
-        claude.harness = HarnessId::ClaudeCode;
-        claude.captures = vec![capture(HarnessId::ClaudeCode, "s1", "req_1")];
+        let claude = batch_of(HarnessId::ClaudeCode, "s1").with_captures(vec![capture(
+            HarnessId::ClaudeCode,
+            "s1",
+            "req_1",
+        )]);
         assert_eq!(store.capture_harness_batch(claude).unwrap().inserted, 1);
 
-        let mut codex = batch("codex:t1");
-        codex.captures = vec![capture(HarnessId::Codex, "codex:t1", "resp:a")];
-        codex.cursor = Some(cursor("codex:t1", 0, 1, &forward));
-        let refused = store.capture_harness_batch(codex).unwrap_err();
+        let codex = batch("codex:t1")
+            .with_captures(vec![capture(HarnessId::Codex, "codex:t1", "resp:a")])
+            .with_cursor(cursor("codex:t1", 0, 1, &forward));
+        let refusal = store.capture_harness_batch(codex).unwrap_err();
         assert!(
             matches!(
-                refused,
+                refusal,
                 DbError::CaptureSourceUpgradeRequired {
                     harness: HarnessId::Codex
                 }
             ),
-            "{refused}"
+            "{refusal}"
         );
-        assert_eq!(refused.retry_disposition(), RetryDisposition::Permanent);
+        assert_eq!(refusal.retry_disposition(), RetryDisposition::Permanent);
         assert!(store.get_conversation("codex:t1").unwrap().is_none());
         assert!(store
             .harness_cursor(HarnessId::Codex, "codex:t1")
@@ -5203,10 +5923,43 @@ mod harness_batch_tests {
 
         let store = CvcStore::open_initialized_upgrading(&path).unwrap();
         assert!(!store.needs_capture_source_upgrade().unwrap());
-        let mut codex = batch("codex:t1");
-        codex.captures = vec![capture(HarnessId::Codex, "codex:t1", "resp:a")];
+        let codex =
+            batch("codex:t1").with_captures(vec![capture(HarnessId::Codex, "codex:t1", "resp:a")]);
         assert_eq!(store.capture_harness_batch(codex).unwrap().inserted, 1);
         assert_eq!(store.conversation_interaction_count("old").unwrap(), 1);
         assert_eq!(store.conversation_interaction_count("s1").unwrap(), 1);
+    }
+
+    /// The triggers come back on the next open whenever they are missing,
+    /// marker or not; an open with nothing to do takes no write lock.
+    #[test]
+    fn missing_triggers_are_recreated_and_a_current_store_opens_without_a_write_lock() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("cvc").join("index.db");
+        drop(CvcStore::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER interactions_capture_source_insert; DROP TRIGGER interactions_capture_source_update;",
+        )
+        .unwrap();
+        drop(CvcStore::open(&path).unwrap());
+        let triggers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='interactions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(triggers, 2);
+
+        // Another connection holds the write lock: a default open of a
+        // current store still succeeds at once, because it has nothing to
+        // write.
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        let store = CvcStore::open(&path).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(1500));
+        assert!(!store.needs_capture_source_upgrade().unwrap());
+        conn.execute_batch("ROLLBACK").unwrap();
     }
 }

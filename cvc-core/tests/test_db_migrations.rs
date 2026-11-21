@@ -308,9 +308,10 @@ fn widened_by_07x(dump: &str) -> bool {
     dump.contains("'claude_code'") || !dump.contains("capture_source")
 }
 
-const CURRENT_MARKERS: [&str; 4] = [
+const CURRENT_MARKERS: [&str; 5] = [
     "capture-source-claude-code/v1",
     "capture-source/v2",
+    "converged-tables/0.8-1",
     "harness-cursors/v1",
     "legacy-link-observations/v1",
 ];
@@ -510,6 +511,7 @@ fn a_hook_style_open_leaves_a_populated_07x_store_for_an_operator_command() {
             markers(&conn),
             [
                 "capture-source-claude-code/v1",
+                "converged-tables/0.8-1",
                 "harness-cursors/v1",
                 "legacy-link-observations/v1"
             ],
@@ -782,6 +784,82 @@ fn cvc_07x_reopening_a_migrated_store_rebuilds_nothing() {
         // And this version, opening it again, restores its own state.
         open(&path);
         assert_eq!(markers(&Connection::open(&path).unwrap()), CURRENT_MARKERS);
+    }
+}
+
+/// cvc 0.7.x's own rebuild of `interactions`, byte for byte as 0.7.2 ships
+/// it (`WIDEN_CAPTURE_SOURCE_SQL`). 0.7.x runs it only when its marker is
+/// missing and the table's SQL lacks `'claude_code'`, which never holds for
+/// a store this version migrated; this runs it anyway.
+const WIDEN_CAPTURE_SOURCE_SQL: &str = "BEGIN IMMEDIATE; CREATE TABLE interactions_cvc_rebuild (id TEXT PRIMARY KEY, conversation_id TEXT, parent_id TEXT, timestamp INTEGER, author TEXT, user_prompt TEXT, model_name TEXT, model_cot TEXT, model_response TEXT, source_request_id TEXT, visibility TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('private','shared')), capture_source TEXT NOT NULL DEFAULT 'legacy' CHECK(capture_source IN ('mcp','vscode_passive','vscode_explicit','cli_run','sync_import','legacy','claude_code')), scrubber_version INTEGER NOT NULL DEFAULT 0 CHECK(scrubber_version BETWEEN 0 AND 1), capture_worktree TEXT CHECK(capture_worktree IS NULL OR (length(capture_worktree)=64 AND capture_worktree NOT GLOB '*[^0-9a-f]*')), FOREIGN KEY(conversation_id) REFERENCES conversations(id), FOREIGN KEY(parent_id) REFERENCES interactions(id)); INSERT INTO interactions_cvc_rebuild (id,conversation_id,parent_id,timestamp,author,user_prompt,model_name,model_cot,model_response,source_request_id,visibility,capture_source,scrubber_version,capture_worktree) SELECT id,conversation_id,parent_id,timestamp,author,user_prompt,model_name,model_cot,model_response,source_request_id,visibility,capture_source,scrubber_version,capture_worktree FROM interactions; DROP TABLE interactions; ALTER TABLE interactions_cvc_rebuild RENAME TO interactions; CREATE INDEX IF NOT EXISTS idx_interactions_conversation_id ON interactions(conversation_id); CREATE INDEX IF NOT EXISTS idx_interactions_source_request_id ON interactions(source_request_id); CREATE INDEX IF NOT EXISTS idx_interactions_visibility ON interactions(visibility); CREATE INDEX IF NOT EXISTS idx_interactions_source_request ON interactions(source_request_id); INSERT INTO cvc_internal_migrations(name) VALUES('capture-source-claude-code/v1'); COMMIT;";
+
+/// Even run unconditionally, on a store this version migrated, 0.7.x's
+/// rebuild fails and rolls back, with the rows of the new harnesses or
+/// without them: the triggers and every row survive.
+#[test]
+fn cvc_07x_rebuild_sql_on_a_migrated_store_rolls_back_and_keeps_everything() {
+    for with_new_harness_rows in [false, true] {
+        let (_temp, path) = database_from(RELEASED[4].1);
+        populate(&Connection::open(&path).unwrap());
+        open(&path);
+        let conn = Connection::open(&path).unwrap();
+        // As 0.7.x opens its store.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        if with_new_harness_rows {
+            conn.execute(
+                "INSERT INTO interactions(id,conversation_id,timestamp,author,user_prompt,capture_source,scrubber_version) VALUES (?1,'conv-1',1,'agent','x','codex',1)",
+                params![interaction_id(700)],
+            )
+            .unwrap();
+        }
+        let (schema_before, contents_before, root) =
+            (schema(&conn), contents(&conn), rootpage(&conn));
+        let result = conn.execute_batch(WIDEN_CAPTURE_SOURCE_SQL);
+        assert!(result.is_err(), "{with_new_harness_rows}");
+        // What 0.7.x does when it fails.
+        let _ = conn.execute_batch("ROLLBACK");
+        assert_eq!(schema(&conn), schema_before, "{with_new_harness_rows}");
+        assert_eq!(contents(&conn), contents_before, "{with_new_harness_rows}");
+        assert_eq!(rootpage(&conn), root, "{with_new_harness_rows}");
+        assert!(conn
+            .execute(
+                "INSERT INTO interactions(id,conversation_id,timestamp,author,user_prompt,capture_source) VALUES (?1,'conv-1',1,'agent','x','bogus')",
+                params![interaction_id(701)],
+            )
+            .is_err());
+    }
+}
+
+/// The typed copy of a 0.7.x cursor is made only of a storable state; a
+/// cursor outside the limits stays in the 0.7.x table alone.
+#[test]
+fn the_cursor_copy_keeps_to_the_typed_limits() {
+    let (_temp, path) = database_from(RELEASED[4].1);
+    let conn = Connection::open(&path).unwrap();
+    let secret = ["ghp_", "abcdefghijklmnopqrstuvwxyz0123456789"].concat();
+    conn.execute_batch(&format!(
+        "INSERT INTO harness_ingest_cursors VALUES ('claude-code','s1','/p/s1.jsonl',1,1);
+         INSERT INTO harness_ingest_cursors VALUES ('claude-code','s2','/p/{secret}.jsonl',1,1);
+         INSERT INTO harness_ingest_cursors VALUES ('claude-code','s3','/{}',1,1);",
+        "p".repeat(2000)
+    ))
+    .unwrap();
+    drop(conn);
+    open_default(&path);
+    let store = CvcStore::open(&path).unwrap();
+    assert!(store
+        .harness_cursor(HarnessId::ClaudeCode, "s1")
+        .unwrap()
+        .is_some());
+    for session in ["s2", "s3"] {
+        assert!(store
+            .harness_cursor(HarnessId::ClaudeCode, session)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .harness_ingest_cursor("claude-code", session)
+            .unwrap()
+            .is_some());
     }
 }
 

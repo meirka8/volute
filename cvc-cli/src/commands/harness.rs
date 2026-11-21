@@ -2,8 +2,9 @@
 use anyhow::{bail, Context, Result};
 use cvc_core::claude_code::harness_record;
 use cvc_core::claude_code::settings::{self, ExcludeAction, InstallAction, WorktreeState};
+use cvc_core::harness::{HarnessId, PassiveChannel};
 use cvc_core::hooks::{self, HookAction};
-use cvc_core::privacy::{self, CaptureAcknowledgement};
+use cvc_core::privacy::{self, CaptureCoverage};
 use cvc_core::repository::RepositoryLayout;
 use std::cmp::Ordering;
 use std::env;
@@ -356,7 +357,7 @@ pub async fn install_claude_code(binary: Option<PathBuf>) -> Result<()> {
     // Hook-driven ingestion is background observation of an agent session, so
     // it needs the same repository-local acknowledgement as passive VS Code
     // capture, and installing hooks that would refuse to run is not useful.
-    require_capture_acknowledged(&layout)?;
+    require_claude_code_capture_covered(&layout)?;
     // `--binary` overrides everything; only the default is steered away from
     // the launcher's versioned cache.
     let (binary, choice) = match binary {
@@ -681,13 +682,18 @@ pub(crate) const ACKNOWLEDGED_ELSEWHERE: &str = "capture was acknowledged for an
 /// How to stop the Claude Code hooks, which end every `consent-required`.
 const STOP_THE_HOOKS: &str = "(or stop the hooks: `/plugin disable cvc@volute` for the Claude Code plugin, `cvc harness uninstall claude-code` for this checkout's hooks)";
 
-pub(crate) fn require_capture_acknowledged(layout: &RepositoryLayout) -> Result<()> {
-    match privacy::capture_acknowledgement(layout.repository())? {
-        CaptureAcknowledgement::Acknowledged => Ok(()),
-        CaptureAcknowledgement::NotAcknowledged => bail!(
+/// The consent gate of Claude Code transcript capture: the capture
+/// acknowledgement must cover the Claude Code channel here. Claude Code is one
+/// of the legacy channels every acknowledgement covers, so this is the gate of
+/// cvc 0.7.x; another harness needs its own channel covered.
+pub(crate) fn require_claude_code_capture_covered(layout: &RepositoryLayout) -> Result<()> {
+    let channel = PassiveChannel::Harness(HarnessId::ClaudeCode);
+    match privacy::capture_coverage(layout.repository(), channel)? {
+        CaptureCoverage::Covered => Ok(()),
+        CaptureCoverage::NotAcknowledged | CaptureCoverage::NotCovering { .. } => bail!(
             "consent-required: Claude Code transcript capture is passive collection and needs the repository-local capture acknowledgement; run `cvc privacy acknowledge-capture` first {STOP_THE_HOOKS}"
         ),
-        CaptureAcknowledgement::OtherCheckoutOrUser => bail!(
+        CaptureCoverage::OtherCheckoutOrUser => bail!(
             "consent-required: Claude Code transcript capture is passive collection and needs the repository-local capture acknowledgement; {ACKNOWLEDGED_ELSEWHERE} {STOP_THE_HOOKS}"
         ),
     }
