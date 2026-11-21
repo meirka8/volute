@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! The harness registry and Claude Code's port onto it (#187), from outside
 //! the crate.
 //!

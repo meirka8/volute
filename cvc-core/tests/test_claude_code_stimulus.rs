@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! What the Claude Code adapter captures, end to end: transcript to planner to
 //! the database. The stimulus has each part scrubbed in full before anything is
 //! cut, a part that cannot be scrubbed is withheld without stopping the

@@ -35,6 +35,8 @@ pub mod transcript;
 
 pub use crate::harness::SESSION_LOCK_WAIT;
 pub use adapter::Adapter;
+// Deprecated, and kept for 0.7.x API callers.
+#[allow(deprecated)]
 pub use ingest::{
     ingest, ingest_waiting, ingest_with, sniff_first_entry, IngestError, IngestMode, IngestOptions,
     IngestReport,

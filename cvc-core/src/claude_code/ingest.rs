@@ -13,9 +13,9 @@
 //! All of it runs on the shared harness engine with the Claude Code adapter
 //! ([`super::Adapter`]). These entry points keep 0.7.x's contract: the
 //! transcript is opened once, sniffed and read through the same handle, and
-//! the capture decision is the caller's (cvc's CLI requires the capture
-//! acknowledgement before it calls them). [`crate::harness::engine::ingest`]
-//! with the same adapter is the gated path, which asks for coverage itself.
+//! the capture decision is the caller's. They are deprecated:
+//! [`crate::harness::engine::ingest`] with the same adapter is the gated
+//! path, which asks for coverage itself, and is what cvc's own CLI runs.
 use super::adapter::{Adapter, Source};
 use super::transcript::{self, FirstEntry, TranscriptError, FIRST_ENTRY_BYTES};
 use crate::db::{CvcStore, DbError, HARNESS_REASONS_SHOWN};
@@ -269,6 +269,8 @@ impl From<EngineReport<JsonlCursor>> for IngestReport {
 /// the advanced one, subagent transcripts included. A run that finds it held
 /// waits up to [`SESSION_LOCK_WAIT`], then fails with
 /// [`IngestError::SessionBusy`].
+#[deprecated(note = "use harness::engine::ingest")]
+#[allow(deprecated)]
 pub fn ingest(
     layout: &RepositoryLayout,
     store: &CvcStore,
@@ -289,6 +291,8 @@ pub fn ingest(
 }
 
 /// [`ingest`] with an explicit bound on the wait for the session's lock.
+#[deprecated(note = "use harness::engine::ingest")]
+#[allow(deprecated)]
 pub fn ingest_waiting(
     layout: &RepositoryLayout,
     store: &CvcStore,
@@ -321,6 +325,7 @@ pub fn ingest_waiting(
 /// runs over what was ingested, the session included, because the session's
 /// cursor is already past its committing response and that response would
 /// never be read again; the subagent's error is then returned.
+#[deprecated(note = "use harness::engine::ingest")]
 pub fn ingest_with(
     layout: &RepositoryLayout,
     store: &CvcStore,
@@ -427,6 +432,7 @@ pub(crate) fn read_to_first_entry(source: impl Read) -> std::io::Result<Vec<u8>>
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::harness::lock::FamilyLock;

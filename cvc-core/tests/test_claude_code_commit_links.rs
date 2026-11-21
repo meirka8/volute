@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Public issue 70: a response that runs `git commit` — and the reasoning
 //! before it — links to the commit it created, by exact transcript evidence
 //! rather than the time-window linker, and re-ingesting changes nothing.

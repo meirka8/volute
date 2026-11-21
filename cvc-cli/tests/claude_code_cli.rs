@@ -1659,7 +1659,7 @@ fn hook_mode_reads_an_oversize_payload_to_the_end_before_it_answers() {
 }
 
 /// The digest `cvc` names a session's ingest lock after, written out from its
-/// description (see `cvc-core/src/claude_code/session_lock.rs`) so that this
+/// description (see `cvc-core/src/harness/lock.rs`) so that this
 /// test can hold the lock as another `cvc` process would.
 fn session_lock_file(repo: &Path, session: &str) -> PathBuf {
     let mut hash = Sha256::new();

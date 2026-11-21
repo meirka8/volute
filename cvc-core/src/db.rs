@@ -2160,6 +2160,7 @@ impl CvcStore {
     ///
     /// The cursor is Claude Code's own: one whose `harness` is anything but
     /// `claude-code` is refused, and nothing is stored.
+    #[deprecated(note = "use harness::engine::ingest")]
     pub fn capture_claude_code_batch(
         &self,
         captures: Vec<crate::privacy::ClaudeCodeCapture>,
@@ -5285,6 +5286,7 @@ mod trusted_api_tests {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod harness_batch_tests {
     use super::*;
     use crate::harness::PassiveChannel;

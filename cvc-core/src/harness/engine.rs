@@ -49,9 +49,9 @@
 //! # Claude Code
 //!
 //! Claude Code runs through this engine like any harness. Its 0.7.x-compatible
-//! entry points (`claude_code::ingest` and its variants) leave the capture
-//! decision to their caller, as they did in 0.7.x: cvc's CLI requires the
-//! capture acknowledgement before it calls them. Their batches are the
+//! entry points (`claude_code::ingest` and its variants, deprecated) leave the
+//! capture decision to their caller, as they did in 0.7.x; cvc's own CLI no
+//! longer calls them. Their batches are the
 //! crate-private, Claude Code-only kind that carries no grant. Through
 //! [`ingest`], Claude Code is gated like every other harness, by its own
 //! channel, which every acknowledgement covers.
