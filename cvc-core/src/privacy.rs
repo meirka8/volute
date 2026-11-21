@@ -1,5 +1,5 @@
 //! Fail-closed capture sanitization and repository-local capture policy.
-use crate::harness::{self, HarnessId};
+use crate::harness::{self, HarnessId, PassiveChannel};
 use crate::models::{
     ArtifactLink, CaptureSource, ContextItem, Conversation, Interaction, InteractionId,
     ToolExecution,
@@ -67,6 +67,14 @@ struct PrivacyFile {
     /// by cvc 0.7.0 and earlier, which recorded the notice version alone.
     #[serde(default)]
     capture_acknowledged_binding: Option<String>,
+    /// The passive channels ([`PassiveChannel::name`]) the capture
+    /// acknowledgement covers beyond [`PassiveChannel::LEGACY_COVERED`], which
+    /// every acknowledgement covers. Absent from files written by cvc 0.7.2 and
+    /// earlier; cvc 0.7.x also drops it whenever it rewrites the file, which
+    /// narrows the coverage back to the legacy channels (the safe direction).
+    /// Names this version does not know grant nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capture_acknowledged_channels: Option<Vec<String>>,
     sharing: Vec<SharingConsent>,
 }
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -97,6 +105,26 @@ pub enum CaptureAcknowledgement {
 impl CaptureAcknowledgement {
     pub fn is_acknowledged(self) -> bool {
         self == Self::Acknowledged
+    }
+}
+/// Whether the repository-local capture acknowledgement covers one passive
+/// channel for the checkout and user asking. Only [`CaptureCoverage::Covered`]
+/// lets that channel capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureCoverage {
+    /// Acknowledged here, by this user, for this channel.
+    Covered,
+    /// Acknowledged here, by this user, before this channel could be covered:
+    /// the acknowledgement does not list it. Acknowledging again covers it.
+    NotCovering { channel: PassiveChannel },
+    /// See [`CaptureAcknowledgement::NotAcknowledged`].
+    NotAcknowledged,
+    /// See [`CaptureAcknowledgement::OtherCheckoutOrUser`].
+    OtherCheckoutOrUser,
+}
+impl CaptureCoverage {
+    pub fn is_covered(self) -> bool {
+        self == Self::Covered
     }
 }
 #[derive(Debug, Clone, Default)]
@@ -825,27 +853,79 @@ fn capture_binding_for(repo: &git2::Repository, user: &str) -> Option<String> {
 }
 
 /// Judges the capture acknowledgement recorded in `state` for `user` in
-/// `repo`. This is the one place that does: [`capture_acknowledged`],
-/// [`capture_acknowledgement`] and [`privacy_status_for_fingerprint`] all
-/// come here. Only the current notice version, recorded together with exactly
-/// the binding this checkout and `user` have now, is
-/// [`CaptureAcknowledgement::Acknowledged`]; a missing, different or
-/// unreadable binding, and an unknown user, are not.
+/// `repo` and the passive `channel`. This is the one place that does:
+/// [`capture_coverage`], [`capture_acknowledged`], [`capture_acknowledgement`]
+/// and [`privacy_status_for_fingerprint`] all come here. Only the current
+/// notice version, recorded together with exactly the binding this checkout
+/// and `user` have now, is acknowledged; a missing, different or unreadable
+/// binding, and an unknown user, are not. An acknowledgement covers the
+/// [`PassiveChannel::LEGACY_COVERED`] channels and the ones it lists, and no
+/// other.
+fn capture_coverage_in(
+    repo: &git2::Repository,
+    state: &PrivacyFile,
+    user: Option<&str>,
+    channel: PassiveChannel,
+) -> CaptureCoverage {
+    if state.capture_acknowledged_version != Some(PRIVACY_NOTICE_VERSION) {
+        return CaptureCoverage::NotAcknowledged;
+    }
+    let current = user.and_then(|user| capture_binding_for(repo, user));
+    match (state.capture_acknowledged_binding.as_deref(), current) {
+        (Some(recorded), Some(current)) if recorded == current => {}
+        _ => return CaptureCoverage::OtherCheckoutOrUser,
+    }
+    let listed = state
+        .capture_acknowledged_channels
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|name| name == channel.name());
+    if PassiveChannel::LEGACY_COVERED.contains(&channel) || listed {
+        CaptureCoverage::Covered
+    } else {
+        CaptureCoverage::NotCovering { channel }
+    }
+}
+
+/// The acknowledgement state alone, as cvc 0.7.x judged it: the legacy
+/// channels are covered by every acknowledgement, so this is the coverage of
+/// one of them.
 fn capture_acknowledgement_in(
     repo: &git2::Repository,
     state: &PrivacyFile,
     user: Option<&str>,
 ) -> CaptureAcknowledgement {
-    if state.capture_acknowledged_version != Some(PRIVACY_NOTICE_VERSION) {
-        return CaptureAcknowledgement::NotAcknowledged;
-    }
-    let current = user.and_then(|user| capture_binding_for(repo, user));
-    match (state.capture_acknowledged_binding.as_deref(), current) {
-        (Some(recorded), Some(current)) if recorded == current => {
-            CaptureAcknowledgement::Acknowledged
+    match capture_coverage_in(repo, state, user, PassiveChannel::LEGACY_COVERED[0]) {
+        CaptureCoverage::Covered => CaptureAcknowledgement::Acknowledged,
+        CaptureCoverage::NotAcknowledged => CaptureAcknowledgement::NotAcknowledged,
+        CaptureCoverage::OtherCheckoutOrUser | CaptureCoverage::NotCovering { .. } => {
+            CaptureAcknowledgement::OtherCheckoutOrUser
         }
-        _ => CaptureAcknowledgement::OtherCheckoutOrUser,
     }
+}
+
+/// Whether the capture acknowledgement covers `channel` for this checkout and
+/// the user running this process (see [`CaptureCoverage`]). A passive channel
+/// records nothing unless this is [`CaptureCoverage::Covered`].
+pub fn capture_coverage(
+    repo: &git2::Repository,
+    channel: PassiveChannel,
+) -> Result<CaptureCoverage> {
+    capture_coverage_as(repo, current_user().as_deref(), channel)
+}
+fn capture_coverage_as(
+    repo: &git2::Repository,
+    user: Option<&str>,
+    channel: PassiveChannel,
+) -> Result<CaptureCoverage> {
+    let state = read_privacy(repo)?;
+    Ok(capture_coverage_in(repo, &state, user, channel))
+}
+/// [`capture_coverage`] is [`CaptureCoverage::Covered`]. For
+/// [`PassiveChannel::Vscode`] this is exactly [`capture_acknowledged`].
+pub fn capture_covers(repo: &git2::Repository, channel: PassiveChannel) -> Result<bool> {
+    Ok(capture_coverage(repo, channel)?.is_covered())
 }
 
 /// Where the capture acknowledgement stands for this checkout and the user
@@ -869,13 +949,44 @@ pub fn capture_acknowledged(repo: &git2::Repository) -> Result<bool> {
     Ok(capture_acknowledgement(repo)?.is_acknowledged())
 }
 /// Records the capture acknowledgement for this checkout and the user running
-/// this process, replacing whatever acknowledgement was on record. Production
-/// code calls this only once the typed challenge of
-/// `cvc privacy acknowledge-capture` has been answered.
+/// this process, replacing whatever acknowledgement was on record. It covers
+/// the [`PassiveChannel::LEGACY_COVERED`] channels, which is what the notice
+/// of `cvc privacy acknowledge-capture` describes. Production code calls this
+/// only once the typed challenge of that command has been answered.
 pub fn acknowledge_capture(repo: &git2::Repository) -> Result<()> {
-    acknowledge_capture_as(repo, current_user().as_deref())
+    acknowledge_capture_channels(repo, &PassiveChannel::LEGACY_COVERED)
 }
+/// [`acknowledge_capture`] covering `channels` as well as the legacy ones.
+/// The caller must have shown the person a notice that names every one of
+/// `channels` and what it reads before the typed challenge was answered: an
+/// acknowledgement grants exactly what was described, and nothing a later
+/// version adds.
+pub fn acknowledge_capture_channels(
+    repo: &git2::Repository,
+    channels: &[PassiveChannel],
+) -> Result<()> {
+    acknowledge_capture_channels_as(repo, current_user().as_deref(), channels)
+}
+/// The channel list an acknowledgement of `channels` records: the legacy
+/// channels and `channels`, each once, in [`PassiveChannel::ALL`] order.
+fn acknowledged_channel_names(channels: &[PassiveChannel]) -> Vec<String> {
+    PassiveChannel::ALL
+        .into_iter()
+        .filter(|channel| {
+            PassiveChannel::LEGACY_COVERED.contains(channel) || channels.contains(channel)
+        })
+        .map(|channel| channel.name().to_owned())
+        .collect()
+}
+#[cfg(test)]
 fn acknowledge_capture_as(repo: &git2::Repository, user: Option<&str>) -> Result<()> {
+    acknowledge_capture_channels_as(repo, user, &PassiveChannel::LEGACY_COVERED)
+}
+fn acknowledge_capture_channels_as(
+    repo: &git2::Repository,
+    user: Option<&str>,
+    channels: &[PassiveChannel],
+) -> Result<()> {
     let user = user.ok_or_else(|| {
         PrivacyError::ConsentState(
             "the current user cannot be identified, so capture cannot be acknowledged for them"
@@ -891,6 +1002,7 @@ fn acknowledge_capture_as(repo: &git2::Repository, user: Option<&str>) -> Result
     let mut s = read_privacy(repo)?;
     s.capture_acknowledged_version = Some(PRIVACY_NOTICE_VERSION);
     s.capture_acknowledged_binding = Some(binding);
+    s.capture_acknowledged_channels = Some(acknowledged_channel_names(channels));
     write_privacy(repo, &s)
 }
 pub fn acknowledge_sharing(repo: &git2::Repository, remote: &str) -> Result<()> {
@@ -2935,6 +3047,134 @@ mod tests {
         // SAFETY: getuid(2) takes no arguments and cannot fail.
         let uid = unsafe { libc::getuid() };
         assert_eq!(current_user(), Some(uid.to_string()));
+    }
+
+    fn privacy_value(repo: &git2::Repository) -> Value {
+        let path = privacy_path(repo).unwrap();
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn write_privacy_value(repo: &git2::Repository, value: &Value) {
+        let state: PrivacyFile = serde_json::from_value(value.clone()).unwrap();
+        write_privacy(repo, &state).unwrap();
+    }
+
+    /// Who is covered for which channel, for every acknowledgement state.
+    #[test]
+    fn coverage_follows_the_acknowledgement_and_its_channel_list() {
+        let (_temp, repo) = repository();
+        let me = Some("1000");
+        let codex = PassiveChannel::Harness(HarnessId::Codex);
+        let coverage =
+            |user: Option<&str>, channel| capture_coverage_as(&repo, user, channel).unwrap();
+
+        // Nothing on record: nothing is covered.
+        for channel in PassiveChannel::ALL {
+            assert_eq!(coverage(me, channel), CaptureCoverage::NotAcknowledged);
+        }
+
+        // Today's acknowledgement covers the legacy channels and lists them.
+        acknowledge_capture_as(&repo, me).unwrap();
+        let state = privacy_value(&repo);
+        assert_eq!(state["version"], 1);
+        assert_eq!(state["capture_acknowledged_version"], 1);
+        assert_eq!(
+            state["capture_acknowledged_channels"],
+            serde_json::json!(["vscode", "claude-code"])
+        );
+        for channel in PassiveChannel::ALL {
+            let expected = if PassiveChannel::LEGACY_COVERED.contains(&channel) {
+                CaptureCoverage::Covered
+            } else {
+                CaptureCoverage::NotCovering { channel }
+            };
+            assert_eq!(coverage(me, channel), expected, "{channel:?}");
+        }
+        assert_eq!(
+            capture_acknowledgement_as(&repo, me).unwrap(),
+            CaptureAcknowledgement::Acknowledged
+        );
+        // Another user is covered for nothing.
+        for channel in PassiveChannel::ALL {
+            assert_eq!(
+                coverage(Some("1001"), channel),
+                CaptureCoverage::OtherCheckoutOrUser
+            );
+            assert_eq!(
+                coverage(None, channel),
+                CaptureCoverage::OtherCheckoutOrUser
+            );
+        }
+
+        // An acknowledgement that names Codex covers it, and still the legacy
+        // channels; the list is written in channel order, each name once.
+        acknowledge_capture_channels_as(&repo, me, &[codex, codex, PassiveChannel::Vscode])
+            .unwrap();
+        assert_eq!(
+            privacy_value(&repo)["capture_acknowledged_channels"],
+            serde_json::json!(["vscode", "claude-code", "codex"])
+        );
+        assert_eq!(coverage(me, codex), CaptureCoverage::Covered);
+        assert_eq!(
+            coverage(me, PassiveChannel::Harness(HarnessId::Cursor)),
+            CaptureCoverage::NotCovering {
+                channel: PassiveChannel::Harness(HarnessId::Cursor)
+            }
+        );
+
+        // cvc 0.7.x rewriting the file drops the list: coverage narrows to the
+        // legacy channels, which is the safe direction.
+        let mut state = privacy_value(&repo);
+        state
+            .as_object_mut()
+            .unwrap()
+            .remove("capture_acknowledged_channels");
+        write_privacy_value(&repo, &state);
+        assert!(!privacy_value(&repo)
+            .as_object()
+            .unwrap()
+            .contains_key("capture_acknowledged_channels"));
+        assert_eq!(
+            coverage(me, codex),
+            CaptureCoverage::NotCovering { channel: codex }
+        );
+        assert_eq!(
+            coverage(me, PassiveChannel::Vscode),
+            CaptureCoverage::Covered
+        );
+
+        // An empty list, or names this version does not know, grant nothing
+        // beyond the legacy channels.
+        for list in [
+            serde_json::json!([]),
+            serde_json::json!(["Codex", "codex ", "future-agent"]),
+        ] {
+            state["capture_acknowledged_channels"] = list;
+            write_privacy_value(&repo, &state);
+            assert_eq!(
+                coverage(me, codex),
+                CaptureCoverage::NotCovering { channel: codex }
+            );
+            assert_eq!(
+                coverage(me, PassiveChannel::Harness(HarnessId::ClaudeCode)),
+                CaptureCoverage::Covered
+            );
+        }
+
+        // A list without the acknowledgement covers nothing.
+        state["capture_acknowledged_channels"] = serde_json::json!(["codex"]);
+        state["capture_acknowledged_version"] = Value::Null;
+        write_privacy_value(&repo, &state);
+        assert_eq!(coverage(me, codex), CaptureCoverage::NotAcknowledged);
+        // A list that is not a list of names makes the whole file unreadable,
+        // and every check fails closed.
+        let path = privacy_path(&repo).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"version":1,"capture_acknowledged_version":1,"capture_acknowledged_channels":"codex","sharing":[]}"#,
+        )
+        .unwrap();
+        assert!(capture_coverage_as(&repo, me, PassiveChannel::Vscode).is_err());
     }
 
     fn namespaced(source: CaptureSource, id: &str) -> bool {
