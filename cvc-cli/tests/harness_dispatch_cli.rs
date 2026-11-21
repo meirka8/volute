@@ -134,7 +134,7 @@ fn claude_code_locates_by_transcript_only() {
 
 const NOT_ACKNOWLEDGED_STATUS: &str = "harness: Claude Code
 checkout_hooks_installed: no
-note: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin list)
+note: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin)
 capture_covered: false
 note: capture is not acknowledged in this repository; run `cvc privacy acknowledge-capture`
 capture_covers: none
@@ -144,7 +144,7 @@ capture_unavailable_in_this_cvc: Codex, OpenCode, Cursor, Antigravity
 
 const ACKNOWLEDGED_STATUS: &str = "harness: Claude Code
 checkout_hooks_installed: no
-note: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin list)
+note: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin)
 capture_covered: true
 capture_covers: VS Code, Claude Code
 capture_unavailable_in_this_cvc: Codex, OpenCode, Cursor, Antigravity
@@ -225,7 +225,7 @@ fn harness_status_shows_the_installation_and_the_coverage_by_channel() {
     let status = fixture.cvc_ok(&["harness", "status", "claude-code"]);
     assert!(
         status.starts_with(&format!(
-            "harness: Claude Code\ncheckout_hooks_installed: yes\nnote: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin list)\nbinary_for_new_worktrees: {binary}\ncapture_covered: true\n"
+            "harness: Claude Code\ncheckout_hooks_installed: yes\nnote: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin)\nbinary_for_new_worktrees: {binary}\ncapture_covered: true\n"
         )),
         "{status}"
     );
@@ -233,7 +233,7 @@ fn harness_status_shows_the_installation_and_the_coverage_by_channel() {
     assert!(fixture
         .cvc_ok(&["harness", "status", "claude-code"])
         .starts_with(
-            "harness: Claude Code\ncheckout_hooks_installed: no\nnote: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin list)\ncapture_covered: true\n"
+            "harness: Claude Code\ncheckout_hooks_installed: no\nnote: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin)\ncapture_covered: true\n"
         ));
 }
 

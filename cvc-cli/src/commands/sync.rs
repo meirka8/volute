@@ -2286,6 +2286,15 @@ mod capture_notice_tests {
             ]
         );
         assert!(channels.iter().all(|channel| channel.notice().is_some()));
+        // The channels' own notices, as people consent to them.
+        assert_eq!(
+            PassiveChannel::Vscode.notice().unwrap(),
+            "VS Code: the CVC extension reads the GitHub Copilot chat session files that VS Code keeps for this workspace, and records each chat request: your prompt, Copilot's response, the reasoning the chat exposes and the model's name."
+        );
+        assert_eq!(
+            PassiveChannel::Harness(HarnessId::ClaudeCode).notice().unwrap(),
+            "Claude Code: CVC's hooks, and `cvc ingest claude-code`, read the transcript of each Claude Code session started in this repository, with its subagents' transcripts and their .meta.json descriptions, and record each response: prompts, the tool output Claude read (file contents, command output), responses, the reasoning the transcript exposes, tool calls with their arguments, the paths they touched and the session's title. A session is recorded whole, including its work in other folders and repositories."
+        );
         assert_eq!(
             capture_notice(&channels),
             format!(

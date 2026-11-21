@@ -761,7 +761,7 @@ fn status_lines(
     }
     if harness == HarnessId::ClaudeCode {
         lines.push(
-            "note: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin list)"
+            "note: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin)"
                 .to_owned(),
         );
     }

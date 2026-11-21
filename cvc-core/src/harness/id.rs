@@ -351,7 +351,7 @@ impl PassiveChannel {
     pub const fn notice(self) -> Option<&'static str> {
         match self {
             PassiveChannel::Vscode => Some(
-                "VS Code: the CVC extension reads the GitHub Copilot chat session files that VS Code keeps for this workspace, and records each chat request: your prompt, Copilot's response and the reasoning the chat exposes.",
+                "VS Code: the CVC extension reads the GitHub Copilot chat session files that VS Code keeps for this workspace, and records each chat request: your prompt, Copilot's response, the reasoning the chat exposes and the model's name.",
             ),
             PassiveChannel::Harness(HarnessId::ClaudeCode) => Some(
                 "Claude Code: CVC's hooks, and `cvc ingest claude-code`, read the transcript of each Claude Code session started in this repository, with its subagents' transcripts and their .meta.json descriptions, and record each response: prompts, the tool output Claude read (file contents, command output), responses, the reasoning the transcript exposes, tool calls with their arguments, the paths they touched and the session's title. A session is recorded whole, including its work in other folders and repositories.",
