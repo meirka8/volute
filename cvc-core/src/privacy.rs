@@ -2643,10 +2643,13 @@ pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
         .model_name
         .map(|s| policy.scrub(&s))
         .transpose()?;
+    // Reasoning is scrubbed body only behind a verified marker (see
+    // `reasoning`), so that no policy rule can rewrite the marker.
+    let id = capture.interaction.id.clone();
     capture.interaction.model_cot = capture
         .interaction
         .model_cot
-        .map(|s| policy.scrub(&s))
+        .map(|s| crate::reasoning::scrub_reasoning(&id, &s, &|text| policy.scrub(text)))
         .transpose()?;
     capture.interaction.model_response = capture
         .interaction
@@ -2889,7 +2892,7 @@ pub fn final_scrub_for_sync(
     interaction.model_cot = interaction
         .model_cot
         .take()
-        .map(|v| scrub(&v))
+        .map(|v| crate::reasoning::scrub_reasoning(&interaction.id, &v, &scrub))
         .transpose()?;
     interaction.model_response = interaction
         .model_response
