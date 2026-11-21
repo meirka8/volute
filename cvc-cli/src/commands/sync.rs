@@ -1773,6 +1773,8 @@ mod output_tests {
             imported: false,
             held: 0,
             held_published: 0,
+            agent: None,
+            parent: None,
         }
     }
 

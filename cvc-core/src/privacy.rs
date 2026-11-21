@@ -2496,6 +2496,58 @@ capture_type!(
     CaptureSource::Harness(HarnessId::ClaudeCode)
 );
 
+/// A capture made by an agent-harness adapter inside `cvc-core`. Its source is
+/// the harness the adapter states, and only code in this crate can construct
+/// one: provenance is assigned by adapters, never decoded from payloads or
+/// chosen by a front.
+pub struct HarnessCaptureInput(Capture);
+impl HarnessCaptureInput {
+    #[allow(dead_code)] // the first adapter on the generic path arrives with the harness registry
+    pub(crate) fn new(
+        harness: HarnessId,
+        conversation: Conversation,
+        interaction: Interaction,
+        context_items: Vec<ContextItem>,
+        tool_executions: Vec<ToolExecution>,
+        policy: PreparedPolicy,
+        capture_worktree: String,
+    ) -> Self {
+        Self(Capture {
+            conversation,
+            interaction,
+            context_items,
+            tool_executions,
+            source: CaptureSource::Harness(harness),
+            policy,
+            capture_worktree: Some(capture_worktree),
+        })
+    }
+    /// The harness that made this capture.
+    pub fn harness(&self) -> HarnessId {
+        match self.0.source {
+            CaptureSource::Harness(harness) => harness,
+            // Every constructor sets a harness source.
+            _ => unreachable!("a harness capture always has a harness source"),
+        }
+    }
+    /// The interaction this capture records.
+    pub fn interaction_id(&self) -> &InteractionId {
+        &self.0.interaction.id
+    }
+    /// The conversation this capture records into.
+    pub fn conversation_id(&self) -> &str {
+        &self.0.interaction.conversation_id
+    }
+    pub(crate) fn into_capture(self) -> Capture {
+        self.0
+    }
+}
+impl From<ClaudeCodeCapture> for HarnessCaptureInput {
+    fn from(capture: ClaudeCodeCapture) -> Self {
+        Self(capture.into_capture())
+    }
+}
+
 pub(crate) fn sync_import_capture(
     conversation: Conversation,
     interaction: Interaction,
