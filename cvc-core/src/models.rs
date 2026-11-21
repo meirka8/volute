@@ -1,3 +1,4 @@
+use crate::harness::HarnessId;
 use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -610,30 +611,66 @@ pub enum PublicationState {
 }
 
 /// Trusted capture provenance; this is assigned by adapters, never decoded from payloads.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
+///
+/// It is stored in `interactions.capture_source` as [`CaptureSource::as_db_str`]
+/// and is serialized nowhere else: no wire format carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum CaptureSource {
     Mcp,
     VscodePassive,
     VscodeExplicit,
     CliRun,
     SyncImport,
-    /// Hook-driven ingestion of Claude Code session transcripts.
-    ClaudeCode,
+    /// Hook-driven ingestion of an agent harness's own session record.
+    /// `Harness(HarnessId::ClaudeCode)` is what 0.7.x called `ClaudeCode`,
+    /// stored as the same `claude_code`.
+    Harness(HarnessId),
     #[default]
     Legacy,
 }
 
 impl CaptureSource {
+    /// Every value `interactions.capture_source` may hold, in the order of the
+    /// database triggers' list (a test pins the two against each other).
+    #[cfg(test)]
+    pub(crate) const ALL: [CaptureSource; 11] = [
+        CaptureSource::Mcp,
+        CaptureSource::VscodePassive,
+        CaptureSource::VscodeExplicit,
+        CaptureSource::CliRun,
+        CaptureSource::SyncImport,
+        CaptureSource::Legacy,
+        CaptureSource::Harness(HarnessId::ClaudeCode),
+        CaptureSource::Harness(HarnessId::Codex),
+        CaptureSource::Harness(HarnessId::OpenCode),
+        CaptureSource::Harness(HarnessId::Cursor),
+        CaptureSource::Harness(HarnessId::Antigravity),
+    ];
+
+    /// The stored value. These strings are persistent: they are never renamed,
+    /// and the ones 0.7.x wrote keep their spelling.
+    pub(crate) const fn as_db_str(self) -> &'static str {
+        match self {
+            CaptureSource::Mcp => "mcp",
+            CaptureSource::VscodePassive => "vscode_passive",
+            CaptureSource::VscodeExplicit => "vscode_explicit",
+            CaptureSource::CliRun => "cli_run",
+            CaptureSource::SyncImport => "sync_import",
+            CaptureSource::Harness(harness) => harness.capture_source_str(),
+            CaptureSource::Legacy => "legacy",
+        }
+    }
+
     /// Whether a capture from this source joins its conversation's future
     /// sharing: the destinations for which `cvc share --future` (or the future
     /// choice of the conversations view) recorded that the conversation's later
     /// thoughts are shared as they are captured.
     ///
     /// Future sharing exists for the passive channels, and they take part: the
-    /// editor's chat-session watcher and its turn notifications, and Claude Code
-    /// transcript ingestion. Each records into the conversation of the session it
-    /// observed. `cvc run` and pulls keep taking part as well; a run always
+    /// editor's chat-session watcher and its turn notifications, and agent
+    /// harness ingestion (decided per harness, by
+    /// `HarnessId::inherits_future_sharing`). Each records into the
+    /// conversation of the session it observed. `cvc run` and pulls keep taking part as well; a run always
     /// starts a conversation of its own, and a pull records into a conversation
     /// namespaced by the destination it came from.
     ///
@@ -650,9 +687,9 @@ impl CaptureSource {
         match self {
             CaptureSource::VscodePassive
             | CaptureSource::VscodeExplicit
-            | CaptureSource::ClaudeCode
             | CaptureSource::CliRun
             | CaptureSource::SyncImport => true,
+            CaptureSource::Harness(harness) => harness.inherits_future_sharing(),
             CaptureSource::Mcp | CaptureSource::Legacy => false,
         }
     }
@@ -661,9 +698,10 @@ impl CaptureSource {
     /// conversation already exists. Every source titles a conversation it
     /// creates; this decides only what happens to one that is already there.
     ///
-    /// The channels that observe a session keep its title current, Claude Code
-    /// ingestion above all: a session is titled from its first prompt until its
-    /// own title appears. The editor, `cvc run` and pulls set theirs as before.
+    /// The channels that observe a session keep its title current, harness
+    /// ingestion above all (decided per harness, by
+    /// `HarnessId::refreshes_conversation_title`): a session is titled from its
+    /// first prompt until its own title appears. The editor, `cvc run` and pulls set theirs as before.
     /// An MCP client names the conversation a thought goes into, so a thought
     /// recorded through MCP leaves an existing conversation's title exactly as
     /// it was, empty or not: that title is what `cvc conversations` lists and
@@ -675,9 +713,9 @@ impl CaptureSource {
         match self {
             CaptureSource::VscodePassive
             | CaptureSource::VscodeExplicit
-            | CaptureSource::ClaudeCode
             | CaptureSource::CliRun
             | CaptureSource::SyncImport => true,
+            CaptureSource::Harness(harness) => harness.refreshes_conversation_title(),
             CaptureSource::Mcp | CaptureSource::Legacy => false,
         }
     }

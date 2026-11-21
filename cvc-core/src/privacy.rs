@@ -1,4 +1,5 @@
 //! Fail-closed capture sanitization and repository-local capture policy.
+use crate::harness::{self, HarnessId};
 use crate::models::{
     ArtifactLink, CaptureSource, ContextItem, Conversation, Interaction, InteractionId,
     ToolExecution,
@@ -2378,7 +2379,10 @@ capture_type!(
 capture_type!(CliRunCapture, CaptureSource::CliRun);
 capture_type!(LspPassiveCapture, CaptureSource::VscodePassive);
 capture_type!(LspExplicitCapture, CaptureSource::VscodeExplicit);
-capture_type!(ClaudeCodeCapture, CaptureSource::ClaudeCode);
+capture_type!(
+    ClaudeCodeCapture,
+    CaptureSource::Harness(HarnessId::ClaudeCode)
+);
 
 pub(crate) fn sync_import_capture(
     conversation: Conversation,
@@ -2452,6 +2456,7 @@ pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
             "unsafe or inconsistent conversation id".into(),
         ));
     }
+    check_conversation_namespace(capture.source, &capture.conversation.id)?;
     capture.interaction.source_request_id = capture
         .interaction
         .source_request_id
@@ -2504,6 +2509,49 @@ pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
         x.arguments = scrub_json_with_policy(&x.arguments, policy)?;
     }
     Ok(capture)
+}
+
+/// Refuses a capture into a conversation-id namespace its source does not own
+/// (see [`crate::harness::id`]):
+///
+/// * an id that starts with a reserved prefix, ignoring ASCII case, is
+///   accepted only from that prefix's own harness, or from a pull (which runs
+///   this before it namespaces the id with `remote:<fingerprint>:`);
+/// * a harness whose ids are prefixed records only under its exact prefix, and
+///   never into an id holding Claude Code's subagent marker `:agent-`.
+///
+/// This covers every front in one check: MCP `commit_thought`, `cvc run`, the
+/// editor, agent harnesses and pulls all pass through [`prepare`].
+fn check_conversation_namespace(source: CaptureSource, id: &str) -> Result<()> {
+    let owner = harness::is_reserved_conversation_id(id);
+    match source {
+        CaptureSource::SyncImport => Ok(()),
+        CaptureSource::Harness(harness) => {
+            if let Some(prefix) = harness.conversation_prefix() {
+                if !id.starts_with(prefix) || id.contains(harness::SUBAGENT_MARKER) {
+                    return Err(PrivacyError::Validation(
+                        "conversation id outside its harness namespace".into(),
+                    ));
+                }
+            }
+            match owner {
+                Some(owner) if owner != harness => Err(PrivacyError::Validation(
+                    "reserved conversation id prefix".into(),
+                )),
+                _ => Ok(()),
+            }
+        }
+        CaptureSource::Mcp
+        | CaptureSource::VscodePassive
+        | CaptureSource::VscodeExplicit
+        | CaptureSource::CliRun
+        | CaptureSource::Legacy => match owner {
+            Some(_) => Err(PrivacyError::Validation(
+                "reserved conversation id prefix".into(),
+            )),
+            None => Ok(()),
+        },
+    }
 }
 
 // ---- a capture that cannot be prepared ----------------------------------------------
@@ -2887,5 +2935,109 @@ mod tests {
         // SAFETY: getuid(2) takes no arguments and cannot fail.
         let uid = unsafe { libc::getuid() };
         assert_eq!(current_user(), Some(uid.to_string()));
+    }
+
+    fn namespaced(source: CaptureSource, id: &str) -> bool {
+        check_conversation_namespace(source, id).is_ok()
+    }
+
+    /// The reserved prefixes, for every source.
+    #[test]
+    fn reserved_conversation_prefixes_are_refused_except_to_their_harness_and_pulls() {
+        let reserved = [
+            "codex:t",
+            "opencode:ses_1",
+            "cursor:c",
+            "antigravity:a",
+            "claude-code:s",
+            "CODEX:t",
+            "Cursor:c",
+        ];
+        for source in [
+            CaptureSource::Mcp,
+            CaptureSource::VscodePassive,
+            CaptureSource::VscodeExplicit,
+            CaptureSource::CliRun,
+            CaptureSource::Legacy,
+        ] {
+            for id in reserved {
+                assert!(!namespaced(source, id), "{source:?} {id}");
+            }
+            for id in ["4f2a9c1e", "s1:agent-a1", "remote:ab:codex:t", "codexx:t"] {
+                assert!(namespaced(source, id), "{source:?} {id}");
+            }
+        }
+        for id in reserved {
+            assert!(namespaced(CaptureSource::SyncImport, id), "{id}");
+        }
+        // Claude Code keeps its unprefixed ids and its subagent convention,
+        // and may use its own reserved prefix; it may not use another's.
+        let claude = CaptureSource::Harness(HarnessId::ClaudeCode);
+        for id in [
+            "4f2a9c1e",
+            "4f2a9c1e:agent-a1",
+            "claude-code:s",
+            "Claude-Code:s",
+        ] {
+            assert!(namespaced(claude, id), "{id}");
+        }
+        for id in ["codex:t", "CODEX:t", "cursor:c"] {
+            assert!(!namespaced(claude, id), "{id}");
+        }
+        // A prefixed harness records only under its exact prefix, never with the
+        // subagent marker.
+        let codex = CaptureSource::Harness(HarnessId::Codex);
+        assert!(namespaced(codex, "codex:019a"));
+        for id in [
+            "019a",
+            "CODEX:019a",
+            "opencode:x",
+            "codex:a:agent-b",
+            "claude-code:x",
+        ] {
+            assert!(!namespaced(codex, id), "{id}");
+        }
+        let error = check_conversation_namespace(CaptureSource::Mcp, "codex:t").unwrap_err();
+        assert_eq!(error.to_string(), "reserved conversation id prefix");
+    }
+
+    /// The check is part of `prepare`, so a harness capture with a refused id
+    /// is lost rather than stored, stand-ins included.
+    #[test]
+    fn prepare_refuses_a_reserved_prefix_and_so_do_the_stand_ins() {
+        let capture = |source: CaptureSource, id: &str| Capture {
+            conversation: Conversation {
+                id: id.into(),
+                title: "t".into(),
+                created_at: chrono::Utc::now(),
+            },
+            interaction: Interaction {
+                id: InteractionId::new(),
+                conversation_id: id.into(),
+                parent_id: None,
+                timestamp: chrono::Utc::now(),
+                author: crate::models::Author::Agent,
+                user_prompt: "p".into(),
+                model_name: None,
+                model_cot: None,
+                model_response: None,
+                source_request_id: None,
+            },
+            context_items: Vec::new(),
+            tool_executions: Vec::new(),
+            source,
+            policy: PreparedPolicy::built_ins_only(),
+            capture_worktree: Some("0".repeat(64)),
+        };
+        assert!(prepare(capture(CaptureSource::Mcp, "codex:t")).is_err());
+        assert!(prepare(capture(CaptureSource::Mcp, "t")).is_ok());
+        assert!(prepare(capture(CaptureSource::Harness(HarnessId::Codex), "codex:t")).is_ok());
+        assert!(matches!(
+            prepare_harness(capture(
+                CaptureSource::Harness(HarnessId::ClaudeCode),
+                "codex:t"
+            )),
+            HarnessCapture::Lost { .. }
+        ));
     }
 }

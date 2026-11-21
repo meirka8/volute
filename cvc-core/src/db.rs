@@ -1418,9 +1418,7 @@ impl CvcStore {
         let author = serde_json::to_string(&i.author)
             .unwrap_or_default()
             .replace('"', "");
-        let source = serde_json::to_string(&capture.source)
-            .unwrap_or_default()
-            .replace('"', "");
+        let source = capture.source.as_db_str();
         let visibility = "private";
         tx.execute("INSERT INTO interactions (id,conversation_id,parent_id,timestamp,author,user_prompt,model_name,model_cot,model_response,source_request_id,visibility,capture_source,scrubber_version,capture_worktree) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13)", params![i.id.to_string(),i.conversation_id,parent,i.timestamp.timestamp(),author,i.user_prompt,i.model_name,i.model_cot,i.model_response,i.source_request_id,visibility,source,capture.capture_worktree])?;
         // The conversation's future sharing extends only to captures whose
@@ -3297,6 +3295,7 @@ impl CvcStore {
 #[cfg(test)]
 mod trusted_api_tests {
     use super::*;
+    use crate::harness::HarnessId;
     use crate::models::{CaptureSource, Evidence};
     use crate::privacy::{McpCapture, PreparedPolicy};
 
@@ -3335,6 +3334,43 @@ mod trusted_api_tests {
         (id, capture)
     }
 
+    /// `name` in the conversation-id namespace `source` records into.
+    fn in_namespace(source: CaptureSource, name: &str) -> String {
+        match source {
+            CaptureSource::Harness(harness) => harness.conversation_id(name).unwrap(),
+            _ => name.to_owned(),
+        }
+    }
+
+    /// The stored `capture_source` strings are persistent: each source keeps
+    /// the spelling it has, the values 0.7.x wrote included.
+    #[test]
+    fn capture_source_strings_are_pinned() {
+        let pinned = [
+            (CaptureSource::Mcp, "mcp"),
+            (CaptureSource::VscodePassive, "vscode_passive"),
+            (CaptureSource::VscodeExplicit, "vscode_explicit"),
+            (CaptureSource::CliRun, "cli_run"),
+            (CaptureSource::SyncImport, "sync_import"),
+            (CaptureSource::Legacy, "legacy"),
+            (CaptureSource::Harness(HarnessId::ClaudeCode), "claude_code"),
+            (CaptureSource::Harness(HarnessId::Codex), "codex"),
+            (CaptureSource::Harness(HarnessId::OpenCode), "opencode"),
+            (CaptureSource::Harness(HarnessId::Cursor), "cursor"),
+            (
+                CaptureSource::Harness(HarnessId::Antigravity),
+                "antigravity",
+            ),
+        ];
+        assert_eq!(
+            pinned.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            CaptureSource::ALL
+        );
+        for (source, value) in pinned {
+            assert_eq!(source.as_db_str(), value);
+        }
+    }
+
     /// Every source titles a conversation it creates. Only the sources that
     /// observe a session rename one that already exists; a thought recorded
     /// through MCP and a capture whose source is not known leave its title
@@ -3349,17 +3385,18 @@ mod trusted_api_tests {
                 .ok_or_else(|| anyhow::anyhow!("no conversation {conversation}"))?
                 .title)
         };
-        for (source, renames) in [
+        let expectations = [
             (CaptureSource::Mcp, false),
             (CaptureSource::Legacy, false),
             (CaptureSource::VscodePassive, true),
             (CaptureSource::VscodeExplicit, true),
-            (CaptureSource::ClaudeCode, true),
+            (CaptureSource::Harness(HarnessId::ClaudeCode), true),
             (CaptureSource::CliRun, true),
             (CaptureSource::SyncImport, true),
-        ] {
+        ];
+        for (source, renames) in expectations {
             assert_eq!(source.refreshes_conversation_title(), renames, "{source:?}");
-            let conversation = format!("{source:?}");
+            let conversation = in_namespace(source, source.as_db_str());
             store.capture(fixture_capture(source, &conversation, "created as").1)?;
             assert_eq!(title_of(&conversation)?, "created as", "{source:?}");
             for existing in ["created as", ""] {
@@ -3390,22 +3427,36 @@ mod trusted_api_tests {
         let store = CvcStore::open(":memory:")?;
         let future_shared = "7".repeat(64);
         let future_private = "8".repeat(64);
-        // Recorded before anything is in the conversation, as `cvc share
-        // policy --future` would record it.
-        store.share_exact_snapshot("policy", &future_shared, &[], FutureSharePolicy::Shared)?;
-        store.share_exact_snapshot("policy", &future_private, &[], FutureSharePolicy::Private)?;
         assert_eq!(CaptureSource::default(), CaptureSource::Legacy);
-        for (source, inherits) in [
+        let expectations = [
             (CaptureSource::Mcp, false),
             (CaptureSource::Legacy, false),
             (CaptureSource::VscodePassive, true),
             (CaptureSource::VscodeExplicit, true),
-            (CaptureSource::ClaudeCode, true),
+            (CaptureSource::Harness(HarnessId::ClaudeCode), true),
             (CaptureSource::CliRun, true),
             (CaptureSource::SyncImport, true),
-        ] {
+        ];
+        for (source, inherits) in expectations {
             assert_eq!(source.inherits_future_sharing(), inherits, "{source:?}");
-            let (id, capture) = fixture_capture(source, "policy", "policy");
+            let conversation = in_namespace(source, "policy");
+            // Recorded before anything is in the conversation, as `cvc share
+            // policy --future` would record it.
+            if store.get_conversation(&conversation)?.is_none() {
+                store.share_exact_snapshot(
+                    &conversation,
+                    &future_shared,
+                    &[],
+                    FutureSharePolicy::Shared,
+                )?;
+                store.share_exact_snapshot(
+                    &conversation,
+                    &future_private,
+                    &[],
+                    FutureSharePolicy::Private,
+                )?;
+            }
+            let (id, capture) = fixture_capture(source, &conversation, "policy");
             store.capture(capture)?;
             let shares: Vec<String> = store
                 .conn
