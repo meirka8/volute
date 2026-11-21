@@ -49,6 +49,9 @@ use std::time::Duration;
 /// One read never buffers more than this; a transcript beyond it is treated as
 /// corruption rather than an ingest target.
 const MAX_READ_BYTES: u64 = 512 * 1024 * 1024;
+/// The most of a subagent's `.meta.json` that is read. Claude Code writes a
+/// few hundred bytes there; a larger file gives no title seed.
+const MAX_META_BYTES: u64 = 64 * 1024;
 
 /// Claude Code exports this to every hook it runs: the directory the session
 /// was started in.
@@ -687,9 +690,21 @@ fn discover_subagents(transcript_path: &Path) -> Result<Vec<Subagent>, IngestErr
 
 /// What a subagent's `.meta.json` says it is (`agentType`: `description`), from
 /// which its title is derived.
+///
+/// The file is read the way its transcript is: opened once, on Unix without
+/// following a link, without blocking and without becoming a controlling
+/// terminal, used only when the handle is a regular file, and read to at
+/// most [`MAX_META_BYTES`]. Anything else (no file, a link, a FIFO, a file
+/// over the bound, text that is not UTF-8 or not the expected JSON) gives no
+/// title seed, and the subagent is ingested all the same.
 fn subagent_title_seed(meta_path: &Path) -> Option<String> {
-    let text = fs::read_to_string(meta_path).ok()?;
-    let value: Value = serde_json::from_str(&text).ok()?;
+    let file = open_transcript_start(meta_path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_META_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_META_BYTES {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
     let agent_type = value.get("agentType").and_then(|v| v.as_str());
     let description = value.get("description").and_then(|v| v.as_str());
     match (agent_type, description) {

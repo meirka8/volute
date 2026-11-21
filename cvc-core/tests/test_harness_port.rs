@@ -659,3 +659,102 @@ fn claude_codes_cursor_advances_beside_a_typed_row_it_cannot_read() {
         assert_eq!(typed_row(), before, "{kind} {version}");
     }
 }
+
+const FAMILY_SESSION: &str = "0f773b11-7a20-427d-bd9d-208729c5fd87";
+const META: &str = r#"{"agentType":"ux-psychologist","description":"Design the keymap","model":"sonnet","spawnDepth":1,"toolUseId":"toolu_01SN"}"#;
+const TASK: &str = "You are the subagent; do the task.";
+
+/// A session that delegates to the subagent `agent-x`, laid out as Claude
+/// Code lays it out; `meta` writes the subagent's `.meta.json`, or puts
+/// something else at its path. Returns the session's transcript.
+fn delegating_session(fixture: &Fixture, meta: impl FnOnce(&Path)) -> PathBuf {
+    let line = |text: String| text + "\n";
+    let main = [
+        format!(r#"{{"parentUuid":null,"isSidechain":false,"type":"user","message":{{"role":"user","content":"Delegate to a subagent"}},"uuid":"u1","timestamp":"2026-08-10T22:04:00.000Z","sessionId":"{FAMILY_SESSION}","version":"2.1.219","cwd":"x"}}"#),
+        format!(r#"{{"parentUuid":"u1","isSidechain":false,"requestId":"req_A","type":"assistant","message":{{"model":"m","id":"a","type":"message","role":"assistant","content":[{{"type":"text","text":"Delegating."}}],"stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":1,"output_tokens":1}}}},"uuid":"s1","timestamp":"2026-08-10T22:04:01.000Z","sessionId":"{FAMILY_SESSION}","version":"2.1.219","cwd":"x"}}"#),
+    ]
+    .map(line)
+    .concat();
+    let subagent = [
+        format!(r#"{{"parentUuid":null,"isSidechain":true,"agentId":"x","type":"user","message":{{"role":"user","content":"{TASK}"}},"uuid":"su1","timestamp":"2026-08-10T22:04:26.089Z","sessionId":"{FAMILY_SESSION}","version":"2.1.219","cwd":"x"}}"#),
+        format!(r#"{{"parentUuid":"su1","isSidechain":true,"agentId":"x","requestId":"req_S","type":"assistant","message":{{"model":"m","id":"sb","type":"message","role":"assistant","content":[{{"type":"text","text":"Subagent done."}}],"stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":1,"output_tokens":1}}}},"uuid":"su2","timestamp":"2026-08-10T22:04:28.000Z","sessionId":"{FAMILY_SESSION}","version":"2.1.219","cwd":"x"}}"#),
+    ]
+    .map(line)
+    .concat();
+    let directory = fixture.root.join("proj");
+    let subagents = directory.join(FAMILY_SESSION).join("subagents");
+    fs::create_dir_all(&subagents).unwrap();
+    let main_path = directory.join(format!("{FAMILY_SESSION}.jsonl"));
+    fs::write(&main_path, main).unwrap();
+    fs::write(subagents.join("agent-x.jsonl"), subagent).unwrap();
+    meta(&subagents.join("agent-x.meta.json"));
+    main_path
+}
+
+/// The subagent's title, and its report, after one ingest of the session.
+fn subagent_title(meta: impl FnOnce(&Path)) -> (String, claude_code::IngestReport) {
+    let fixture = Fixture::new(Ack::None);
+    let path = delegating_session(&fixture, meta);
+    let started = std::time::Instant::now();
+    let report = claude_code::ingest(
+        &fixture.layout,
+        &fixture.store,
+        &fixture.policy,
+        &path,
+        Some(FAMILY_SESSION),
+        claude_code::IngestMode::Final,
+    )
+    .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the ingest returns promptly"
+    );
+    let title = fixture
+        .store
+        .get_conversation(&format!("{FAMILY_SESSION}:agent-x"))
+        .unwrap()
+        .unwrap()
+        .title;
+    (title, report)
+}
+
+/// A subagent's `.meta.json` is read the way its transcript is, to at most
+/// 64 KiB: a regular file under the bound titles the subagent as before, and
+/// anything else at its path gives no title seed (the subagent's own task
+/// titles it) while the subagent is ingested all the same.
+#[cfg(unix)]
+#[test]
+fn a_subagents_meta_file_is_read_the_way_its_transcript_is() {
+    let (title, report) = subagent_title(|path| fs::write(path, META).unwrap());
+    assert_eq!(title, "ux-psychologist: Design the keymap");
+    assert_eq!(report.subagent_inserted, 1);
+
+    let fifo = |path: &Path| {
+        let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: `name` is a valid, NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    };
+    let link = |path: &Path| {
+        let target = path.with_file_name("elsewhere.json");
+        fs::write(&target, META).unwrap();
+        std::os::unix::fs::symlink(&target, path).unwrap();
+    };
+    let oversized = |path: &Path| {
+        let padding = "p".repeat(64 * 1024);
+        fs::write(
+            path,
+            format!(r#"{{"agentType":"ux-psychologist","description":"Design the keymap","padding":"{padding}"}}"#),
+        )
+        .unwrap();
+    };
+    for (name, meta) in [
+        ("a FIFO", &fifo as &dyn Fn(&Path)),
+        ("a link", &link),
+        ("a file over 64 KiB", &oversized),
+    ] {
+        let (title, report) = subagent_title(meta);
+        assert_eq!(title, TASK, "{name}");
+        assert_eq!(report.subagent_sessions, 1, "{name}");
+        assert_eq!(report.subagent_inserted, 1, "{name}");
+    }
+}

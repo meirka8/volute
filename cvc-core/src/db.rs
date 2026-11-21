@@ -2140,11 +2140,19 @@ impl CvcStore {
     /// Like 0.7.x's, this batch carries no coverage grant: its caller makes
     /// the capture decision. Claude Code ingestion itself goes through
     /// [`Self::capture_harness_batch`].
+    ///
+    /// The cursor is Claude Code's own: one whose `harness` is anything but
+    /// `claude-code` is refused, and nothing is stored.
     pub fn capture_claude_code_batch(
         &self,
         captures: Vec<crate::privacy::ClaudeCodeCapture>,
         cursor: HarnessCursorUpdate<'_>,
     ) -> Result<HarnessBatchOutcome> {
+        if cursor.harness != HarnessId::ClaudeCode.name() {
+            return Err(DbError::HarnessBatch(
+                "a Claude Code batch keeps Claude Code's cursor only".into(),
+            ));
+        }
         let batch = PreparedHarnessBatch::prepare(
             captures
                 .into_iter()
@@ -2156,9 +2164,7 @@ impl CvcStore {
             let outcome = Self::insert_harness_captures_tx(tx, &batch)?;
             let now = Utc::now().timestamp();
             Self::write_legacy_cursor_tx(tx, &cursor, byte_offset, now)?;
-            if cursor.harness == HarnessId::ClaudeCode.name() {
-                Self::mirror_claude_code_cursor_tx(tx, &cursor, byte_offset, now)?;
-            }
+            Self::mirror_claude_code_cursor_tx(tx, &cursor, byte_offset, now)?;
             Ok(outcome)
         })?;
         outcome.lost = batch.lost.len();
@@ -5838,6 +5844,30 @@ mod harness_batch_tests {
                 );
             }
         }
+    }
+
+    /// A Claude Code batch keeps Claude Code's cursor and no other harness's.
+    #[test]
+    fn the_claude_code_batch_refuses_another_harness_cursor() {
+        let store = CvcStore::open(":memory:").unwrap();
+        for harness in ["codex", "Claude-Code", ""] {
+            refused(store.capture_claude_code_batch(
+                Vec::new(),
+                HarnessCursorUpdate {
+                    harness,
+                    session_id: "s1",
+                    transcript_path: "/t.jsonl",
+                    byte_offset: 1,
+                },
+            ));
+        }
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM harness_ingest_cursors", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     /// A harness batch that carries only the Claude Code legacy cursor keeps

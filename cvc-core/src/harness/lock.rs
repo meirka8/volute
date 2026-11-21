@@ -265,6 +265,19 @@ mod tests {
         found
     }
 
+    /// The name cvc 0.7.2 gives a Claude Code session's lock, worked out
+    /// from its `claude_code/session_lock.rs` (`ingest-` and the hex SHA-256
+    /// of `cvc.ingest-lock/v1`, NUL, the harness, NUL, the session, then
+    /// `.lock`), so that 0.7.x and this version, run by hooks on the same
+    /// event, keep excluding each other.
+    #[test]
+    fn a_claude_code_sessions_lock_has_the_name_0_7_2_gives_it() {
+        assert_eq!(
+            file_name("claude-code", "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60"),
+            "ingest-2934d76c9809e331f3f880074470c786f500397267bacef92ec56111956a0ff1.lock"
+        );
+    }
+
     #[test]
     fn the_name_hides_the_session_and_separates_harnesses_and_sessions() {
         let name = file_name("claude-code", "session-1");
