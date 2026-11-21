@@ -79,6 +79,7 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", self.home.join("empty.gitconfig"))
+            .envs(NO_BACKGROUND_MAINTENANCE)
             .env("GIT_TEMPLATE_DIR", self.home.join("templates"))
             .stdin(Stdio::null());
         command
@@ -3034,3 +3035,18 @@ fn ingest_transcript_refuses_a_file_that_is_not_a_claude_code_transcript() {
     );
     assert_eq!(unacknowledged.interaction_count(), 0);
 }
+
+/// Git's automatic background maintenance, which `git commit` and other
+/// commands start detached, keeps writing under `.git` (a
+/// `maintenance.lock`, packs) after the command has returned, and races with
+/// tests that compare a repository's state (#217). Every `git` these tests
+/// run, and every process it starts, gets it turned off: `maintenance.auto`
+/// for the `git maintenance` Git runs, `gc.auto` for its `gc` task.
+/// `GIT_CONFIG_COUNT` needs Git 2.31 or later.
+const NO_BACKGROUND_MAINTENANCE: [(&str, &str); 5] = [
+    ("GIT_CONFIG_COUNT", "2"),
+    ("GIT_CONFIG_KEY_0", "maintenance.auto"),
+    ("GIT_CONFIG_VALUE_0", "false"),
+    ("GIT_CONFIG_KEY_1", "gc.auto"),
+    ("GIT_CONFIG_VALUE_1", "0"),
+];
