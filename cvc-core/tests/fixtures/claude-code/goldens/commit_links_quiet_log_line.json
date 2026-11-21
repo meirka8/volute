@@ -1,0 +1,64 @@
+{
+  "final": {
+    "artifact_links": [
+      {"git_commit_hash":"bba1c773ab892954b9b5cb25a0f9a13ebfa76166","interaction_id":"1303e26d-cab3-8e8a-9c55-dbe0195d78aa","link_type":"generated","linked_by":"fixture@example.invalid"},
+      {"git_commit_hash":"bba1c773ab892954b9b5cb25a0f9a13ebfa76166","interaction_id":"6307f51b-a892-86ab-ae38-900c3adaf2cf","link_type":"generated","linked_by":"fixture@example.invalid"}
+    ],
+    "context_items": [],
+    "conversation_share_policy": [],
+    "conversation_shares": [],
+    "conversations": [
+      {"created_at":1789473597,"id":"5f2a7c9d-1e60-4c8d-9e3b-0b7d2c4e6a1f","title":"Add a feature and commit it"}
+    ],
+    "derivation_events": [],
+    "derivation_observations": [
+      {"event_id":"legacy:1303e26d-cab3-8e8a-9c55-dbe0195d78aa:bba1c773ab892954b9b5cb25a0f9a13ebfa76166","origin":"local_api","source_fingerprint":null,"source_key":"legacy:1303e26d-cab3-8e8a-9c55-dbe0195d78aa:bba1c773ab892954b9b5cb25a0f9a13ebfa76166","trusted_local":1},
+      {"event_id":"legacy:6307f51b-a892-86ab-ae38-900c3adaf2cf:bba1c773ab892954b9b5cb25a0f9a13ebfa76166","origin":"local_api","source_fingerprint":null,"source_key":"legacy:6307f51b-a892-86ab-ae38-900c3adaf2cf:bba1c773ab892954b9b5cb25a0f9a13ebfa76166","trusted_local":1}
+    ],
+    "harness_ingest_cursors": [
+      {"byte_offset":2526,"harness":"claude-code","session_id":"5f2a7c9d-1e60-4c8d-9e3b-0b7d2c4e6a1f","transcript_path":"__WORKTREE__/proj/5f2a7c9d-1e60-4c8d-9e3b-0b7d2c4e6a1f.jsonl","updated_at":"__WALL_CLOCK__"}
+    ],
+    "interaction_shares": [],
+    "interactions": [
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5f2a7c9d-1e60-4c8d-9e3b-0b7d2c4e6a1f","id":"6307f51b-a892-86ab-ae38-900c3adaf2cf","model_cot":"I will design the feature first.","model_name":"m","model_response":null,"parent_id":null,"scrubber_version":1,"source_request_id":"req_A","timestamp":1789473597,"user_prompt":"[prompt ~cvc-9a5d3c7da91fbdda] Add a feature and commit it","visibility":"private"},
+      {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5f2a7c9d-1e60-4c8d-9e3b-0b7d2c4e6a1f","id":"1303e26d-cab3-8e8a-9c55-dbe0195d78aa","model_cot":null,"model_name":"m","model_response":null,"parent_id":"6307f51b-a892-86ab-ae38-900c3adaf2cf","scrubber_version":1,"source_request_id":"req_B","timestamp":1789473598,"user_prompt":"[no stimulus recorded]","visibility":"private"},
+      {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5f2a7c9d-1e60-4c8d-9e3b-0b7d2c4e6a1f","id":"3ad8442a-88b3-80c1-9cc2-3ed85ea2eb3b","model_cot":null,"model_name":"m","model_response":"Committed.","parent_id":"1303e26d-cab3-8e8a-9c55-dbe0195d78aa","scrubber_version":1,"source_request_id":"req_C","timestamp":1789473601,"user_prompt":"[tool_result Bash ~cvc-6955581f73846136] bba1c77 quiet\n0123456 older work","visibility":"private"}
+    ],
+    "publications": [],
+    "tombstones": [],
+    "tool_executions": [
+      {"arguments":"{\"command\":\"git add -A && git commit -q -F - <<'EOF'\\nquiet\\nEOF\\ngit log --oneline -2\"}","id":1,"interaction_id":"1303e26d-cab3-8e8a-9c55-dbe0195d78aa","status":"success","tool_name":"Bash","tool_protocol":"native"}
+    ]
+  },
+  "golden": "cvc-core/claude-code-golden/v2",
+  "legend": [
+    "__WORKTREE__: the fixture repository's canonical root, always 240 bytes long",
+    "__TMPDIR__: the temporary directory holding that root",
+    "__WORKTREE_FINGERPRINT__: the capture_worktree hash of that root",
+    "__WALL_CLOCK__: a wall-clock column whose value lies within the test's run",
+    "marker-<n>: the random UUID of a redaction marker, numbered by first appearance",
+    "$long_string: a string over 4096 bytes, as its length, SHA-256, head and tail",
+    "{rows, sha256, first, last}: over 20 rows, by count, SHA-256 of their compact JSON, 3 each end",
+    "same_as_final: a step's rows for a table (or all its changes) are exactly the final rows",
+    "published.files: each file's byte length, SHA-256 and, as one string, its content",
+    "published.files content: every non-node file, and every node (first and last 3 if over 20)"
+  ],
+  "published": {
+    "empty_trees": ["events","ranges"],
+    "files": [
+      {"bytes":1,"content":"5","mode":"100644","path":"FORMAT","sha256":"ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d"},
+      {"bytes":0,"mode":"100644","path":"by-commit/bba1c773ab892954b9b5cb25a0f9a13ebfa76166/1303e26d-cab3-8e8a-9c55-dbe0195d78aa","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      {"bytes":0,"mode":"100644","path":"by-commit/bba1c773ab892954b9b5cb25a0f9a13ebfa76166/6307f51b-a892-86ab-ae38-900c3adaf2cf","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      {"bytes":180,"content":"{\"interaction_id\":\"1303e26d-cab3-8e8a-9c55-dbe0195d78aa\",\"git_commit_hash\":\"bba1c773ab892954b9b5cb25a0f9a13ebfa76166\",\"link_type\":\"generated\",\"linked_by\":\"fixture@example.invalid\"}","mode":"100644","path":"links/1303e26d-cab3-8e8a-9c55-dbe0195d78aa/bba1c773ab892954b9b5cb25a0f9a13ebfa76166.json","sha256":"13a00e43db5f125afa0b37e8d237a17afc7c0f077b40186d8c91b5123fb53df8"},
+      {"bytes":180,"content":"{\"interaction_id\":\"6307f51b-a892-86ab-ae38-900c3adaf2cf\",\"git_commit_hash\":\"bba1c773ab892954b9b5cb25a0f9a13ebfa76166\",\"link_type\":\"generated\",\"linked_by\":\"fixture@example.invalid\"}","mode":"100644","path":"links/6307f51b-a892-86ab-ae38-900c3adaf2cf/bba1c773ab892954b9b5cb25a0f9a13ebfa76166.json","sha256":"c64ed4aecfa33524bf56b75049729052370ffc29a1171b84c7767ed99702dcf1"},
+      {"bytes":1008,"content":"{\n  \"interaction\": {\n    \"id\": \"1303e26d-cab3-8e8a-9c55-dbe0195d78aa\",\n    \"conversation_id\": \"5f2a7c9d-1e60-4c8d-9e3b-0b7d2c4e6a1f\",\n    \"parent_id\": \"6307f51b-a892-86ab-ae38-900c3adaf2cf\",\n    \"timestamp\": \"2026-09-15T11:59:58Z\",\n    \"author\": \"system\",\n    \"user_prompt\": \"[no stimulus recorded]\",\n    \"model_name\": \"m\",\n    \"model_cot\": null,\n    \"model_response\": null,\n    \"source_request_id\": \"req_B\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [\n    {\n      \"id\": 1,\n      \"interaction_id\": \"1303e26d-cab3-8e8a-9c55-dbe0195d78aa\",\n      \"tool_protocol\": \"native\",\n      \"tool_name\": \"Bash\",\n      \"arguments\": \"{\\\"command\\\":\\\"git add -A && git commit -q -F - <<'EOF'\\\\nquiet\\\\nEOF\\\\ngit log --oneline -2\\\"}\",\n      \"status\": \"success\"\n    }\n  ],\n  \"artifact_links\": [\n    {\n      \"interaction_id\": \"1303e26d-cab3-8e8a-9c55-dbe0195d78aa\",\n      \"git_commit_hash\": \"bba1c773ab892954b9b5cb25a0f9a13ebfa76166\",\n      \"link_type\": \"generated\",\n      \"linked_by\": \"fixture@example.invalid\"\n    }\n  ]\n}","mode":"100644","path":"nodes/13/1303e26d-cab3-8e8a-9c55-dbe0195d78aa.json","sha256":"c0cb537844dcf7264659f65f4475a2009881eb277d49c360e638a10c3317b839"},
+      {"bytes":545,"content":"{\n  \"interaction\": {\n    \"id\": \"3ad8442a-88b3-80c1-9cc2-3ed85ea2eb3b\",\n    \"conversation_id\": \"5f2a7c9d-1e60-4c8d-9e3b-0b7d2c4e6a1f\",\n    \"parent_id\": \"1303e26d-cab3-8e8a-9c55-dbe0195d78aa\",\n    \"timestamp\": \"2026-09-15T12:00:01Z\",\n    \"author\": \"system\",\n    \"user_prompt\": \"[tool_result Bash ~cvc-6955581f73846136] bba1c77 quiet\\n0123456 older work\",\n    \"model_name\": \"m\",\n    \"model_cot\": null,\n    \"model_response\": \"Committed.\",\n    \"source_request_id\": \"req_C\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/3a/3ad8442a-88b3-80c1-9cc2-3ed85ea2eb3b.json","sha256":"ba81fe3b46075bda841a608f0b8fbd02bd800bff54d98f364cc2daf6b5609f0a"},
+      {"bytes":741,"content":"{\n  \"interaction\": {\n    \"id\": \"6307f51b-a892-86ab-ae38-900c3adaf2cf\",\n    \"conversation_id\": \"5f2a7c9d-1e60-4c8d-9e3b-0b7d2c4e6a1f\",\n    \"parent_id\": null,\n    \"timestamp\": \"2026-09-15T11:59:57Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-9a5d3c7da91fbdda] Add a feature and commit it\",\n    \"model_name\": \"m\",\n    \"model_cot\": \"I will design the feature first.\",\n    \"model_response\": null,\n    \"source_request_id\": \"req_A\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": [\n    {\n      \"interaction_id\": \"6307f51b-a892-86ab-ae38-900c3adaf2cf\",\n      \"git_commit_hash\": \"bba1c773ab892954b9b5cb25a0f9a13ebfa76166\",\n      \"link_type\": \"generated\",\n      \"linked_by\": \"fixture@example.invalid\"\n    }\n  ]\n}","mode":"100644","path":"nodes/63/6307f51b-a892-86ab-ae38-900c3adaf2cf.json","sha256":"6f8f1e197b440cd9eb9d9812b8ddd0dbf16a483c5542d34bb006b5946b36aaf4"}
+    ]
+  },
+  "scenario": "commit_links_quiet_log_line",
+  "steps": [
+    {"changes":{},"outcome":{"commit":{"file":"q.rs","sha":"bba1c773ab892954b9b5cb25a0f9a13ebfa76166","time":1789473600}},"step":"commit q.rs"},
+    {"changes":{"same_as_final":true},"outcome":{"ingest":{"mode":"final","rescan":false,"session_id":"5f2a7c9d-1e60-4c8d-9e3b-0b7d2c4e6a1f","transcript":"__WORKTREE__/proj/5f2a7c9d-1e60-4c8d-9e3b-0b7d2c4e6a1f.jsonl"},"report":{"already_present":0,"cursor":2526,"inserted":3,"linked_from_commits":2,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"5f2a7c9d-1e60-4c8d-9e3b-0b7d2c4e6a1f","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":3184,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"final"}
+  ]
+}

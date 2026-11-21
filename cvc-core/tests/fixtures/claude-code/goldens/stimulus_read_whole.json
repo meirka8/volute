@@ -1,0 +1,56 @@
+{
+  "final": {
+    "artifact_links": [],
+    "context_items": [],
+    "conversation_share_policy": [],
+    "conversation_shares": [],
+    "conversations": [
+      {"created_at":1790848802,"id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","title":"First request"}
+    ],
+    "derivation_events": [],
+    "derivation_observations": [],
+    "harness_ingest_cursors": [
+      {"byte_offset":36195,"harness":"claude-code","session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript_path":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl","updated_at":"__WALL_CLOCK__"}
+    ],
+    "interaction_shares": [],
+    "interactions": [
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"2a350447-7771-8b4e-8fa5-0627983aa754","model_cot":null,"model_name":"claude-fixture-1","model_response":null,"parent_id":null,"scrubber_version":1,"source_request_id":"req_A","timestamp":1790848802,"user_prompt":"[prompt ~cvc-f3902419cc9f3a5e] First request","visibility":"private"},
+      {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da","model_cot":null,"model_name":"claude-fixture-1","model_response":"Built.","parent_id":"2a350447-7771-8b4e-8fa5-0627983aa754","scrubber_version":1,"source_request_id":"req_B","timestamp":1790848804,"user_prompt":{"$long_string":{"bytes":8288,"head":"[tool_result Bash ~cvc-82322db99f4b14cf] line of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline","sha256":"cbf37f7bfa85c7298bc87b2fa566cc50ec0eb2cedb21ccd4816b70079a34bfb7","tail":"line of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\nline of output\n"}},"visibility":"private"},
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"a9c8913d-5601-817e-9dc3-8cedf9891c2d","model_cot":null,"model_name":"claude-fixture-1","model_response":null,"parent_id":"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da","scrubber_version":1,"source_request_id":"req_C","timestamp":1790848806,"user_prompt":"[prompt ~cvc-08a08f9f607d5eef] Second request, with [CVC_REDACTED:v1:secret_assignment:marker-1] in it","visibility":"private"},
+      {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"4b143a0d-22ff-84fb-aad9-832add69a9ed","model_cot":null,"model_name":"claude-fixture-1","model_response":"Could not read.","parent_id":"a9c8913d-5601-817e-9dc3-8cedf9891c2d","scrubber_version":1,"source_request_id":"req_D","timestamp":1790848808,"user_prompt":"[tool_result Read error ~cvc-d0e2520e9d9e2886] contents","visibility":"private"}
+    ],
+    "publications": [],
+    "tombstones": [],
+    "tool_executions": [
+      {"arguments":"{\"command\":\"make\"}","id":1,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Bash","tool_protocol":"native"},
+      {"arguments":"{\"file_path\":\"a\"}","id":2,"interaction_id":"a9c8913d-5601-817e-9dc3-8cedf9891c2d","status":"failure","tool_name":"Read","tool_protocol":"native"}
+    ]
+  },
+  "golden": "cvc-core/claude-code-golden/v2",
+  "legend": [
+    "__WORKTREE__: the fixture repository's canonical root, always 240 bytes long",
+    "__TMPDIR__: the temporary directory holding that root",
+    "__WORKTREE_FINGERPRINT__: the capture_worktree hash of that root",
+    "__WALL_CLOCK__: a wall-clock column whose value lies within the test's run",
+    "marker-<n>: the random UUID of a redaction marker, numbered by first appearance",
+    "$long_string: a string over 4096 bytes, as its length, SHA-256, head and tail",
+    "{rows, sha256, first, last}: over 20 rows, by count, SHA-256 of their compact JSON, 3 each end",
+    "same_as_final: a step's rows for a table (or all its changes) are exactly the final rows",
+    "published.files: each file's byte length, SHA-256 and, as one string, its content",
+    "published.files content: every non-node file, and every node (first and last 3 if over 20)"
+  ],
+  "published": {
+    "empty_trees": ["events","ranges"],
+    "files": [
+      {"bytes":1,"content":"5","mode":"100644","path":"FORMAT","sha256":"ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d"},
+      {"bytes":712,"content":"{\n  \"interaction\": {\n    \"id\": \"2a350447-7771-8b4e-8fa5-0627983aa754\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": null,\n    \"timestamp\": \"2026-10-01T10:00:02Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-f3902419cc9f3a5e] First request\",\n    \"model_name\": \"claude-fixture-1\",\n    \"model_cot\": null,\n    \"model_response\": null,\n    \"source_request_id\": \"req_A\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [\n    {\n      \"id\": 1,\n      \"interaction_id\": \"2a350447-7771-8b4e-8fa5-0627983aa754\",\n      \"tool_protocol\": \"native\",\n      \"tool_name\": \"Bash\",\n      \"arguments\": \"{\\\"command\\\":\\\"make\\\"}\",\n      \"status\": \"success\"\n    }\n  ],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/2a/2a350447-7771-8b4e-8fa5-0627983aa754.json","sha256":"fd0a066e914ef8d2d9f42ec172a9566a7632b4a8ab3007081746e51985612e21"},
+      {"bytes":546,"content":"{\n  \"interaction\": {\n    \"id\": \"4b143a0d-22ff-84fb-aad9-832add69a9ed\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": \"a9c8913d-5601-817e-9dc3-8cedf9891c2d\",\n    \"timestamp\": \"2026-10-01T10:00:08Z\",\n    \"author\": \"system\",\n    \"user_prompt\": \"[tool_result Read error ~cvc-d0e2520e9d9e2886] contents\",\n    \"model_name\": \"claude-fixture-1\",\n    \"model_cot\": null,\n    \"model_response\": \"Could not read.\",\n    \"source_request_id\": \"req_D\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/4b/4b143a0d-22ff-84fb-aad9-832add69a9ed.json","sha256":"6a0902360a9aa86f468551952e642f04748c974bd4863ccf4c9011486fc5f2d5"},
+      {"bytes":9318,"content":{"$long_string":{"bytes":9318,"head":"{\n  \"interaction\": {\n    \"id\": \"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": \"2a350447-7771-8b4e-8fa5-0627983aa754\",\n    \"timestamp\": \"2026-10-01T10:00:04Z\",\n    \"aut","sha256":"3be8b4b22f6d7183c543aa4232407d2929950b7a6fdeebaab5f2925381addd42","tail":"\\nline of output\\nline of output\\n\",\n    \"model_name\": \"claude-fixture-1\",\n    \"model_cot\": null,\n    \"model_response\": \"Built.\",\n    \"source_request_id\": \"req_B\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}"}},"mode":"100644","path":"nodes/72/723dd8dc-8f19-8f67-8f4a-4c1f53cec0da.json","sha256":"3be8b4b22f6d7183c543aa4232407d2929950b7a6fdeebaab5f2925381addd42"},
+      {"bytes":831,"content":"{\n  \"interaction\": {\n    \"id\": \"a9c8913d-5601-817e-9dc3-8cedf9891c2d\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": \"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da\",\n    \"timestamp\": \"2026-10-01T10:00:06Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-08a08f9f607d5eef] Second request, with [CVC_REDACTED:v1:secret_assignment:marker-1] in it\",\n    \"model_name\": \"claude-fixture-1\",\n    \"model_cot\": null,\n    \"model_response\": null,\n    \"source_request_id\": \"req_C\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [\n    {\n      \"id\": 2,\n      \"interaction_id\": \"a9c8913d-5601-817e-9dc3-8cedf9891c2d\",\n      \"tool_protocol\": \"native\",\n      \"tool_name\": \"Read\",\n      \"arguments\": \"{\\\"file_path\\\":\\\"a\\\"}\",\n      \"status\": \"failure\"\n    }\n  ],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/a9/a9c8913d-5601-817e-9dc3-8cedf9891c2d.json","sha256":"fcc77bdfa14f51335550ec9801e8306fe55ad64a79b983ef992fa332990534e9"}
+    ]
+  },
+  "scenario": "stimulus_read_whole",
+  "steps": [
+    {"changes":{"same_as_final":true},"outcome":{"ingest":{"mode":"final","rescan":false,"session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl"},"report":{"already_present":0,"cursor":36195,"inserted":4,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":36881,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"final"}
+  ]
+}

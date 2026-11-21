@@ -1,0 +1,27 @@
+{
+  "final": {"artifact_links":[],"context_items":[],"conversation_share_policy":[],"conversation_shares":[],"conversations":[],"derivation_events":[],"derivation_observations":[],"harness_ingest_cursors":[],"interaction_shares":[],"interactions":[],"publications":[],"tombstones":[],"tool_executions":[]},
+  "golden": "cvc-core/claude-code-golden/v2",
+  "legend": [
+    "__WORKTREE__: the fixture repository's canonical root, always 240 bytes long",
+    "__TMPDIR__: the temporary directory holding that root",
+    "__WORKTREE_FINGERPRINT__: the capture_worktree hash of that root",
+    "__WALL_CLOCK__: a wall-clock column whose value lies within the test's run",
+    "marker-<n>: the random UUID of a redaction marker, numbered by first appearance",
+    "$long_string: a string over 4096 bytes, as its length, SHA-256, head and tail",
+    "{rows, sha256, first, last}: over 20 rows, by count, SHA-256 of their compact JSON, 3 each end",
+    "same_as_final: a step's rows for a table (or all its changes) are exactly the final rows",
+    "published.files: each file's byte length, SHA-256 and, as one string, its content",
+    "published.files content: every non-node file, and every node (first and last 3 if over 20)"
+  ],
+  "published": {"no_changes":{"shared_total":0}},
+  "scenario": "refusals_write_nothing",
+  "steps": [
+    {"changes":{},"outcome":{"error":{"kind":"Transcript","message":"transcript entry at byte 1971 is malformed: assistant content block has no type"},"ingest":{"mode":"final","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60.jsonl"}},"step":"a block without a type"},
+    {"changes":{},"outcome":{"error":{"kind":"NotClaudeCode","message":"not a Claude Code transcript: \"__WORKTREE__/proj/7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60.jsonl\" begins with an entry in another agent's format"},"ingest":{"mode":"final","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60.jsonl"}},"step":"another agent's transcript"},
+    {"changes":{},"outcome":{"error":{"kind":"NotClaudeCode","message":"not a Claude Code transcript: \"__WORKTREE__/proj/7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60.jsonl\" begins with an entry in another agent's format"},"ingest":{"mode":"final","rescan":false,"session_id":"not a session id","transcript":"__WORKTREE__/proj/7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60.jsonl"}},"step":"another agent's transcript, with an unsafe session id"},
+    {"changes":{},"outcome":{"error":{"kind":"Transcript","message":"transcript entry at byte 103 has Claude Code version 3.0.0; this cvc supports transcript major version 2 only"},"ingest":{"mode":"final","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60.jsonl"}},"step":"an unsupported major version"},
+    {"changes":{},"outcome":{"error":{"kind":"InvalidSession","message":"session id \"not a session id\" is not a safe identifier"},"ingest":{"mode":"final","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/not a session id.jsonl"}},"step":"a file stem that is not a session id"},
+    {"changes":{},"outcome":{"error":{"kind":"NotRegularFile","message":"transcript \"__WORKTREE__/proj/7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60-dir.jsonl\" is not a regular file"},"ingest":{"mode":"final","rescan":false,"session_id":"7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60","transcript":"__WORKTREE__/proj/7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60-dir.jsonl"}},"step":"a directory"},
+    {"changes":{},"outcome":{"error":{"kind":"Io","message":"transcript I/O: No such file or directory (os error 2)"},"ingest":{"mode":"final","rescan":false,"session_id":"7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60","transcript":"__WORKTREE__/proj/missing.jsonl"}},"step":"a missing file"}
+  ]
+}

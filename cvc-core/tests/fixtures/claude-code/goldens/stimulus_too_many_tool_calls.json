@@ -1,0 +1,104 @@
+{
+  "final": {
+    "artifact_links": [],
+    "context_items": [],
+    "conversation_share_policy": [],
+    "conversation_shares": [],
+    "conversations": [
+      {"created_at":1790848802,"id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","title":"Run all of them"}
+    ],
+    "derivation_events": [],
+    "derivation_observations": [],
+    "harness_ingest_cursors": [
+      {"byte_offset":45463,"harness":"claude-code","session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript_path":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl","updated_at":"__WALL_CLOCK__"}
+    ],
+    "interaction_shares": [],
+    "interactions": [
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"2a350447-7771-8b4e-8fa5-0627983aa754","model_cot":null,"model_name":"claude-fixture-1","model_response":null,"parent_id":null,"scrubber_version":1,"source_request_id":"req_A","timestamp":1790848802,"user_prompt":"[prompt ~cvc-f3902419cc9f3a5e] Run all of them","visibility":"private"},
+      {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da","model_cot":null,"model_name":"claude-fixture-1","model_response":"Ran them.","parent_id":"2a350447-7771-8b4e-8fa5-0627983aa754","scrubber_version":1,"source_request_id":"req_B","timestamp":1790848804,"user_prompt":{"$long_string":{"bytes":11563,"head":"[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Ba","sha256":"6e60d3d768a863c9bf3dd6d814102932bdf1e046d8937331cbf60f159c51237e","tail":"eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok"}},"visibility":"private"},
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"a9c8913d-5601-817e-9dc3-8cedf9891c2d","model_cot":null,"model_name":"claude-fixture-1","model_response":"You are welcome.","parent_id":"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da","scrubber_version":1,"source_request_id":"req_C","timestamp":1790848806,"user_prompt":"[prompt ~cvc-08a08f9f607d5eef] Thanks","visibility":"private"},
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"a2435a4b-92fa-8658-bca9-03e44d2ce930","model_cot":null,"model_name":"claude-fixture-1","model_response":"Done.","parent_id":"a9c8913d-5601-817e-9dc3-8cedf9891c2d","scrubber_version":1,"source_request_id":"req_Z","timestamp":1790848808,"user_prompt":"[prompt ~cvc-412a80f93a779ea2] One more thing","visibility":"private"}
+    ],
+    "publications": [],
+    "tombstones": [],
+    "tool_executions": {
+      "first": [
+        {"arguments":"{\"command\":\"echo 0\"}","id":1,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Bash","tool_protocol":"native"},
+        {"arguments":"{\"command\":\"echo 1\"}","id":2,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Bash","tool_protocol":"native"},
+        {"arguments":"{\"command\":\"echo 2\"}","id":3,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Bash","tool_protocol":"native"}
+      ],
+      "last": [
+        {"arguments":"{\"command\":\"echo 253\"}","id":254,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Bash","tool_protocol":"native"},
+        {"arguments":"{\"command\":\"echo 254\"}","id":255,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Bash","tool_protocol":"native"},
+        {"arguments":"{\"context_items\":0,\"cvc_omitted\":true,\"tool_calls\":2}","id":256,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"cvc-omitted","tool_protocol":"cvc"}
+      ],
+      "rows": 256,
+      "sha256": "c390888ea4ef1c8319bf9b82f0a82a61c21cb2d2455843805217af0c10f16644"
+    }
+  },
+  "golden": "cvc-core/claude-code-golden/v2",
+  "legend": [
+    "__WORKTREE__: the fixture repository's canonical root, always 240 bytes long",
+    "__TMPDIR__: the temporary directory holding that root",
+    "__WORKTREE_FINGERPRINT__: the capture_worktree hash of that root",
+    "__WALL_CLOCK__: a wall-clock column whose value lies within the test's run",
+    "marker-<n>: the random UUID of a redaction marker, numbered by first appearance",
+    "$long_string: a string over 4096 bytes, as its length, SHA-256, head and tail",
+    "{rows, sha256, first, last}: over 20 rows, by count, SHA-256 of their compact JSON, 3 each end",
+    "same_as_final: a step's rows for a table (or all its changes) are exactly the final rows",
+    "published.files: each file's byte length, SHA-256 and, as one string, its content",
+    "published.files content: every non-node file, and every node (first and last 3 if over 20)"
+  ],
+  "published": {
+    "empty_trees": ["events","ranges"],
+    "files": [
+      {"bytes":1,"content":"5","mode":"100644","path":"FORMAT","sha256":"ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d"},
+      {"bytes":58934,"content":{"$long_string":{"bytes":58934,"head":"{\n  \"interaction\": {\n    \"id\": \"2a350447-7771-8b4e-8fa5-0627983aa754\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": null,\n    \"timestamp\": \"2026-10-01T10:00:02Z\",\n    \"author\": \"human\",\n    \"user_prompt\": ","sha256":"e857bc5af58f6d5da5650f8fadc9cf410da9b25b84c4737014b809dc57be0da1","tail":"47-7771-8b4e-8fa5-0627983aa754\",\n      \"tool_protocol\": \"cvc\",\n      \"tool_name\": \"cvc-omitted\",\n      \"arguments\": \"{\\\"context_items\\\":0,\\\"cvc_omitted\\\":true,\\\"tool_calls\\\":2}\",\n      \"status\": \"success\"\n    }\n  ],\n  \"artifact_links\": []\n}"}},"mode":"100644","path":"nodes/2a/2a350447-7771-8b4e-8fa5-0627983aa754.json","sha256":"e857bc5af58f6d5da5650f8fadc9cf410da9b25b84c4737014b809dc57be0da1"},
+      {"bytes":12560,"content":{"$long_string":{"bytes":12560,"head":"{\n  \"interaction\": {\n    \"id\": \"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": \"2a350447-7771-8b4e-8fa5-0627983aa754\",\n    \"timestamp\": \"2026-10-01T10:00:04Z\",\n    \"aut","sha256":"5b133cdaa3a5287cf7b073b8fdbc6837de2e464558975ca54b831b949a39154d","tail":" Bash ~cvc-08173eab500a8b9f] ok\",\n    \"model_name\": \"claude-fixture-1\",\n    \"model_cot\": null,\n    \"model_response\": \"Ran them.\",\n    \"source_request_id\": \"req_B\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}"}},"mode":"100644","path":"nodes/72/723dd8dc-8f19-8f67-8f4a-4c1f53cec0da.json","sha256":"5b133cdaa3a5287cf7b073b8fdbc6837de2e464558975ca54b831b949a39154d"},
+      {"bytes":525,"content":"{\n  \"interaction\": {\n    \"id\": \"a2435a4b-92fa-8658-bca9-03e44d2ce930\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": \"a9c8913d-5601-817e-9dc3-8cedf9891c2d\",\n    \"timestamp\": \"2026-10-01T10:00:08Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-412a80f93a779ea2] One more thing\",\n    \"model_name\": \"claude-fixture-1\",\n    \"model_cot\": null,\n    \"model_response\": \"Done.\",\n    \"source_request_id\": \"req_Z\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/a2/a2435a4b-92fa-8658-bca9-03e44d2ce930.json","sha256":"3524fb81a21a42c62e06024505cbdcdd0404e97a702e2e9b850ea4fc3b6f992a"},
+      {"bytes":528,"content":"{\n  \"interaction\": {\n    \"id\": \"a9c8913d-5601-817e-9dc3-8cedf9891c2d\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": \"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da\",\n    \"timestamp\": \"2026-10-01T10:00:06Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-08a08f9f607d5eef] Thanks\",\n    \"model_name\": \"claude-fixture-1\",\n    \"model_cot\": null,\n    \"model_response\": \"You are welcome.\",\n    \"source_request_id\": \"req_C\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/a9/a9c8913d-5601-817e-9dc3-8cedf9891c2d.json","sha256":"2df3c4da9994b4450c724f8bd102c23f2825fde88b5b0e16c25263edc457f23c"}
+    ]
+  },
+  "scenario": "stimulus_too_many_tool_calls",
+  "steps": [
+    {
+      "changes": {
+        "conversations": {"same_as_final":true},
+        "harness_ingest_cursors": {
+          "added": [
+            {"byte_offset":44298,"harness":"claude-code","session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript_path":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl","updated_at":"__WALL_CLOCK__"}
+          ]
+        },
+        "interactions": {
+          "added": [
+            {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"2a350447-7771-8b4e-8fa5-0627983aa754","model_cot":null,"model_name":"claude-fixture-1","model_response":null,"parent_id":null,"scrubber_version":1,"source_request_id":"req_A","timestamp":1790848802,"user_prompt":"[prompt ~cvc-f3902419cc9f3a5e] Run all of them","visibility":"private"},
+            {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da","model_cot":null,"model_name":"claude-fixture-1","model_response":"Ran them.","parent_id":"2a350447-7771-8b4e-8fa5-0627983aa754","scrubber_version":1,"source_request_id":"req_B","timestamp":1790848804,"user_prompt":{"$long_string":{"bytes":11563,"head":"[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Ba","sha256":"6e60d3d768a863c9bf3dd6d814102932bdf1e046d8937331cbf60f159c51237e","tail":"eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok\n\n[tool_result Bash ~cvc-08173eab500a8b9f] ok"}},"visibility":"private"},
+            {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"a9c8913d-5601-817e-9dc3-8cedf9891c2d","model_cot":null,"model_name":"claude-fixture-1","model_response":"You are welcome.","parent_id":"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da","scrubber_version":1,"source_request_id":"req_C","timestamp":1790848806,"user_prompt":"[prompt ~cvc-08a08f9f607d5eef] Thanks","visibility":"private"}
+          ]
+        },
+        "tool_executions": {"same_as_final":true}
+      },
+      "outcome": {"ingest":{"mode":"final","rescan":false,"session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl"},"report":{"already_present":0,"cursor":44298,"inserted":3,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":2,"pending_responses":0,"session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":44985,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},
+      "step": "final"
+    },
+    {
+      "changes": {
+        "harness_ingest_cursors": {
+          "added": [
+            {"byte_offset":45463,"harness":"claude-code","session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript_path":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl","updated_at":"__WALL_CLOCK__"}
+          ],
+          "removed": [
+            {"byte_offset":44298,"harness":"claude-code","session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript_path":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl","updated_at":"__WALL_CLOCK__"}
+          ]
+        },
+        "interactions": {
+          "added": [
+            {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"a2435a4b-92fa-8658-bca9-03e44d2ce930","model_cot":null,"model_name":"claude-fixture-1","model_response":"Done.","parent_id":"a9c8913d-5601-817e-9dc3-8cedf9891c2d","scrubber_version":1,"source_request_id":"req_Z","timestamp":1790848808,"user_prompt":"[prompt ~cvc-412a80f93a779ea2] One more thing","visibility":"private"}
+          ]
+        }
+      },
+      "outcome": {"ingest":{"mode":"final","rescan":false,"session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl"},"report":{"already_present":1,"cursor":45463,"inserted":1,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":46139,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},
+      "step": "final, after a later turn"
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "final": {
+    "artifact_links": [],
+    "context_items": [
+      {"dirty_patch":null,"end_line":null,"file_path":"src/lib.rs","git_blob_sha":null,"id":1,"interaction_id":"8fc40ad6-0885-8c48-8d10-ddec124a3a0a","start_line":null}
+    ],
+    "conversation_share_policy": [],
+    "conversation_shares": [],
+    "conversations": [
+      {"created_at":1792314001,"id":"2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d","title":"Server tool outcomes"}
+    ],
+    "derivation_events": [],
+    "derivation_observations": [],
+    "harness_ingest_cursors": [
+      {"byte_offset":14657,"harness":"claude-code","session_id":"2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d","transcript_path":"__WORKTREE__/proj/2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d.jsonl","updated_at":"__WALL_CLOCK__"}
+    ],
+    "interaction_shares": [],
+    "interactions": [
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d","id":"8fc40ad6-0885-8c48-8d10-ddec124a3a0a","model_cot":null,"model_name":"claude-fixture-3","model_response":"Searching and fetching.\n\n[web_search_tool_result]\n\n[web_search_tool_result]\n\n[web_fetch_tool_result]\n\n[bash_code_execution_tool_result]\n\n[bash_code_execution_tool_result]\n\n[text_editor_code_execution_tool_result]","parent_id":null,"scrubber_version":1,"source_request_id":"req_A","timestamp":1792314001,"user_prompt":"[prompt ~cvc-fae0ca4a4f6e07b5] Look things up, run the checks in the sandbox, and read lib.rs","visibility":"private"},
+      {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d","id":"94705671-dba9-8399-8430-839c3fb758d0","model_cot":null,"model_name":"claude-fixture-3","model_response":"Summary of the lookups.\n\n[web_search_tool_result]","parent_id":"8fc40ad6-0885-8c48-8d10-ddec124a3a0a","scrubber_version":1,"source_request_id":"req_B","timestamp":1792314017,"user_prompt":"[tool_result Read ~cvc-64d3f6f22c747e25]      1\tfn main() {}","visibility":"private"}
+    ],
+    "publications": [],
+    "tombstones": [],
+    "tool_executions": [
+      {"arguments":"{\"query\":\"fixture query\"}","id":1,"interaction_id":"8fc40ad6-0885-8c48-8d10-ddec124a3a0a","status":"success","tool_name":"server:web_search","tool_protocol":"server"},
+      {"arguments":"{\"query\":\"second query\"}","id":2,"interaction_id":"8fc40ad6-0885-8c48-8d10-ddec124a3a0a","status":"failure","tool_name":"server:web_search","tool_protocol":"server"},
+      {"arguments":"{\"url\":\"https://example.invalid/page\"}","id":3,"interaction_id":"8fc40ad6-0885-8c48-8d10-ddec124a3a0a","status":"success","tool_name":"server:web_fetch","tool_protocol":"server"},
+      {"arguments":"{\"command\":\"echo ok\"}","id":4,"interaction_id":"8fc40ad6-0885-8c48-8d10-ddec124a3a0a","status":"success","tool_name":"server:bash_code_execution","tool_protocol":"server"},
+      {"arguments":"{\"command\":\"false\"}","id":5,"interaction_id":"8fc40ad6-0885-8c48-8d10-ddec124a3a0a","status":"failure","tool_name":"server:bash_code_execution","tool_protocol":"server"},
+      {"arguments":"{\"command\":\"view\",\"path\":\"/tmp/notes.txt\"}","id":6,"interaction_id":"8fc40ad6-0885-8c48-8d10-ddec124a3a0a","status":"success","tool_name":"server:text_editor_code_execution","tool_protocol":"server"},
+      {"arguments":"{\"query\":\"never answered\"}","id":7,"interaction_id":"8fc40ad6-0885-8c48-8d10-ddec124a3a0a","status":"failure","tool_name":"server:web_search","tool_protocol":"server"},
+      {"arguments":"{\"file_path\":\"__WORKTREE__/src/lib.rs\"}","id":8,"interaction_id":"8fc40ad6-0885-8c48-8d10-ddec124a3a0a","status":"success","tool_name":"Read","tool_protocol":"native"},
+      {"arguments":"{\"query\":\"follow up\"}","id":9,"interaction_id":"94705671-dba9-8399-8430-839c3fb758d0","status":"success","tool_name":"server:web_search","tool_protocol":"server"}
+    ]
+  },
+  "golden": "cvc-core/claude-code-golden/v2",
+  "legend": [
+    "__WORKTREE__: the fixture repository's canonical root, always 240 bytes long",
+    "__TMPDIR__: the temporary directory holding that root",
+    "__WORKTREE_FINGERPRINT__: the capture_worktree hash of that root",
+    "__WALL_CLOCK__: a wall-clock column whose value lies within the test's run",
+    "marker-<n>: the random UUID of a redaction marker, numbered by first appearance",
+    "$long_string: a string over 4096 bytes, as its length, SHA-256, head and tail",
+    "{rows, sha256, first, last}: over 20 rows, by count, SHA-256 of their compact JSON, 3 each end",
+    "same_as_final: a step's rows for a table (or all its changes) are exactly the final rows",
+    "published.files: each file's byte length, SHA-256 and, as one string, its content",
+    "published.files content: every non-node file, and every node (first and last 3 if over 20)"
+  ],
+  "published": {
+    "empty_trees": ["events","ranges"],
+    "files": [
+      {"bytes":1,"content":"5","mode":"100644","path":"FORMAT","sha256":"ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d"},
+      {"bytes":3221,"content":"{\n  \"interaction\": {\n    \"id\": \"8fc40ad6-0885-8c48-8d10-ddec124a3a0a\",\n    \"conversation_id\": \"2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d\",\n    \"parent_id\": null,\n    \"timestamp\": \"2026-10-18T09:00:01Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-fae0ca4a4f6e07b5] Look things up, run the checks in the sandbox, and read lib.rs\",\n    \"model_name\": \"claude-fixture-3\",\n    \"model_cot\": null,\n    \"model_response\": \"Searching and fetching.\\n\\n[web_search_tool_result]\\n\\n[web_search_tool_result]\\n\\n[web_fetch_tool_result]\\n\\n[bash_code_execution_tool_result]\\n\\n[bash_code_execution_tool_result]\\n\\n[text_editor_code_execution_tool_result]\",\n    \"source_request_id\": \"req_A\"\n  },\n  \"context_items\": [\n    {\n      \"id\": 1,\n      \"interaction_id\": \"8fc40ad6-0885-8c48-8d10-ddec124a3a0a\",\n      \"file_path\": \"src/lib.rs\",\n      \"git_blob_sha\": null,\n      \"dirty_patch\": null,\n      \"start_line\": null,\n      \"end_line\": null\n    }\n  ],\n  \"tool_executions\": [\n    {\n      \"id\": 1,\n      \"interaction_id\": \"8fc40ad6-0885-8c48-8d10-ddec124a3a0a\",\n      \"tool_protocol\": \"server\",\n      \"tool_name\": \"server:web_search\",\n      \"arguments\": \"{\\\"query\\\":\\\"fixture query\\\"}\",\n      \"status\": \"success\"\n    },\n    {\n      \"id\": 2,\n      \"interaction_id\": \"8fc40ad6-0885-8c48-8d10-ddec124a3a0a\",\n      \"tool_protocol\": \"server\",\n      \"tool_name\": \"server:web_search\",\n      \"arguments\": \"{\\\"query\\\":\\\"second query\\\"}\",\n      \"status\": \"failure\"\n    },\n    {\n      \"id\": 3,\n      \"interaction_id\": \"8fc40ad6-0885-8c48-8d10-ddec124a3a0a\",\n      \"tool_protocol\": \"server\",\n      \"tool_name\": \"server:web_fetch\",\n      \"arguments\": \"{\\\"url\\\":\\\"https://example.invalid/page\\\"}\",\n      \"status\": \"success\"\n    },\n    {\n      \"id\": 4,\n      \"interaction_id\": \"8fc40ad6-0885-8c48-8d10-ddec124a3a0a\",\n      \"tool_protocol\": \"server\",\n      \"tool_name\": \"server:bash_code_execution\",\n      \"arguments\": \"{\\\"command\\\":\\\"echo ok\\\"}\",\n      \"status\": \"success\"\n    },\n    {\n      \"id\": 5,\n      \"interaction_id\": \"8fc40ad6-0885-8c48-8d10-ddec124a3a0a\",\n      \"tool_protocol\": \"server\",\n      \"tool_name\": \"server:bash_code_execution\",\n      \"arguments\": \"{\\\"command\\\":\\\"false\\\"}\",\n      \"status\": \"failure\"\n    },\n    {\n      \"id\": 6,\n      \"interaction_id\": \"8fc40ad6-0885-8c48-8d10-ddec124a3a0a\",\n      \"tool_protocol\": \"server\",\n      \"tool_name\": \"server:text_editor_code_execution\",\n      \"arguments\": \"{\\\"command\\\":\\\"view\\\",\\\"path\\\":\\\"/tmp/notes.txt\\\"}\",\n      \"status\": \"success\"\n    },\n    {\n      \"id\": 7,\n      \"interaction_id\": \"8fc40ad6-0885-8c48-8d10-ddec124a3a0a\",\n      \"tool_protocol\": \"server\",\n      \"tool_name\": \"server:web_search\",\n      \"arguments\": \"{\\\"query\\\":\\\"never answered\\\"}\",\n      \"status\": \"failure\"\n    },\n    {\n      \"id\": 8,\n      \"interaction_id\": \"8fc40ad6-0885-8c48-8d10-ddec124a3a0a\",\n      \"tool_protocol\": \"native\",\n      \"tool_name\": \"Read\",\n      \"arguments\": \"{\\\"file_path\\\":\\\"__WORKTREE__/src/lib.rs\\\"}\",\n      \"status\": \"success\"\n    }\n  ],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/8f/8fc40ad6-0885-8c48-8d10-ddec124a3a0a.json","sha256":"3b589f3d2092ebf9fe216315a69c45cc9e3cee0e9dd636199b90a37d5e3e6a53"},
+      {"bytes":829,"content":"{\n  \"interaction\": {\n    \"id\": \"94705671-dba9-8399-8430-839c3fb758d0\",\n    \"conversation_id\": \"2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d\",\n    \"parent_id\": \"8fc40ad6-0885-8c48-8d10-ddec124a3a0a\",\n    \"timestamp\": \"2026-10-18T09:00:17Z\",\n    \"author\": \"system\",\n    \"user_prompt\": \"[tool_result Read ~cvc-64d3f6f22c747e25]      1\\tfn main() {}\",\n    \"model_name\": \"claude-fixture-3\",\n    \"model_cot\": null,\n    \"model_response\": \"Summary of the lookups.\\n\\n[web_search_tool_result]\",\n    \"source_request_id\": \"req_B\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [\n    {\n      \"id\": 9,\n      \"interaction_id\": \"94705671-dba9-8399-8430-839c3fb758d0\",\n      \"tool_protocol\": \"server\",\n      \"tool_name\": \"server:web_search\",\n      \"arguments\": \"{\\\"query\\\":\\\"follow up\\\"}\",\n      \"status\": \"success\"\n    }\n  ],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/94/94705671-dba9-8399-8430-839c3fb758d0.json","sha256":"d6c3f67e2772d7704fd3af940926431317ea503f5db22492c1cab307a6b1feed"}
+    ]
+  },
+  "scenario": "fixture_v2_1_300_server_tools_final",
+  "steps": [
+    {"changes":{"same_as_final":true},"outcome":{"ingest":{"mode":"final","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d.jsonl"},"report":{"already_present":0,"cursor":14657,"inserted":2,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":17288,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"final"},
+    {"changes":{},"outcome":{"ingest":{"mode":"final","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d.jsonl"},"report":{"already_present":1,"cursor":14657,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":17288,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"final again: nothing new"},
+    {"changes":{},"outcome":{"ingest":{"mode":"final","rescan":true,"session_id":null,"transcript":"__WORKTREE__/proj/2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d.jsonl"},"report":{"already_present":2,"cursor":14657,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":17288,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"rescan, final"},
+    {"changes":{},"outcome":{"ingest":{"mode":"incremental","rescan":true,"session_id":null,"transcript":"__WORKTREE__/proj/2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d.jsonl"},"report":{"already_present":1,"cursor":14657,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":1,"session_id":"2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":17288,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"rescan, incremental"},
+    {"changes":{},"outcome":{"ingest":{"mode":"final","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d.jsonl"},"report":{"already_present":1,"cursor":14657,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"2d7f4b9e-3a5c-4c1e-8b6d-9e0f1a2b3c4d","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":17288,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"final after the rescans"}
+  ]
+}

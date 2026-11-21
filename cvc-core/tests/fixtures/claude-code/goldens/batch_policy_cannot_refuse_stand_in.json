@@ -1,0 +1,47 @@
+{
+  "final": {
+    "artifact_links": [],
+    "context_items": [],
+    "conversation_share_policy": [],
+    "conversation_shares": [],
+    "conversations": [
+      {"created_at":1789473600,"id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","title":"[CVC_REDACTED:v1:policy_regex:marker-1][CVC_REDACTED:v1:policy_regex:marker-2][CVC_REDACTED:v1:policy_regex:marker-3][CVC_REDACTED:v1:policy_regex:marker-4][CVC_REDACTED:v1:policy_regex:marker-5][CVC_REDACTED:v1:policy_regex:marker-6][CVC_REDACTED:v1:policy_regex:marker-7][CVC_REDACTED:v1:policy_regex:marker-8][CVC_REDACTED:v1:policy_regex:marker-9][CVC_REDACTED:v1:policy_regex:marker-10]"}
+    ],
+    "derivation_events": [],
+    "derivation_observations": [],
+    "harness_ingest_cursors": [
+      {"byte_offset":5,"harness":"claude-code","session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript_path":"/transcripts/session.jsonl","updated_at":"__WALL_CLOCK__"}
+    ],
+    "interaction_shares": [],
+    "interactions": [
+      {"author":"human","capture_source":"claude_code","capture_worktree":"0000000000000000000000000000000000000000000000000000000000000000","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"2a350447-7771-8b4e-8fa5-0627983aa754","model_cot":null,"model_name":null,"model_response":"[cvc: withheld this response: it could not be scrubbed within the limits]","parent_id":null,"scrubber_version":1,"source_request_id":"req_A","timestamp":1789473600,"user_prompt":"[prompt ~cvc-f3902419cc9f3a5e] [CVC_REDACTED:v1:policy_regex:marker-11][CVC_REDACTED:v1:policy_regex:marker-12][CVC_REDACTED:v1:policy_regex:marker-13][CVC_REDACTED:v1:policy_regex:marker-14][CVC_REDACTED:v1:policy_regex:marker-15][CVC_REDACTED:v1:policy_regex:marker-16][CVC_REDACTED:v1:policy_regex:marker-17][CVC_REDACTED:v1:policy_regex:marker-18][CVC_REDACTED:v1:policy_regex:marker-19][CVC_REDACTED:v1:policy_regex:marker-20][CVC_REDACTED:v1:policy_regex:marker-21][CVC_REDACTED:v1:policy_regex:marker-22]","visibility":"private"}
+    ],
+    "publications": [],
+    "tombstones": [],
+    "tool_executions": []
+  },
+  "golden": "cvc-core/claude-code-golden/v2",
+  "legend": [
+    "__WORKTREE__: the fixture repository's canonical root, always 240 bytes long",
+    "__TMPDIR__: the temporary directory holding that root",
+    "__WORKTREE_FINGERPRINT__: the capture_worktree hash of that root",
+    "__WALL_CLOCK__: a wall-clock column whose value lies within the test's run",
+    "marker-<n>: the random UUID of a redaction marker, numbered by first appearance",
+    "$long_string: a string over 4096 bytes, as its length, SHA-256, head and tail",
+    "{rows, sha256, first, last}: over 20 rows, by count, SHA-256 of their compact JSON, 3 each end",
+    "same_as_final: a step's rows for a table (or all its changes) are exactly the final rows",
+    "published.files: each file's byte length, SHA-256 and, as one string, its content",
+    "published.files content: every non-node file, and every node (first and last 3 if over 20)"
+  ],
+  "published": {
+    "empty_trees": ["events","ranges"],
+    "files": [
+      {"bytes":1,"content":"5","mode":"100644","path":"FORMAT","sha256":"ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d"},
+      {"bytes":1335,"content":"{\n  \"interaction\": {\n    \"id\": \"2a350447-7771-8b4e-8fa5-0627983aa754\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": null,\n    \"timestamp\": \"2026-09-15T12:00:00Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-f3902419cc9f3a5e] [CVC_REDACTED:v1:policy_regex:marker-11][CVC_REDACTED:v1:policy_regex:marker-12][CVC_REDACTED:v1:policy_regex:marker-13][CVC_REDACTED:v1:policy_regex:marker-14][CVC_REDACTED:v1:policy_regex:marker-15][CVC_REDACTED:v1:policy_regex:marker-16][CVC_REDACTED:v1:policy_regex:marker-17][CVC_REDACTED:v1:policy_regex:marker-18][CVC_REDACTED:v1:policy_regex:marker-19][CVC_REDACTED:v1:policy_regex:marker-20][CVC_REDACTED:v1:policy_regex:marker-21][CVC_REDACTED:v1:policy_regex:marker-22]\",\n    \"model_name\": null,\n    \"model_cot\": null,\n    \"model_response\": \"[cvc: withheld this response: it could not be scrubbed within the limits]\",\n    \"source_request_id\": \"req_A\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/2a/2a350447-7771-8b4e-8fa5-0627983aa754.json","sha256":"e4a4a3d0d44846a70e95fb762f1c950289e69d872474e09ba7412d04a615a85e"}
+    ]
+  },
+  "scenario": "batch_policy_cannot_refuse_stand_in",
+  "steps": [
+    {"changes":{"same_as_final":true},"outcome":{"batch":{"byte_offset":5,"captures":1,"harness":"claude-code","session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript_path":"/transcripts/session.jsonl"},"outcome":{"inserted":1,"lost":0,"reasons":["capture collection exceeds limit"],"suppressed":0,"withheld":1}},"step":"a capture the policy refuses"}
+  ]
+}

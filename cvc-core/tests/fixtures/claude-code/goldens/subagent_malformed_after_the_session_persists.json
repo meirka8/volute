@@ -1,0 +1,64 @@
+{
+  "final": {
+    "artifact_links": [
+      {"git_commit_hash":"4e7ded9c29f8c0c92e555136697a53dbcb71a19a","interaction_id":"240e6ddc-8308-8c33-a67b-6cc1a968f20e","link_type":"generated","linked_by":"fixture@example.invalid"},
+      {"git_commit_hash":"4e7ded9c29f8c0c92e555136697a53dbcb71a19a","interaction_id":"cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2","link_type":"generated","linked_by":"fixture@example.invalid"}
+    ],
+    "context_items": [],
+    "conversation_share_policy": [],
+    "conversation_shares": [],
+    "conversations": [
+      {"created_at":1789472650,"id":"0f773b11-7a20-427d-bd9d-208729c5fd87","title":"Delegate to a subagent"}
+    ],
+    "derivation_events": [],
+    "derivation_observations": [
+      {"event_id":"legacy:240e6ddc-8308-8c33-a67b-6cc1a968f20e:4e7ded9c29f8c0c92e555136697a53dbcb71a19a","origin":"local_api","source_fingerprint":null,"source_key":"legacy:240e6ddc-8308-8c33-a67b-6cc1a968f20e:4e7ded9c29f8c0c92e555136697a53dbcb71a19a","trusted_local":1},
+      {"event_id":"legacy:cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2:4e7ded9c29f8c0c92e555136697a53dbcb71a19a","origin":"local_api","source_fingerprint":null,"source_key":"legacy:cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2:4e7ded9c29f8c0c92e555136697a53dbcb71a19a","trusted_local":1}
+    ],
+    "harness_ingest_cursors": [
+      {"byte_offset":2476,"harness":"claude-code","session_id":"0f773b11-7a20-427d-bd9d-208729c5fd87","transcript_path":"__WORKTREE__/proj/0f773b11-7a20-427d-bd9d-208729c5fd87.jsonl","updated_at":"__WALL_CLOCK__"}
+    ],
+    "interaction_shares": [],
+    "interactions": [
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"0f773b11-7a20-427d-bd9d-208729c5fd87","id":"240e6ddc-8308-8c33-a67b-6cc1a968f20e","model_cot":null,"model_name":"m","model_response":"Delegating.","parent_id":null,"scrubber_version":1,"source_request_id":"req_A","timestamp":1789472650,"user_prompt":"[prompt ~cvc-c6c18e5c1f06f15a] Delegate to a subagent","visibility":"private"},
+      {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"0f773b11-7a20-427d-bd9d-208729c5fd87","id":"cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2","model_cot":null,"model_name":"m","model_response":null,"parent_id":"240e6ddc-8308-8c33-a67b-6cc1a968f20e","scrubber_version":1,"source_request_id":"req_B","timestamp":1789473598,"user_prompt":"[no stimulus recorded]","visibility":"private"},
+      {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"0f773b11-7a20-427d-bd9d-208729c5fd87","id":"9df38791-dffc-8e4d-afa7-ee15fddd9292","model_cot":null,"model_name":"m","model_response":"Committed.","parent_id":"cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2","scrubber_version":1,"source_request_id":"req_C","timestamp":1789473610,"user_prompt":"[tool_result Bash ~cvc-9a8e9a9a6fee5b57] [main 4e7ded9] work\n 1 file changed","visibility":"private"}
+    ],
+    "publications": [],
+    "tombstones": [],
+    "tool_executions": [
+      {"arguments":"{\"command\":\"git commit -am work\"}","id":1,"interaction_id":"cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2","status":"success","tool_name":"Bash","tool_protocol":"native"}
+    ]
+  },
+  "golden": "cvc-core/claude-code-golden/v2",
+  "legend": [
+    "__WORKTREE__: the fixture repository's canonical root, always 240 bytes long",
+    "__TMPDIR__: the temporary directory holding that root",
+    "__WORKTREE_FINGERPRINT__: the capture_worktree hash of that root",
+    "__WALL_CLOCK__: a wall-clock column whose value lies within the test's run",
+    "marker-<n>: the random UUID of a redaction marker, numbered by first appearance",
+    "$long_string: a string over 4096 bytes, as its length, SHA-256, head and tail",
+    "{rows, sha256, first, last}: over 20 rows, by count, SHA-256 of their compact JSON, 3 each end",
+    "same_as_final: a step's rows for a table (or all its changes) are exactly the final rows",
+    "published.files: each file's byte length, SHA-256 and, as one string, its content",
+    "published.files content: every non-node file, and every node (first and last 3 if over 20)"
+  ],
+  "published": {
+    "empty_trees": ["events","ranges"],
+    "files": [
+      {"bytes":1,"content":"5","mode":"100644","path":"FORMAT","sha256":"ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d"},
+      {"bytes":0,"mode":"100644","path":"by-commit/4e7ded9c29f8c0c92e555136697a53dbcb71a19a/240e6ddc-8308-8c33-a67b-6cc1a968f20e","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      {"bytes":0,"mode":"100644","path":"by-commit/4e7ded9c29f8c0c92e555136697a53dbcb71a19a/cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      {"bytes":180,"content":"{\"interaction_id\":\"240e6ddc-8308-8c33-a67b-6cc1a968f20e\",\"git_commit_hash\":\"4e7ded9c29f8c0c92e555136697a53dbcb71a19a\",\"link_type\":\"generated\",\"linked_by\":\"fixture@example.invalid\"}","mode":"100644","path":"links/240e6ddc-8308-8c33-a67b-6cc1a968f20e/4e7ded9c29f8c0c92e555136697a53dbcb71a19a.json","sha256":"0bbd45c5fb227df5e38d79d3c3b842031cac3a0a73f03731d6e104b68573fd0d"},
+      {"bytes":180,"content":"{\"interaction_id\":\"cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2\",\"git_commit_hash\":\"4e7ded9c29f8c0c92e555136697a53dbcb71a19a\",\"link_type\":\"generated\",\"linked_by\":\"fixture@example.invalid\"}","mode":"100644","path":"links/cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2/4e7ded9c29f8c0c92e555136697a53dbcb71a19a.json","sha256":"7a21bfa439af57a2a1acdc9ce54a6d313d6047c177a7185cc534414fe5360c67"},
+      {"bytes":715,"content":"{\n  \"interaction\": {\n    \"id\": \"240e6ddc-8308-8c33-a67b-6cc1a968f20e\",\n    \"conversation_id\": \"0f773b11-7a20-427d-bd9d-208729c5fd87\",\n    \"parent_id\": null,\n    \"timestamp\": \"2026-09-15T11:44:10Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-c6c18e5c1f06f15a] Delegate to a subagent\",\n    \"model_name\": \"m\",\n    \"model_cot\": null,\n    \"model_response\": \"Delegating.\",\n    \"source_request_id\": \"req_A\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": [\n    {\n      \"interaction_id\": \"240e6ddc-8308-8c33-a67b-6cc1a968f20e\",\n      \"git_commit_hash\": \"4e7ded9c29f8c0c92e555136697a53dbcb71a19a\",\n      \"link_type\": \"generated\",\n      \"linked_by\": \"fixture@example.invalid\"\n    }\n  ]\n}","mode":"100644","path":"nodes/24/240e6ddc-8308-8c33-a67b-6cc1a968f20e.json","sha256":"a138831dd58929d15aacafecd4a692903ca3a29521542b713e056d149a2bd723"},
+      {"bytes":548,"content":"{\n  \"interaction\": {\n    \"id\": \"9df38791-dffc-8e4d-afa7-ee15fddd9292\",\n    \"conversation_id\": \"0f773b11-7a20-427d-bd9d-208729c5fd87\",\n    \"parent_id\": \"cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2\",\n    \"timestamp\": \"2026-09-15T12:00:10Z\",\n    \"author\": \"system\",\n    \"user_prompt\": \"[tool_result Bash ~cvc-9a8e9a9a6fee5b57] [main 4e7ded9] work\\n 1 file changed\",\n    \"model_name\": \"m\",\n    \"model_cot\": null,\n    \"model_response\": \"Committed.\",\n    \"source_request_id\": \"req_C\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/9d/9df38791-dffc-8e4d-afa7-ee15fddd9292.json","sha256":"7d0283f919b7acb6e45664192b272ada92685f02d3cc91fa19e06c4a12d3cd50"},
+      {"bytes":950,"content":"{\n  \"interaction\": {\n    \"id\": \"cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2\",\n    \"conversation_id\": \"0f773b11-7a20-427d-bd9d-208729c5fd87\",\n    \"parent_id\": \"240e6ddc-8308-8c33-a67b-6cc1a968f20e\",\n    \"timestamp\": \"2026-09-15T11:59:58Z\",\n    \"author\": \"system\",\n    \"user_prompt\": \"[no stimulus recorded]\",\n    \"model_name\": \"m\",\n    \"model_cot\": null,\n    \"model_response\": null,\n    \"source_request_id\": \"req_B\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [\n    {\n      \"id\": 1,\n      \"interaction_id\": \"cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2\",\n      \"tool_protocol\": \"native\",\n      \"tool_name\": \"Bash\",\n      \"arguments\": \"{\\\"command\\\":\\\"git commit -am work\\\"}\",\n      \"status\": \"success\"\n    }\n  ],\n  \"artifact_links\": [\n    {\n      \"interaction_id\": \"cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2\",\n      \"git_commit_hash\": \"4e7ded9c29f8c0c92e555136697a53dbcb71a19a\",\n      \"link_type\": \"generated\",\n      \"linked_by\": \"fixture@example.invalid\"\n    }\n  ]\n}","mode":"100644","path":"nodes/ca/cafe41e0-9f6b-83ff-85fa-6f8d6f4923a2.json","sha256":"a99af8ccf426892431a0778502615f1e36769b047ac12dc47fd4a1852a1ac657"}
+    ]
+  },
+  "scenario": "subagent_malformed_after_the_session_persists",
+  "steps": [
+    {"changes":{},"outcome":{"commit":{"file":"work.rs","sha":"4e7ded9c29f8c0c92e555136697a53dbcb71a19a","time":1789473600}},"step":"commit work.rs"},
+    {"changes":{"same_as_final":true},"outcome":{"error":{"kind":"Transcript","message":"transcript entry at byte 289 is malformed: assistant content block has no type"},"ingest":{"mode":"final","rescan":false,"session_id":"0f773b11-7a20-427d-bd9d-208729c5fd87","transcript":"__WORKTREE__/proj/0f773b11-7a20-427d-bd9d-208729c5fd87.jsonl"}},"step":"final, the subagent is malformed"}
+  ]
+}
