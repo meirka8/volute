@@ -605,8 +605,11 @@ fn ingest_into(
     }
     let policy = PreparedPolicy::load(layout.policy_root()?)
         .map_err(|error| anyhow!("CVC capture blocked by .thoughtignore: {error}"))?;
-    // An operator's run also finishes the store's one-time upgrade; a hook
-    // never runs it, whatever the store's size.
+    // An operator's run also finishes the store's one-time capture-source
+    // upgrade. A hook's open runs it only where it costs nothing or where
+    // cvc 0.7.x would run it in the same open (an empty table, or one from
+    // before 0.7.x that cannot hold Claude Code's value yet); a populated
+    // 0.7.x store waits for an operator command.
     let store = match caller {
         Caller::Operator => CvcStore::open_initialized_upgrading(layout.db_path())?,
         Caller::Hook { .. } => CvcStore::open_initialized(layout.db_path())?,

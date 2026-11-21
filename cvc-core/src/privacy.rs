@@ -2762,9 +2762,15 @@ pub(crate) fn prepare(mut capture: Capture) -> Result<Capture> {
 ///
 /// This covers every front in one check: MCP `commit_thought`, `cvc run`, the
 /// editor, agent harnesses and pulls all pass through [`prepare`].
-fn check_conversation_namespace(source: CaptureSource, id: &str) -> Result<()> {
+pub(crate) fn check_conversation_namespace(source: CaptureSource, id: &str) -> Result<()> {
     let owner = harness::is_reserved_conversation_id(id);
-    if owner.is_some_and(|owner| id.len() == owner.reserved_prefix().len()) {
+    // A pull keeps whatever id the destination published (it is namespaced
+    // by the destination before it is stored, and labels no agent), so that
+    // one node cannot fail the whole pull. Every local source must name an id
+    // after a reserved prefix.
+    if source != CaptureSource::SyncImport
+        && owner.is_some_and(|owner| id.len() == owner.reserved_prefix().len())
+    {
         return Err(PrivacyError::Validation(
             "reserved conversation id prefix without an id".into(),
         ));
@@ -3444,21 +3450,22 @@ mod tests {
         for id in reserved {
             assert!(namespaced(CaptureSource::SyncImport, id), "{id}");
         }
-        // A prefix with nothing after it is refused from every source, its own
-        // harness and pulls included.
+        // A prefix with nothing after it is refused from every local source,
+        // its own harness included; a pull keeps the id it was published with.
         for harness in HarnessId::ALL {
             let prefix = harness.reserved_prefix();
-            for source in [
-                CaptureSource::Mcp,
-                CaptureSource::SyncImport,
-                CaptureSource::Harness(harness),
-            ] {
+            for source in [CaptureSource::Mcp, CaptureSource::Harness(harness)] {
                 assert!(!namespaced(source, prefix), "{source:?} {prefix}");
                 assert!(
                     !namespaced(source, &prefix.to_uppercase()),
                     "{source:?} {prefix}"
                 );
             }
+            assert!(namespaced(CaptureSource::SyncImport, prefix), "{prefix}");
+            assert!(
+                namespaced(CaptureSource::SyncImport, &prefix.to_uppercase()),
+                "{prefix}"
+            );
         }
         // Claude Code keeps its unprefixed ids and its subagent convention,
         // and may use its own reserved prefix; it may not use another's.

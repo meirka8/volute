@@ -830,6 +830,104 @@ fn cvc_07x_rebuild_sql_on_a_migrated_store_rolls_back_and_keeps_everything() {
     }
 }
 
+fn trigger_sql(conn: &Connection, name: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// A trigger whose value list holds every value this version writes is
+/// kept as it is, a later version's wider list included; one that misses a
+/// value, or is missing, is created again.
+#[test]
+fn a_wider_trigger_is_kept_and_a_narrower_one_is_replaced() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("cvc").join("index.db");
+    open(&path);
+    let conn = Connection::open(&path).unwrap();
+    let insert = "interactions_capture_source_insert";
+    let update = "interactions_capture_source_update";
+    let ours = trigger_sql(&conn, insert).unwrap();
+    let wider = ours.replace("'antigravity')", "'antigravity','later_agent')");
+    assert_ne!(wider, ours);
+    conn.execute_batch(&format!("DROP TRIGGER {insert}; {wider};"))
+        .unwrap();
+    for upgrading in [false, true] {
+        if upgrading {
+            open(&path);
+        } else {
+            open_default(&path);
+        }
+        assert_eq!(trigger_sql(&conn, insert).as_deref(), Some(wider.as_str()));
+    }
+    conn.execute(
+        "INSERT INTO conversations(id,title,created_at) VALUES('c','t',1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO interactions(id,conversation_id,timestamp,author,user_prompt,capture_source) VALUES (?1,'c',1,'agent','x','later_agent')",
+        params![interaction_id(1)],
+    )
+    .unwrap();
+
+    let narrower = trigger_sql(&conn, update)
+        .unwrap()
+        .replace(",'antigravity')", ")");
+    conn.execute_batch(&format!("DROP TRIGGER {update}; {narrower};"))
+        .unwrap();
+    open_default(&path);
+    let restored = trigger_sql(&conn, update).unwrap();
+    assert!(restored.contains("'antigravity'"), "{restored}");
+    assert_eq!(trigger_sql(&conn, insert).as_deref(), Some(wider.as_str()));
+}
+
+/// The upgrade's `DROP TABLE interactions` runs with foreign keys off, so it
+/// deletes nothing that references the table: commit evidence and relations
+/// stay.
+#[test]
+fn the_rebuild_keeps_the_rows_that_reference_interactions() {
+    let (_temp, path) = database_from(RELEASED[4].1);
+    populate(&Connection::open(&path).unwrap());
+    open_default(&path);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(&format!(
+        "INSERT INTO harness_commit_evidence(harness,family_root,interaction_id,commit_oid,response_at) VALUES ('claude-code','conv-1','{id}','{commit}',1);
+         INSERT INTO conversation_relations(child_id,parent_id,kind,harness,spawn_interaction_id,spawn_call_id,evidence,recorded_at) VALUES ('codex:c','codex:p','subagent','codex','{id}','call_1','child_record',1);",
+        id = interaction_id(0),
+        commit = "ab".repeat(20)
+    ))
+    .unwrap();
+    let before = (
+        rows(&conn, "harness_commit_evidence"),
+        rows(&conn, "conversation_relations"),
+    );
+    let root = rootpage(&conn);
+    drop(conn);
+    open(&path);
+    let conn = Connection::open(&path).unwrap();
+    assert_ne!(rootpage(&conn), root, "the upgrade rebuilt interactions");
+    assert_eq!(
+        (
+            rows(&conn, "harness_commit_evidence"),
+            rows(&conn, "conversation_relations")
+        ),
+        before
+    );
+    // The reference still holds: deleting the interaction deletes its
+    // evidence.
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute_batch(&format!(
+        "DELETE FROM context_items WHERE interaction_id='{id}'; DELETE FROM tool_executions WHERE interaction_id='{id}'; DELETE FROM artifact_links WHERE interaction_id='{id}'; DELETE FROM interaction_shares WHERE interaction_id='{id}'; DELETE FROM publications WHERE interaction_id='{id}'; UPDATE interactions SET parent_id=NULL WHERE parent_id='{id}'; DELETE FROM interactions WHERE id='{id}';",
+        id = interaction_id(0)
+    ))
+    .unwrap();
+    assert!(rows(&conn, "harness_commit_evidence").1.is_empty());
+}
+
 /// The typed copy of a 0.7.x cursor is made only of a storable state; a
 /// cursor outside the limits stays in the 0.7.x table alone.
 #[test]
