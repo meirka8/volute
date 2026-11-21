@@ -56,7 +56,6 @@ use crate::models::{Conversation, InteractionId};
 use crate::privacy::{self, PreparedPolicy, PrivacyError};
 use crate::repository::{RepositoryLayout, RepositoryLayoutError};
 use chrono::Utc;
-use std::any::TypeId;
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
@@ -155,9 +154,9 @@ where
         family_root: String,
         source: std::io::Error,
     },
-    /// The adapter claims a harness whose registered adapter is another: it
-    /// records nothing.
-    #[error("{0} has another adapter in this build; this one records nothing")]
+    /// The adapter is not the one registered for the harness it names (or
+    /// the harness has none in this build): it records nothing.
+    #[error("this adapter is not the one registered for {0}; it records nothing")]
     Unregistered(HarnessId),
 }
 
@@ -240,7 +239,9 @@ fn run<A: HarnessAdapter>(
     options: EngineOptions,
     consent: Consent,
 ) -> Result<EngineReport<A::Cursor>, EngineError<A::Error>> {
-    if crate::harness::registered_adapter(A::ID).is_some_and(|ours| ours != TypeId::of::<A>()) {
+    // Only the adapter registered for its harness records, so a harness's
+    // provenance is never claimed by any other code.
+    if !crate::harness::is_registered::<A>() {
         return Err(EngineError::Unregistered(A::ID));
     }
     if consent == Consent::Covered {

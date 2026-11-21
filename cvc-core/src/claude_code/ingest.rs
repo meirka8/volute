@@ -114,7 +114,7 @@ pub enum IngestError {
     #[error(transparent)]
     Privacy(#[from] PrivacyError),
     /// The engine refused an adapter that is not the registered one.
-    #[error("{0} has another adapter in this build; this one records nothing")]
+    #[error("this adapter is not the one registered for {0}; it records nothing")]
     Unregistered(HarnessId),
 }
 

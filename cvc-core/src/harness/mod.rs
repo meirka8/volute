@@ -18,10 +18,14 @@
 //! The adapters this build has are listed once, in the `harnesses!`
 //! invocation below. Adding a harness is one line there; the traits'
 //! associated types rule out trait objects, so dispatch is a generic call
-//! through [`with_adapter`]. A harness without a line is known (its id,
-//! capture source, namespace and channel are fixed in [`id`]) but not
-//! available: [`HarnessId::available`] is false, and nothing can capture from
-//! it.
+//! through [`with_adapter`].
+//!
+//! The engine records only for the adapter registered for its harness: any
+//! other type that implements the traits, inside this crate or outside it,
+//! records nothing, whichever harness it names. A harness without a line is
+//! known (its id, capture source, namespace and channel are fixed in [`id`])
+//! but not available: [`HarnessId::available`] is false, and nothing records
+//! under its provenance.
 pub mod adapter;
 pub mod candidate;
 pub mod cursor;
@@ -71,9 +75,7 @@ macro_rules! harnesses {
             }
         }
 
-        /// The type of the adapter registered for `id`. The engine records
-        /// nothing for an adapter that claims a registered harness and is not
-        /// its registered adapter.
+        /// The type of the adapter registered for `id`, if this build has one.
         #[allow(unreachable_patterns)]
         pub(crate) fn registered_adapter(id: HarnessId) -> Option<std::any::TypeId> {
             match id {
@@ -91,3 +93,44 @@ harnesses! {
     // Cursor => crate::cursor::Adapter,           (#198)
     // Antigravity => crate::antigravity::Adapter, (#202)
 }
+
+/// Whether `A` is the adapter registered for its harness, the only adapter
+/// the engine records for.
+pub(crate) fn is_registered<A: HarnessAdapter>() -> bool {
+    let registered = registered_adapter(A::ID) == Some(std::any::TypeId::of::<A>());
+    #[cfg(test)]
+    let registered = registered || test_registry::registered::<A>();
+    registered
+}
+
+/// This crate's own unit tests register a stand-in adapter for a harness that
+/// has none in the build, on the test's own thread. It exists in no other
+/// build: nothing outside the crate's unit tests can register an adapter.
+#[cfg(test)]
+pub(crate) mod test_registry {
+    use super::{registered_adapter, HarnessAdapter, HarnessId};
+    use std::any::TypeId;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ADAPTERS: RefCell<Vec<(HarnessId, TypeId)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Registers `A` for its harness on this thread. A harness that has an
+    /// adapter in the build cannot be registered again.
+    pub(crate) fn register<A: HarnessAdapter>() {
+        assert!(
+            registered_adapter(A::ID).is_none(),
+            "{} has an adapter in this build",
+            A::ID
+        );
+        ADAPTERS.with(|adapters| adapters.borrow_mut().push((A::ID, TypeId::of::<A>())));
+    }
+
+    pub(super) fn registered<A: HarnessAdapter>() -> bool {
+        ADAPTERS.with(|adapters| adapters.borrow().contains(&(A::ID, TypeId::of::<A>())))
+    }
+}
+
+#[cfg(test)]
+mod port_tests;

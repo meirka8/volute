@@ -1,26 +1,25 @@
-//! The harness registry with a second adapter (#187).
+//! The harness registry and Claude Code's port onto it (#187), from outside
+//! the crate.
 //!
-//! `Fake` is a minimal adapter of the kind a v0.8.0 lane writes: it reads a
-//! JSONL record of its own invented shape and claims `HarnessId::Codex`,
-//! which has no adapter in this build, so the shared pieces can be exercised
-//! with a harness that is not Claude Code: the engine, the cursor codec, the
-//! drift rule, the family rescue and the consent coverage. Nothing here is a
-//! real agent's format, and nothing is a captured prompt.
+//! The engine records only for the adapter registered for its harness, so an
+//! adapter written outside `cvc-core` records nothing, whichever harness it
+//! names: `Outsider` shows that. The engine tests with a recording second
+//! adapter live inside the crate (`harness::port_tests`), where a stand-in
+//! can be registered for a harness that has no adapter in the build.
 //!
-//! Codex cannot be acknowledged in this build (it has no notice yet), so a
-//! test that needs it covered writes the channel into `privacy.json` itself,
-//! as an acknowledgement given by a build that can capture Codex would.
-use chrono::{DateTime, TimeZone, Utc};
+//! Everything else here is Claude Code on the registry: its gated path, its
+//! cursor rules and its family, through the public API only. Nothing here is
+//! a captured prompt.
+use chrono::{TimeZone, Utc};
 use cvc_core::claude_code;
-use cvc_core::db::{CvcStore, DbError, StoredHarnessCursor};
+use cvc_core::db::{CvcStore, DbError};
 use cvc_core::harness::adapter::{
     CallerVerdict, HarnessStatus, HookCaller, HookEnv, HookRequest, InstallContext, InstallOutcome,
     InstallScope, Installer, Located, OutputContract, PayloadError, Planner, Read, ReadContext,
     RecordSource, Sniff, StartLocation, UninstallOutcome,
 };
 use cvc_core::harness::candidate::{
-    CaptureCandidate, ChildRef, ConversationRole, Finality, Plan, PlanInput, Reasoning,
-    ReasoningKind, SourcePosition, StimulusPart, TitleHint, TitleRank,
+    CaptureCandidate, ConversationRole, Finality, Plan, PlanInput, SourcePosition, StimulusPart,
 };
 use cvc_core::harness::cursor::{
     Carry, CursorCodec, CursorError, JsonlCursor, Progress, SeqCursor, SpoolCursor, SqliteWatermark,
@@ -28,70 +27,44 @@ use cvc_core::harness::cursor::{
 use cvc_core::harness::drift::{
     Drift, DriftError, DriftRule, FormatPin, MalformedLine, PlaceholderStyle,
 };
-use cvc_core::harness::engine::{self, EngineError, EngineOptions, EngineReport};
+use cvc_core::harness::engine::{self, EngineError, EngineOptions};
 use cvc_core::harness::{
-    derived_interaction_id, with_adapter, AdapterVisitor, HarnessAdapter, HarnessId, PassiveChannel,
+    derived_interaction_id, with_adapter, AdapterVisitor, HarnessAdapter, HarnessId,
 };
 use cvc_core::models::Author;
 use cvc_core::privacy::{self, CaptureCoverage, PreparedPolicy, PrivacyError};
-use cvc_core::reasoning::{self, ReasoningView};
 use cvc_core::repository::RepositoryLayout;
-use git2::{Repository, Signature, Time};
+use git2::Repository;
 use rusqlite::{params, Connection};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 
-// ---- the fake adapter ---------------------------------------------------------------
+// ---- an adapter from outside the crate ------------------------------------------------
 
-/// The fake record's format, pinned to major version 1.
-const FAKE_DRIFT: DriftRule = DriftRule {
-    pin: FormatPin {
-        harness: HarnessId::Codex,
-        supported_major: &[1],
-        verified: &["1.0"],
-    },
-    placeholders: PlaceholderStyle::Sanitised,
-    malformed: MalformedLine::Fail,
-};
-
-/// A fake adapter. `CLAUDE` makes it claim Claude Code instead, which the
-/// engine must refuse: Claude Code's registered adapter is another.
+/// An adapter written outside `cvc-core`: it would record one response. It
+/// claims Codex (no adapter in this build) or, with `CLAUDE`, Claude Code
+/// (whose registered adapter is another).
 #[derive(Debug, Default, Clone, Copy)]
-struct Fake<const CLAUDE: bool>;
-
-type Codex = Fake<false>;
+struct Outsider<const CLAUDE: bool>;
 
 #[derive(Debug, thiserror::Error)]
-enum FakeError {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+enum OutsiderError {
     #[error(transparent)]
     Db(#[from] DbError),
-    #[error("line at byte {offset}: {error}")]
-    Drift { offset: u64, error: DriftError },
-    #[error("line at byte {0} is not a record")]
-    Malformed(u64),
     #[error("not offered")]
     Unsupported,
 }
 
-struct FakeWindow {
-    lines: Vec<(u64, Value)>,
-    end: u64,
-    from: JsonlCursor,
-}
-
-impl<const CLAUDE: bool> HookCaller for Fake<CLAUDE> {
+impl<const CLAUDE: bool> HookCaller for Outsider<CLAUDE> {
     fn classify(&self, _payload: &Map<String, Value>, _env: &dyn HookEnv) -> CallerVerdict {
         CallerVerdict::Ours { foreign_env: None }
     }
     fn request(&self, _payload: Map<String, Value>) -> Result<HookRequest, PayloadError> {
-        Err(PayloadError::NotTheShape("Fake"))
+        Err(PayloadError::NotTheShape("Outsider"))
     }
     fn start(&self, _request: &HookRequest, _env: &dyn HookEnv) -> StartLocation {
         StartLocation::Unknown
@@ -109,11 +82,11 @@ impl<const CLAUDE: bool> HookCaller for Fake<CLAUDE> {
         OutputContract::EmptyObject
     }
     fn stop_hint(&self) -> &'static str {
-        "(or stop the fake hooks)"
+        "(or stop the outsider's hooks)"
     }
 }
 
-impl<const CLAUDE: bool> RecordSource for Fake<CLAUDE> {
+impl<const CLAUDE: bool> RecordSource for Outsider<CLAUDE> {
     const ID: HarnessId = if CLAUDE {
         HarnessId::ClaudeCode
     } else {
@@ -121,21 +94,24 @@ impl<const CLAUDE: bool> RecordSource for Fake<CLAUDE> {
     };
     type Source = PathBuf;
     type Cursor = JsonlCursor;
-    type Window = FakeWindow;
-    type Error = FakeError;
+    type Window = JsonlCursor;
+    type Error = OutsiderError;
 
     fn locate_hook(
         &self,
         _request: &HookRequest,
         _layout: &RepositoryLayout,
-    ) -> Result<Located<PathBuf>, FakeError> {
-        Err(FakeError::Unsupported)
+    ) -> Result<Located<PathBuf>, OutsiderError> {
+        Err(OutsiderError::Unsupported)
     }
-    fn locate_file(&self, path: &Path, id: Option<&str>) -> Result<Located<PathBuf>, FakeError> {
-        let agent_id = id.ok_or(FakeError::Unsupported)?;
+    fn locate_file(
+        &self,
+        path: &Path,
+        id: Option<&str>,
+    ) -> Result<Located<PathBuf>, OutsiderError> {
         let conversation_id = Self::ID
-            .conversation_id(agent_id)
-            .map_err(|_| FakeError::Unsupported)?;
+            .conversation_id(id.ok_or(OutsiderError::Unsupported)?)
+            .map_err(|_| OutsiderError::Unsupported)?;
         Ok(Located {
             family_root: conversation_id.clone(),
             conversation_id,
@@ -148,10 +124,10 @@ impl<const CLAUDE: bool> RecordSource for Fake<CLAUDE> {
         &self,
         _id: &str,
         _layout: &RepositoryLayout,
-    ) -> Result<Located<PathBuf>, FakeError> {
-        Err(FakeError::Unsupported)
+    ) -> Result<Located<PathBuf>, OutsiderError> {
+        Err(OutsiderError::Unsupported)
     }
-    fn scan(&self, _layout: &RepositoryLayout) -> Result<Vec<Located<PathBuf>>, FakeError> {
+    fn scan(&self, _layout: &RepositoryLayout) -> Result<Vec<Located<PathBuf>>, OutsiderError> {
         Ok(Vec::new())
     }
     fn sniff(&self, _source: &PathBuf) -> Sniff {
@@ -162,140 +138,61 @@ impl<const CLAUDE: bool> RecordSource for Fake<CLAUDE> {
     }
     fn read(
         &self,
-        source: &mut PathBuf,
+        _source: &mut PathBuf,
         from: &JsonlCursor,
-        context: &ReadContext<'_>,
-    ) -> Result<Read<FakeWindow, JsonlCursor>, FakeError> {
-        let mut bytes = Vec::new();
-        fs::File::open(&*source)?.read_to_end(&mut bytes)?;
-        let start = if context.rescan { 0 } else { from.byte_offset };
-        let mut lines = Vec::new();
-        let mut offset = start as usize;
-        while let Some(newline) = bytes[offset..].iter().position(|b| *b == b'\n') {
-            let line = &bytes[offset..offset + newline];
-            let value: Value =
-                serde_json::from_slice(line).map_err(|_| FakeError::Malformed(offset as u64))?;
-            let version = value.get("v").and_then(Value::as_str).unwrap_or("");
-            FAKE_DRIFT
-                .pin
-                .check_major(version)
-                .map_err(|error| FakeError::Drift {
-                    offset: offset as u64,
-                    error,
-                })?;
-            lines.push((offset as u64, value));
-            offset += newline + 1;
-        }
+        _context: &ReadContext<'_>,
+    ) -> Result<Read<JsonlCursor, JsonlCursor>, OutsiderError> {
         Ok(Read {
-            window: FakeWindow {
-                lines,
-                end: offset as u64,
-                from: from.clone(),
-            },
+            window: from.clone(),
             trusted: from.clone(),
             replaced: None,
-            record_len: Some(bytes.len() as u64),
+            record_len: None,
         })
     }
 }
 
-impl<const CLAUDE: bool> Planner for Fake<CLAUDE> {
-    const DRIFT: DriftRule = FAKE_DRIFT;
-    const DEFAULT_TITLE: &'static str = "Fake session";
+impl<const CLAUDE: bool> Planner for Outsider<CLAUDE> {
+    const DRIFT: DriftRule = DriftRule {
+        pin: FormatPin {
+            harness: HarnessId::Codex,
+            supported_major: &[1],
+            verified: &[],
+        },
+        placeholders: PlaceholderStyle::Sanitised,
+        malformed: MalformedLine::Fail,
+    };
+    const DEFAULT_TITLE: &'static str = "Outsider session";
 
-    fn plan(&self, window: &FakeWindow, input: &PlanInput<'_>) -> Plan<JsonlCursor> {
-        let mut drift = Drift::default();
-        let mut candidates = Vec::new();
-        let mut children = Vec::new();
-        let mut title = None;
-        let mut first_prompt = None;
-        let mut previous = None;
-        for (offset, line) in &window.lines {
-            let text = |key: &str| line.get(key).and_then(Value::as_str).map(str::to_owned);
-            match line.get("type").and_then(Value::as_str) {
-                Some("response") => {}
-                Some("title") => {
-                    title = text("text").map(|text| TitleHint {
-                        text,
-                        rank: TitleRank::UserSet,
-                    });
-                    continue;
-                }
-                other => {
-                    drift.skip(other.unwrap_or(""));
-                    continue;
-                }
-            }
-            let key = text("key").unwrap();
-            let id = derived_interaction_id(input.harness, input.conversation_id, &key);
-            let mut response = text("text");
-            let mut unrecorded = Vec::new();
-            for block in line
-                .get("blocks")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let block = block.as_str().unwrap_or("");
-                if block != "text" {
-                    let placeholder = drift.placeholder(Self::DRIFT.placeholders, block);
-                    unrecorded.push(PlaceholderStyle::Sanitised.name(block));
-                    let joined = [response.unwrap_or_default(), placeholder].join("\n\n");
-                    response = Some(joined);
-                }
-            }
-            if let Some(child) = text("child") {
-                children.push(ChildRef {
-                    agent_id: child,
-                    kind: cvc_core::db::RelationKind::Subagent,
-                    spawn_key: Some(key.clone()),
-                    spawn_call_id: None,
-                    evidence: cvc_core::db::RelationEvidence::ParentRecord,
-                });
-            }
-            let prompt = text("prompt");
-            if first_prompt.is_none() {
-                first_prompt = prompt.clone();
-            }
-            let timestamp: DateTime<Utc> = text("ts").unwrap().parse().unwrap();
-            candidates.push(CaptureCandidate {
-                key,
-                id: id.clone(),
-                parent: previous.replace(id),
-                timestamp,
-                author: if prompt.is_some() {
-                    Author::Human
-                } else {
-                    Author::System
-                },
-                stimulus: prompt.into_iter().map(StimulusPart::prompt).collect(),
+    fn plan(&self, window: &JsonlCursor, input: &PlanInput<'_>) -> Plan<JsonlCursor> {
+        Plan {
+            candidates: vec![CaptureCandidate {
+                key: "resp:1".into(),
+                id: derived_interaction_id(input.harness, input.conversation_id, "resp:1"),
+                parent: None,
+                timestamp: Utc.timestamp_opt(1_767_225_600, 0).unwrap(),
+                author: Author::Human,
+                stimulus: vec![StimulusPart::prompt("fix the flaky test")],
                 model_name: None,
-                reasoning: text("summary").map(|text| Reasoning {
-                    text,
-                    kind: ReasoningKind::ProviderSummary,
-                }),
-                response,
+                reasoning: None,
+                response: Some("done".into()),
                 tools: Vec::new(),
                 context: Vec::new(),
-                commit_candidates: text("commit").into_iter().collect(),
-                unrecorded,
-                start: SourcePosition::Byte(*offset),
-            });
-        }
-        Plan {
-            candidates,
+                commit_candidates: Vec::new(),
+                unrecorded: Vec::new(),
+                start: SourcePosition::Byte(0),
+            }],
             pending: 0,
-            resume: window.from.at(window.end),
-            title,
-            first_prompt,
-            children,
+            resume: window.at(1),
+            title: None,
+            first_prompt: None,
+            children: Vec::new(),
             parent: None,
-            drift,
+            drift: Drift::default(),
         }
     }
 }
 
-impl<const CLAUDE: bool> Installer for Fake<CLAUDE> {
+impl<const CLAUDE: bool> Installer for Outsider<CLAUDE> {
     fn scopes(&self) -> &'static [InstallScope] {
         &[]
     }
@@ -321,15 +218,6 @@ impl<const CLAUDE: bool> Installer for Fake<CLAUDE> {
 
 // ---- fixture ------------------------------------------------------------------------
 
-/// 2026-01-01T00:00:00Z: the clock of every record and commit here.
-const T0: i64 = 1_767_225_600;
-
-fn at(seconds: i64) -> String {
-    Utc.timestamp_opt(T0 + seconds, 0)
-        .unwrap()
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
 struct Fixture {
     _temp: TempDir,
     layout: RepositoryLayout,
@@ -351,13 +239,7 @@ enum Ack {
 impl Fixture {
     fn new(ack: Ack) -> Self {
         let temp = TempDir::new().unwrap();
-        let repo = Repository::init(temp.path()).unwrap();
-        let mut config = repo.config().unwrap();
-        config.set_str("user.name", "Fixture").unwrap();
-        config
-            .set_str("user.email", "fixture@example.invalid")
-            .unwrap();
-        drop(repo);
+        Repository::init(temp.path()).unwrap();
         let layout = RepositoryLayout::discover(temp.path()).unwrap();
         let root = layout.worktree_root().unwrap().to_path_buf();
         let store = CvcStore::open(layout.db_path()).unwrap();
@@ -371,7 +253,7 @@ impl Fixture {
             state["capture_acknowledged_channels"]
                 .as_array_mut()
                 .unwrap()
-                .push(json!("codex"));
+                .push(Value::from("codex"));
             fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
         }
         Self {
@@ -383,35 +265,6 @@ impl Fixture {
         }
     }
 
-    /// Writes the record `name` from `lines`, one JSON object per line.
-    fn record(&self, name: &str, lines: &[Value]) -> PathBuf {
-        let path = self.root.join(format!("{name}.jsonl"));
-        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
-        fs::write(&path, text).unwrap();
-        path
-    }
-
-    fn ingest<const C: bool>(
-        &self,
-        path: &Path,
-        agent_id: &str,
-    ) -> Result<EngineReport<JsonlCursor>, EngineError<FakeError>> {
-        let adapter = Fake::<C>;
-        let located = adapter.locate_file(path, Some(agent_id)).unwrap();
-        engine::ingest(
-            &adapter,
-            &self.layout,
-            &self.store,
-            &self.policy,
-            located,
-            EngineOptions {
-                finality: Finality::Final,
-                rescan: false,
-                lock_wait: Duration::from_secs(5),
-            },
-        )
-    }
-
     fn conn(&self) -> Connection {
         Connection::open(self.layout.db_path()).unwrap()
     }
@@ -420,194 +273,110 @@ impl Fixture {
         self.conn().query_row(sql, [], |row| row.get(0)).unwrap()
     }
 
-    /// A commit made at `T0 + seconds`, by the fixture's identity.
-    fn commit(&self, seconds: i64) -> String {
-        let repo = self.layout.repository();
-        let signature = Signature::new(
-            "Fixture",
-            "fixture@example.invalid",
-            &Time::new(T0 + seconds, 0),
+    /// The v2.1.260 fixture as the session's transcript in this worktree.
+    fn basic_transcript(&self) -> PathBuf {
+        let path = self.root.join(format!("{BASIC_SESSION}.jsonl"));
+        fs::write(
+            &path,
+            BASIC.replace("__WORKTREE__", self.root.to_str().unwrap()),
         )
         .unwrap();
-        let tree = repo.treebuilder(None).unwrap().write().unwrap();
-        let tree = repo.find_tree(tree).unwrap();
-        let parents: Vec<git2::Commit<'_>> = repo
-            .head()
-            .ok()
-            .and_then(|head| head.peel_to_commit().ok())
-            .into_iter()
-            .collect();
-        let parents: Vec<&git2::Commit<'_>> = parents.iter().collect();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            "work",
-            &tree,
-            &parents,
+        path
+    }
+
+    fn ingest_claude_code(&self, path: &Path) -> claude_code::IngestReport {
+        claude_code::ingest(
+            &self.layout,
+            &self.store,
+            &self.policy,
+            path,
+            None,
+            claude_code::IngestMode::Final,
         )
         .unwrap()
-        .to_string()
-    }
-
-    fn linked(&self, conversation: &str, key: &str) -> bool {
-        let id = derived_interaction_id(HarnessId::Codex, conversation, key);
-        self.count(&format!(
-            "SELECT COUNT(*) FROM artifact_links WHERE interaction_id='{id}'"
-        )) > 0
     }
 }
 
-fn response(key: &str, seconds: i64) -> Value {
-    json!({"v": "1.0", "type": "response", "key": key, "ts": at(seconds), "prompt": "fix the flaky test", "text": "done"})
+fn options() -> EngineOptions {
+    EngineOptions {
+        finality: Finality::Final,
+        rescan: false,
+        lock_wait: Duration::from_secs(5),
+    }
 }
+
+const BASIC: &str = include_str!("fixtures/claude-code/v2.1.260/basic.jsonl");
+const BASIC_SESSION: &str = "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60";
 
 // ---- tests --------------------------------------------------------------------------
 
-/// A whole record through the engine: captures of the fake's own source in
-/// its own namespace, its title, placeholders and skipped records reported,
-/// a provider summary marked, the typed cursor at the end; and a second run
-/// records nothing twice and keeps the cursor where it is.
+/// An adapter from outside the crate records nothing, whichever harness it
+/// names and however covered the channel is: neither a harness without an
+/// adapter in the build, nor one whose registered adapter is another.
 #[test]
-fn a_second_adapter_ingests_through_the_engine() {
+fn an_adapter_that_is_not_the_registered_one_records_nothing() {
     let fixture = Fixture::new(Ack::WithCodex);
-    let mut summarised = response("resp:2", 20);
-    summarised["summary"] = json!("looked at the retry loop");
-    summarised["blocks"] = json!(["text", "mystery", "evil] name"]);
-    let path = fixture.record(
-        "t1",
-        &[
-            json!({"v": "1.0", "type": "session_meta"}),
-            response("resp:1", 10),
-            summarised,
-            json!({"v": "1.0", "type": "token_count"}),
-        ],
-    );
-
-    let report = fixture.ingest::<false>(&path, "t1").unwrap();
-    let root = &report.root;
-    assert_eq!(root.conversation_id, "codex:t1");
-    assert_eq!((root.inserted, root.already_present), (2, 0));
-    assert_eq!(root.unrecorded, ["mystery", "unknown-type"]);
-    assert_eq!(root.drift.placeholders["mystery"], 1);
-    assert_eq!(root.drift.placeholders["unknown-type"], 1);
-    assert_eq!(root.drift.skipped["session_meta"], 1);
-    assert_eq!(root.drift.skipped["token_count"], 1);
-    let len = fs::metadata(&path).unwrap().len();
-    assert_eq!(root.cursor.byte_offset, len);
-    assert_eq!(root.record_len, Some(len));
-    assert!(!root.cursor_held);
-    assert!(report.members.is_empty());
-
-    let conn = fixture.conn();
-    let sources: Vec<(String, String, String)> = conn
-        .prepare("SELECT conversation_id, capture_source, model_response FROM interactions ORDER BY timestamp")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert!(sources
-        .iter()
-        .all(|(conversation, source, _)| conversation == "codex:t1" && source == "codex"));
-    assert_eq!(sources[1].2, "done\n\n[mystery]\n\n[unknown-type]");
-    let title: String = conn
-        .query_row(
-            "SELECT title FROM conversations WHERE id='codex:t1'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(title, "fix the flaky test");
-
-    // The provider summary is marked, and reads back as one.
-    let id = derived_interaction_id(HarnessId::Codex, "codex:t1", "resp:2");
-    let cot: String = conn
-        .query_row(
-            "SELECT model_cot FROM interactions WHERE id=?1",
-            params![id.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        reasoning::read(&id, &cot),
-        ReasoningView::Verified {
-            kind: ReasoningKind::ProviderSummary,
-            body: "looked at the retry loop"
-        }
-    );
-    // The chain: the second response's parent is the first.
-    let parent: Option<String> = conn
-        .query_row(
-            "SELECT parent_id FROM interactions WHERE id=?1",
-            params![id.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        parent,
-        Some(derived_interaction_id(HarnessId::Codex, "codex:t1", "resp:1").to_string())
-    );
-    // No 0.7.x row for a harness other than Claude Code.
-    assert!(fixture
-        .store
-        .harness_ingest_cursor("codex", "codex:t1")
-        .unwrap()
-        .is_none());
-
-    let again = fixture.ingest::<false>(&path, "t1").unwrap();
-    assert_eq!((again.root.inserted, again.root.already_present), (0, 0));
-    assert_eq!(again.root.cursor, report.root.cursor);
-    // Read from the start, everything is already there.
-    let adapter = Codex::default();
-    let located = adapter.locate_file(&path, Some("t1")).unwrap();
-    let rescanned = engine::ingest(
-        &adapter,
-        &fixture.layout,
-        &fixture.store,
-        &fixture.policy,
-        located,
-        EngineOptions {
-            finality: Finality::Final,
-            rescan: true,
-            lock_wait: Duration::from_secs(5),
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        (rescanned.root.inserted, rescanned.root.already_present),
-        (0, 2)
-    );
-    assert_eq!(rescanned.root.cursor, report.root.cursor);
-    assert_eq!(fixture.count("SELECT COUNT(*) FROM interactions"), 2);
+    let path = fixture.root.join("t1.jsonl");
+    fs::write(&path, "").unwrap();
+    let codex = Outsider::<false>;
+    let located = codex.locate_file(&path, Some("t1")).unwrap();
+    assert!(matches!(
+        engine::ingest(
+            &codex,
+            &fixture.layout,
+            &fixture.store,
+            &fixture.policy,
+            located,
+            options()
+        ),
+        Err(EngineError::Unregistered(HarnessId::Codex))
+    ));
+    let claude = Outsider::<true>;
+    let located = claude.locate_file(&path, Some("t1")).unwrap();
+    assert!(matches!(
+        engine::ingest(
+            &claude,
+            &fixture.layout,
+            &fixture.store,
+            &fixture.policy,
+            located,
+            options()
+        ),
+        Err(EngineError::Unregistered(HarnessId::ClaudeCode))
+    ));
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM interactions"), 0);
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM harness_cursors"), 0);
 }
 
-/// The typed cursor the engine stores decodes with the adapter's codec into
-/// the cursor it committed; every codec round-trips and refuses what it did
-/// not write.
-#[test]
-fn the_cursor_codec_round_trips_through_the_store() {
-    let fixture = Fixture::new(Ack::WithCodex);
-    let path = fixture.record("t1", &[response("resp:1", 10)]);
-    let report = fixture.ingest::<false>(&path, "t1").unwrap();
-    let stored: StoredHarnessCursor = fixture
-        .store
-        .harness_cursor(HarnessId::Codex, "codex:t1")
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        (stored.kind.as_str(), stored.version, stored.epoch),
-        ("jsonl", 1, 0)
-    );
-    assert_eq!(
-        JsonlCursor::decode_stored(&stored).unwrap(),
-        report.root.cursor
-    );
-    assert_eq!(
-        stored.state,
-        json!({"path": path.to_string_lossy(), "byte_offset": report.root.cursor.byte_offset})
-    );
+struct Name;
+impl AdapterVisitor for Name {
+    type Output = (HarnessId, &'static str);
+    fn visit<A: HarnessAdapter>(self, _adapter: &A) -> Self::Output {
+        (A::ID, A::DEFAULT_TITLE)
+    }
+}
 
+#[test]
+fn the_registry_has_claude_code_and_knows_the_others_by_name() {
+    assert!(HarnessId::ClaudeCode.available());
+    assert_eq!(
+        with_adapter(HarnessId::ClaudeCode, Name),
+        Some((HarnessId::ClaudeCode, "Claude Code session"))
+    );
+    for harness in [
+        HarnessId::Codex,
+        HarnessId::OpenCode,
+        HarnessId::Cursor,
+        HarnessId::Antigravity,
+    ] {
+        assert!(!harness.available(), "{harness}");
+        assert_eq!(with_adapter(harness, Name), None);
+    }
+}
+
+/// Every codec round-trips and refuses what it did not write.
+#[test]
+fn every_cursor_codec_round_trips() {
     let jsonl = JsonlCursor {
         last_ordinal: Some(88),
         carry: Carry {
@@ -649,40 +418,9 @@ fn the_cursor_codec_round_trips_through_the_store() {
     );
 }
 
-/// An unknown major version fails loudly and writes nothing; unfamiliar
-/// blocks are placeholders that name their type (sanitised), never their
-/// content. Claude Code's instance of the rule is its 0.7.x behaviour.
+/// Claude Code's instance of the drift rule is its 0.7.x behaviour.
 #[test]
-fn the_drift_rule_fails_loudly_on_a_major_version_and_names_what_it_keeps() {
-    let fixture = Fixture::new(Ack::WithCodex);
-    let mut later = response("resp:2", 20);
-    later["v"] = json!("2.0");
-    let path = fixture.record("t1", &[response("resp:1", 10), later]);
-    let error = fixture.ingest::<false>(&path, "t1").unwrap_err();
-    match &error {
-        EngineError::Adapter(FakeError::Drift {
-            error: DriftError::UnsupportedMajor { found, supported },
-            ..
-        }) => {
-            assert_eq!(found, "2.0");
-            assert_eq!(supported.to_vec(), vec![1u64]);
-        }
-        other => panic!("{other:?}"),
-    }
-    assert!(fixture
-        .store
-        .get_conversation("codex:t1")
-        .unwrap()
-        .is_none());
-    assert!(fixture
-        .store
-        .harness_cursor(HarnessId::Codex, "codex:t1")
-        .unwrap()
-        .is_none());
-    assert_eq!(fixture.count("SELECT COUNT(*) FROM interactions"), 0);
-
-    // Claude Code's instance: major version 2, placeholders as 0.7.x spelled
-    // them, and a line that is not an entry fails the read.
+fn claude_codes_drift_rule_is_its_0_7_behaviour() {
     let rule = claude_code::transcript::DRIFT;
     assert_eq!(rule.pin.harness, HarnessId::ClaudeCode);
     assert_eq!(rule.pin.check_major("2.1.300"), Ok(()));
@@ -699,171 +437,25 @@ fn the_drift_rule_fails_loudly_on_a_major_version_and_names_what_it_keeps() {
     );
 }
 
-/// A commit a family member made links the family's floating responses of
-/// the harness's own source, root and recorded subagent alike, and never a
-/// row another source recorded in a member's conversation.
-#[test]
-fn the_family_rescue_claims_only_its_own_harness_rows() {
-    let fixture = Fixture::new(Ack::WithCodex);
-    // The subagent's own record first.
-    let child = fixture.record("c1", &[response("resp:c", 10)]);
-    fixture.ingest::<false>(&child, "c1").unwrap();
-    // A row another source recorded in the subagent's conversation (as a
-    // 0.7.x MCP client could), floating, in this worktree, before the commit.
-    let worktree = fixture.layout.worktree_origin().unwrap();
-    let mcp = "6b1f0c0e-1111-4aaa-8bbb-000000000042";
-    fixture
-        .conn()
-        .execute(
-            "INSERT INTO interactions(id,conversation_id,timestamp,author,user_prompt,capture_source,scrubber_version,capture_worktree) VALUES (?1,'codex:c1',?2,'agent','an mcp thought','mcp',1,?3)",
-            params![mcp, T0 + 15, worktree],
-        )
-        .unwrap();
-    // The root names the subagent and the commit it made.
-    let sha = fixture.commit(100);
-    let mut committing = response("resp:r", 30);
-    committing["child"] = json!("c1");
-    committing["commit"] = json!(sha.clone());
-    let root = fixture.record("r1", &[committing]);
-    let report = fixture.ingest::<false>(&root, "r1").unwrap();
-
-    assert_eq!(report.root.relations_recorded, 1);
-    let relation = fixture
-        .store
-        .conversation_relation("codex:c1")
-        .unwrap()
-        .unwrap();
-    assert_eq!(relation.parent_id, "codex:r1");
-    assert_eq!(
-        relation.spawn_interaction_id,
-        Some(derived_interaction_id(
-            HarnessId::Codex,
-            "codex:r1",
-            "resp:r"
-        ))
-    );
-    assert_eq!((report.linked.root, report.linked.members), (1, 1));
-    assert!(fixture.linked("codex:r1", "resp:r"));
-    assert!(fixture.linked("codex:c1", "resp:c"));
-    assert_eq!(
-        fixture.count(&format!(
-            "SELECT COUNT(*) FROM artifact_links WHERE interaction_id='{mcp}'"
-        )),
-        0,
-        "another source's row is never claimed"
-    );
-}
-
-/// Without coverage of the harness's channel nothing is read, recorded or
-/// moved: not with no acknowledgement, and not with one that predates the
-/// channel.
-#[test]
-fn an_uncovered_channel_captures_nothing_and_moves_no_cursor() {
-    for (ack, expected) in [
-        (Ack::None, CaptureCoverage::NotAcknowledged),
-        (
-            Ack::Legacy,
-            CaptureCoverage::NotCovering {
-                channel: PassiveChannel::Harness(HarnessId::Codex),
-            },
-        ),
-    ] {
-        let fixture = Fixture::new(ack);
-        let path = fixture.record("t1", &[response("resp:1", 10)]);
-        match fixture.ingest::<false>(&path, "t1") {
-            Err(EngineError::Privacy(PrivacyError::NotCovered(coverage))) => {
-                assert_eq!(coverage, expected)
-            }
-            other => panic!("{:?}", other.map(|_| ())),
-        }
-        assert_eq!(fixture.count("SELECT COUNT(*) FROM interactions"), 0);
-        assert_eq!(fixture.count("SELECT COUNT(*) FROM conversations"), 0);
-        assert_eq!(fixture.count("SELECT COUNT(*) FROM harness_cursors"), 0);
-    }
-}
-
-/// An adapter that claims a harness whose registered adapter is another
-/// records nothing, however covered the channel is.
-#[test]
-fn an_adapter_that_is_not_the_registered_one_records_nothing() {
-    let fixture = Fixture::new(Ack::WithCodex);
-    let path = fixture.record("t1", &[response("resp:1", 10)]);
-    assert!(matches!(
-        fixture.ingest::<true>(&path, "t1"),
-        Err(EngineError::Unregistered(HarnessId::ClaudeCode))
-    ));
-    assert_eq!(fixture.count("SELECT COUNT(*) FROM interactions"), 0);
-}
-
-struct Name;
-impl AdapterVisitor for Name {
-    type Output = (HarnessId, &'static str);
-    fn visit<A: HarnessAdapter>(self, _adapter: &A) -> Self::Output {
-        (A::ID, A::DEFAULT_TITLE)
-    }
-}
-
-#[test]
-fn the_registry_has_claude_code_and_knows_the_others_by_name() {
-    assert!(HarnessId::ClaudeCode.available());
-    assert_eq!(
-        with_adapter(HarnessId::ClaudeCode, Name),
-        Some((HarnessId::ClaudeCode, "Claude Code session"))
-    );
-    for harness in [
-        HarnessId::Codex,
-        HarnessId::OpenCode,
-        HarnessId::Cursor,
-        HarnessId::Antigravity,
-    ] {
-        assert!(!harness.available(), "{harness}");
-        assert_eq!(with_adapter(harness, Name), None);
-    }
-}
-
-const BASIC: &str = include_str!("fixtures/claude-code/v2.1.260/basic.jsonl");
-const BASIC_SESSION: &str = "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60";
-
 /// Claude Code through the gated engine path records what its
 /// 0.7.x-compatible entry point records, and only when covered.
 #[test]
 fn claude_code_on_the_gated_path_records_what_the_compatible_path_records() {
-    let run = |ack: Ack| {
-        let fixture = Fixture::new(ack);
-        let path = fixture.root.join(format!("{BASIC_SESSION}.jsonl"));
-        fs::write(
-            &path,
-            BASIC.replace("__WORKTREE__", fixture.root.to_str().unwrap()),
-        )
-        .unwrap();
-        (fixture, path)
-    };
+    let compatible = Fixture::new(Ack::None);
+    let expected = compatible.ingest_claude_code(&compatible.basic_transcript());
 
-    let (compatible, path) = run(Ack::None);
-    let expected = claude_code::ingest(
-        &compatible.layout,
-        &compatible.store,
-        &compatible.policy,
-        &path,
-        None,
-        claude_code::IngestMode::Final,
-    )
-    .unwrap();
-
-    let (gated, path) = run(Ack::Legacy);
+    let gated = Fixture::new(Ack::Legacy);
     let adapter = claude_code::Adapter;
-    let located = adapter.locate_file(&path, None).unwrap();
+    let located = adapter
+        .locate_file(&gated.basic_transcript(), None)
+        .unwrap();
     let report = engine::ingest(
         &adapter,
         &gated.layout,
         &gated.store,
         &gated.policy,
         located,
-        EngineOptions {
-            finality: Finality::Final,
-            rescan: false,
-            lock_wait: Duration::from_secs(5),
-        },
+        options(),
     )
     .unwrap();
     assert_eq!(claude_code::IngestReport::from(report), expected);
@@ -889,19 +481,17 @@ fn claude_code_on_the_gated_path_records_what_the_compatible_path_records() {
     );
 
     // Uncovered: the gated path reads nothing and records nothing.
-    let (uncovered, path) = run(Ack::None);
-    let located = adapter.locate_file(&path, None).unwrap();
+    let uncovered = Fixture::new(Ack::None);
+    let located = adapter
+        .locate_file(&uncovered.basic_transcript(), None)
+        .unwrap();
     let error = engine::ingest(
         &adapter,
         &uncovered.layout,
         &uncovered.store,
         &uncovered.policy,
         located,
-        EngineOptions {
-            finality: Finality::Final,
-            rescan: false,
-            lock_wait: Duration::from_secs(5),
-        },
+        options(),
     )
     .unwrap_err();
     assert!(
@@ -921,17 +511,17 @@ fn claude_code_on_the_gated_path_records_what_the_compatible_path_records() {
         .is_none());
 }
 
-/// The environment-free parts of the fake's hook contract are reachable
-/// through the trait, as the hook shell (#187, PR 3) will reach them.
+/// The environment-free parts of a hook contract are reachable through the
+/// trait, as the hook shell will reach them.
 #[test]
 fn hook_callers_are_pure_over_an_injected_environment() {
     let env: std::collections::HashMap<String, OsString> = std::collections::HashMap::new();
-    let fake = Codex::default();
+    let outsider = Outsider::<false>;
     assert_eq!(
-        fake.classify(&Map::new(), &env),
+        outsider.classify(&Map::new(), &env),
         CallerVerdict::Ours { foreign_env: None }
     );
-    assert_eq!(fake.contract(None), OutputContract::EmptyObject);
+    assert_eq!(outsider.contract(None), OutputContract::EmptyObject);
     let claude = claude_code::Adapter;
     assert_eq!(claude.contract(Some("Stop")), OutputContract::Silent);
     assert!(claude
@@ -946,20 +536,8 @@ fn hook_callers_are_pure_over_an_injected_environment() {
 #[test]
 fn claude_codes_typed_cursor_opens_an_epoch_instead_of_moving_back() {
     let fixture = Fixture::new(Ack::None);
-    let path = fixture.root.join(format!("{BASIC_SESSION}.jsonl"));
-    let full = BASIC.replace("__WORKTREE__", fixture.root.to_str().unwrap());
-    fs::write(&path, &full).unwrap();
-    let ingest = || {
-        claude_code::ingest(
-            &fixture.layout,
-            &fixture.store,
-            &fixture.policy,
-            &path,
-            None,
-            claude_code::IngestMode::Final,
-        )
-        .unwrap()
-    };
+    let path = fixture.basic_transcript();
+    let full = fs::read_to_string(&path).unwrap();
     let cursors = || {
         let legacy = fixture
             .store
@@ -975,7 +553,7 @@ fn claude_codes_typed_cursor_opens_an_epoch_instead_of_moving_back() {
         (legacy, JsonlCursor::decode_stored(&stored).unwrap())
     };
 
-    let first = ingest();
+    let first = fixture.ingest_claude_code(&path);
     let (legacy, typed) = cursors();
     assert_eq!(
         (legacy, typed.byte_offset, typed.epoch),
@@ -990,7 +568,7 @@ fn claude_codes_typed_cursor_opens_an_epoch_instead_of_moving_back() {
         .map(|line| format!("{line}\n"))
         .collect::<String>();
     fs::write(&path, cut).unwrap();
-    let second = ingest();
+    let second = fixture.ingest_claude_code(&path);
     assert!(second.cursor < first.cursor);
     let (legacy, typed) = cursors();
     assert_eq!(
@@ -1004,7 +582,7 @@ fn claude_codes_typed_cursor_opens_an_epoch_instead_of_moving_back() {
 
     // The full transcript again, read forward in the same epoch.
     fs::write(&path, &full).unwrap();
-    let third = ingest();
+    let third = fixture.ingest_claude_code(&path);
     let (legacy, typed) = cursors();
     assert_eq!(
         (legacy, typed.byte_offset, typed.epoch),
@@ -1020,7 +598,7 @@ fn claude_codes_typed_cursor_opens_an_epoch_instead_of_moving_back() {
             params![BASIC_SESSION],
         )
         .unwrap();
-    let fourth = ingest();
+    let fourth = fixture.ingest_claude_code(&path);
     let (legacy, typed) = cursors();
     assert_eq!(
         (legacy, typed.byte_offset, typed.epoch),
