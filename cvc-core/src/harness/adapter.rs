@@ -171,7 +171,12 @@ pub enum StartLocation {
     /// line, bounded (at most 4 MiB, from a regular file opened without
     /// following a link), in memory, before the repository is known, and
     /// hands it to [`HookCaller::start_from_first_entry`]; the bytes are then
-    /// discarded. Only an adapter whose start is there returns this.
+    /// discarded. Only an adapter whose start is there returns this. It fails
+    /// closed: when the line cannot be read (unfinished, over the bound, a
+    /// link, not a regular file, missing) or gives no directory, the start
+    /// cannot be named and the event records nothing, rather than being
+    /// filed by the payload's working directory under another repository; a
+    /// later event catches up from the cursor.
     FromRecordStart(PathBuf),
 }
 

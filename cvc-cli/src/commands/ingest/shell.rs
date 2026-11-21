@@ -265,7 +265,9 @@ impl ContractOut<'_> {
 
 thread_local! {
     /// This thread is inside a hook run's catch: a panic is recorded by its
-    /// location only, and printed by no one.
+    /// location only, and printed by no one. Per thread, so a hook run's work
+    /// must stay on the shell's own thread: a panic on any other thread goes
+    /// to the panic hook this one replaced, which prints its message.
     static CATCHING: Cell<bool> = const { Cell::new(false) };
     /// Where the last panic caught by a hook run on this thread was raised.
     static PANICKED_AT: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -283,15 +285,41 @@ fn install_panic_hook() {
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             if CATCHING.with(Cell::get) {
-                let at = info
-                    .location()
-                    .map(|location| format!("{}:{}", location.file(), location.line()));
+                let at = info.location().map(|location| {
+                    format!("{}:{}", source_file(location.file()), location.line())
+                });
                 PANICKED_AT.with(|panicked| *panicked.borrow_mut() = at);
             } else {
                 previous(info);
             }
         }));
     });
+}
+
+/// The source file a panic location names, without the build machine's
+/// paths: a relative path (cvc's own sources, as cargo compiles them) is
+/// kept; of an absolute one, only what follows `registry/src/<index>/` (a
+/// crate from the registry: `<crate>-<version>/src/...`) or else the file
+/// name, since the rest can name the local user's home.
+fn source_file(file: &str) -> String {
+    let path = Path::new(file);
+    if !path.is_absolute() {
+        return file.to_owned();
+    }
+    let parts: Vec<_> = path.components().collect();
+    let registry = parts
+        .windows(2)
+        .position(|pair| pair[0].as_os_str() == "registry" && pair[1].as_os_str() == "src");
+    if let Some(at) = registry {
+        // `registry`, `src`, then the index directory.
+        let tail: PathBuf = parts.iter().skip(at + 3).collect();
+        if tail.components().count() > 1 {
+            return tail.to_string_lossy().into_owned();
+        }
+    }
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Marks this thread as catching for as long as it lives.
@@ -411,14 +439,19 @@ where
 
     let unknown = HookRequest::default();
     let start = match caller.start(readable.unwrap_or(&unknown), env) {
-        // Read from the record only for an adapter whose start is there.
-        StartLocation::FromRecordStart(record) => match first_line_of(&record) {
-            Some(line) => match caller.start_from_first_entry(&line) {
-                StartLocation::FromRecordStart(_) => StartLocation::Unknown,
-                start => start,
-            },
-            None => StartLocation::Unknown,
-        },
+        // Read from the record only for an adapter whose start is there. A
+        // start that cannot be read from it is not guessed from anything
+        // else: the event records nothing, and a later event catches up from
+        // the cursor once the line is complete.
+        StartLocation::FromRecordStart(record) => {
+            match first_line_of(&record).map(|line| caller.start_from_first_entry(&line)) {
+                Some(StartLocation::Directory(directory)) => StartLocation::Directory(directory),
+                Some(StartLocation::NotNameable)
+                | Some(StartLocation::Unknown)
+                | Some(StartLocation::FromRecordStart(_))
+                | None => StartLocation::NotNameable,
+            }
+        }
         start => start,
     };
     let cwd = readable.and_then(|request| request.cwd.clone());

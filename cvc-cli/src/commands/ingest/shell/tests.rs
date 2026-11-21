@@ -971,13 +971,14 @@ fn a_harness_without_an_adapter_gets_its_contract_and_its_payload_drained() {
 }
 
 /// A start in the record's first entry (Codex's) is read from that one line
-/// only, bounded, and only from a regular file; anything else is an unknown
-/// start, which falls back to the payload's working directory.
+/// only, bounded, and only from a regular file. A start that cannot be read
+/// from it records nothing: the payload's working directory, here in
+/// another CVC repository, never files the session there instead.
 #[test]
 fn a_start_in_the_record_is_read_from_its_first_line_only() {
     let repo = repository(true);
     let records = TempDir::new().unwrap();
-    let elsewhere = TempDir::new().unwrap();
+    let elsewhere = repository(true);
     let fake = Fake {
         contract: OutputContract::Silent,
         start: None,
@@ -1001,6 +1002,7 @@ fn a_start_in_the_record_is_read_from_its_first_line_only() {
     long.extend(std::iter::repeat_n(b' ', MAX_FIRST_LINE_BYTES as usize));
     long.push(b'\n');
     let too_long = write("long.jsonl", &long);
+    let no_start = write("no-start.jsonl", b"{\"model\":\"m\"}\n");
     let link = records.path().join("link.jsonl");
     #[cfg(unix)]
     std::os::unix::fs::symlink(&complete, &link).unwrap();
@@ -1028,6 +1030,7 @@ fn a_start_in_the_record_is_read_from_its_first_line_only() {
     let mut unreadable = vec![
         unfinished,
         too_long,
+        no_start,
         records.path().join("absent.jsonl"),
         records.path().to_path_buf(),
     ];
@@ -1060,5 +1063,48 @@ fn a_start_in_the_record_is_read_from_its_first_line_only() {
             claude_code::Adapter.start(&request, &environment),
             StartLocation::FromRecordStart(_)
         ));
+    }
+}
+
+/// A panic location names the source file without the build machine's
+/// paths: cvc's own relative path as it is, a registry crate from its
+/// `<crate>-<version>` directory on, anything else by its file name.
+#[test]
+fn a_panic_location_names_no_local_path() {
+    assert_eq!(
+        source_file("cvc-cli/src/commands/ingest/shell.rs"),
+        "cvc-cli/src/commands/ingest/shell.rs"
+    );
+    assert_eq!(source_file("src/lib.rs"), "src/lib.rs");
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            source_file(
+                "/home/someone/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.140/src/de.rs"
+            ),
+            "serde_json-1.0.140/src/de.rs"
+        );
+        assert_eq!(
+            source_file(
+                "/home/someone/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cvc-cli-0.7.2/src/commands/ingest/shell.rs"
+            ),
+            "cvc-cli-0.7.2/src/commands/ingest/shell.rs"
+        );
+        assert_eq!(
+            source_file("/home/someone/src/volute/cvc-cli/src/main.rs"),
+            "main.rs"
+        );
+        assert_eq!(
+            source_file("/rustc/0123abcd/library/core/src/str/mod.rs"),
+            "mod.rs"
+        );
+        // An index directory with nothing after it is just a file name.
+        assert_eq!(source_file("/home/someone/registry/src/index"), "index");
+        for path in [
+            "/home/someone/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.140/src/de.rs",
+            "/home/someone/src/volute/cvc-cli/src/main.rs",
+        ] {
+            assert!(!source_file(path).contains("someone"), "{path}");
+        }
     }
 }
