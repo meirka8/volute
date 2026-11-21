@@ -1121,6 +1121,92 @@ fn ingest_rejects_bad_transcripts_without_writing() {
     ));
 }
 
+/// Another agent's transcript (Cursor's lines carry a role and a message, and
+/// none of Claude Code's entry fields) is refused by name, before the session
+/// lock is taken or anything is written, and is told apart from a Claude Code
+/// transcript of a version this cvc does not support.
+#[test]
+fn another_agents_transcript_is_refused_as_not_claude_codes() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let policy = fixture.policy();
+    let cursor = concat!(
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"Say hello"}]}}"#,
+        "\n",
+        r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}"#,
+        "\n",
+    );
+    let path = fixture.write_transcript(&format!("{BASIC_SESSION}.jsonl"), cursor);
+    let error = ingest(
+        &fixture.layout,
+        &store,
+        &policy,
+        &path,
+        None,
+        IngestMode::Final,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, IngestError::NotClaudeCode(named) if named == &path),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .starts_with("not a Claude Code transcript: "),
+        "{error}"
+    );
+    assert_eq!(
+        store.conversation_interaction_count(BASIC_SESSION).unwrap(),
+        0
+    );
+    assert!(store
+        .harness_ingest_cursor(transcript::HARNESS, BASIC_SESSION)
+        .unwrap()
+        .is_none());
+    // No session lock file was made.
+    let locks = fs::read_dir(fixture.layout.cvc_dir())
+        .unwrap()
+        .filter(|entry| {
+            let name = entry.as_ref().unwrap().file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("ingest-") && name.ends_with(".lock")
+        })
+        .count();
+    assert_eq!(locks, 0);
+    // Whatever session id is passed, and before that id is judged.
+    assert!(matches!(
+        ingest(
+            &fixture.layout,
+            &store,
+            &policy,
+            &path,
+            Some("not a session id"),
+            IngestMode::Final,
+        ),
+        Err(IngestError::NotClaudeCode(_))
+    ));
+
+    // A Claude Code transcript of another major version is still Claude
+    // Code's, and its version is what is reported.
+    let future = fixture.render(BASIC).replace("\"2.1.260\"", "\"3.0.0\"");
+    assert_ne!(future, fixture.render(BASIC));
+    let path = fixture.write_transcript(&format!("{BASIC_SESSION}.jsonl"), &future);
+    assert!(matches!(
+        ingest(
+            &fixture.layout,
+            &store,
+            &policy,
+            &path,
+            None,
+            IngestMode::Final
+        ),
+        Err(IngestError::Transcript(
+            TranscriptError::UnsupportedVersion { .. }
+        ))
+    ));
+}
+
 #[test]
 fn stale_cursor_resets_and_stays_idempotent() {
     let fixture = Fixture::new();
