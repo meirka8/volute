@@ -5,6 +5,7 @@ pub mod git;
 pub mod harness;
 pub mod models;
 pub mod privacy;
+pub mod reasoning;
 pub mod repository;
 pub mod stimulus;
 
