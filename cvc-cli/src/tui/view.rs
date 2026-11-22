@@ -808,6 +808,7 @@ mod tests {
                     unconfirmed: 0,
                 }),
                 backlog: Default::default(),
+                backlog_unreadable: Vec::new(),
             },
             None,
             settings(glyphs),
@@ -1143,6 +1144,7 @@ mod tests {
                 remotes,
                 counts: None,
                 backlog: Default::default(),
+                backlog_unreadable: Vec::new(),
             },
             requested,
             settings(Glyphs::UNICODE),
@@ -1730,6 +1732,34 @@ mod tests {
         assert!(lines[2].contains("when (UTC)"));
     }
 
+    /// A backlog that cannot be read is said in a notice, as the plain listing
+    /// warns, and the list is drawn without marks.
+    #[test]
+    fn an_unreadable_backlog_is_a_notice() {
+        use cvc_core::harness::HarnessId;
+        let mut model = Model::new(
+            Data {
+                summaries: conversations(),
+                remotes: vec![remote("origin")],
+                counts: None,
+                backlog: Default::default(),
+                backlog_unreadable: vec![(
+                    HarnessId::ClaudeCode,
+                    "no such table: harness_cursors\u{1b}[2J".to_owned(),
+                )],
+            },
+            None,
+            settings(Glyphs::UNICODE),
+        );
+        model.set_size(150, 30);
+        let lines = rendered(&model);
+        assert_eq!(
+            lines[2],
+            " Cannot read which Claude Code sessions a hook left unread, so none is marked: no such table: harness_cursors?[2J."
+        );
+        assert!(!contains(&lines, "backlog"), "{}", dump(&lines));
+    }
+
     // ----- overlays -----
 
     #[test]
@@ -1784,6 +1814,7 @@ mod tests {
                 remotes: vec![remote("origin")],
                 counts: None,
                 backlog: [("session-1".to_owned(), HarnessId::ClaudeCode)].into(),
+                backlog_unreadable: Vec::new(),
             },
             None,
             settings(Glyphs::UNICODE),

@@ -58,6 +58,9 @@ pub struct Data {
     /// of the family's root, with the harness whose `cvc harness status` names
     /// the catch-up command (`conversations::read_backlog`).
     pub backlog: BTreeMap<String, HarnessId>,
+    /// The harnesses whose backlog could not be read, with why; the view says
+    /// so in a notice.
+    pub backlog_unreadable: Vec<(HarnessId, String)>,
 }
 
 /// What is read about the selected conversation each time it matters: the
@@ -412,8 +415,26 @@ impl Model {
             status: None,
             shared_remote: None,
         };
+        model.note_unreadable_backlog(&data.backlog_unreadable);
         model.rebuild_visible(None);
         model
+    }
+
+    /// Says, as the notice, that a harness's backlog could not be read, as the
+    /// plain listing warns; a notice already showing (a flow's outcome) stays.
+    fn note_unreadable_backlog(&mut self, unreadable: &[(HarnessId, String)]) {
+        if self.status.is_some() {
+            return;
+        }
+        if let Some((harness, reason)) = unreadable.first() {
+            let words = crate::commands::conversations::backlog_unreadable_words(*harness, reason);
+            let mut first = words.chars();
+            let words: String = first
+                .next()
+                .map(|c| c.to_uppercase().chain(first).collect())
+                .unwrap_or_default();
+            self.set_status(&format!("{words}."));
+        }
     }
 
     /// Makes `name` the selected remote, together with the data loaded for it,
@@ -432,6 +453,7 @@ impl Model {
         self.counts = data.counts;
         self.tree = Tree::build(&data.summaries);
         self.backlog = data.backlog;
+        self.note_unreadable_backlog(&data.backlog_unreadable);
         // The old indices point into the old tree.
         self.visible.clear();
         self.info.clear();
@@ -1433,6 +1455,7 @@ mod tests {
                 unconfirmed: 0,
             }),
             backlog: BTreeMap::new(),
+            backlog_unreadable: Vec::new(),
         }
     }
 

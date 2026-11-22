@@ -191,14 +191,15 @@ fn load(ctx: &Context, remotes: Vec<RemoteOverview>, remote: Option<&str>) -> Re
         .as_deref()
         .map(|fingerprint| ctx.store.destination_publication_counts(fingerprint))
         .transpose()?;
-    // Only a hint: a store whose cursors cannot be read lists every
-    // conversation unmarked rather than not at all.
-    let backlog = crate::commands::conversations::read_backlog(ctx.store).unwrap_or_default();
+    // Only a hint: a harness whose cursors cannot be read lists its
+    // conversations unmarked, and the view says so in a notice.
+    let backlog = crate::commands::conversations::read_backlog(ctx.store);
     Ok(Data {
         summaries,
         remotes,
         counts,
-        backlog,
+        backlog: backlog.sessions,
+        backlog_unreadable: backlog.unreadable,
     })
 }
 

@@ -144,11 +144,23 @@ const NESTED_INDENT: &str = "    ";
 /// What ends the first line of a conversation whose session has a backlog.
 const BACKLOG_MARK: &str = "  [backlog]";
 
+/// What [`read_backlog`] found.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BacklogRead {
+    /// The family roots with a backlog, by conversation id, with their harness.
+    pub sessions: BTreeMap<String, HarnessId>,
+    /// The harnesses whose cursors could not be read, with why (text from the
+    /// store's error, to be sanitized before it is shown). Their sessions are
+    /// not marked; the others' still are.
+    pub unreadable: Vec<(HarnessId, String)>,
+}
+
 /// The family roots that a hook run left unread to the end and that no run has
 /// read to the end since (`harness::engine::backlog`), by conversation id, for
-/// every harness this build can capture. Read-only: it reads the stored cursors
-/// and writes nothing.
-pub(crate) fn read_backlog(store: &CvcStore) -> Result<BTreeMap<String, HarnessId>> {
+/// every harness this build can capture. Each harness is read on its own, so
+/// one whose cursors cannot be read is reported and skipped and the others are
+/// still marked. Read-only: it reads the stored cursors and writes nothing.
+pub(crate) fn read_backlog(store: &CvcStore) -> BacklogRead {
     struct Read<'a>(&'a CvcStore);
     impl AdapterVisitor for Read<'_> {
         type Output = Result<Vec<Backlog>>;
@@ -156,15 +168,28 @@ pub(crate) fn read_backlog(store: &CvcStore) -> Result<BTreeMap<String, HarnessI
             Ok(engine::backlog::<A>(self.0)?)
         }
     }
-    let mut sessions = BTreeMap::new();
+    let mut read = BacklogRead::default();
     for harness in HarnessId::ALL {
-        if let Some(backlog) = with_adapter(harness, Read(store)) {
-            for session in backlog? {
-                sessions.insert(session.conversation_id, harness);
+        match with_adapter(harness, Read(store)) {
+            None => {}
+            Some(Ok(sessions)) => {
+                for session in sessions {
+                    read.sessions.insert(session.conversation_id, harness);
+                }
             }
+            Some(Err(error)) => read.unreadable.push((harness, format!("{error:#}"))),
         }
     }
-    Ok(sessions)
+    read
+}
+
+/// The one line that says a harness's backlog could not be read.
+pub(crate) fn backlog_unreadable_words(harness: HarnessId, reason: &str) -> String {
+    format!(
+        "cannot read which {} sessions a hook left unread, so none is marked: {}",
+        harness.display(),
+        sanitize_for_terminal(reason.lines().next().unwrap_or("").trim())
+    )
 }
 
 /// The command that names the catch-up command for a harness's backlog.
@@ -335,16 +360,13 @@ pub async fn run(requested: Option<&str>, limit: Option<usize>, plain: bool) -> 
         ),
         None => println!("Conversations (most recent first); no remote resolved for share state:"),
     }
-    // Best effort, like the share state: a listing that cannot tell which
-    // sessions are behind says so and lists them unmarked.
-    let backlog = read_backlog(&store).unwrap_or_else(|error| {
-        eprintln!(
-            "warning: cannot read which sessions a hook left unread: {}",
-            sanitize_for_terminal(&format!("{error:#}"))
-        );
-        BTreeMap::new()
-    });
-    for line in listing_lines(&summaries, destination.is_some(), &backlog) {
+    // Best effort, like the share state: a harness whose cursors cannot be
+    // read is named, and its sessions are listed unmarked.
+    let backlog = read_backlog(&store);
+    for (harness, reason) in &backlog.unreadable {
+        eprintln!("warning: {}", backlog_unreadable_words(*harness, reason));
+    }
+    for line in listing_lines(&summaries, destination.is_some(), &backlog.sessions) {
         println!("{line}");
     }
     println!(
@@ -794,7 +816,8 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("index.db");
         let store = CvcStore::open(&path).unwrap();
-        assert!(read_backlog(&store).unwrap().is_empty());
+        let empty = read_backlog(&store);
+        assert!(empty.sessions.is_empty() && empty.unreadable.is_empty());
         let raw = rusqlite::Connection::open(&path).unwrap();
         let cursor = |key: &str, backlog: bool| {
             raw.execute(
@@ -818,11 +841,35 @@ mod tests {
                 .unwrap()
         };
         let before = (changes(), store_dump(&raw));
+        let read = read_backlog(&store);
         assert_eq!(
-            read_backlog(&store).unwrap(),
+            read.sessions,
             BTreeMap::from([("behind".to_owned(), HarnessId::ClaudeCode)])
         );
+        assert!(read.unreadable.is_empty());
         assert_eq!((changes(), store_dump(&raw)), before);
+    }
+
+    /// A harness whose cursors cannot be read is reported, not fatal, and its
+    /// reason reaches the terminal sanitized.
+    #[test]
+    fn an_unreadable_backlog_is_reported_per_harness() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("index.db");
+        let store = CvcStore::open(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE harness_cursors")
+            .unwrap();
+        let read = read_backlog(&store);
+        assert!(read.sessions.is_empty());
+        let harnesses: Vec<HarnessId> = read.unreadable.iter().map(|(h, _)| *h).collect();
+        assert_eq!(harnesses, vec![HarnessId::ClaudeCode]);
+        let words = backlog_unreadable_words(HarnessId::ClaudeCode, "bad\u{1b}[2J\nsecond line");
+        assert_eq!(
+            words,
+            "cannot read which Claude Code sessions a hook left unread, so none is marked: bad?[2J"
+        );
     }
 
     fn store_dump(raw: &rusqlite::Connection) -> Vec<String> {
