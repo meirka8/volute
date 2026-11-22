@@ -38,14 +38,17 @@
 //!
 //! # Writing: scrub, bound, then mark
 //!
-//! [`mark`] takes text that has already been scrubbed and bounded, so the
-//! marker sits outside the text's size bound and no scrubber has to be
-//! trusted not to cut it. It marks nothing that is empty (or only white
-//! space), nothing that is a note standing in for text that could not be
-//! scrubbed, and nothing of kind [`ReasoningKind::Exposed`]. The marker uses
-//! the boundary-token shape of stimulus version 2, which the built-in
-//! scrubber leaves alone (a test pins it), so it survives every later scrub
-//! byte for byte.
+//! [`mark`] takes [`SealedText`]: text that [`crate::harness::seal`] has
+//! scrubbed with the capture's policy and then bounded, and that is not a
+//! note standing in for text that could not be scrubbed. Only the seal makes
+//! one, after the last policy scrub, so the marker sits outside the text's
+//! size bound, no scrubber has to be trusted not to cut it, and a withheld
+//! field is never marked (the seal knows it withheld one from the failed
+//! scrub itself, not from the note's words). [`mark`] marks nothing that is
+//! empty (or only white space) and nothing of kind
+//! [`ReasoningKind::Exposed`]. The marker uses the boundary-token shape of
+//! stimulus version 2, which the built-in scrubber leaves alone (a test pins
+//! it), so it survives every later scrub byte for byte.
 //!
 //! # Reading
 //!
@@ -140,46 +143,61 @@ fn marker(words: &str, token: &str) -> String {
     format!("{MARKER_OPEN}{words} {token}{MARKER_CLOSE}{SEPARATOR}")
 }
 
-/// Whether `text` is, in full, the note a capture stores for a text field it
-/// could not scrub: `[cvc: withheld N bytes that could not be scrubbed]`.
-pub fn is_withheld_note(text: &str) -> bool {
-    text.strip_prefix("[cvc: withheld ")
-        .and_then(|rest| rest.strip_suffix(" bytes that could not be scrubbed]"))
-        .is_some_and(|count| {
-            !count.is_empty()
-                && count.bytes().all(|b| b.is_ascii_digit())
-                && (count == "0" || !count.starts_with('0'))
-        })
+/// Reasoning text the seal scrubbed in full with the capture's policy and
+/// then bounded: what [`mark`] takes. Only [`crate::harness::seal`] makes
+/// one, and never of a note standing in for text that could not be scrubbed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedText(String);
+
+impl SealedText {
+    /// For the seal only: `text` is scrubbed with the capture's policy,
+    /// bounded, and not a withheld note.
+    pub(crate) fn sealed(text: String) -> Self {
+        Self(text)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
 }
 
 /// `text` as it is stored for reasoning of kind `kind` in interaction `id`.
 ///
-/// `text` must already be scrubbed and bounded. It comes back unchanged when
-/// `kind` is not marked ([`ReasoningKind::Exposed`]), when it is empty or only
-/// white space, when it is a withheld note ([`is_withheld_note`]), or when it
-/// already opens with this interaction's verified marker of that kind.
-/// Otherwise it is prefixed with the marker. In the degenerate case where all
-/// [`BOUNDARY_CANDIDATES`] tokens occur in the text, the first is used
-/// anyway: the marker then does not verify, and readers show the text
+/// It comes back unchanged when `kind` is not marked
+/// ([`ReasoningKind::Exposed`]), when it is empty or only white space, or
+/// when it already opens with this interaction's verified marker of that
+/// kind. Otherwise it is prefixed with the marker. In the degenerate case
+/// where all [`BOUNDARY_CANDIDATES`] tokens occur in the text, the first is
+/// used anyway: the marker then does not verify, and readers show the text
 /// literally, which still says "provider summary".
-pub fn mark(id: &InteractionId, kind: ReasoningKind, bounded_scrubbed: String) -> String {
+pub fn mark(id: &InteractionId, kind: ReasoningKind, text: SealedText) -> String {
+    mark_scrubbed(id, kind, text.0)
+}
+
+/// [`mark`] of text already scrubbed: the seal's, or a later scrub's of a
+/// verified body ([`scrub_reasoning`]).
+fn mark_scrubbed(id: &InteractionId, kind: ReasoningKind, scrubbed: String) -> String {
     let Some(words) = kind.marker_words() else {
-        return bounded_scrubbed;
+        return scrubbed;
     };
-    if bounded_scrubbed.trim().is_empty() || is_withheld_note(&bounded_scrubbed) {
-        return bounded_scrubbed;
+    if scrubbed.trim().is_empty() {
+        return scrubbed;
     }
-    if matches!(read(id, &bounded_scrubbed), ReasoningView::Verified { kind: found, .. } if found == kind)
-    {
-        return bounded_scrubbed;
+    if matches!(read(id, &scrubbed), ReasoningView::Verified { kind: found, .. } if found == kind) {
+        return scrubbed;
     }
-    let present: std::collections::HashSet<&str> = tokens_in(&bounded_scrubbed).collect();
+    let present: std::collections::HashSet<&str> = tokens_in(&scrubbed).collect();
     let token = (0..BOUNDARY_CANDIDATES)
         .map(|candidate| boundary(id, kind, candidate))
         .find(|token| !present.contains(token.as_str()))
         .unwrap_or_else(|| boundary(id, kind, 0));
     let mut out = marker(words, &token);
-    out.push_str(&bounded_scrubbed);
+    out.push_str(&scrubbed);
     out
 }
 
@@ -204,18 +222,16 @@ pub fn scrub_reasoning(
     let Some((kind, token, body)) = verified_marker(id, model_cot) else {
         return scrub(model_cot);
     };
+    // A scrub that fails fails the whole value (the capture boundary then
+    // stores a stand-in), so `scrubbed` is always text, never a note.
     let scrubbed = scrub(body)?;
     match kind.marker_words() {
-        Some(words)
-            if !scrubbed.trim().is_empty()
-                && !is_withheld_note(&scrubbed)
-                && !scrubbed.contains(token) =>
-        {
+        Some(words) if !scrubbed.trim().is_empty() && !scrubbed.contains(token) => {
             let mut out = marker(words, token);
             out.push_str(&scrubbed);
             Ok(out)
         }
-        _ => Ok(mark(id, kind, scrubbed)),
+        _ => Ok(mark_scrubbed(id, kind, scrubbed)),
     }
 }
 
@@ -300,6 +316,11 @@ fn verified_body<'a>(
 mod tests {
     use super::*;
 
+    /// [`super::mark`] of `text` as if the seal had sealed it.
+    fn mark(id: &InteractionId, kind: ReasoningKind, text: String) -> String {
+        super::mark(id, kind, SealedText::for_tests(text))
+    }
+
     fn id() -> InteractionId {
         "6b1f0c0e-1111-4aaa-8bbb-000000000001".parse().unwrap()
     }
@@ -352,11 +373,7 @@ mod tests {
 
     #[test]
     fn what_is_never_marked() {
-        for text in [
-            "",
-            "  \n",
-            "[cvc: withheld 12 bytes that could not be scrubbed]",
-        ] {
+        for text in ["", "  \n"] {
             assert_eq!(
                 mark(&id(), ReasoningKind::ProviderSummary, text.into()),
                 text
@@ -372,23 +389,25 @@ mod tests {
         assert_eq!(view.label(), "Reasoning as the agent exposed it");
     }
 
+    /// Sealed text that happens to read like a withheld note is text: the
+    /// seal decides what it withheld from the scrub, not from the words. A
+    /// later scrub keeps its marker as it keeps any other.
     #[test]
-    fn withheld_notes_are_recognised_exactly() {
-        assert!(is_withheld_note(
-            "[cvc: withheld 0 bytes that could not be scrubbed]"
-        ));
-        assert!(is_withheld_note(
-            "[cvc: withheld 7000000 bytes that could not be scrubbed]"
-        ));
-        for text in [
-            "[cvc: withheld bytes that could not be scrubbed]",
-            "[cvc: withheld 01 bytes that could not be scrubbed]",
-            "[cvc: withheld 1 bytes that could not be scrubbed] and more",
-            "x[cvc: withheld 1 bytes that could not be scrubbed]",
-            "[cvc: withheld -1 bytes that could not be scrubbed]",
-        ] {
-            assert!(!is_withheld_note(text), "{text}");
-        }
+    fn sealed_text_that_reads_like_a_note_is_marked_like_any_other() {
+        let lookalike = "[cvc: withheld 12 bytes that could not be scrubbed]";
+        let marked = mark(&id(), ReasoningKind::ProviderSummary, lookalike.into());
+        assert_eq!(
+            read(&id(), &marked),
+            ReasoningView::Verified {
+                kind: ReasoningKind::ProviderSummary,
+                body: lookalike
+            }
+        );
+        let policy = crate::privacy::PreparedPolicy::built_ins_only();
+        assert_eq!(
+            scrub_reasoning(&id(), &marked, &|t| policy.scrub(t)).unwrap(),
+            marked
+        );
     }
 
     #[test]

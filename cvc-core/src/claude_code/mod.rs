@@ -8,28 +8,35 @@
 //! every completed assistant response becomes one private interaction in the
 //! shared local database, attributed to the worktree the hook ran in.
 //!
-//! The pieces are independent and individually testable:
+//! Claude Code is the first adapter on the harness registry
+//! ([`crate::harness`]): the consent check, the lock, scrub-then-bound, the
+//! cursor rules and the commit rescue are the shared ones. The pieces here
+//! are what is particular to Claude Code, each testable on its own:
 //!
 //! * [`transcript`] parses transcript lines and plans captures without touching
 //!   the filesystem or the database;
-//! * [`ingest`] applies a plan to a store idempotently, under a per-session
-//!   lock so that concurrent runs on one session take turns;
+//! * [`adapter`] is Claude Code's implementation of the adapter traits: its
+//!   hook payload, its transcript and cursor, its subagent family and its
+//!   installer;
+//! * [`ingest`](mod@ingest) is the 0.7.x-compatible entry points, which run
+//!   the shared engine with the adapter under a per-session lock so that
+//!   concurrent runs on one session take turns;
 //! * [`settings`] installs and removes the hook entries in the checkout-local
 //!   Claude Code settings file;
 //! * [`harness_record`] is the repository-wide record that the harness is
 //!   wanted, which Git's `post-checkout` hook reads to install the entries into
 //!   a new linked worktree.
-mod fields;
+pub mod adapter;
 pub mod harness_record;
 pub mod ingest;
 pub mod links;
-mod session_lock;
 pub mod settings;
 pub mod transcript;
 
+pub use crate::harness::SESSION_LOCK_WAIT;
+pub use adapter::Adapter;
 pub use ingest::{
     ingest, ingest_waiting, ingest_with, sniff_first_entry, IngestError, IngestMode, IngestOptions,
     IngestReport,
 };
-pub use session_lock::SESSION_LOCK_WAIT;
 pub use transcript::{FirstEntry, HARNESS};

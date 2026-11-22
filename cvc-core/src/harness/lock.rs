@@ -1,16 +1,26 @@
-//! An exclusive, per-session lock around the ingestion of one transcript.
+//! An exclusive lock around the ingestion of one session family.
 //!
-//! The same hook event can start several `cvc ingest claude-code` processes
-//! for one session at once (the Claude Code plugin's hook and a checkout's own
-//! entries both fire, in parallel), and an operator can run `--transcript` by
-//! hand while hooks fire. Each plans from the stored cursor and commits the new
-//! captures with the advanced cursor. The deterministic ids keep that correct,
-//! but only the lock makes it orderly: the second run starts from the cursor the
-//! first one advanced, finds nothing new, and neither can move the cursor back.
+//! The same hook event can start several `cvc ingest` processes for one
+//! session at once (the Claude Code plugin's hook and a checkout's own entries
+//! both fire, in parallel), and an operator can run `--transcript` by hand
+//! while hooks fire. Each plans from the stored cursors and commits the new
+//! captures with the advanced cursors. The deterministic ids keep that correct,
+//! but only the lock makes it orderly: the second run starts from the cursors
+//! the first one advanced, finds nothing new, and neither can move a cursor
+//! back.
+//!
+//! The lock is taken on the family's root, not on each conversation: a run
+//! reads and advances the cursors of the root and of every member it ingests,
+//! and links the family's commits, under one lock. For Claude Code the root is
+//! the session, as in 0.7.x; for Codex it is the payload's `session_id`, which
+//! names the root thread even in a `SubagentStop`; for OpenCode, Cursor and
+//! Antigravity it is the root session or conversation.
 //!
 //! The lock is a file in the repository's CVC directory, which lives in the
 //! common Git directory and so is shared by every worktree. It is named from a
-//! hash of the harness and the session id, never the id itself. It is held with
+//! hash of the harness and the family root, never the id itself, exactly as
+//! 0.7.x named a Claude Code session's lock, so that 0.7.x and this version
+//! exclude each other. It is held with
 //! the same advisory file lock (`fs2`) the privacy state uses, so it is released
 //! by the operating system when the process ends however it ends, and it is
 //! taken without blocking in a bounded polling loop, because a hook has a
@@ -22,9 +32,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// How long `ingest` waits for another run on the same session. Below the 30 s
-/// timeout of the hooks (`settings::HOOK_TIMEOUT_SECS`), so a waiting hook
-/// gives up on its own terms rather than being killed.
+/// How long an ingest waits for another run on the same family. Below the
+/// 30 s timeout of the hooks (Claude Code's `settings::HOOK_TIMEOUT_SECS`), so
+/// a waiting hook gives up on its own terms rather than being killed.
 pub const SESSION_LOCK_WAIT: Duration = Duration::from_secs(20);
 
 const POLL_FIRST: Duration = Duration::from_millis(5);
@@ -32,9 +42,9 @@ const POLL_LONGEST: Duration = Duration::from_millis(100);
 
 /// Holds the lock for as long as it lives.
 #[derive(Debug)]
-pub(crate) struct SessionLock {
+pub(crate) struct FamilyLock {
     /// The locked file; `None` where the filesystem cannot lock at all, and the
-    /// run goes on without the lock (see [`SessionLock::acquire`]).
+    /// run goes on without the lock (see [`FamilyLock::acquire`]).
     held: Option<Held>,
 }
 
@@ -46,9 +56,9 @@ struct Held {
     path: PathBuf,
 }
 
-impl SessionLock {
-    /// Takes the lock for `session` of `harness`, waiting up to `wait` for
-    /// whoever holds it. `Ok(None)` means it was still held when the wait ended.
+impl FamilyLock {
+    /// Takes the lock for the family rooted at `family_root` of `harness`,
+    /// waiting up to `wait` for whoever holds it. `Ok(None)` means it was still held when the wait ended.
     /// The lock is attempted at least once, so a zero wait is a try.
     ///
     /// On a filesystem that cannot lock at all (see [`is_lock_unsupported`])
@@ -65,25 +75,25 @@ impl SessionLock {
     pub(crate) fn acquire(
         cvc_dir: &Path,
         harness: &str,
-        session: &str,
+        family_root: &str,
         wait: Duration,
     ) -> io::Result<Option<Self>> {
-        Self::acquire_with(cvc_dir, harness, session, wait, |file| {
+        Self::acquire_with(cvc_dir, harness, family_root, wait, |file| {
             fs2::FileExt::try_lock_exclusive(file)
         })
     }
 
-    /// [`SessionLock::acquire`] with the attempt to lock a file given, so that
+    /// [`FamilyLock::acquire`] with the attempt to lock a file given, so that
     /// what the operating system can answer can be injected.
     fn acquire_with(
         cvc_dir: &Path,
         harness: &str,
-        session: &str,
+        family_root: &str,
         wait: Duration,
         try_lock: impl Fn(&File) -> io::Result<()>,
     ) -> io::Result<Option<Self>> {
         check_directory(cvc_dir)?;
-        let path = cvc_dir.join(file_name(harness, session));
+        let path = cvc_dir.join(file_name(harness, family_root));
         let deadline = Instant::now() + wait;
         let mut delay = POLL_FIRST;
         loop {
@@ -125,7 +135,7 @@ impl SessionLock {
     }
 }
 
-impl Drop for SessionLock {
+impl Drop for FamilyLock {
     fn drop(&mut self) {
         let Some(held) = &self.held else {
             return;
@@ -141,13 +151,14 @@ impl Drop for SessionLock {
     }
 }
 
-/// `ingest-<hex SHA-256 of the harness and session>.lock`.
-fn file_name(harness: &str, session: &str) -> String {
+/// `ingest-<hex SHA-256 of the harness and the family root>.lock`, as 0.7.x
+/// named a session's.
+fn file_name(harness: &str, family_root: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(b"cvc.ingest-lock/v1\0");
     hash.update(harness.as_bytes());
     hash.update(b"\0");
-    hash.update(session.as_bytes());
+    hash.update(family_root.as_bytes());
     format!("ingest-{}.lock", hex::encode(hash.finalize()))
 }
 
@@ -254,6 +265,19 @@ mod tests {
         found
     }
 
+    /// The name cvc 0.7.2 gives a Claude Code session's lock, worked out
+    /// from its `claude_code/session_lock.rs` (`ingest-` and the hex SHA-256
+    /// of `cvc.ingest-lock/v1`, NUL, the harness, NUL, the session, then
+    /// `.lock`), so that 0.7.x and this version, run by hooks on the same
+    /// event, keep excluding each other.
+    #[test]
+    fn a_claude_code_sessions_lock_has_the_name_0_7_2_gives_it() {
+        assert_eq!(
+            file_name("claude-code", "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60"),
+            "ingest-2934d76c9809e331f3f880074470c786f500397267bacef92ec56111956a0ff1.lock"
+        );
+    }
+
     #[test]
     fn the_name_hides_the_session_and_separates_harnesses_and_sessions() {
         let name = file_name("claude-code", "session-1");
@@ -277,22 +301,22 @@ mod tests {
     #[test]
     fn a_second_taker_waits_out_its_time_and_gets_the_lock_once_it_is_released() {
         let directory = TempDir::new().unwrap();
-        let held = SessionLock::acquire(directory.path(), "h", "s", SHORT)
+        let held = FamilyLock::acquire(directory.path(), "h", "s", SHORT)
             .unwrap()
             .expect("an unheld lock is taken");
 
         let started = Instant::now();
-        let busy = SessionLock::acquire(directory.path(), "h", "s", SHORT).unwrap();
+        let busy = FamilyLock::acquire(directory.path(), "h", "s", SHORT).unwrap();
         assert!(busy.is_none(), "the lock is held");
         assert!(started.elapsed() >= SHORT, "it waited for its time");
 
         // Another session is not affected.
-        assert!(SessionLock::acquire(directory.path(), "h", "other", SHORT)
+        assert!(FamilyLock::acquire(directory.path(), "h", "other", SHORT)
             .unwrap()
             .is_some());
 
         drop(held);
-        assert!(SessionLock::acquire(directory.path(), "h", "s", SHORT)
+        assert!(FamilyLock::acquire(directory.path(), "h", "s", SHORT)
             .unwrap()
             .is_some());
     }
@@ -301,15 +325,15 @@ mod tests {
     fn a_zero_wait_is_a_single_try() {
         let directory = TempDir::new().unwrap();
         assert!(
-            SessionLock::acquire(directory.path(), "h", "s", Duration::ZERO)
+            FamilyLock::acquire(directory.path(), "h", "s", Duration::ZERO)
                 .unwrap()
                 .is_some()
         );
-        let _held = SessionLock::acquire(directory.path(), "h", "s", Duration::ZERO)
+        let _held = FamilyLock::acquire(directory.path(), "h", "s", Duration::ZERO)
             .unwrap()
             .unwrap();
         assert!(
-            SessionLock::acquire(directory.path(), "h", "s", Duration::ZERO)
+            FamilyLock::acquire(directory.path(), "h", "s", Duration::ZERO)
                 .unwrap()
                 .is_none()
         );
@@ -318,12 +342,12 @@ mod tests {
     #[test]
     fn a_waiter_gets_the_lock_when_the_holder_lets_go_within_its_time() {
         let directory = TempDir::new().unwrap();
-        let held = SessionLock::acquire(directory.path(), "h", "s", SHORT)
+        let held = FamilyLock::acquire(directory.path(), "h", "s", SHORT)
             .unwrap()
             .unwrap();
         let path = directory.path().to_path_buf();
         let waiter = std::thread::spawn(move || {
-            SessionLock::acquire(&path, "h", "s", Duration::from_secs(30))
+            FamilyLock::acquire(&path, "h", "s", Duration::from_secs(30))
                 .unwrap()
                 .is_some()
         });
@@ -335,7 +359,7 @@ mod tests {
     #[test]
     fn the_lock_file_does_not_outlive_the_lock_on_unix() {
         let directory = TempDir::new().unwrap();
-        let lock = SessionLock::acquire(directory.path(), "h", "s", SHORT)
+        let lock = FamilyLock::acquire(directory.path(), "h", "s", SHORT)
             .unwrap()
             .unwrap();
         assert_eq!(names(directory.path()).len(), 1);
@@ -363,7 +387,7 @@ mod tests {
                 let (inside, overlaps, turns) = (inside.clone(), overlaps.clone(), turns.clone());
                 std::thread::spawn(move || {
                     for _ in 0..25 {
-                        let lock = SessionLock::acquire(&path, "h", "s", Duration::from_secs(60))
+                        let lock = FamilyLock::acquire(&path, "h", "s", Duration::from_secs(60))
                             .unwrap()
                             .expect("within a minute");
                         if inside.fetch_add(1, Ordering::SeqCst) != 0 {
@@ -440,14 +464,14 @@ mod tests {
             attempts.set(attempts.get() + 1);
             Err(unsupported())
         };
-        let first = SessionLock::acquire_with(directory.path(), "h", "s", SHORT, none)
+        let first = FamilyLock::acquire_with(directory.path(), "h", "s", SHORT, none)
             .unwrap()
             .expect("the run goes on");
         assert!(first.held.is_none(), "nothing is held");
         assert_eq!(attempts.get(), 1, "it is not retried until the wait ends");
         // And nothing excludes anything: a second run is given the same.
         let second =
-            SessionLock::acquire_with(directory.path(), "h", "s", SHORT, |_| Err(unsupported()))
+            FamilyLock::acquire_with(directory.path(), "h", "s", SHORT, |_| Err(unsupported()))
                 .unwrap()
                 .expect("the run goes on");
         assert!(second.held.is_none());
@@ -466,12 +490,12 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let failure = |_: &File| Err(io::Error::from(io::ErrorKind::PermissionDenied));
         let error =
-            SessionLock::acquire_with(directory.path(), "h", "s", SHORT, failure).unwrap_err();
+            FamilyLock::acquire_with(directory.path(), "h", "s", SHORT, failure).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
 
         let held = |_: &File| Err(io::Error::from(io::ErrorKind::WouldBlock));
         let started = Instant::now();
-        let busy = SessionLock::acquire_with(directory.path(), "h", "s", SHORT, held).unwrap();
+        let busy = FamilyLock::acquire_with(directory.path(), "h", "s", SHORT, held).unwrap();
         assert!(busy.is_none());
         assert!(started.elapsed() >= SHORT);
     }
@@ -485,12 +509,12 @@ mod tests {
         let elsewhere = TempDir::new().unwrap();
         let link = elsewhere.path().join("cvc");
         symlink(real.path(), &link).unwrap();
-        let error = SessionLock::acquire(&link, "h", "s", SHORT).unwrap_err();
+        let error = FamilyLock::acquire(&link, "h", "s", SHORT).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
         assert!(names(real.path()).is_empty());
 
         let missing = elsewhere.path().join("absent");
-        let error = SessionLock::acquire(&missing, "h", "s", SHORT).unwrap_err();
+        let error = FamilyLock::acquire(&missing, "h", "s", SHORT).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
 
         // The lock's own path is a link: not followed.
@@ -498,7 +522,7 @@ mod tests {
         let target = elsewhere.path().join("target");
         fs::write(&target, "x").unwrap();
         symlink(&target, directory.path().join(file_name("h", "s"))).unwrap();
-        assert!(SessionLock::acquire(directory.path(), "h", "s", SHORT).is_err());
+        assert!(FamilyLock::acquire(directory.path(), "h", "s", SHORT).is_err());
         assert_eq!(fs::read_to_string(&target).unwrap(), "x");
     }
 }
