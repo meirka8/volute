@@ -1,4 +1,4 @@
-//! Idempotent application of a transcript plan to the local store.
+//! Claude Code transcript ingestion: the 0.7.x-compatible entry points.
 //!
 //! Every run reads the transcript from the session's stored cursor, plans the
 //! closed responses in that window, skips the ones already recorded (by their
@@ -8,31 +8,30 @@
 //! A session and its subagents are one family: each transcript is ingested into
 //! its own conversation, and once all of them are, one rescue links the
 //! family's floating responses to the commits any of them created (see
-//! [`links`]).
-use super::fields;
-use super::links;
-use super::session_lock::{SessionLock, SESSION_LOCK_WAIT};
-use super::transcript::{
-    self, FirstEntry, ParsedLine, PlanInput, TranscriptError, FIRST_ENTRY_BYTES, HARNESS,
-};
-use crate::db::{CvcStore, DbError, HarnessCursorUpdate, HARNESS_REASONS_SHOWN};
-use crate::models::{Conversation, Interaction, InteractionId};
-use crate::privacy::{self, ClaudeCodeCapture, PreparedPolicy};
+//! [`super::links`]).
+//!
+//! All of it runs on the shared harness engine with the Claude Code adapter
+//! ([`super::Adapter`]). These entry points keep 0.7.x's contract: the
+//! transcript is opened once, sniffed and read through the same handle, and
+//! the capture decision is the caller's. They are deprecated:
+//! [`crate::harness::engine::ingest`] with the same adapter is the gated
+//! path, which asks for coverage itself, and is what cvc's own CLI runs.
+use super::adapter::{Adapter, Source};
+use super::transcript::{self, FirstEntry, TranscriptError, FIRST_ENTRY_BYTES};
+use crate::db::{CvcStore, DbError, HARNESS_REASONS_SHOWN};
+use crate::harness::adapter::{PayloadError, RecordSource, Sniff};
+use crate::harness::candidate::Finality;
+use crate::harness::cursor::JsonlCursor;
+use crate::harness::engine::{self, EngineError, EngineOptions, EngineReport};
+use crate::harness::{HarnessId, SESSION_LOCK_WAIT};
+use crate::privacy::{PreparedPolicy, PrivacyError};
 use crate::repository::{RepositoryLayout, RepositoryLayoutError};
-use crate::stimulus;
-use chrono::Utc;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
-
-/// One read never buffers more than this; a transcript beyond it is treated as
-/// corruption rather than an ingest target.
-const MAX_READ_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_DERIVED_TITLE_BYTES: usize = 80;
-const DEFAULT_TITLE: &str = "Claude Code session";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestMode {
@@ -103,6 +102,59 @@ pub enum IngestError {
     /// reach, the next ingest of the session picks up from the cursor.
     #[error("another cvc process is still ingesting Claude Code session {session} and did not finish within {waited_secs} s; run this again once it has")]
     SessionBusy { session: String, waited_secs: u64 },
+    /// A hook payload this adapter cannot use.
+    #[error(transparent)]
+    Payload(#[from] PayloadError),
+    /// A way of locating sessions Claude Code's adapter does not offer.
+    #[error("{0} is not supported for claude-code; pass --transcript")]
+    Unsupported(&'static str),
+    /// The gated path only ([`crate::harness::engine::ingest`]): the capture
+    /// acknowledgement does not cover Claude Code here, or its state could
+    /// not be read.
+    #[error(transparent)]
+    Privacy(#[from] PrivacyError),
+    /// The engine refused an adapter that is not the registered one.
+    #[error("this adapter is not the one registered for {0}; it records nothing")]
+    Unregistered(HarnessId),
+}
+
+impl From<IngestMode> for Finality {
+    fn from(mode: IngestMode) -> Self {
+        match mode {
+            IngestMode::Incremental => Finality::Incremental,
+            IngestMode::Final => Finality::Final,
+        }
+    }
+}
+
+/// The engine's failures in this module's terms: a busy or unusable lock is
+/// the session's, as in 0.7.x.
+impl From<EngineError<IngestError>> for IngestError {
+    fn from(error: EngineError<IngestError>) -> Self {
+        match error {
+            EngineError::Adapter(error) => error,
+            EngineError::Db(error) => IngestError::Db(error),
+            EngineError::Layout(error) => IngestError::Layout(error),
+            EngineError::Privacy(error) => IngestError::Privacy(error),
+            EngineError::Busy {
+                family_root,
+                waited,
+                ..
+            } => IngestError::SessionBusy {
+                session: family_root,
+                waited_secs: waited.as_secs(),
+            },
+            EngineError::Lock {
+                family_root,
+                source,
+                ..
+            } => IngestError::SessionLock {
+                session: family_root,
+                source,
+            },
+            EngineError::Unregistered(harness) => IngestError::Unregistered(harness),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,34 +202,59 @@ pub struct IngestReport {
     pub omitted_context_items: usize,
 }
 
-/// One transcript file to ingest: the file, the session id every entry must
-/// carry, and the conversation id under which its interactions are stored.
-/// For the main session these coincide; a subagent file carries the parent
-/// session id but is stored under its own per-agent conversation.
-struct Target<'a> {
-    transcript_path: &'a Path,
-    file_session: &'a str,
-    conversation_id: &'a str,
-    include_sidechain: bool,
-    title_override: Option<String>,
-}
-
-/// What stays the same for every transcript of one run.
-struct Run<'a> {
-    layout: &'a RepositoryLayout,
-    store: &'a CvcStore,
-    policy: &'a PreparedPolicy,
-    mode: IngestMode,
-    rescan: bool,
-}
-
-/// One ingested transcript: what it recorded, and the responses in the window
-/// it read that reported creating a commit. Those are rescued once for the
-/// whole session family, not per transcript, so none is linked before every
-/// transcript of the family is in the store.
-struct Ingested {
-    report: IngestReport,
-    commit_bearing: Vec<links::CommitBearingResponse>,
+/// A run's report, in 0.7.x's figures: the session's own, with its
+/// subagents' summed.
+impl From<EngineReport<JsonlCursor>> for IngestReport {
+    fn from(run: EngineReport<JsonlCursor>) -> Self {
+        let root = run.root;
+        let mut report = IngestReport {
+            session_id: root.conversation_id,
+            inserted: root.inserted,
+            already_present: root.already_present,
+            pending_responses: root.pending,
+            linked_from_commits: run.linked.root,
+            cursor: root.cursor.byte_offset,
+            transcript_len: root.record_len.unwrap_or(0),
+            subagent_sessions: 0,
+            subagent_inserted: 0,
+            subagent_linked: run.linked.members,
+            unrecorded_blocks: root.unrecorded.len(),
+            unrecorded_block_types: root
+                .unrecorded
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            withheld: root.withheld,
+            lost: root.lost,
+            withheld_reasons: root.withheld_reasons,
+            omitted_tool_calls: root.omitted_tool_calls,
+            omitted_context_items: root.omitted_context_items,
+        };
+        for member in run.members {
+            report.subagent_sessions += 1;
+            report.subagent_inserted += member.inserted;
+            report.unrecorded_blocks += member.unrecorded.len();
+            for kind in member.unrecorded {
+                if !report.unrecorded_block_types.contains(&kind) {
+                    report.unrecorded_block_types.push(kind);
+                }
+            }
+            report.unrecorded_block_types.sort();
+            report.withheld += member.withheld;
+            report.lost += member.lost;
+            for reason in member.withheld_reasons {
+                if report.withheld_reasons.len() < HARNESS_REASONS_SHOWN
+                    && !report.withheld_reasons.contains(&reason)
+                {
+                    report.withheld_reasons.push(reason);
+                }
+            }
+            report.omitted_tool_calls += member.omitted_tool_calls;
+            report.omitted_context_items += member.omitted_context_items;
+        }
+        report
+    }
 }
 
 /// Ingests `transcript_path` for the worktree described by `layout`, then any
@@ -192,6 +269,8 @@ struct Ingested {
 /// the advanced one, subagent transcripts included. A run that finds it held
 /// waits up to [`SESSION_LOCK_WAIT`], then fails with
 /// [`IngestError::SessionBusy`].
+#[deprecated(note = "use harness::engine::ingest")]
+#[allow(deprecated)]
 pub fn ingest(
     layout: &RepositoryLayout,
     store: &CvcStore,
@@ -212,6 +291,8 @@ pub fn ingest(
 }
 
 /// [`ingest`] with an explicit bound on the wait for the session's lock.
+#[deprecated(note = "use harness::engine::ingest")]
+#[allow(deprecated)]
 pub fn ingest_waiting(
     layout: &RepositoryLayout,
     store: &CvcStore,
@@ -240,10 +321,11 @@ pub fn ingest_waiting(
 /// The session and its subagents are ingested first, the session before the
 /// subagents, each into its own conversation. Then one rescue links the family's
 /// floating responses to the commits that any of those transcripts created (see
-/// [`links::link_transcript_commits`]). If a subagent fails, the rescue still
+/// [`super::links::link_transcript_commits`]). If a subagent fails, the rescue still
 /// runs over what was ingested, the session included, because the session's
 /// cursor is already past its committing response and that response would
 /// never be read again; the subagent's error is then returned.
+#[deprecated(note = "use harness::engine::ingest")]
 pub fn ingest_with(
     layout: &RepositoryLayout,
     store: &CvcStore,
@@ -253,76 +335,29 @@ pub fn ingest_with(
     mode: IngestMode,
     options: IngestOptions,
 ) -> Result<IngestReport, IngestError> {
+    let adapter = Adapter;
+    // Opened once: this handle is sniffed, then read.
+    let source = Source::open(transcript_path);
     // Before anything else, the lock included, so that another agent's file
-    // leaves nothing behind. A transcript that cannot be read here is reported
-    // by the read below, as before.
-    if let Ok(FirstEntry::NotClaudeCode) = sniff_first_entry(transcript_path) {
+    // leaves nothing behind. A transcript that cannot be opened or read here
+    // is reported by the read, as before.
+    if adapter.sniff(&source) == Sniff::NotOurs {
         return Err(IngestError::NotClaudeCode(transcript_path.to_path_buf()));
     }
-    let session = session_id
-        .map(str::to_owned)
-        .or_else(|| {
-            transcript_path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .map(str::to_owned)
-        })
-        .ok_or(IngestError::UnknownSession)?;
-    if !privacy::is_safe_identifier(&session) {
-        return Err(IngestError::InvalidSession(session));
-    }
-
-    // Held until this function returns: the cursors of the session and of its
-    // subagents are read and advanced under it.
-    let lock_wait = options.lock_wait;
-    let _lock = match SessionLock::acquire(&layout.cvc_dir(), HARNESS, &session, lock_wait) {
-        Ok(Some(lock)) => lock,
-        Ok(None) => {
-            return Err(IngestError::SessionBusy {
-                session,
-                waited_secs: lock_wait.as_secs(),
-            })
-        }
-        Err(source) => return Err(IngestError::SessionLock { session, source }),
-    };
-
-    let run = Run {
+    let located = adapter.locate_opened(source, session_id)?;
+    let report = engine::ingest_claude_code_caller_decided(
+        &adapter,
         layout,
         store,
         policy,
-        mode,
-        rescan: options.rescan,
-    };
-    let parent = ingest_target(
-        &run,
-        &Target {
-            transcript_path,
-            file_session: &session,
-            conversation_id: &session,
-            include_sidechain: false,
-            title_override: None,
+        located,
+        EngineOptions {
+            finality: mode.into(),
+            rescan: options.rescan,
+            lock_wait: options.lock_wait,
         },
     )?;
-    let mut report = parent.report;
-    let mut commit_bearing = parent.commit_bearing;
-    let mut family = links::SessionFamily::new(&session);
-
-    // Whatever happens to the subagents, the session is in the store now, so
-    // the family is rescued before the outcome is returned.
-    let subagents = ingest_subagents(
-        &run,
-        transcript_path,
-        &session,
-        &mut family,
-        &mut report,
-        &mut commit_bearing,
-    );
-    let linked = rescue_family(&run, &family, &commit_bearing);
-    subagents?;
-    let linked = linked?;
-    report.linked_from_commits = linked.parent;
-    report.subagent_linked = linked.subagents;
-    Ok(report)
+    Ok(report.into())
 }
 
 /// Classifies the first complete entry of the transcript at `path` (see
@@ -343,7 +378,7 @@ pub fn sniff_first_entry(path: &Path) -> Result<FirstEntry, IngestError> {
 }
 
 #[cfg(unix)]
-fn open_transcript_start(path: &Path) -> Result<fs::File, IngestError> {
+pub(crate) fn open_transcript_start(path: &Path) -> Result<fs::File, IngestError> {
     use std::os::unix::fs::OpenOptionsExt;
     let opened = fs::OpenOptions::new()
         .read(true)
@@ -369,7 +404,7 @@ fn open_transcript_start(path: &Path) -> Result<fs::File, IngestError> {
 }
 
 #[cfg(not(unix))]
-fn open_transcript_start(path: &Path) -> Result<fs::File, IngestError> {
+pub(crate) fn open_transcript_start(path: &Path) -> Result<fs::File, IngestError> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(IngestError::NotRegularFile(path.to_path_buf()));
@@ -380,7 +415,7 @@ fn open_transcript_start(path: &Path) -> Result<fs::File, IngestError> {
 /// The start of `source`, up to and including its first non-blank complete
 /// line, or up to [`FIRST_ENTRY_BYTES`] + 1 bytes, or to its end, whichever
 /// comes first: what [`transcript::first_entry`] needs, and no more.
-fn read_to_first_entry(source: impl Read) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_to_first_entry(source: impl Read) -> std::io::Result<Vec<u8>> {
     let mut reader = BufReader::new(source.take(FIRST_ENTRY_BYTES as u64 + 1));
     let mut start = Vec::new();
     loop {
@@ -396,442 +431,18 @@ fn read_to_first_entry(source: impl Read) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Ingests the subagent transcripts stored beside `transcript_path`. Subagents
-/// run inside the same session and worktree; Claude Code stores each in
-/// `<session>/subagents/agent-<id>.jsonl` beside the main file. Each becomes its
-/// own conversation, keyed off the parent session so it never collides with the
-/// parent or another agent.
-///
-/// Every subagent conversation found is added to `family` before any is
-/// ingested, so one that fails (or that is not reached) is still part of the
-/// family whose responses a commit claims; only the ones found beside this
-/// session's transcript are, never another session's.
-fn ingest_subagents(
-    run: &Run<'_>,
-    transcript_path: &Path,
-    session: &str,
-    family: &mut links::SessionFamily,
-    report: &mut IngestReport,
-    commit_bearing: &mut Vec<links::CommitBearingResponse>,
-) -> Result<(), IngestError> {
-    let mut found = Vec::new();
-    for subagent in discover_subagents(transcript_path, run.policy)? {
-        let conversation_id = format!("{session}:{}", subagent.agent_stem);
-        if !privacy::is_safe_identifier(&conversation_id) {
-            continue;
-        }
-        family.add_subagent(&conversation_id);
-        found.push((subagent, conversation_id));
-    }
-    for (subagent, conversation_id) in found {
-        let target = ingest_target(
-            run,
-            &Target {
-                transcript_path: &subagent.path,
-                file_session: session,
-                conversation_id: &conversation_id,
-                include_sidechain: true,
-                title_override: subagent.title,
-            },
-        )?;
-        let target_report = target.report;
-        commit_bearing.extend(target.commit_bearing);
-        report.subagent_sessions += 1;
-        report.subagent_inserted += target_report.inserted;
-        report.unrecorded_blocks += target_report.unrecorded_blocks;
-        for kind in target_report.unrecorded_block_types {
-            if !report.unrecorded_block_types.contains(&kind) {
-                report.unrecorded_block_types.push(kind);
-            }
-        }
-        report.unrecorded_block_types.sort();
-        report.withheld += target_report.withheld;
-        report.lost += target_report.lost;
-        for reason in target_report.withheld_reasons {
-            if report.withheld_reasons.len() < HARNESS_REASONS_SHOWN
-                && !report.withheld_reasons.contains(&reason)
-            {
-                report.withheld_reasons.push(reason);
-            }
-        }
-        report.omitted_tool_calls += target_report.omitted_tool_calls;
-        report.omitted_context_items += target_report.omitted_context_items;
-    }
-    Ok(())
-}
-
-/// Rescues the responses the time-window linker cannot reach: those that
-/// created a commit, and the family's reasoning before them. Attribution
-/// records who linked, matching the linker, not the historical commit author.
-fn rescue_family(
-    run: &Run<'_>,
-    family: &links::SessionFamily,
-    commit_bearing: &[links::CommitBearingResponse],
-) -> Result<links::FamilyLinks, IngestError> {
-    if commit_bearing.is_empty() {
-        return Ok(links::FamilyLinks::default());
-    }
-    let capture_worktree = run.layout.worktree_origin()?;
-    let linked_by = run
-        .layout
-        .repository()
-        .signature()
-        .ok()
-        .and_then(|signature| signature.email().map(str::to_owned));
-    Ok(links::link_transcript_commits(
-        run.layout.repository(),
-        run.store,
-        family,
-        &capture_worktree,
-        commit_bearing,
-        linked_by.as_deref(),
-    )?)
-}
-
-/// Ingests one transcript file into one conversation. The commit links of its
-/// responses are left to [`rescue_family`].
-fn ingest_target(run: &Run<'_>, target: &Target<'_>) -> Result<Ingested, IngestError> {
-    let Run {
-        layout,
-        store,
-        policy,
-        mode,
-        rescan,
-    } = *run;
-    let metadata = fs::symlink_metadata(target.transcript_path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(IngestError::NotRegularFile(
-            target.transcript_path.to_path_buf(),
-        ));
-    }
-    let worktree_root = layout.worktree_root()?.to_path_buf();
-    let capture_worktree = layout.worktree_origin()?;
-
-    let mut file = fs::File::open(target.transcript_path)?;
-    let saved = store
-        .harness_ingest_cursor(HARNESS, target.conversation_id)?
-        .map(|cursor| cursor.byte_offset)
-        .unwrap_or(0);
-    // A rewritten or truncated transcript invalidates the cursor; the
-    // deterministic ids make a full re-read harmless.
-    let trusted = if cursor_is_consistent(&mut file, saved, metadata.len())? {
-        saved
-    } else {
-        0
-    };
-    // A rescan reads it all again regardless: the recorded responses are
-    // skipped by id, and the commits they reported are collected again.
-    let offset = if rescan { 0 } else { trusted };
-    file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = Vec::new();
-    file.by_ref()
-        .take(MAX_READ_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_READ_BYTES {
-        return Err(IngestError::TooLarge);
-    }
-    let transcript_len = offset + bytes.len() as u64;
-
-    let window = transcript::parse_window(
-        &bytes,
-        offset,
-        target.file_session,
-        target.include_sidechain,
-    )?;
-    let path_aliases = path_aliases(&window.lines, &worktree_root);
-    let plan = transcript::plan(
-        &window.lines,
-        offset,
-        &PlanInput {
-            session_id: target.conversation_id,
-            worktree_root: &worktree_root,
-            path_aliases: &path_aliases,
-            final_mode: mode == IngestMode::Final,
-            subagent: target.include_sidechain,
-        },
-    );
-
-    let existing = store.get_conversation(target.conversation_id)?;
-    let title = target
-        .title_override
-        .clone()
-        .or_else(|| {
-            plan.title
-                .as_deref()
-                .and_then(|title| fields::captured_title(title, policy))
-        })
-        .or_else(|| {
-            existing
-                .as_ref()
-                .map(|conversation| conversation.title.clone())
-                .filter(|title| !title.trim().is_empty())
-        })
-        .or_else(|| {
-            plan.first_human_prompt
-                .as_deref()
-                .and_then(|prompt| derive_title(prompt, policy))
-        })
-        .unwrap_or_else(|| DEFAULT_TITLE.to_owned());
-    let created_at = existing
-        .as_ref()
-        .map(|conversation| conversation.created_at)
-        .or_else(|| plan.interactions.first().map(|planned| planned.timestamp))
-        .unwrap_or_else(Utc::now);
-    let conversation = Conversation {
-        id: target.conversation_id.to_owned(),
-        title,
-        created_at,
-    };
-
-    let mut captures = Vec::new();
-    let mut batch_ids: HashSet<InteractionId> = HashSet::new();
-    let mut already_present = 0usize;
-    let mut unrecorded_blocks = 0usize;
-    let mut unrecorded_block_types: BTreeSet<String> = BTreeSet::new();
-    let mut omitted_tool_calls = 0usize;
-    let mut omitted_context_items = 0usize;
-    let mut commit_bearing: Vec<links::CommitBearingResponse> = Vec::new();
-    for planned in plan.interactions {
-        if !planned.commit_candidates.is_empty() {
-            commit_bearing.push(links::CommitBearingResponse {
-                interaction_id: planned.id.clone(),
-                timestamp: planned.timestamp,
-                candidates: planned.commit_candidates.clone(),
-            });
-        }
-        if store.interaction_exists(&planned.id)? {
-            already_present += 1;
-            continue;
-        }
-        unrecorded_blocks += planned.unrecorded_blocks.len();
-        unrecorded_block_types.extend(planned.unrecorded_blocks.iter().cloned());
-        // Scrubbed part by part with this capture's policy, then bounded and
-        // marked: see `crate::stimulus`.
-        let user_prompt = planned.user_prompt(policy);
-        // A parent outside this batch and outside the store (suppressed, or
-        // never recorded) breaks the chain rather than failing the batch.
-        let parent_id = match planned.parent_id {
-            Some(parent) if batch_ids.contains(&parent) || store.interaction_exists(&parent)? => {
-                Some(parent)
-            }
-            _ => None,
-        };
-        // The model's text, its reasoning and the tool arguments are scrubbed
-        // in full here, with the capture's policy, and only then bounded; one
-        // the scrubber cannot process is recorded as a note instead of failing
-        // the batch and holding the cursor back: see `fields`.
-        let model_cot = planned
-            .model_cot
-            .map(|text| fields::captured_text(text, policy));
-        let model_response = planned
-            .model_response
-            .map(|text| fields::captured_text(text, policy));
-        // The same for the paths and the calls, which are also capped at what the
-        // capture boundary takes (a response with more would otherwise keep the
-        // cursor from moving): see `fields`.
-        let (context_items, left_out_context_items) =
-            fields::captured_context_items(planned.context_items, policy);
-        let (tool_executions, left_out_tool_calls) = fields::captured_tool_executions(
-            planned.tool_executions,
-            left_out_context_items,
-            &planned.id,
-            policy,
-        );
-        omitted_tool_calls += left_out_tool_calls;
-        omitted_context_items += left_out_context_items;
-        let interaction = Interaction {
-            id: planned.id.clone(),
-            conversation_id: target.conversation_id.to_owned(),
-            parent_id,
-            timestamp: planned.timestamp,
-            author: planned.author,
-            user_prompt,
-            model_name: planned.model_name,
-            model_cot,
-            model_response,
-            source_request_id: Some(planned.response_key),
-        };
-        batch_ids.insert(planned.id);
-        captures.push(ClaudeCodeCapture::new(
-            conversation.clone(),
-            interaction,
-            context_items,
-            tool_executions,
-            policy.clone(),
-            capture_worktree.clone(),
-        ));
-    }
-
-    // A rescan reads from the start, so the plan may end earlier than where an
-    // earlier run (a final one, say, after an incremental rescan) left the
-    // cursor; it is never moved back, because everything before it is recorded.
-    let cursor_offset = if rescan {
-        plan.cursor_offset.max(trusted)
-    } else {
-        plan.cursor_offset
-    };
-    let outcome = store.capture_claude_code_batch(
-        captures,
-        HarnessCursorUpdate {
-            harness: HARNESS,
-            session_id: target.conversation_id,
-            transcript_path: &target.transcript_path.to_string_lossy(),
-            byte_offset: cursor_offset,
-        },
-    )?;
-
-    Ok(Ingested {
-        report: IngestReport {
-            session_id: target.conversation_id.to_owned(),
-            inserted: outcome.inserted,
-            already_present: already_present + outcome.suppressed,
-            pending_responses: plan.pending_responses,
-            linked_from_commits: 0,
-            cursor: cursor_offset,
-            transcript_len,
-            subagent_sessions: 0,
-            subagent_inserted: 0,
-            subagent_linked: 0,
-            unrecorded_blocks,
-            unrecorded_block_types: unrecorded_block_types.into_iter().collect(),
-            withheld: outcome.withheld,
-            lost: outcome.lost,
-            withheld_reasons: outcome.reasons,
-            omitted_tool_calls,
-            omitted_context_items,
-        },
-        commit_bearing,
-    })
-}
-
-/// A subagent transcript discovered beside the main session file.
-struct Subagent {
-    path: PathBuf,
-    /// The file stem, e.g. `agent-a0bd78e0`, used to form the conversation id.
-    agent_stem: String,
-    /// Title from the sibling `.meta.json`, if present.
-    title: Option<String>,
-}
-
-/// Finds `<session>/subagents/agent-*.jsonl` beside `<session>.jsonl`. A missing
-/// directory yields nothing; symlinks and non-files are ignored.
-fn discover_subagents(
-    transcript_path: &Path,
-    policy: &PreparedPolicy,
-) -> Result<Vec<Subagent>, IngestError> {
-    let directory = transcript_path.with_extension("").join("subagents");
-    let entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut subagents = Vec::new();
-    for entry in entries {
-        let path = entry?.path();
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
-            || !stem.starts_with("agent-")
-        {
-            continue;
-        }
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            continue;
-        }
-        let title = subagent_title(&path.with_extension("meta.json"), policy);
-        subagents.push(Subagent {
-            path: path.clone(),
-            agent_stem: stem.to_owned(),
-            title,
-        });
-    }
-    // Deterministic order so cursors and logs are stable.
-    subagents.sort_by(|a, b| a.agent_stem.cmp(&b.agent_stem));
-    Ok(subagents)
-}
-
-/// A short title from a subagent's `.meta.json` (`agentType`: `description`).
-fn subagent_title(meta_path: &Path, policy: &PreparedPolicy) -> Option<String> {
-    let text = fs::read_to_string(meta_path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let agent_type = value.get("agentType").and_then(|v| v.as_str());
-    let description = value.get("description").and_then(|v| v.as_str());
-    let combined = match (agent_type, description) {
-        (Some(kind), Some(desc)) if !desc.trim().is_empty() => format!("{kind}: {desc}"),
-        (Some(kind), _) => format!("subagent ({kind})"),
-        (None, Some(desc)) if !desc.trim().is_empty() => desc.to_owned(),
-        _ => return None,
-    };
-    derive_title(&combined, policy)
-}
-
-/// The stored cursor is trusted only when it still lands on a line boundary
-/// of the current file.
-fn cursor_is_consistent(file: &mut fs::File, offset: u64, len: u64) -> std::io::Result<bool> {
-    if offset == 0 {
-        return Ok(true);
-    }
-    if offset > len {
-        return Ok(false);
-    }
-    file.seek(SeekFrom::Start(offset - 1))?;
-    let mut previous = [0u8; 1];
-    file.read_exact(&mut previous)?;
-    Ok(previous[0] == b'\n')
-}
-
-/// Transcript `cwd` spellings that resolve inside the worktree, so tool paths
-/// written through a symlinked or non-canonical checkout path still attribute.
-fn path_aliases(lines: &[ParsedLine], worktree_root: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let mut seen = BTreeSet::new();
-    let mut aliases = Vec::new();
-    for line in lines {
-        let ParsedLine::Entry(entry) = line else {
-            continue;
-        };
-        let Some(cwd) = entry.cwd.as_deref() else {
-            continue;
-        };
-        if !seen.insert(cwd.to_owned()) {
-            continue;
-        }
-        let spelled = PathBuf::from(cwd);
-        if spelled == worktree_root {
-            continue;
-        }
-        if let Ok(canonical) = fs::canonicalize(&spelled) {
-            if canonical.starts_with(worktree_root) {
-                aliases.push((spelled, canonical));
-            }
-        }
-    }
-    aliases
-}
-
-/// A title from the first non-blank line of `prompt`. The line is scrubbed in
-/// full before it is cut, so a secret is redacted whole rather than cut in
-/// half; a line that cannot be scrubbed yields no title.
-fn derive_title(prompt: &str, policy: &PreparedPolicy) -> Option<String> {
-    let line = prompt.lines().find(|line| !line.trim().is_empty())?.trim();
-    let line = policy.scrub(line).ok()?;
-    if line.len() <= MAX_DERIVED_TITLE_BYTES {
-        return Some(line);
-    }
-    let end = stimulus::head_len(&line, MAX_DERIVED_TITLE_BYTES);
-    Some(format!("{}…", &line[..end]))
-}
-
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
+    use crate::harness::lock::FamilyLock;
+    use crate::harness::HarnessId;
+    use crate::models::InteractionId;
     use git2::Repository;
     use std::time::Instant;
     use tempfile::TempDir;
+
+    const HARNESS: &str = transcript::HARNESS;
 
     const BASIC: &str = include_str!("../../tests/fixtures/claude-code/v2.1.260/basic.jsonl");
     const SESSION: &str = "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60";
@@ -890,10 +501,15 @@ mod tests {
             )
         }
 
-        fn lock(&self, session: &str) -> SessionLock {
-            SessionLock::acquire(&self.layout.cvc_dir(), HARNESS, session, SHORT)
-                .unwrap()
-                .expect("nothing else holds it")
+        fn lock(&self, session: &str) -> FamilyLock {
+            FamilyLock::acquire(
+                &self.layout.cvc_dir(),
+                HarnessId::ClaudeCode.name(),
+                session,
+                SHORT,
+            )
+            .unwrap()
+            .expect("nothing else holds it")
         }
 
         fn cursor(&self) -> Option<u64> {
@@ -978,7 +594,7 @@ mod tests {
         let plan = transcript::plan(
             &window.lines,
             0,
-            &PlanInput {
+            &transcript::PlanInput {
                 session_id: SESSION,
                 worktree_root: root,
                 path_aliases: &[],

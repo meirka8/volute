@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Public issue 71: a session's subagent (Agent tool) transcripts are ingested
 //! as their own conversations alongside the main session, once, with their own
 //! titles from the sibling meta file.

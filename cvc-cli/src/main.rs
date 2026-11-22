@@ -1,11 +1,23 @@
 use anyhow::Result;
+use clap::builder::PossibleValue;
 use clap::{Parser, Subcommand, ValueEnum};
+use cvc_core::harness::HarnessId;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 mod commands;
 mod terminal_text;
 mod tty;
 mod tui;
+
+static STARTED: OnceLock<Instant> = OnceLock::new();
+
+/// When this process started, as far as it can tell: the moment `main` began.
+/// A hook's time budget is measured from here.
+pub(crate) fn started() -> Instant {
+    *STARTED.get_or_init(Instant::now)
+}
 
 #[derive(Parser)]
 #[command(name = "cvc")]
@@ -114,8 +126,10 @@ enum Commands {
     },
     /// Record an agent-harness session transcript as local private capture
     Ingest {
-        #[command(subcommand)]
-        command: IngestCommands,
+        /// The agent harness whose session to record
+        harness: HarnessArg,
+        #[command(flatten)]
+        args: commands::ingest::IngestArgs,
     },
     /// Internal hook commands
     Hook {
@@ -131,10 +145,36 @@ enum Commands {
     Log,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum HarnessKind {
-    /// Claude Code (Anthropic's CLI agent)
-    ClaudeCode,
+/// An agent harness on the command line: every harness CVC knows, by its
+/// name. One this build has no adapter for is accepted here and refused when
+/// the command runs, with a message that says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HarnessArg(HarnessId);
+
+/// [`HarnessId::ALL`], as command-line values.
+const HARNESS_ARGS: [HarnessArg; HarnessId::ALL.len()] = {
+    let mut args = [HarnessArg(HarnessId::ClaudeCode); HarnessId::ALL.len()];
+    let mut index = 0;
+    while index < args.len() {
+        args[index] = HarnessArg(HarnessId::ALL[index]);
+        index += 1;
+    }
+    args
+};
+
+impl ValueEnum for HarnessArg {
+    fn value_variants<'a>() -> &'a [Self] {
+        &HARNESS_ARGS
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        let help = match self.0 {
+            HarnessId::ClaudeCode => "Claude Code (Anthropic's CLI agent)".to_owned(),
+            harness if harness.available() => harness.display().to_owned(),
+            harness => format!("{} (not available in this build)", harness.display()),
+        };
+        Some(PossibleValue::new(self.0.name()).help(help))
+    }
 }
 
 #[derive(Subcommand)]
@@ -146,8 +186,11 @@ enum HarnessCommands {
     /// while this repository's capture acknowledgement stands; existing
     /// worktrees do not. Refuses, and changes nothing, in a checkout whose
     /// .claude/settings.local.json Git tracks or whose .claude is a symlink.
+    ///
+    /// Requires the capture acknowledgement to cover the agent. A harness this
+    /// build cannot capture yet is refused.
     Install {
-        harness: HarnessKind,
+        harness: HarnessArg,
         /// Absolute path of the cvc binary the hooks run (default: this executable, or ~/.cvc/bin/cvc when this is the npm launcher's versioned cache copy and that file is at least as new)
         #[arg(long)]
         binary: Option<PathBuf>,
@@ -156,26 +199,9 @@ enum HarnessCommands {
     ///
     /// Other worktrees keep theirs and keep capturing (they are listed; run
     /// this in each), and the capture acknowledgement is not withdrawn.
-    Uninstall { harness: HarnessKind },
-}
-
-#[derive(Subcommand)]
-enum IngestCommands {
-    /// Ingest a Claude Code JSONL session transcript
-    ClaudeCode {
-        /// Transcript file (~/.claude/projects/<workspace>/<session>.jsonl)
-        #[arg(long, conflicts_with = "hook")]
-        transcript: Option<PathBuf>,
-        /// Session id; defaults to the transcript file name
-        #[arg(long, requires = "transcript")]
-        session: Option<String>,
-        /// Read the hook payload Claude Code delivers on stdin
-        #[arg(long)]
-        hook: bool,
-        /// Read the session and its subagents from the start, ignoring saved cursors: recorded thoughts are kept and commit links are derived again
-        #[arg(long, requires = "transcript", conflicts_with = "hook")]
-        rescan: bool,
-    },
+    Uninstall { harness: HarnessArg },
+    /// Show where an agent's hooks are installed and whether capture covers it here
+    Status { harness: HarnessArg },
 }
 
 #[derive(Subcommand)]
@@ -207,6 +233,7 @@ enum HookCommands {
 }
 
 fn main() -> std::process::ExitCode {
+    started();
     let args: Vec<_> = std::env::args_os().collect();
     let advisory_hook = args.get(1).is_some_and(|arg| arg == "hook");
     let result = (|| -> Result<()> {
@@ -278,22 +305,15 @@ async fn dispatch(cli: Cli) -> Result<()> {
             commands::sync::pull().await?;
         }
         Commands::Harness { command } => match command {
-            HarnessCommands::Install {
-                harness: HarnessKind::ClaudeCode,
-                binary,
-            } => commands::harness::install_claude_code(binary).await?,
-            HarnessCommands::Uninstall {
-                harness: HarnessKind::ClaudeCode,
-            } => commands::harness::uninstall_claude_code().await?,
+            HarnessCommands::Install { harness, binary } => {
+                commands::harness::install(harness.0, binary).await?
+            }
+            HarnessCommands::Uninstall { harness } => {
+                commands::harness::uninstall(harness.0).await?
+            }
+            HarnessCommands::Status { harness } => commands::harness::status(harness.0).await?,
         },
-        Commands::Ingest { command } => match command {
-            IngestCommands::ClaudeCode {
-                transcript,
-                session,
-                hook,
-                rescan,
-            } => commands::ingest::claude_code(transcript, session, hook, rescan).await?,
-        },
+        Commands::Ingest { harness, args } => commands::ingest::run(harness.0, args).await?,
         Commands::Hook { command } => match command {
             HookCommands::PostCommit => {
                 commands::hook::post_commit().await?;
@@ -501,8 +521,9 @@ mod hook_cli_tests {
         }
         let rescan_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
             Commands::Ingest {
-                command: IngestCommands::ClaudeCode { rescan, .. },
-            } => rescan,
+                harness: HarnessArg(HarnessId::ClaudeCode),
+                args,
+            } => args.rescan,
             _ => panic!("not the ingest command: {args:?}"),
         };
         assert!(rescan_of(&[
@@ -520,7 +541,59 @@ mod hook_cli_tests {
             "--transcript",
             "s.jsonl"
         ]));
-        assert!(Cli::try_parse_from(["cvc", "harness", "install", "cursor"]).is_err());
+        // A harness CVC does not know is not a value at all. (One it knows
+        // but this build cannot capture, such as `cursor`, parses: see
+        // `every_known_harness_parses_and_the_grammar_is_the_same_for_each`.)
+        assert!(Cli::try_parse_from(["cvc", "harness", "install", "vim"]).is_err());
+        assert!(Cli::try_parse_from(["cvc", "ingest", "vim", "--hook"]).is_err());
+    }
+
+    /// Every harness CVC knows is a value, so that one this build has no
+    /// adapter for gets a message that says so when the command runs, rather
+    /// than a usage error; the same flags are accepted and refused for each.
+    #[test]
+    fn every_known_harness_parses_and_the_grammar_is_the_same_for_each() {
+        for harness in HarnessId::ALL {
+            let name = harness.name();
+            for args in [
+                vec!["cvc", "harness", "install", name],
+                vec!["cvc", "harness", "uninstall", name],
+                vec!["cvc", "harness", "status", name],
+                vec!["cvc", "ingest", name, "--hook"],
+                vec!["cvc", "ingest", name, "--transcript", "s.jsonl"],
+                vec!["cvc", "ingest", name, "--session", "s"],
+                vec!["cvc", "ingest", name, "--session", "s", "--rescan"],
+                vec!["cvc", "ingest", name, "--scan"],
+                vec!["cvc", "ingest", name, "--scan", "--rescan"],
+            ] {
+                match Cli::try_parse_from(&args) {
+                    Ok(cli) => match cli.command {
+                        Commands::Ingest {
+                            harness: parsed, ..
+                        } => assert_eq!(parsed.0, harness, "{args:?}"),
+                        Commands::Harness {
+                            command:
+                                HarnessCommands::Install {
+                                    harness: parsed, ..
+                                }
+                                | HarnessCommands::Uninstall { harness: parsed }
+                                | HarnessCommands::Status { harness: parsed },
+                        } => assert_eq!(parsed.0, harness, "{args:?}"),
+                        _ => panic!("{args:?}"),
+                    },
+                    Err(error) => panic!("{args:?}: {error}"),
+                }
+            }
+            for args in [
+                vec!["cvc", "ingest", name, "--hook", "--session", "s"],
+                vec!["cvc", "ingest", name, "--hook", "--scan"],
+                vec!["cvc", "ingest", name, "--scan", "--transcript", "s.jsonl"],
+                vec!["cvc", "ingest", name, "--scan", "--session", "s"],
+                vec!["cvc", "ingest", name, "--rescan"],
+            ] {
+                assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+            }
+        }
     }
 
     #[test]

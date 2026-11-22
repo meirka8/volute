@@ -1,7 +1,8 @@
 //! The captured fields that hold what the model or a tool said, other than the
 //! stimulus (which has its own encoding, see [`crate::stimulus`]): the model's
 //! text (`model_response`), its reasoning (`model_cot`), the arguments of a
-//! tool call, and a title taken from the transcript.
+//! tool call, and a title taken from the agent's record. The same for every
+//! harness: [`crate::harness::seal`] applies them.
 //!
 //! The planner hands these over raw. Each is scrubbed here, in full, with the
 //! capture's own policy, and only then bounded, so a size limit never cuts a
@@ -102,16 +103,70 @@ fn bounded(text: String, max: usize) -> String {
 }
 
 /// `text` scrubbed with `policy`, or the note that stands in for it.
-pub(crate) fn scrubbed_text(text: String, policy: &PreparedPolicy) -> String {
-    policy
-        .scrub(&text)
-        .unwrap_or_else(|_| withheld_text(text.len()))
+#[cfg(test)]
+fn scrubbed_text(text: String, policy: &PreparedPolicy) -> String {
+    capture_text_unbounded(text, policy).into_text()
+}
+
+/// A text field as it is captured, and whether it is the text or the note
+/// that stands in for it. The kind is decided here, where the scrub fails,
+/// never by matching the note's words afterwards: a text that happens to read
+/// like a note is still text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CapturedText {
+    /// The text, scrubbed in full with the capture's policy, then bounded.
+    Kept(String),
+    /// The text could not be scrubbed: the note that stands in for it.
+    Withheld(String),
+}
+
+impl CapturedText {
+    #[cfg(test)]
+    fn into_text(self) -> String {
+        match self {
+            CapturedText::Kept(text) | CapturedText::Withheld(text) => text,
+        }
+    }
+}
+
+fn capture_text_unbounded(text: String, policy: &PreparedPolicy) -> CapturedText {
+    match policy.scrub(&text) {
+        Ok(scrubbed) => CapturedText::Kept(scrubbed),
+        Err(_) => CapturedText::Withheld(withheld_text(text.len())),
+    }
 }
 
 /// The model's text or reasoning as it is captured: scrubbed in full, then
 /// bounded.
-pub(crate) fn captured_text(text: String, policy: &PreparedPolicy) -> String {
-    bounded(scrubbed_text(text, policy), MAX_TEXT_BYTES)
+#[cfg(test)]
+fn captured_text(text: String, policy: &PreparedPolicy) -> String {
+    capture_text(text, policy).into_text()
+}
+
+/// [`captured_text`], saying whether the text was kept or withheld.
+pub(crate) fn capture_text(text: String, policy: &PreparedPolicy) -> CapturedText {
+    match capture_text_unbounded(text, policy) {
+        CapturedText::Kept(text) => CapturedText::Kept(bounded(text, MAX_TEXT_BYTES)),
+        // The note is far below the bound.
+        withheld @ CapturedText::Withheld(_) => withheld,
+    }
+}
+
+/// How much of a prompt's first line a title derived from it keeps.
+pub(crate) const MAX_DERIVED_TITLE_BYTES: usize = 80;
+
+/// A title from the first non-blank line of `text` (a prompt, or what a
+/// record says a subagent is for). The line is scrubbed in full before it is
+/// cut, so a secret is redacted whole rather than cut in half; a line that
+/// cannot be scrubbed yields no title.
+pub(crate) fn derived_title(text: &str, policy: &PreparedPolicy) -> Option<String> {
+    let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
+    let line = policy.scrub(line).ok()?;
+    if line.len() <= MAX_DERIVED_TITLE_BYTES {
+        return Some(line);
+    }
+    let end = stimulus::head_len(&line, MAX_DERIVED_TITLE_BYTES);
+    Some(format!("{}…", &line[..end]))
 }
 
 /// A title from the transcript as it is captured, or `None` when it cannot be
@@ -607,6 +662,27 @@ mod tests {
         items.push(item(&"z".repeat(MAX_TEXT + 1), &id));
         let (kept, left_out) = captured_context_items(items, &policy);
         assert_eq!((kept.len(), left_out), (256, 1));
+    }
+
+    #[test]
+    fn the_kind_of_a_captured_text_is_decided_by_the_scrub_not_by_its_words() {
+        let policy = PreparedPolicy::built_ins_only();
+        // Text that reads like the note is text, kept as it is.
+        let lookalike = withheld_text(12);
+        assert_eq!(
+            capture_text(lookalike.clone(), &policy),
+            CapturedText::Kept(lookalike)
+        );
+        let text = noisy();
+        assert_eq!(
+            capture_text(text.clone(), &policy),
+            CapturedText::Withheld(withheld_text(text.len()))
+        );
+        let long = "x".repeat(MAX_TEXT_BYTES + 5);
+        match capture_text(long.clone(), &policy) {
+            CapturedText::Kept(kept) => assert_eq!(kept, captured_text(long, &policy)),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
