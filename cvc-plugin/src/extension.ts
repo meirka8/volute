@@ -68,8 +68,8 @@ function updatePrivacyIndicator(status: PrivacyStatus | undefined): void {
 
 async function showPrivacyNotice(): Promise<void> {
   const choice = await vscode.window.showInformationMessage(
-    "CVC can read this workspace’s local VS Code chat sessions only after you acknowledge capture.",
-    { modal: true, detail: "Captured locally: prompts, responses, exposed reasoning, and tool/context patches. Data is stored in this repository’s Git common directory under cvc/index.db and is private by default. Sharing uses the hidden refs/cvc/main Git ref only after separate remote consent/share. Scrubbing helps detect secrets but cannot guarantee removal; Git sharing can be permanent." },
+    "CVC records this workspace’s VS Code chats, and Claude Code sessions started in this repository, only after you acknowledge capture.",
+    { modal: true, detail: "VS Code: the extension reads the GitHub Copilot chat session files VS Code keeps for this workspace and records each chat request: your prompt, Copilot’s response, the reasoning the chat exposes and the model’s name. It records no tool executions or context items. Claude Code: the acknowledgement also covers Claude Code capture in this repository and all its worktrees, and turns on Claude Code hooks that are already installed (the cvc plugin, or cvc harness install claude-code), which record from their next event. Acknowledging installs nothing. The terminal shows what each records before you type the phrase. Data is stored in this repository’s Git common directory under cvc/index.db and is private by default. Sharing uses the hidden refs/cvc/main Git ref only after separate remote consent/share. Scrubbing helps detect secrets but cannot guarantee removal; Git sharing can be permanent." },
     "Not now",
     "Learn more",
     "Open terminal to acknowledge",

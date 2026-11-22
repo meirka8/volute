@@ -1,0 +1,19 @@
+import { AGENT_LABEL_NOTE, agentLabelTitle, type ConversationAgent } from '../../lib/agentLabel';
+import { BADGE_NEUTRAL } from './styles';
+
+/**
+ * Which agent a conversation came from, read from the prefix of its id (see `agentLabel.ts`). It is the
+ * publisher's claim and not proof, which the title says. Nothing is drawn for an unprefixed id.
+ */
+export function AgentBadge({ agent }: { agent: ConversationAgent | null }) {
+  if (agent === null) return null;
+  return (
+    <>
+      <span className={BADGE_NEUTRAL} title={agentLabelTitle(agent)} data-agent={agent.harness}>
+        {agent.label}
+        {/* The title is a mouse tooltip: the note also reaches screen readers (and the header button's name) as hidden text. */}
+        <span className="sr-only"> ({AGENT_LABEL_NOTE})</span>
+      </span>{' '}
+    </>
+  );
+}

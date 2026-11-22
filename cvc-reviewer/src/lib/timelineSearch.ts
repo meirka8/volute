@@ -52,6 +52,8 @@ import { fold, isWhiteSpaceCode, withSlashes } from './searchFold';
 import { StringTable } from './stringTable';
 import { cutAtCodePoint } from './textLines';
 import { splitOmitted, toolCallPieces, toolTitle, type DrawnPiece } from './toolCalls';
+import { AGENT_LABEL_NOTE, agentOfConversation } from './agentLabel';
+import { reasoningDisplay } from './reasoningView';
 import { getActionLines, getObservation, getThought, showsReasoning } from './triadNode';
 import {
   groupStimulus,
@@ -462,6 +464,13 @@ export function toolCallTexts(exec: { tool_name?: unknown; arguments?: unknown }
   return texts;
 }
 
+/** The reasoning as the card draws it: a verified provider summary without its marker, other text as it is, and nothing for the withheld note. */
+function pushReasoning(node: InteractionNode, texts: string[]): void {
+  if (!hasText(node.model_cot)) return;
+  const shown = reasoningDisplay(node.id, node.model_cot);
+  if (shown.kind !== 'withheld') texts.push(shown.text);
+}
+
 /**
  * Reads one step the way its card draws it. The two layouts draw different things from the same fields (see
  * `nodeLayout`): the transcript layout draws the stimulus in its parts, the reasoning and the response if
@@ -483,7 +492,7 @@ function readStep(node: InteractionNode, parentTools: readonly ParentToolCall[] 
     parts.origin = origin === 'Prompt' ? 'prompt' : origin === 'Tool results' ? 'tool-results' : 'other';
     stimulusViewTexts(view, parts.texts);
     // Text the capture could not scrub is not recorded, and the card says so in its own words instead of drawing it.
-    if (hasText(node.model_cot) && withheldFieldBytes(node.model_cot) === null) parts.texts.push(node.model_cot);
+    pushReasoning(node, parts.texts);
     if (hasText(node.model_response) && !isWithheldResponse(node) && withheldFieldBytes(node.model_response) === null) {
       parts.texts.push(node.model_response);
     }
@@ -494,7 +503,7 @@ function readStep(node: InteractionNode, parentTools: readonly ParentToolCall[] 
     for (const line of getActionLines(node)) if (line.kind === 'tool' && line.args !== '') parts.texts.push(line.args);
     const observation = getObservation(node);
     if (observation.recorded && observation.text !== thought.text) parts.texts.push(observation.text);
-    if (showsReasoning(node)) parts.texts.push(node.model_cot as string);
+    if (showsReasoning(node)) pushReasoning(node, parts.texts);
   }
 
   if (Array.isArray(node.tool_executions)) {
@@ -1045,7 +1054,11 @@ export function conversationNameOf(id: string): string {
     const agent = agentOfSubagent(id);
     return agent === '' ? 'Subagent' : `Subagent ${agent.length > WHOLE_AGENT_ID ? agent.slice(0, SHORT_ID) : agent}`;
   }
-  return id === '' ? 'Unknown session' : `Session ${id.length > WHOLE_SESSION_ID ? id.slice(0, SHORT_ID) : id}`;
+  const agent = agentOfConversation(id);
+  const own = agent === null ? id : agent.rest;
+  const form = own.length > WHOLE_SESSION_ID ? own.slice(0, SHORT_ID) : own;
+  if (agent !== null) return form === '' ? `${agent.label} session` : `${agent.label} session ${form}`;
+  return id === '' ? 'Unknown session' : `Session ${form}`;
 }
 
 /**
@@ -1054,6 +1067,8 @@ export function conversationNameOf(id: string): string {
  * and says nothing of where they came from.
  *
  * - `<session>:agent-<agent>` is "Subagent <agent>", with the session it belongs to as its note ("of session <session>");
+ * - `<harness>:<id>` (codex, opencode, cursor, antigravity, claude-code: see `agentLabel.ts`) is "<Agent> session <id>", with
+ *   the note that the agent is as the publisher recorded it; a subagent of such an agent is a conversation of its own;
  * - every other conversation is "Session <id>": a Claude Code session, or the conversation of the MCP server, the
  *   editor or `cvc run`, whose ids are their own.
  *
@@ -1067,7 +1082,9 @@ function conversationNames(drafts: readonly ConversationDraft[]): ConversationNa
   const sessionIds: string[] = [];
   const sessionAt: number[] = drafts.map((draft, k) => {
     if (subagent[k]) return sessionIds.push(sessionOfSubagent(draft.id)) - 1;
-    return draft.id === '' ? -1 : sessionIds.push(draft.id) - 1;
+    if (draft.id === '') return -1;
+    // The id of an agent's own conversation (`codex:<id>`) is named by what follows the prefix.
+    return sessionIds.push(agentOfConversation(draft.id)?.rest ?? draft.id) - 1;
   });
   const sessionForms = shortForms(sessionIds, WHOLE_SESSION_ID);
   const agentIds: string[] = [];
@@ -1079,7 +1096,11 @@ function conversationNames(drafts: readonly ConversationDraft[]): ConversationNa
       const agent = agentForms[agentAt[k]];
       return { label: agent === '' ? 'Subagent' : `Subagent ${agent}`, note: `of session ${sessionForms[sessionAt[k]]}` };
     }
-    return { label: draft.id === '' ? 'Unknown session' : `Session ${sessionForms[sessionAt[k]]}` };
+    if (draft.id === '') return { label: 'Unknown session' };
+    const agent = agentOfConversation(draft.id);
+    if (agent === null) return { label: `Session ${sessionForms[sessionAt[k]]}` };
+    const form = sessionForms[sessionAt[k]];
+    return { label: form === '' ? `${agent.label} session` : `${agent.label} session ${form}`, note: `agent ${AGENT_LABEL_NOTE}` };
   });
   return numbered(names);
 }

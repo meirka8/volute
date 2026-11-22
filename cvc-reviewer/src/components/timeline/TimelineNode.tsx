@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   User,
@@ -10,12 +10,15 @@ import {
   GitCommit
 } from 'lucide-react';
 import { clsx } from 'clsx';
+import { agentOfConversation } from '../../lib/agentLabel';
 import { formatTimestamp } from '../../lib/formatTimestamp';
 import { hiddenAsText } from '../../lib/hiddenChars';
+import { reasoningDisplay } from '../../lib/reasoningView';
 import { toolTitle } from '../../lib/toolCalls';
 import { actionLineText, getActionLines, getObservation, getThought, hasContent, showsReasoning, type ActionLine } from '../../lib/triadNode';
 import { nodeLayout, type ParentToolCall } from '../../lib/transcriptNode';
 import type { InteractionNode } from '../../types/cvc';
+import { AgentBadge } from './AgentBadge';
 import { CardHeader, type CardSelection } from './CardHeader';
 import { HiddenCharsNotice, HiddenCharsScope, HiddenText } from './HiddenText';
 import { usePersistentToggle } from './nodeUiState';
@@ -160,6 +163,16 @@ function TriadNodeBody({ interaction, selection }: { interaction: InteractionNod
   const [isObservationTruncated, setIsObservationTruncated] = useState(false);
 
   const hasReasoning = hasContent(interaction.model_cot);
+  // A provider's summary (a marker that verifies against this node's id says so) is shown without the marker and
+  // under its own label; text that is not marked keeps "Decision Factors".
+  const reasoning = useMemo(() => (hasReasoning ? reasoningDisplay(interaction.id, interaction.model_cot as string) : null), [hasReasoning, interaction.id, interaction.model_cot]);
+  const reasoningText =
+    reasoning === null
+      ? 'No recorded decision factors for this AI step.'
+      : reasoning.kind === 'withheld'
+        ? `Withheld: ${reasoning.bytes.toLocaleString('en-US')} bytes could not be scrubbed.`
+        : reasoning.text;
+  const reasoningLabel = reasoning === null || reasoning.kind === 'exposed' ? 'Decision Factors' : reasoning.label;
   const showWhyButton = showsReasoning(interaction);
   const { text: thoughtText, recorded: thoughtRecorded } = getThought(interaction);
   const { text: observationText, recorded: observationRecorded } = getObservation(interaction);
@@ -168,7 +181,7 @@ function TriadNodeBody({ interaction, selection }: { interaction: InteractionNod
   // While the timeline is searched: what each fold that is shut holds, said on its control.
   const thoughtMatches = useMatchCount(thoughtText, thoughtRecorded && !isThoughtExpanded && isThoughtTruncated);
   const observationMatches = useMatchCount(observationText, observationRecorded && !isObservationExpanded && isObservationTruncated);
-  const reasoningMatches = useMatchCount(interaction.model_cot ?? '', showWhyButton && !isReasoningExpanded);
+  const reasoningMatches = useMatchCount(reasoning === null ? '' : reasoningText, showWhyButton && !isReasoningExpanded);
 
   const thoughtRef = useCallback((node: HTMLParagraphElement | null) => {
     setThoughtElement(node);
@@ -226,6 +239,7 @@ function TriadNodeBody({ interaction, selection }: { interaction: InteractionNod
         speaker={getAuthorLabel(interaction.author)}
         badges={
           <>
+            <AgentBadge agent={agentOfConversation(interaction.conversation_id)} />
             <span className={clsx('rounded-full px-2.5 py-1 text-[11px] font-medium', signal.className)}>{signal.label}</span>{' '}
           </>
         }
@@ -321,11 +335,11 @@ function TriadNodeBody({ interaction, selection }: { interaction: InteractionNod
               >
                 <div className="rr-thought mt-3 rounded-[1.25rem] p-3">
                   <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-action">
-                    Decision Factors
+                    {reasoningLabel}
                   </div>
                   <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-muted">
                     <HiddenText
-                      text={hasReasoning ? interaction.model_cot! : 'No recorded decision factors for this AI step.'}
+                      text={reasoningText}
                       mode="prose"
                     />
                   </pre>
