@@ -3,10 +3,10 @@ import { useAuth } from '../auth/AuthContext';
 import { ThemeToggle } from '../components/ui/ThemeToggle';
 
 export function Paywall() {
-    const { isHostedMode } = useAuth();
-    // Assuming platform URL is where billing settings live
-    const platformUrl = import.meta.env.VITE_PLATFORM_API_URL || 'https://app.cvc.dev';
-    const upgradeUrl = `${platformUrl}/dashboard/billing`;
+    const { isHostedMode, hostedConfig } = useAuth();
+    // Billing and seats live on the platform. A build that does not say where its platform is links nowhere
+    // rather than to a guessed address (lib/hostedConfig.ts).
+    const upgradeUrl = hostedConfig.mode === 'hosted' ? `${hostedConfig.platformBase}/dashboard/billing` : null;
 
     return (
         <div className="relative flex min-h-screen flex-col items-center justify-center p-4 text-ink">
@@ -37,13 +37,15 @@ export function Paywall() {
                             </div>
                         </div>
 
-                        <a 
-                            href={upgradeUrl}
-                            className="rr-action-button group flex w-full items-center justify-between rounded-full px-4 py-3 text-sm font-medium transition-opacity hover:opacity-90"
-                        >
-                            <span>Manage Billing & Seats</span>
-                            <ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
-                        </a>
+                        {upgradeUrl !== null && (
+                            <a
+                                href={upgradeUrl}
+                                className="rr-action-button group flex w-full items-center justify-between rounded-full px-4 py-3 text-sm font-medium transition-opacity hover:opacity-90"
+                            >
+                                <span>Manage Billing & Seats</span>
+                                <ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+                            </a>
+                        )}
                     </div>
                     
                     <div className="border-t border-line/80 bg-surface/40 p-4">

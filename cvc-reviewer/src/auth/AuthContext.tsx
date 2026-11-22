@@ -4,12 +4,16 @@ import { useQueryClient } from '@tanstack/react-query';
 import { StorageService } from './StorageService';
 import { PaymentRequiredError } from './errors';
 import { clearReviewerCaches } from '../lib/cognitiveCache';
+import { readHostedConfig, type HostedConfig } from '../lib/hostedConfig';
 
 // Use strict types for the context
 interface AuthContextType {
     token: string | null;
     isAuthenticated: boolean;
+    /** The build asks for hosted mode (VITE_HOSTED_MODE=true), whether or not it says where its platform is. */
     isHostedMode: boolean;
+    /** Where the platform is, when the build says (see lib/hostedConfig.ts). */
+    hostedConfig: HostedConfig;
     login: (token: string) => Promise<boolean>;
     logout: () => void;
     acquireToken: (owner?: string, repo?: string) => Promise<string>;
@@ -17,10 +21,21 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+/** Why a hosted build that does not say where its platform is cannot get a token. */
+const MISSING_PLATFORM_MESSAGE =
+    "Hosted mode is on (VITE_HOSTED_MODE=true), but VITE_PLATFORM_API_URL is missing or is not an http(s) URL, so there is no platform to get a token from.";
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
     const queryClient = useQueryClient();
-    const isHostedMode = import.meta.env.VITE_HOSTED_MODE === 'true';
-    const platformUrl = import.meta.env.VITE_PLATFORM_API_URL || 'https://app.cvc.dev';
+    // Each variable is named: `import.meta.env` as a whole would put every VITE_ variable of the build into the bundle.
+    const hostedConfig = readHostedConfig({
+        VITE_HOSTED_MODE: import.meta.env.VITE_HOSTED_MODE,
+        VITE_PLATFORM_API_URL: import.meta.env.VITE_PLATFORM_API_URL,
+    });
+    // A hosted build that does not say where its platform is stays a hosted build: it takes no PAT, and it calls no
+    // platform (App shows it a configuration error instead).
+    const isHostedMode = hostedConfig.mode !== 'local';
+    const platformBase = hostedConfig.mode === 'hosted' ? hostedConfig.platformBase : null;
 
     // Initialize from StorageService for local mode
     const [token, setToken] = useState<string | null>(() => {
@@ -54,6 +69,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             return currentToken;
         }
 
+        if (platformBase === null) {
+            // No platform address is guessed (lib/hostedConfig.ts), so no request leaves for one.
+            throw new Error(MISSING_PLATFORM_MESSAGE);
+        }
+
         if (!owner || !repo) {
             throw new Error("Owner and repo are required to acquire a scoped token in Hosted Mode.");
         }
@@ -74,7 +94,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         const fetchToken = async (): Promise<string> => {
             try {
-                const response = await fetch(`${platformUrl}/api/platform/vend-token`, {
+                const response = await fetch(`${platformBase}/api/platform/vend-token`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     credentials: 'include',
@@ -82,7 +102,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                 });
 
                 if (response.status === 401) {
-                    window.location.href = `${platformUrl}/login`;
+                    window.location.href = `${platformBase}/login`;
                     throw new Error("Unauthorized");
                 }
 
@@ -179,8 +199,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // be interrupted, whereas browser-resident cognitive data must be removed.
         void clearReviewerCaches(queryClient);
         if (isHostedMode) {
-            // In hosted mode, log out via the platform
-            window.location.href = `${platformUrl}/logout`; // Or platform specific route
+            // In hosted mode, log out via the platform. A build that does not say where its platform is has no
+            // platform session to end, and guesses no address to go to (lib/hostedConfig.ts).
+            if (platformBase !== null) {
+                window.location.href = `${platformBase}/logout`;
+            }
             return;
         }
         setToken(null);
@@ -192,7 +215,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
 
     return (
-        <AuthContext.Provider value={{ token, isAuthenticated, isHostedMode, login, logout, acquireToken }}>
+        <AuthContext.Provider value={{ token, isAuthenticated, isHostedMode, hostedConfig, login, logout, acquireToken }}>
             {children}
         </AuthContext.Provider>
     );
