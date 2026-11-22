@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Characterisation goldens for Claude Code capture (public issue 187).
 //!
 //! #187 generalises the Claude Code harness adapter so that other agents can be

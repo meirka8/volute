@@ -11,11 +11,12 @@
 
 use chrono::{TimeZone, Utc};
 use cvc_core::db::{ConversationDetails, ConversationSummary, UnshareCheck};
+use cvc_core::harness::HarnessId;
 use cvc_core::models::FutureSharePolicy;
 use cvc_core::privacy::CaptureAcknowledgement;
 
 use super::text::{self, Glyphs};
-use crate::commands::conversations::RemoteOverview;
+use crate::commands::conversations::{agent_label, RemoteOverview};
 use crate::commands::failure::FlowFailure;
 use crate::commands::sync::PublishOutcome;
 
@@ -1573,8 +1574,10 @@ pub enum Lineage {
     None,
     /// An agent listed under this parent (its sanitized title).
     AgentOf(String),
-    /// An agent whose parent is not in the list.
-    OrphanAgent,
+    /// An agent that is not listed under its parent (its parent is not in the
+    /// list, or is itself listed under another), with the parent's sanitized
+    /// id. It may have agents of its own.
+    OrphanAgent(String),
 }
 
 /// What the details of one conversation are built from.
@@ -1588,6 +1591,17 @@ pub struct DetailsInput<'a> {
     pub agents: usize,
     /// The selected remote, when it can be a destination.
     pub remote: Option<&'a RemoteOverview>,
+    /// The harness whose hook run left this session unread to the end, when
+    /// one did.
+    pub backlog: Option<HarnessId>,
+}
+
+/// What a backlog means, and where the catch-up command is.
+fn backlog_words(harness: HarnessId) -> String {
+    format!(
+        "A hook run left this session unread to the end. For the catch-up command, run `{}`.",
+        crate::commands::conversations::backlog_hint(harness)
+    )
 }
 
 /// `Share covers 29 thoughts: 27 already shared, 2 new`, and its other forms.
@@ -1643,8 +1657,8 @@ pub fn details_page(input: &DetailsInput, g: &Glyphs) -> Vec<Page> {
             Some(format!("Subagent of \"{parent}\", imported from a remote"))
         }
         (Lineage::AgentOf(parent), false) => Some(format!("Subagent of \"{parent}\"")),
-        (Lineage::OrphanAgent, imported) => Some(format!(
-            "Subagent{}. Parent session is not captured on this machine.",
+        (Lineage::OrphanAgent(parent), imported) => Some(format!(
+            "Subagent of {parent}{}, listed on its own",
             if imported {
                 ", imported from a remote"
             } else {
@@ -1658,6 +1672,18 @@ pub fn details_page(input: &DetailsInput, g: &Glyphs) -> Vec<Page> {
         page.push(Page::Field {
             label: "Kind",
             value: lineage,
+        });
+    }
+    if let Some(agent) = agent_label(summary) {
+        page.push(Page::Field {
+            label: "Recorded by",
+            value: agent,
+        });
+    }
+    if let Some(harness) = input.backlog {
+        page.push(Page::Field {
+            label: "Backlog",
+            value: backlog_words(harness),
         });
     }
     page.push(Page::Field {
@@ -1765,13 +1791,17 @@ pub fn strip_lines(input: &DetailsInput, g: &Glyphs) -> Vec<String> {
     } else {
         format!("{} linked to commits", summary.linked)
     };
+    let counts = format!(
+        "{}, {linked}, {}",
+        thoughts(summary.thoughts),
+        activity(summary.first_activity, summary.last_activity, g)
+    );
     let mut lines = vec![
         text::title(&summary.title),
-        format!(
-            "{}, {linked}, {}",
-            thoughts(summary.thoughts),
-            activity(summary.first_activity, summary.last_activity, g)
-        ),
+        match agent_label(summary) {
+            Some(agent) => format!("{agent}: {counts}"),
+            None => counts,
+        },
     ];
     if input.remote.is_some() && !summary.imported {
         if let Some(details) = input.details {
@@ -1806,10 +1836,13 @@ pub fn strip_lines(input: &DetailsInput, g: &Glyphs) -> Vec<String> {
             ));
         }
     }
+    if let Some(harness) = input.backlog {
+        lines.push(backlog_words(harness));
+    }
     match (&input.lineage, summary.imported) {
         (Lineage::AgentOf(parent), _) => lines.push(format!("Subagent of \"{parent}\".")),
-        (Lineage::OrphanAgent, _) => {
-            lines.push("Parent session is not captured on this machine.".to_owned());
+        (Lineage::OrphanAgent(parent), _) => {
+            lines.push(format!("Subagent of {parent}, listed on its own."));
         }
         (Lineage::None, true) => lines.push(IMPORTED_IS_READ_ONLY.to_owned()),
         (Lineage::None, false) => {}
@@ -3648,6 +3681,7 @@ mod tests {
                     lineage: Lineage::None,
                     agents,
                     remote: None,
+                    backlog: None,
                 },
                 &U,
             );
@@ -3684,6 +3718,7 @@ mod tests {
                     lineage: Lineage::None,
                     agents: 0,
                     remote: Some(&remote),
+                    backlog: None,
                 },
                 &U,
             );
@@ -3715,6 +3750,7 @@ mod tests {
                 lineage: Lineage::None,
                 agents: 2,
                 remote: Some(&remote),
+                backlog: None,
             },
             &U,
         );
@@ -3760,6 +3796,7 @@ mod tests {
                     lineage,
                     agents: 0,
                     remote: None,
+                    backlog: None,
                 },
                 &U,
             );
@@ -3777,8 +3814,8 @@ mod tests {
             Some("Kind: Subagent of \"Refactor\"")
         );
         assert_eq!(
-            kind(Lineage::OrphanAgent, false).as_deref(),
-            Some("Kind: Subagent. Parent session is not captured on this machine.")
+            kind(Lineage::OrphanAgent("s-1".to_owned()), false).as_deref(),
+            Some("Kind: Subagent of s-1, listed on its own")
         );
     }
 
@@ -3807,6 +3844,7 @@ mod tests {
                 lineage: Lineage::None,
                 agents: 0,
                 remote: Some(&remote),
+                backlog: None,
             },
             &U,
         );
@@ -3832,6 +3870,7 @@ mod tests {
                 lineage: Lineage::AgentOf(text::sanitize("par\u{1b}ent")),
                 agents: 0,
                 remote: None,
+                backlog: None,
             },
             &U,
         );
@@ -3857,6 +3896,7 @@ mod tests {
                 lineage: Lineage::None,
                 agents: 0,
                 remote: Some(&remote),
+                backlog: None,
             },
             &U,
         );
@@ -3879,17 +3919,15 @@ mod tests {
             &DetailsInput {
                 summary: &summary,
                 details: Some(&details),
-                lineage: Lineage::OrphanAgent,
+                lineage: Lineage::OrphanAgent("s-1".to_owned()),
                 agents: 0,
                 remote: None,
+                backlog: None,
             },
             &U,
         );
         assert_eq!(without.len(), 3);
-        assert_eq!(
-            without[2],
-            "Parent session is not captured on this machine."
-        );
+        assert_eq!(without[2], "Subagent of s-1, listed on its own.");
         summary.imported = true;
         let remote = overview("origin");
         let imported = strip_lines(
@@ -3899,6 +3937,7 @@ mod tests {
                 lineage: Lineage::None,
                 agents: 0,
                 remote: Some(&remote),
+                backlog: None,
             },
             &U,
         );

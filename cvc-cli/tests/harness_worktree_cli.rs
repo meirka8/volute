@@ -216,6 +216,7 @@ impl Fixture {
             .env("CVC_CALL_LOG", &self.calls)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", self.home.join("empty.gitconfig"))
+            .envs(NO_BACKGROUND_MAINTENANCE)
             .env("GIT_TEMPLATE_DIR", self.home.join("templates"))
             .stdin(Stdio::null());
         for (name, value) in exported {
@@ -315,6 +316,7 @@ impl Fixture {
                 .env("PATH", &self.git_only)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", self.home.join("empty.gitconfig"))
+                .envs(NO_BACKGROUND_MAINTENANCE)
                 .env("GIT_INDEX_FILE", &index)
                 .env("GIT_AUTHOR_NAME", "QA")
                 .env("GIT_AUTHOR_EMAIL", "qa@example.invalid")
@@ -723,6 +725,7 @@ fn the_hook_runs_the_recorded_binary_whatever_is_on_path_or_home() {
         .env("CVC_CALL_LOG", &fixture.calls)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", fixture.home.join("empty.gitconfig"))
+        .envs(NO_BACKGROUND_MAINTENANCE)
         .env("GIT_TEMPLATE_DIR", fixture.home.join("templates"))
         .output()
         .unwrap();
@@ -1060,6 +1063,7 @@ fn real_git_keeps_the_status_of_a_users_hook_and_runs_under_set_u_without_home()
             .env("PATH", &fixture.git_only)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", fixture.home.join("empty.gitconfig"))
+            .envs(NO_BACKGROUND_MAINTENANCE)
             .env("GIT_TEMPLATE_DIR", fixture.home.join("templates"))
             .output()
             .unwrap();
@@ -3083,3 +3087,18 @@ fn leaving_an_orphan_branch_does_not_install_hooks_in_an_existing_linked_worktre
     assert!(!run.all().contains("CVC"), "{}", run.all());
     assert!(!wt.join(SETTINGS).exists());
 }
+
+/// Git's automatic background maintenance, which `git commit` and other
+/// commands start detached, keeps writing under `.git` (a
+/// `maintenance.lock`, packs) after the command has returned, and races with
+/// tests that compare a repository's state (#217). Every `git` these tests
+/// run, and every process it starts, gets it turned off: `maintenance.auto`
+/// for the `git maintenance` Git runs, `gc.auto` for its `gc` task.
+/// `GIT_CONFIG_COUNT` needs Git 2.31 or later.
+const NO_BACKGROUND_MAINTENANCE: [(&str, &str); 5] = [
+    ("GIT_CONFIG_COUNT", "2"),
+    ("GIT_CONFIG_KEY_0", "maintenance.auto"),
+    ("GIT_CONFIG_VALUE_0", "false"),
+    ("GIT_CONFIG_KEY_1", "gc.auto"),
+    ("GIT_CONFIG_VALUE_1", "0"),
+];

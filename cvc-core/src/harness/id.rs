@@ -135,6 +135,22 @@ impl HarnessId {
         PassiveChannel::Harness(self)
     }
 
+    /// What a hook of this harness must print on stdout when cvc refuses it
+    /// before any adapter runs (this build has none for the harness): `{}`
+    /// for the agents that treat anything else as a failed hook (Cursor,
+    /// Antigravity), nothing for the others. An adapter's own
+    /// [`HookCaller::contract`](crate::harness::adapter::HookCaller::contract)
+    /// for an event with no name agrees with it.
+    pub const fn hook_contract(self) -> crate::harness::adapter::OutputContract {
+        use crate::harness::adapter::OutputContract;
+        match self {
+            HarnessId::Cursor | HarnessId::Antigravity => OutputContract::EmptyObject,
+            HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::OpenCode => {
+                OutputContract::Silent
+            }
+        }
+    }
+
     /// The harness named `name` ([`HarnessId::name`]), exactly.
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|h| h.name() == name)
@@ -335,10 +351,10 @@ impl PassiveChannel {
     pub const fn notice(self) -> Option<&'static str> {
         match self {
             PassiveChannel::Vscode => Some(
-                "VS Code: the CVC extension reads the GitHub Copilot chat sessions that VS Code stores for this workspace, and records each turn (prompts, responses, reasoning the chat exposes, tool calls and context file paths) privately in this repository's CVC store.",
+                "VS Code: the CVC extension reads the GitHub Copilot chat session files that VS Code keeps for this workspace, and records each chat request: your prompt, Copilot's response, the reasoning the chat exposes and the model's name.",
             ),
             PassiveChannel::Harness(HarnessId::ClaudeCode) => Some(
-                "Claude Code: CVC's hooks read the Claude Code session transcripts of sessions working in this repository, and record each response (prompts, responses, reasoning the transcript exposes, tool calls and context file paths) privately in this repository's CVC store.",
+                "Claude Code: CVC's hooks, and `cvc ingest claude-code`, read the transcript of each Claude Code session started in this repository, with its subagents' transcripts and their .meta.json descriptions, and record each response: prompts, the tool output Claude read (file contents, command output), responses, the reasoning the transcript exposes, tool calls with their arguments, the paths they touched and the session's title. A session is recorded whole, including its work in other folders and repositories.",
             ),
             PassiveChannel::Harness(
                 HarnessId::Codex | HarnessId::OpenCode | HarnessId::Cursor | HarnessId::Antigravity,

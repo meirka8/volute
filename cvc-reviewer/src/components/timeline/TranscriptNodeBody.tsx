@@ -2,7 +2,9 @@ import { useMemo, type ReactNode } from 'react';
 import { Bot, ExternalLink, User } from 'lucide-react';
 import { clsx } from 'clsx';
 import { usePaged } from '../../hooks/usePaged';
+import { agentOfConversation } from '../../lib/agentLabel';
 import { formatTimestamp } from '../../lib/formatTimestamp';
+import { reasoningDisplay } from '../../lib/reasoningView';
 import { toolCallTexts } from '../../lib/timelineSearch';
 import { describeOmitted, splitOmitted, type OmittedCounts } from '../../lib/toolCalls';
 import {
@@ -16,6 +18,7 @@ import {
   type StimulusOrigin,
 } from '../../lib/transcriptNode';
 import type { InteractionNode, ToolExecution } from '../../types/cvc';
+import { AgentBadge } from './AgentBadge';
 import { CardHeader, type CardSelection } from './CardHeader';
 import { ClampedText } from './ClampedText';
 import { HiddenCharsNotice, HiddenText } from './HiddenText';
@@ -71,6 +74,7 @@ function TranscriptHeader({ interaction, origin, failedTools, selection }: Heade
       speaker={headerLabel(interaction.author)}
       badges={
         <>
+          <AgentBadge agent={agentOfConversation(interaction.conversation_id)} />
           <span className={BADGE_NEUTRAL}>{origin}</span>{' '}
           {failedTools > 0 && (
             <>
@@ -101,6 +105,7 @@ function TextPane({
   labelClass,
   text,
   note,
+  verbatim = false,
   lines,
   textClass,
 }: {
@@ -108,10 +113,12 @@ function TextPane({
   labelClass: string;
   text: string;
   note?: string;
+  /** The text is shown as it is, even when it reads like the capture's withheld note (a verified summary's body). */
+  verbatim?: boolean;
   lines: 3 | 4 | 6;
   textClass: string;
 }) {
-  const withheld = withheldFieldBytes(text);
+  const withheld = verbatim ? null : withheldFieldBytes(text);
   const said = note ?? (withheld === null ? null : `Withheld: ${withheld.toLocaleString('en-US')} bytes could not be scrubbed.`);
   return (
     <div className="rr-thought min-w-0 rounded-[1.25rem] p-4">
@@ -196,6 +203,10 @@ export function TranscriptNodeBody({ interaction, parentToolNames = null, select
   const { calls: tools, omitted } = useMemo(() => splitOmitted(Array.isArray(executions) ? executions : []), [executions]);
   // A step the capture had to withhold whole is recorded with its stimulus and a note in place of the response.
   const withheldResponse = isWithheldResponse(interaction);
+  // What the reasoning is: a provider's summary when a marker that verifies against this node's id says so (shown
+  // without the marker), "Withheld" when the capture recorded only the note, and otherwise the text as it is.
+  const cot = interaction.model_cot;
+  const reasoning = useMemo(() => (hasText(cot) ? reasoningDisplay(id, cot) : null), [id, cot]);
 
   return (
     <>
@@ -206,12 +217,13 @@ export function TranscriptNodeBody({ interaction, parentToolNames = null, select
         <Section name="stimulus">
           <StimulusPane view={view} origin={origin} author={author} />
         </Section>
-        {hasText(interaction.model_cot) && (
+        {reasoning !== null && (
           <Section name="reasoning">
             <TextPane
-              label="Reasoning"
+              label={reasoning.label}
               labelClass="text-muted"
-              text={interaction.model_cot}
+              text={reasoning.kind === 'withheld' ? (cot as string) : reasoning.text}
+              verbatim={reasoning.kind === 'provider_summary'}
               lines={4}
               textClass="font-serif text-sm leading-relaxed text-muted"
             />

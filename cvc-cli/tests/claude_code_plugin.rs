@@ -390,6 +390,7 @@ mod scripts {
                 .env("HOME", home)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", home.join("empty.gitconfig"))
+                .envs(NO_BACKGROUND_MAINTENANCE)
                 .env("GIT_TEMPLATE_DIR", home.join("templates"))
                 .env("CLAUDE_PLUGIN_ROOT", root)
                 // The directory the session was started in, which Claude Code
@@ -695,6 +696,7 @@ mod scripts {
             .env("HOME", home)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", home.join("empty.gitconfig"))
+            .envs(NO_BACKGROUND_MAINTENANCE)
             .env("GIT_TEMPLATE_DIR", home.join("templates"))
             .stdin(Stdio::null());
         command
@@ -1140,3 +1142,18 @@ mod scripts {
         assert!(!marker.exists());
     }
 }
+
+/// Git's automatic background maintenance, which `git commit` and other
+/// commands start detached, keeps writing under `.git` (a
+/// `maintenance.lock`, packs) after the command has returned, and races with
+/// tests that compare a repository's state (#217). Every `git` these tests
+/// run, and every process it starts, gets it turned off: `maintenance.auto`
+/// for the `git maintenance` Git runs, `gc.auto` for its `gc` task.
+/// `GIT_CONFIG_COUNT` needs Git 2.31 or later.
+const NO_BACKGROUND_MAINTENANCE: [(&str, &str); 5] = [
+    ("GIT_CONFIG_COUNT", "2"),
+    ("GIT_CONFIG_KEY_0", "maintenance.auto"),
+    ("GIT_CONFIG_VALUE_0", "false"),
+    ("GIT_CONFIG_KEY_1", "gc.auto"),
+    ("GIT_CONFIG_VALUE_1", "0"),
+];

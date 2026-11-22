@@ -2,9 +2,15 @@
 use anyhow::{bail, Context, Result};
 use cvc_core::claude_code::harness_record;
 use cvc_core::claude_code::settings::{self, ExcludeAction, InstallAction, WorktreeState};
-use cvc_core::harness::{HarnessId, PassiveChannel};
+use cvc_core::db::CvcStore;
+use cvc_core::harness::adapter::{
+    HarnessAdapter, HarnessStatus, InstallAction as AdapterInstallAction, InstallContext,
+    InstallScope,
+};
+use cvc_core::harness::engine::Backlog;
+use cvc_core::harness::{with_adapter, AdapterVisitor, HarnessId, PassiveChannel};
 use cvc_core::hooks::{self, HookAction};
-use cvc_core::privacy::{self, CaptureCoverage};
+use cvc_core::privacy::{self, CaptureCoverage, CoverageGrant, CoverageSummary, PrivacyError};
 use cvc_core::repository::RepositoryLayout;
 use std::cmp::Ordering;
 use std::env;
@@ -352,30 +358,101 @@ pub(crate) fn resolve_hook_binary(
     running(BinaryChoice::Running)
 }
 
-pub async fn install_claude_code(binary: Option<PathBuf>) -> Result<()> {
-    let layout = discover_initialized()?;
-    // Hook-driven ingestion is background observation of an agent session, so
-    // it needs the same repository-local acknowledgement as passive VS Code
-    // capture, and installing hooks that would refuse to run is not useful.
-    require_claude_code_capture_covered(&layout)?;
-    // `--binary` overrides everything; only the default is steered away from
-    // the launcher's versioned cache.
-    let (binary, choice) = match binary {
-        Some(binary) => (binary, None),
-        None => {
-            let running = env::current_exe().context(
-                "cannot resolve the running cvc executable; pass --binary <absolute path>",
-            )?;
-            let resolved = resolve_hook_binary(
-                &running,
-                home_dir().as_deref(),
-                env!("CARGO_PKG_VERSION"),
-                probe_version,
-            );
-            (resolved.path, Some(resolved.choice))
+/// `cvc harness install <harness>`.
+pub async fn install(harness: HarnessId, binary: Option<PathBuf>) -> Result<()> {
+    with_adapter(harness, Install { binary }).unwrap_or_else(|| Err(not_available(harness)))
+}
+
+struct Install {
+    binary: Option<PathBuf>,
+}
+
+impl AdapterVisitor for Install {
+    type Output = Result<()>;
+
+    fn visit<A: HarnessAdapter>(self, adapter: &A) -> Result<()> {
+        let layout = discover_initialized()?;
+        // Hook-driven ingestion is background observation of an agent
+        // session, so it needs the same repository-local acknowledgement as
+        // passive VS Code capture, covering this harness's channel, and
+        // installing hooks that would refuse to run is not useful.
+        drop(require_capture_covered(
+            &layout,
+            A::ID,
+            adapter.stop_hint(),
+        )?);
+        // A person runs this and waits for it: the store's one-time upgrade
+        // is finished here, so that the hooks installed can record (a hook
+        // never runs it on a populated store).
+        drop(CvcStore::open_initialized_upgrading(layout.db_path())?);
+        // `--binary` overrides everything; only the default is steered away
+        // from the launcher's versioned cache.
+        let (binary, choice) = match self.binary {
+            Some(binary) => (binary, None),
+            None => {
+                let running = env::current_exe().context(
+                    "cannot resolve the running cvc executable; pass --binary <absolute path>",
+                )?;
+                let resolved = resolve_hook_binary(
+                    &running,
+                    home_dir().as_deref(),
+                    env!("CARGO_PKG_VERSION"),
+                    probe_version,
+                );
+                (resolved.path, Some(resolved.choice))
+            }
+        };
+        if A::ID == HarnessId::ClaudeCode {
+            return install_claude_code(&layout, binary, choice);
         }
+        install_generic(adapter, &layout, &binary)
+    }
+}
+
+/// Another harness's install, as its adapter's installer reports it.
+fn install_generic<A: HarnessAdapter>(
+    adapter: &A,
+    layout: &RepositoryLayout,
+    binary: &Path,
+) -> Result<()> {
+    let scope = *adapter
+        .scopes()
+        .first()
+        .context("this harness has no scope its hooks can be installed in")?;
+    let outcome = adapter.install(&InstallContext { layout }, scope, binary)?;
+    let action = match outcome.action {
+        AdapterInstallAction::Created => "installed",
+        AdapterInstallAction::Updated => "updated",
+        AdapterInstallAction::AlreadyPresent => "already present",
     };
-    let outcome = settings::install(&layout, &binary)?;
+    // Which scope is always said: hooks installed for the user run in every
+    // repository the user opens.
+    println!(
+        "{} hooks {action} for {} in {}",
+        A::ID.display(),
+        scope_name(scope),
+        printable_path(&outcome.location)
+    );
+    if scope == InstallScope::User {
+        println!(
+            "  they run in every repository you open with {}, and record in each one where capture is acknowledged for {}",
+            A::ID.display(),
+            A::ID.display()
+        );
+    }
+    for warning in &outcome.warnings {
+        eprintln!("  warning: {}", printable(warning));
+    }
+    Ok(())
+}
+
+/// Claude Code's install, with the output cvc 0.7.x prints.
+fn install_claude_code(
+    layout: &RepositoryLayout,
+    binary: PathBuf,
+    choice: Option<BinaryChoice>,
+) -> Result<()> {
+    let outcome = settings::install(layout, &binary)?;
     let action = match outcome.action {
         InstallAction::Created => "installed",
         InstallAction::Updated => "updated",
@@ -450,7 +527,7 @@ pub async fn install_claude_code(binary: Option<PathBuf>) -> Result<()> {
         // worktree created from the record would inherit the staleness, so
         // this install is not recorded. What that means depends on whether an
         // earlier install left a usable record.
-        let earlier = harness_record::read_record(&layout)
+        let earlier = harness_record::read_record(layout)
             .ok()
             .flatten()
             .filter(|recorded| settings::binary_problem(recorded).is_none());
@@ -463,7 +540,7 @@ pub async fn install_claude_code(binary: Option<PathBuf>) -> Result<()> {
                 "New worktrees will not get these hooks until you run `cvc harness install claude-code` again with a current cvc in ~/.cvc/bin."
             ),
         }
-    } else if enable_worktree_propagation(&layout, &binary) {
+    } else if enable_worktree_propagation(layout, &binary) {
         println!(
             "Claude Code sessions in worktrees created from now on (git worktree add, Claude Code's worktree option) are captured too: they get these hooks automatically while this repository's capture acknowledgement stands. `cvc harness uninstall claude-code` stops this."
         );
@@ -471,7 +548,7 @@ pub async fn install_claude_code(binary: Option<PathBuf>) -> Result<()> {
         println!("This install is per checkout: run it again in each linked worktree you use.");
     }
     report_other_worktrees(
-        &layout,
+        layout,
         WorktreeWanted::WithoutHooks,
         "Existing worktrees without these hooks (run `cvc harness install claude-code` there once):",
         Some(WORKTREE_LIST_LIMIT),
@@ -603,7 +680,245 @@ fn enable_worktree_propagation(layout: &RepositoryLayout, binary: &Path) -> bool
     complete
 }
 
-pub async fn uninstall_claude_code() -> Result<()> {
+/// `cvc harness uninstall <harness>`.
+pub async fn uninstall(harness: HarnessId) -> Result<()> {
+    with_adapter(harness, Uninstall).unwrap_or_else(|| Err(not_available(harness)))
+}
+
+struct Uninstall;
+
+impl AdapterVisitor for Uninstall {
+    type Output = Result<()>;
+
+    fn visit<A: HarnessAdapter>(self, adapter: &A) -> Result<()> {
+        if A::ID == HarnessId::ClaudeCode {
+            return uninstall_claude_code();
+        }
+        let layout = discover_initialized()?;
+        let context = InstallContext { layout: &layout };
+        let installed = adapter.status(&context)?.installed;
+        if installed.is_empty() {
+            println!("No CVC {} hooks are installed here", A::ID.display());
+        }
+        for scope in installed {
+            let outcome = adapter.uninstall(&context, scope)?;
+            println!(
+                "Removed {} CVC hook entr{} from {}",
+                outcome.removed,
+                if outcome.removed == 1 { "y" } else { "ies" },
+                printable_path(&outcome.location)
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `cvc harness status <harness>`: where the harness's hooks are installed,
+/// and whether the capture acknowledgement covers it here.
+pub async fn status(harness: HarnessId) -> Result<()> {
+    let lines = with_adapter(harness, Status).unwrap_or_else(|| Err(not_available(harness)))?;
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+struct Status;
+
+impl AdapterVisitor for Status {
+    type Output = Result<Vec<String>>;
+
+    fn visit<A: HarnessAdapter>(self, adapter: &A) -> Result<Vec<String>> {
+        let layout = discover_initialized()?;
+        let installed = adapter.status(&InstallContext { layout: &layout })?;
+        let coverage = privacy::capture_coverage_summary(layout.repository())?;
+        let mut lines = status_lines(A::ID, adapter.scopes(), &installed, &coverage);
+        let backlog = CvcStore::open_initialized(layout.db_path())
+            .map_err(anyhow::Error::from)
+            .and_then(|store| Ok(cvc_core::harness::engine::backlog::<A>(&store)?));
+        match backlog {
+            Ok(sessions) => {
+                lines.extend(backlog_lines(A::ID, adapter.locates_sessions(), &sessions))
+            }
+            Err(error) => lines.push(format!(
+                "problem: cannot read where its sessions were read up to: {}",
+                printable(&error.to_string())
+            )),
+        }
+        Ok(lines)
+    }
+}
+
+/// The sessions a hook run left unread to the end, and that no run has read
+/// to the end since (#149): a later event may never come, so the person is
+/// told how to catch up, and where each session's record is. Nothing when
+/// there are none.
+fn backlog_lines(harness: HarnessId, by_session: bool, sessions: &[Backlog]) -> Vec<String> {
+    /// Sessions listed by id; the rest are counted.
+    const SHOWN: usize = 10;
+    if sessions.is_empty() {
+        return Vec::new();
+    }
+    let catch_up = if harness == HarnessId::ClaudeCode {
+        "cvc ingest claude-code --transcript ~/.claude/projects/<workspace>/<id>.jsonl".to_owned()
+    } else if by_session {
+        format!("cvc ingest {} --session <id>", harness.name())
+    } else {
+        format!("cvc ingest {} --transcript <file>", harness.name())
+    };
+    let mut lines = vec![format!(
+        "backlog: {} session(s) that a hook run left unread to the end, and that no run has read to the end since; catch up with `{catch_up}`",
+        sessions.len()
+    )];
+    for session in sessions.iter().take(SHOWN) {
+        lines.push(format!(
+            "backlog_session: {}",
+            printable(&session.conversation_id)
+        ));
+        if let Some(record) = &session.record {
+            lines.push(format!(
+                "backlog_transcript: {}",
+                printable_path(Path::new(record))
+            ));
+        }
+    }
+    if sessions.len() > SHOWN {
+        lines.push(format!("backlog_more: {}", sessions.len() - SHOWN));
+    }
+    lines
+}
+
+/// What `cvc harness status <harness>` prints, one `key: value` per line.
+fn status_lines(
+    harness: HarnessId,
+    offered: &[InstallScope],
+    installed: &HarnessStatus,
+    coverage: &CoverageSummary,
+) -> Vec<String> {
+    let mut lines = vec![format!("harness: {}", harness.display())];
+    // One line for each scope cvc installs this harness's hooks in.
+    for scope in offered {
+        let key = match scope {
+            InstallScope::Checkout => "checkout",
+            InstallScope::Project => "project",
+            InstallScope::User => "user",
+        };
+        lines.push(format!(
+            "{key}_hooks_installed: {}",
+            if installed.installed.contains(scope) {
+                "yes"
+            } else {
+                "no"
+            }
+        ));
+    }
+    if harness == HarnessId::ClaudeCode {
+        lines.push(
+            "note: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin)"
+                .to_owned(),
+        );
+    }
+    if let Some(binary) = &installed.binary {
+        lines.push(format!(
+            "binary_for_new_worktrees: {}",
+            printable_path(binary)
+        ));
+    }
+    for problem in &installed.problems {
+        lines.push(format!("problem: {}", printable(problem)));
+    }
+    let own = coverage
+        .channels
+        .iter()
+        .find(|(channel, _)| *channel == harness.channel())
+        .map(|(_, coverage)| *coverage)
+        .unwrap_or(CaptureCoverage::NotAcknowledged);
+    lines.push(format!("capture_covered: {}", own.is_covered()));
+    if let Some(why) = not_covered_note(own) {
+        lines.push(format!("note: {why}"));
+    }
+    lines.extend(coverage_lines(coverage));
+    lines
+}
+
+/// Why `coverage` lets a harness record nothing, as a note to show, or `None`
+/// when it is covered.
+fn not_covered_note(coverage: CaptureCoverage) -> Option<String> {
+    match coverage {
+        CaptureCoverage::Covered => None,
+        CaptureCoverage::NotAcknowledged => Some(
+            "capture is not acknowledged in this repository; run `cvc privacy acknowledge-capture`"
+                .to_owned(),
+        ),
+        CaptureCoverage::OtherCheckoutOrUser => Some(ACKNOWLEDGED_ELSEWHERE.to_owned()),
+        CaptureCoverage::NotCovering { channel } => Some(not_covering(channel.display())),
+    }
+}
+
+/// The capture acknowledgement's coverage, channel by channel, as `key: value`
+/// lines: what `cvc privacy status` adds once an acknowledgement stands, and
+/// what `cvc harness status` ends with. A channel this build has no notice
+/// for cannot be acknowledged here, so it is listed apart.
+pub(crate) fn coverage_lines(summary: &CoverageSummary) -> Vec<String> {
+    let names = |keep: &dyn Fn(PassiveChannel, CaptureCoverage) -> bool| -> Vec<&'static str> {
+        summary
+            .channels
+            .iter()
+            .filter(|(channel, coverage)| keep(*channel, *coverage))
+            .map(|(channel, _)| channel.display())
+            .collect()
+    };
+    let covered = names(&|_, coverage| coverage.is_covered());
+    let not_covered =
+        names(&|channel, coverage| !coverage.is_covered() && channel.notice().is_some());
+    let unavailable =
+        names(&|channel, coverage| !coverage.is_covered() && channel.notice().is_none());
+    let mut lines = vec![format!(
+        "capture_covers: {}",
+        if covered.is_empty() {
+            "none".to_owned()
+        } else {
+            covered.join(", ")
+        }
+    )];
+    if !not_covered.is_empty() {
+        lines.push(format!("capture_not_covered: {}", not_covered.join(", ")));
+    }
+    if !unavailable.is_empty() {
+        lines.push(format!(
+            "capture_unavailable_in_this_cvc: {}",
+            unavailable.join(", ")
+        ));
+    }
+    if summary.acknowledgement.is_acknowledged() && !summary.lists_channels {
+        lines.push(format!(
+            "note: this acknowledgement was recorded without a list of what it covers (by cvc 0.7.2 or earlier, or rewritten by such a cvc since), so it covers {} only. An agent added by a later cvc needs `cvc privacy acknowledge-capture` run with that cvc.",
+            and_list(&PassiveChannel::LEGACY_COVERED.map(PassiveChannel::display))
+        ));
+    }
+    lines
+}
+
+/// A scope as a person reads it.
+fn scope_name(scope: InstallScope) -> &'static str {
+    match scope {
+        InstallScope::Checkout => "this checkout",
+        InstallScope::Project => "this project",
+        InstallScope::User => "this user",
+    }
+}
+
+/// `a`, `a and b`, `a, b and c`.
+pub(crate) fn and_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Claude Code's uninstall, with the output cvc 0.7.x prints.
+fn uninstall_claude_code() -> Result<()> {
     let layout = discover_initialized()?;
     // Two independent halves: this checkout's entries, and the repository-wide
     // record that gives them to new worktrees. A failure in one must not stop
@@ -679,24 +994,68 @@ pub(crate) fn discover_initialized_at(path: &std::path::Path) -> Result<Reposito
 /// earlier.
 pub(crate) const ACKNOWLEDGED_ELSEWHERE: &str = "capture was acknowledged for another checkout or user, or by an older cvc; run `cvc privacy acknowledge-capture` here";
 
-/// How to stop the Claude Code hooks, which end every `consent-required`.
-const STOP_THE_HOOKS: &str = "(or stop the hooks: `/plugin disable cvc@volute` for the Claude Code plugin, `cvc harness uninstall claude-code` for this checkout's hooks)";
+/// What `cvc ingest <harness>` and `cvc harness ... <harness>` say about a
+/// harness CVC knows but this build has no adapter for.
+pub(crate) fn not_available(harness: HarnessId) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cvc {} cannot capture {} yet",
+        env!("CARGO_PKG_VERSION"),
+        harness.display()
+    )
+}
 
-/// The consent gate of Claude Code transcript capture: the capture
-/// acknowledgement must cover the Claude Code channel here. Claude Code is one
-/// of the legacy channels every acknowledgement covers, so this is the gate of
-/// cvc 0.7.x; another harness needs its own channel covered.
-pub(crate) fn require_claude_code_capture_covered(layout: &RepositoryLayout) -> Result<()> {
-    let channel = PassiveChannel::Harness(HarnessId::ClaudeCode);
-    match privacy::capture_coverage(layout.repository(), channel)? {
-        CaptureCoverage::Covered => Ok(()),
-        CaptureCoverage::NotAcknowledged | CaptureCoverage::NotCovering { .. } => bail!(
-            "consent-required: Claude Code transcript capture is passive collection and needs the repository-local capture acknowledgement; run `cvc privacy acknowledge-capture` first {STOP_THE_HOOKS}"
-        ),
-        CaptureCoverage::OtherCheckoutOrUser => bail!(
-            "consent-required: Claude Code transcript capture is passive collection and needs the repository-local capture acknowledgement; {ACKNOWLEDGED_ELSEWHERE} {STOP_THE_HOOKS}"
-        ),
+/// The consent gate of every harness: the capture acknowledgement must cover
+/// the harness's own channel here. Claude Code is one of the legacy channels
+/// every acknowledgement covers, so for it this is the gate of cvc 0.7.x; a
+/// newer harness needs an acknowledgement given by a cvc that could capture
+/// it. `stop_hint` (the adapter's) ends every refusal.
+pub(crate) fn require_capture_covered(
+    layout: &RepositoryLayout,
+    harness: HarnessId,
+    stop_hint: &str,
+) -> Result<CoverageGrant> {
+    match privacy::require_coverage(layout.repository(), harness.channel()) {
+        Ok(grant) => Ok(grant),
+        Err(PrivacyError::NotCovered(coverage)) => {
+            Err(coverage_refusal(harness, coverage, stop_hint)
+                .unwrap_or_else(|| PrivacyError::NotCovered(coverage).into()))
+        }
+        Err(error) => Err(error.into()),
     }
+}
+
+/// The `consent-required` refusal for `harness` when the acknowledgement's
+/// coverage of its channel is `coverage`; `None` when it is covered.
+pub(crate) fn coverage_refusal(
+    harness: HarnessId,
+    coverage: CaptureCoverage,
+    stop_hint: &str,
+) -> Option<anyhow::Error> {
+    let what = match harness {
+        HarnessId::ClaudeCode => "Claude Code transcript capture".to_owned(),
+        other => format!("{} session capture", other.display()),
+    };
+    let refusal = match coverage {
+        CaptureCoverage::Covered => return None,
+        CaptureCoverage::NotAcknowledged => format!(
+            "consent-required: {what} is passive collection and needs the repository-local capture acknowledgement; run `cvc privacy acknowledge-capture` first {stop_hint}"
+        ),
+        CaptureCoverage::OtherCheckoutOrUser => format!(
+            "consent-required: {what} is passive collection and needs the repository-local capture acknowledgement; {ACKNOWLEDGED_ELSEWHERE} {stop_hint}"
+        ),
+        CaptureCoverage::NotCovering { channel } => format!(
+            "consent-required: {} {stop_hint}",
+            not_covering(channel.display())
+        ),
+    };
+    Some(anyhow::anyhow!(refusal))
+}
+
+/// Why an acknowledgement on record does not cover `agent`.
+fn not_covering(agent: &str) -> String {
+    format!(
+        "the capture acknowledgement here does not cover {agent}: it was given by a cvc that could not capture {agent}, or an older cvc has rewritten it since; run `cvc privacy acknowledge-capture` again"
+    )
 }
 
 #[cfg(test)]
@@ -986,6 +1345,43 @@ mod tests {
 
         let third = settings::install(&layout, &resolved.path).unwrap();
         assert_eq!(third.action, InstallAction::AlreadyPresent);
+    }
+
+    /// No backlog prints nothing, so that the status of a repository without
+    /// one reads as before; a backlog names its sessions and their records as
+    /// plain text, at most ten, and the catch-up command the harness takes.
+    #[test]
+    fn a_backlog_is_listed_with_its_catch_up_command() {
+        let session = |id: &str, record: Option<&str>| Backlog {
+            conversation_id: id.into(),
+            record: record.map(str::to_owned),
+        };
+        assert!(backlog_lines(HarnessId::ClaudeCode, false, &[]).is_empty());
+        assert_eq!(
+            backlog_lines(
+                HarnessId::ClaudeCode,
+                false,
+                &[
+                    session("s1", Some("/h/.claude/projects/w/s1.jsonl")),
+                    session("s\u{1b}[2J2", Some("/h/s\u{1b}[2J2.jsonl")),
+                ]
+            ),
+            [
+                "backlog: 2 session(s) that a hook run left unread to the end, and that no run has read to the end since; catch up with `cvc ingest claude-code --transcript ~/.claude/projects/<workspace>/<id>.jsonl`",
+                "backlog_session: s1",
+                "backlog_transcript: /h/.claude/projects/w/s1.jsonl",
+                "backlog_session: s?[2J2",
+                "backlog_transcript: /h/s?[2J2.jsonl",
+            ]
+        );
+        let many: Vec<Backlog> = (0..12)
+            .map(|n| session(&format!("codex:t{n:02}"), None))
+            .collect();
+        let lines = backlog_lines(HarnessId::Codex, true, &many);
+        assert!(lines[0].ends_with("catch up with `cvc ingest codex --session <id>`"));
+        assert_eq!(lines.len(), 12);
+        assert_eq!(lines[10], "backlog_session: codex:t09");
+        assert_eq!(lines[11], "backlog_more: 2");
     }
 
     #[test]

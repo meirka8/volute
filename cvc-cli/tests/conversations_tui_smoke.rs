@@ -222,7 +222,7 @@ fn plain_prints_the_listing_without_the_alternate_screen() {
     assert!(status.success(), "{output}");
     assert!(!output.contains(ENTER_ALTERNATE_SCREEN), "{output:?}");
     assert!(
-        output.contains("Conversations (most recent first); share state for remote 'origin'"),
+        output.contains("Conversations (most recent activity first, subagents under their parent); share state for remote 'origin'"),
         "{output}"
     );
     assert!(output.contains("Run: printf"), "{output}");
@@ -242,7 +242,7 @@ fn a_window_that_is_too_small_gets_the_plain_listing_and_says_why() {
         "{output}"
     );
     assert!(
-        output.contains("Conversations (most recent first)"),
+        output.contains("Conversations (most recent activity first, subagents under their parent)"),
         "{output}"
     );
 }

@@ -36,7 +36,8 @@
 mod model;
 mod terminal;
 mod text;
-mod tree;
+/// Also the plain listing's grouping, so that both nest subagents alike.
+pub(crate) mod tree;
 mod view;
 mod words;
 
@@ -190,10 +191,15 @@ fn load(ctx: &Context, remotes: Vec<RemoteOverview>, remote: Option<&str>) -> Re
         .as_deref()
         .map(|fingerprint| ctx.store.destination_publication_counts(fingerprint))
         .transpose()?;
+    // Only a hint: a harness whose cursors cannot be read lists its
+    // conversations unmarked, and the view says so in a notice.
+    let backlog = crate::commands::conversations::read_backlog(ctx.store);
     Ok(Data {
         summaries,
         remotes,
         counts,
+        backlog: backlog.sessions,
+        backlog_unreadable: backlog.unreadable,
     })
 }
 

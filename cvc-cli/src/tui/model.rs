@@ -13,11 +13,12 @@
 //! - Where consent actions are not available (the platform cannot keep type-
 //!   ahead from answering a challenge), no bar that leads to a flow opens.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cvc_core::db::{
     ConversationDetails, ConversationSummary, DestinationPublicationCounts, UnshareCheck,
 };
+use cvc_core::harness::HarnessId;
 use cvc_core::models::FutureSharePolicy;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -27,7 +28,7 @@ use super::words::{
     self, Available, Destination, DetailsInput, FlowKind, Lineage, Page, RemoteRow, RemoteView,
     Seg, ShareAsk, Tone,
 };
-use crate::commands::conversations::RemoteOverview;
+use crate::commands::conversations::{agent_label, RemoteOverview};
 use crate::commands::failure::FlowFailure;
 use crate::commands::sync::{PublishOutcome, ShareOutcome};
 
@@ -53,6 +54,13 @@ pub struct Data {
     /// Shared and published thoughts of the selected remote, over all
     /// conversations; `None` without a usable remote.
     pub counts: Option<DestinationPublicationCounts>,
+    /// The sessions a hook run left unread to the end, by the conversation id
+    /// of the family's root, with the harness whose `cvc harness status` names
+    /// the catch-up command (`conversations::read_backlog`).
+    pub backlog: BTreeMap<String, HarnessId>,
+    /// The harnesses whose backlog could not be read, with why; the view says
+    /// so in a notice.
+    pub backlog_unreadable: Vec<(HarnessId, String)>,
 }
 
 /// What is read about the selected conversation each time it matters: the
@@ -253,6 +261,17 @@ pub enum When {
     OrphanAt(i64),
 }
 
+/// What the first column of an entry's row holds: an agent listed under its
+/// parent is marked as one; an agent that is not, whether or not it has agents
+/// of its own, keeps its date and the agent tag.
+fn when_of(entry: &Entry) -> When {
+    match (&entry.kind, entry.unlisted_parent()) {
+        (Kind::Child { .. }, _) => When::Agent,
+        (_, Some(_)) => When::OrphanAt(entry.summary.last_activity),
+        (_, None) => When::At(entry.summary.last_activity),
+    }
+}
+
 /// The text of a first-column cell: the main part, and a dim tag after it.
 pub fn when_cell(when: When, short: bool, g: &Glyphs) -> (String, Option<String>) {
     match when {
@@ -265,6 +284,25 @@ pub fn when_cell(when: When, short: bool, g: &Glyphs) -> (String, Option<String>
     }
 }
 
+/// The header of the column that names the agent.
+pub const AGENT_HEAD: &str = "recorded by";
+
+/// The text of an agent cell: the agent that recorded the conversation, as
+/// [`agent_label`](crate::commands::conversations::agent_label) names it, and a
+/// tag after it when its session has a backlog. Both empty when neither is
+/// known.
+pub fn agent_cell(agent: Option<&str>, backlog: bool) -> (String, Option<String>) {
+    let main = agent.unwrap_or_default().to_owned();
+    let tag = backlog.then(|| {
+        if main.is_empty() {
+            "backlog".to_owned()
+        } else {
+            " backlog".to_owned()
+        }
+    });
+    (main, tag)
+}
+
 /// One row of the list as drawn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowView {
@@ -272,6 +310,11 @@ pub struct RowView {
     pub disclosure: Disclosure,
     pub when: When,
     pub title: String,
+    /// The agent that recorded it, as
+    /// [`agent_label`](crate::commands::conversations::agent_label) names it.
+    pub agent: Option<String>,
+    /// A hook run left its session unread to the end.
+    pub backlog: bool,
     pub thoughts: i64,
     pub linked: i64,
     pub state: String,
@@ -291,6 +334,9 @@ pub struct Columns {
     pub thoughts: usize,
     pub linked: usize,
     pub state: usize,
+    /// The agent column; 0 when no listed row has an agent or a backlog, and
+    /// the column is not drawn.
+    pub agent: usize,
 }
 
 /// What an overlay holds.
@@ -309,6 +355,8 @@ pub struct Model {
     /// The selected remote's name; `None` when none is selected.
     remote: Option<String>,
     tree: Tree,
+    /// See [`Data::backlog`].
+    backlog: BTreeMap<String, HarnessId>,
     expanded: HashSet<String>,
     /// Indices into the tree's entries, in the order they are shown.
     visible: Vec<usize>,
@@ -356,6 +404,7 @@ impl Model {
             counts: data.counts,
             remote,
             tree: Tree::build(&data.summaries),
+            backlog: data.backlog,
             expanded: HashSet::new(),
             visible: Vec::new(),
             columns: Columns::default(),
@@ -366,8 +415,26 @@ impl Model {
             status: None,
             shared_remote: None,
         };
+        model.note_unreadable_backlog(&data.backlog_unreadable);
         model.rebuild_visible(None);
         model
+    }
+
+    /// Says, as the notice, that a harness's backlog could not be read, as the
+    /// plain listing warns; a notice already showing (a flow's outcome) stays.
+    fn note_unreadable_backlog(&mut self, unreadable: &[(HarnessId, String)]) {
+        if self.status.is_some() {
+            return;
+        }
+        if let Some((harness, reason)) = unreadable.first() {
+            let words = crate::commands::conversations::backlog_unreadable_words(*harness, reason);
+            let mut first = words.chars();
+            let words: String = first
+                .next()
+                .map(|c| c.to_uppercase().chain(first).collect())
+                .unwrap_or_default();
+            self.set_status(&format!("{words}."));
+        }
     }
 
     /// Makes `name` the selected remote, together with the data loaded for it,
@@ -385,6 +452,8 @@ impl Model {
         self.remotes = data.remotes;
         self.counts = data.counts;
         self.tree = Tree::build(&data.summaries);
+        self.backlog = data.backlog;
+        self.note_unreadable_backlog(&data.backlog_unreadable);
         // The old indices point into the old tree.
         self.visible.clear();
         self.info.clear();
@@ -707,16 +776,14 @@ impl Model {
             }
             _ => (Disclosure::None, None),
         };
-        let when = match entry.kind {
-            Kind::Child { .. } => When::Agent,
-            Kind::Orphan => When::OrphanAt(summary.last_activity),
-            _ => When::At(summary.last_activity),
-        };
+        let when = when_of(entry);
         RowView {
             id: text::sanitize(&summary.id),
             disclosure,
             when,
             title: text::title(&summary.title),
+            agent: agent_label(summary),
+            backlog: self.backlog.contains_key(&summary.id),
             thoughts: summary.thoughts,
             linked: summary.linked,
             state,
@@ -746,15 +813,12 @@ impl Model {
             thoughts: 8,
             linked: 6,
             state: 0,
+            agent: 0,
         };
         for &index in &self.visible {
             let entry = &self.tree.entries[index];
             let summary = &entry.summary;
-            let when = match entry.kind {
-                Kind::Child { .. } => When::Agent,
-                Kind::Orphan => When::OrphanAt(summary.last_activity),
-                _ => When::At(summary.last_activity),
-            };
+            let when = when_of(entry);
             let cell = |short| {
                 let (main, tag) = when_cell(when, short, &g);
                 text::width(&main) + tag.map_or(0, |tag| text::width(&tag))
@@ -765,6 +829,12 @@ impl Model {
             columns.linked = columns.linked.max(summary.linked.to_string().len());
             let (state, _) = words::state_label(summary, has_destination, &g);
             columns.state = columns.state.max(text::width(&state));
+            let label = agent_label(summary);
+            let (agent, tag) = agent_cell(label.as_deref(), self.backlog.contains_key(&summary.id));
+            let agent = text::width(&agent) + tag.map_or(0, |tag| text::width(&tag));
+            if agent > 0 {
+                columns.agent = columns.agent.max(agent).max(text::width(AGENT_HEAD));
+            }
         }
         self.columns = columns;
     }
@@ -854,12 +924,12 @@ impl Model {
         entry: &'a Entry,
         info: Option<&'a RowInfo>,
     ) -> DetailsInput<'a> {
-        let lineage = match entry.kind {
-            Kind::Child { parent } => {
-                Lineage::AgentOf(text::title(&self.tree.entries[parent].summary.title))
+        let lineage = match (&entry.kind, entry.unlisted_parent()) {
+            (Kind::Child { parent }, _) => {
+                Lineage::AgentOf(text::title(&self.tree.entries[*parent].summary.title))
             }
-            Kind::Orphan => Lineage::OrphanAgent,
-            _ => Lineage::None,
+            (_, Some(parent)) => Lineage::OrphanAgent(text::sanitize(parent)),
+            (_, None) => Lineage::None,
         };
         // The numbers read for this row just now beat the ones the list was
         // loaded with.
@@ -873,6 +943,7 @@ impl Model {
                 _ => 0,
             },
             remote: self.usable_remote(),
+            backlog: self.backlog.get(&entry.summary.id).copied(),
         }
     }
 
@@ -1383,6 +1454,8 @@ mod tests {
                 published: 2,
                 unconfirmed: 0,
             }),
+            backlog: BTreeMap::new(),
+            backlog_unreadable: Vec::new(),
         }
     }
 

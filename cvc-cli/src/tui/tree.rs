@@ -1,10 +1,15 @@
 //! Grouping conversations into parents and their agents, and the order they are
 //! listed in. Pure data: no terminal, no store.
 //!
-//! Claude Code stores each subagent as its own conversation named
-//! `<session>:agent-<agent id>` (see `cvc ingest claude-code`). The view puts
-//! such a conversation under its session, which is still a separate
-//! conversation for sharing: nothing here links their share state.
+//! A subagent is its own conversation, and the view puts it under the
+//! conversation that spawned it, which is still a separate conversation for
+//! sharing: nothing here links their share state. Its parent is, in order:
+//!
+//! - the relation a harness recorded for it ([`ConversationSummary::parent`]),
+//!   which is how agents other than Claude Code name a subagent's parent;
+//! - Claude Code's key convention: a subagent's conversation is named
+//!   `<session>:agent-<agent id>` (see `cvc ingest claude-code`), and Claude
+//!   Code records no relation.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -21,6 +26,17 @@ const AGENT_MARKER: &str = ":agent-";
 pub fn split_agent_id(id: &str) -> Option<(&str, &str)> {
     let (parent, agent) = id.rsplit_once(AGENT_MARKER)?;
     (!parent.is_empty() && !agent.is_empty()).then_some((parent, agent))
+}
+
+/// The conversation a conversation says it is a subagent of: the recorded
+/// relation, else the parent its id names under Claude Code's convention.
+/// Whether that conversation is listed is the tree's business.
+pub fn claimed_parent(summary: &ConversationSummary) -> Option<&str> {
+    summary
+        .parent
+        .as_deref()
+        .filter(|parent| !parent.is_empty() && *parent != summary.id)
+        .or_else(|| split_agent_id(&summary.id).map(|(parent, _)| parent))
 }
 
 /// Where a conversation sits in the list.
@@ -45,6 +61,20 @@ pub struct Entry {
     pub kind: Kind,
 }
 
+impl Entry {
+    /// The parent this entry claims but is not listed under: an orphan's, and
+    /// also a parent's whose own claimed parent is not listed (or is itself
+    /// listed under another), so that it still says whose subagent it is.
+    /// `None` for an entry listed under its parent and for one that claims
+    /// none.
+    pub fn unlisted_parent(&self) -> Option<&str> {
+        match self.kind {
+            Kind::Child { .. } => None,
+            _ => claimed_parent(&self.summary),
+        }
+    }
+}
+
 /// The listed conversations and the order of their groups.
 #[derive(Clone, Debug, Default)]
 pub struct Tree {
@@ -58,13 +88,21 @@ impl Tree {
     /// Builds the tree of the conversations that have at least one thought; a
     /// conversation with none is not listed at all.
     ///
-    /// A conversation is an agent's child when the part of its id before the
-    /// last `:agent-` is the id of a listed conversation that is not itself an
-    /// agent's child; the tree is two levels deep, so an agent of an agent is
-    /// listed on its own like an orphan.
+    /// A conversation is an agent's child when its [`claimed_parent`] is the id
+    /// of a listed conversation that is not itself an agent's child; the tree
+    /// is two levels deep, so an agent of an agent is listed on its own like an
+    /// orphan.
     pub fn build(summaries: &[ConversationSummary]) -> Self {
-        let summaries: Vec<&ConversationSummary> =
-            summaries.iter().filter(|s| s.thoughts > 0).collect();
+        Self::of(summaries.iter().filter(|s| s.thoughts > 0).collect())
+    }
+
+    /// [`Self::build`], keeping the conversations without thoughts: the plain
+    /// listing of `cvc conversations` lists them too.
+    pub fn build_with_empty(summaries: &[ConversationSummary]) -> Self {
+        Self::of(summaries.iter().collect())
+    }
+
+    fn of(summaries: Vec<&ConversationSummary>) -> Self {
         let index: HashMap<&str, usize> = summaries
             .iter()
             .enumerate()
@@ -73,8 +111,8 @@ impl Tree {
         let candidate: Vec<Option<usize>> = summaries
             .iter()
             .map(|s| {
-                split_agent_id(&s.id)
-                    .and_then(|(parent, _)| index.get(parent))
+                claimed_parent(s)
+                    .and_then(|parent| index.get(parent))
                     .copied()
             })
             .collect();
@@ -107,7 +145,7 @@ impl Tree {
                     Kind::Parent {
                         children: children[i].clone(),
                     }
-                } else if split_agent_id(&summary.id).is_some() {
+                } else if claimed_parent(summary).is_some() {
                     Kind::Orphan
                 } else {
                     Kind::Plain
@@ -360,6 +398,119 @@ pub(crate) mod tests {
             3,
             "every listed conversation is reachable"
         );
+    }
+
+    /// A conversation with a parent recorded as a relation.
+    fn child_of(id: &str, parent: &str, first: i64, last: i64) -> ConversationSummary {
+        ConversationSummary {
+            parent: Some(parent.to_owned()),
+            ..conversation(id, first, last, 1)
+        }
+    }
+
+    #[test]
+    fn a_recorded_relation_nests_a_subagent_under_its_parent() {
+        let tree = Tree::build(&[
+            child_of("codex:t-child-b", "codex:t-root", 300, 310),
+            conversation("codex:t-root", 100, 200, 4),
+            child_of("codex:t-child-a", "codex:t-root", 150, 160),
+            conversation("other", 100, 250, 1),
+        ]);
+        // The group is as recent as its newest member, and the children are
+        // in spawn order.
+        assert_eq!(
+            listed(&tree),
+            vec![
+                "codex:t-root",
+                "codex:t-child-a",
+                "codex:t-child-b",
+                "other"
+            ]
+        );
+        let root = tree.position("codex:t-root").unwrap();
+        assert_eq!(tree.children_of(root).len(), 2);
+        assert_eq!(
+            tree.parent_of(tree.position("codex:t-child-a").unwrap()),
+            Some(root)
+        );
+    }
+
+    #[test]
+    fn a_recorded_relation_whose_parent_is_not_listed_is_an_orphan() {
+        let tree = Tree::build(&[
+            child_of("codex:t-child", "codex:t-gone", 100, 200),
+            // A parent without thoughts is not listed either.
+            conversation("codex:t-empty", 100, 200, 0),
+            child_of("codex:t-child-2", "codex:t-empty", 100, 150),
+        ]);
+        assert_eq!(kind_of(&tree, "codex:t-child"), Kind::Orphan);
+        assert_eq!(kind_of(&tree, "codex:t-child-2"), Kind::Orphan);
+    }
+
+    #[test]
+    fn a_relation_outranks_the_key_and_the_tree_stays_two_levels_deep() {
+        let tree = Tree::build(&[
+            conversation("root", 100, 200, 1),
+            child_of("mid", "root", 110, 120),
+            child_of("leaf", "mid", 115, 118),
+            // The key would say `s`; the relation says `root`.
+            conversation("s", 100, 200, 1),
+            child_of("s:agent-a", "root", 130, 140),
+        ]);
+        assert!(matches!(kind_of(&tree, "mid"), Kind::Child { .. }));
+        assert_eq!(kind_of(&tree, "leaf"), Kind::Orphan);
+        let root = tree.position("root").unwrap();
+        assert_eq!(
+            tree.parent_of(tree.position("s:agent-a").unwrap()),
+            Some(root)
+        );
+        assert_eq!(kind_of(&tree, "s"), Kind::Plain);
+    }
+
+    #[test]
+    fn a_parent_whose_own_parent_is_not_listed_still_names_it() {
+        let tree = Tree::build(&[
+            child_of("codex:mid", "codex:gone", 100, 200),
+            child_of("codex:leaf", "codex:mid", 110, 120),
+            conversation("s", 100, 200, 1),
+            conversation("s:agent-a", 110, 120, 1),
+        ]);
+        let unlisted = |id: &str| {
+            tree.entries[tree.position(id).unwrap()]
+                .unlisted_parent()
+                .map(str::to_owned)
+        };
+        assert!(matches!(kind_of(&tree, "codex:mid"), Kind::Parent { .. }));
+        assert_eq!(unlisted("codex:mid").as_deref(), Some("codex:gone"));
+        // Listed under its parent: nothing to say. A root claims none.
+        assert_eq!(unlisted("codex:leaf"), None);
+        assert_eq!(unlisted("s:agent-a"), None);
+        assert_eq!(unlisted("s"), None);
+    }
+
+    #[test]
+    fn a_relation_cycle_or_a_self_reference_nests_nothing() {
+        let tree = Tree::build(&[
+            child_of("a", "b", 100, 200),
+            child_of("b", "a", 100, 200),
+            child_of("c", "c", 100, 200),
+        ]);
+        assert_eq!(kind_of(&tree, "a"), Kind::Orphan);
+        assert_eq!(kind_of(&tree, "b"), Kind::Orphan);
+        assert_eq!(kind_of(&tree, "c"), Kind::Plain);
+        assert_eq!(listed(&tree).len(), 3);
+    }
+
+    #[test]
+    fn the_plain_listing_keeps_conversations_without_thoughts() {
+        let summaries = [
+            conversation("empty", 100, 900, 0),
+            conversation("s", 100, 200, 1),
+            conversation("s:agent-a", 110, 120, 0),
+        ];
+        let tree = Tree::build_with_empty(&summaries);
+        assert_eq!(listed(&tree), vec!["empty", "s", "s:agent-a"]);
+        assert!(matches!(kind_of(&tree, "s"), Kind::Parent { .. }));
     }
 
     #[test]
