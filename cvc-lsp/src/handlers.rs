@@ -1,6 +1,7 @@
 use crate::protocol::*;
 use crate::state::AppState;
 use chrono::Utc;
+use cvc_core::harness::PassiveChannel;
 use cvc_core::models::{Author, Conversation, Interaction, InteractionId};
 use cvc_core::privacy::{LspExplicitCapture, LspPassiveCapture, PreparedPolicy};
 use cvc_core::vscode::ChatRequest;
@@ -20,7 +21,9 @@ pub async fn handle_privacy_status(state: Arc<AppState>) -> PrivacyStatusRespons
         let acknowledged = binding
             .as_deref()
             .and_then(Option::as_ref)
-            .and_then(|binding| cvc_core::privacy::capture_acknowledged(binding.layout.repository()).ok())
+            .and_then(|binding| {
+                cvc_core::privacy::capture_covers(binding.layout.repository(), PassiveChannel::Vscode).ok()
+            })
             .unwrap_or(false);
 
         let (sharing_summary, auto_push_enabled) = binding
@@ -200,8 +203,11 @@ pub async fn handle_turn_batch(client: &Client, state: Arc<AppState>, params: Tu
             .expect("CVC binding mutex poisoned");
 
         if let Some(binding) = binding.as_ref() {
-            if !cvc_core::privacy::capture_acknowledged(binding.layout.repository())
-                .map_err(|e| cvc_core::db::DbError::Migration(format!("consent-required: {e}")))?
+            if !cvc_core::privacy::capture_covers(
+                binding.layout.repository(),
+                PassiveChannel::Vscode,
+            )
+            .map_err(|e| cvc_core::db::DbError::Migration(format!("consent-required: {e}")))?
             {
                 return Err(cvc_core::db::DbError::Migration(
                     "consent-required: acknowledge capture before passive collection".into(),

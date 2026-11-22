@@ -287,6 +287,27 @@ fn map_interaction_row(row: &Row) -> rusqlite::Result<Interaction> {
 pub struct CvcStore {
     conn: Connection,
     path: PathBuf,
+    /// When set, no write waits for another writer past it (see
+    /// [`CvcStore::cap_write_waits`]).
+    write_deadline: std::cell::Cell<Option<Instant>>,
+}
+
+/// The cap [`CvcStore::cap_write_waits`] set, in force while this lives.
+pub(crate) struct WriteWaitCap<'a> {
+    store: &'a CvcStore,
+    previous: Option<Instant>,
+}
+
+impl Drop for WriteWaitCap<'_> {
+    fn drop(&mut self) {
+        self.store.write_deadline.set(self.previous);
+        // Best effort: a connection whose timeout cannot be set keeps the
+        // one it has, which is never longer than the default.
+        let _ = self
+            .store
+            .conn
+            .busy_timeout(self.store.capped_wait(BUSY_TIMEOUT));
+    }
 }
 
 /// Observable result of best-effort SQLite cleanup.  This reports database
@@ -589,9 +610,17 @@ fn is_storable_cursor_state(state: &serde_json::Value, encoded: &str) -> bool {
     state.is_object() && encoded.len() <= MAX_CURSOR_STATE_BYTES && storable(state, 0)
 }
 
+/// Whether a typed cursor keyed `cursor_key` with `state` is within the
+/// limits a harness batch stores (see [`HarnessCursorWrite::state`]).
+pub(crate) fn is_storable_cursor(cursor_key: &str, state: &serde_json::Value) -> bool {
+    is_storable_identifier(cursor_key)
+        && serde_json::to_string(state)
+            .is_ok_and(|encoded| is_storable_cursor_state(state, &encoded))
+}
+
 /// Whether `value` is an identifier a harness batch may store in a side
 /// table: a safe identifier the built-in scrubber would not change.
-fn is_storable_identifier(value: &str) -> bool {
+pub(crate) fn is_storable_identifier(value: &str) -> bool {
     privacy::is_safe_identifier(value) && privacy::scrub(value).is_ok_and(|s| s == value)
 }
 
@@ -665,8 +694,22 @@ pub struct HarnessCommitEvidence {
     pub interaction_id: InteractionId,
     /// The resolved commit id.
     pub commit: CommitSha,
-    /// When the response was made, in seconds.
+    /// When the response was made, in seconds. The store records the stored
+    /// interaction's own time, whatever a batch passes here.
     pub response_at: i64,
+}
+
+/// A floating interaction as a family's commit rescue sees it
+/// ([`CvcStore::floating_family_interactions`]): no captured text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FloatingInteraction {
+    pub(crate) id: InteractionId,
+    pub(crate) conversation_id: String,
+    /// In seconds.
+    pub(crate) timestamp: i64,
+    /// The worktree it was captured in; `None` on rows from before
+    /// attribution, which every worktree's linker may claim.
+    pub(crate) capture_worktree: Option<String>,
 }
 
 /// What a child conversation is to its parent.
@@ -746,11 +789,18 @@ pub struct ConversationRelation {
 /// Everything one harness ingest batch commits for one conversation, in one
 /// immediate transaction: all of it or none of it.
 ///
-/// A batch is made only by [`HarnessBatch::new`], which requires a
-/// [`privacy::CoverageGrant`] for the harness's own channel; the store also
-/// checks that the grant was given for the repository it belongs to.
+/// A batch is made by [`HarnessBatch::new`], which takes a
+/// [`privacy::CoverageGrant`] for the harness's own channel and consumes it:
+/// a grant covers exactly one batch, and the store also checks that it was
+/// given for the repository it belongs to. Every harness other than Claude
+/// Code can write only this way.
+///
+/// The one other way is crate-private and Claude Code's alone: the batches of
+/// its 0.7.x-compatible entry points (`claude_code::ingest` and its
+/// variants), whose callers make the capture decision as they did in 0.7.x
+/// (cvc's CLI requires the acknowledgement before it calls them).
 pub struct HarnessBatch<'a> {
-    grant: &'a privacy::CoverageGrant,
+    grant: Option<privacy::CoverageGrant>,
     harness: HarnessId,
     conversation_id: &'a str,
     policy: &'a privacy::PreparedPolicy,
@@ -762,13 +812,13 @@ pub struct HarnessBatch<'a> {
 }
 
 impl<'a> HarnessBatch<'a> {
-    /// An empty batch of `harness` for `conversation_id`, under `grant`.
-    /// `policy` is the repository's capture policy, which the batch's
-    /// evidence must also pass. Refused when the grant covers another
-    /// channel than the harness's, or when the conversation id is not an
-    /// identifier the built-in scrubber would leave as it is.
+    /// An empty batch of `harness` for `conversation_id`, under `grant`,
+    /// which the batch consumes. `policy` is the repository's capture policy,
+    /// which the batch's evidence must also pass. Refused when the grant
+    /// covers another channel than the harness's, or when the conversation id
+    /// is not an identifier the built-in scrubber would leave as it is.
     pub fn new(
-        grant: &'a privacy::CoverageGrant,
+        grant: privacy::CoverageGrant,
         harness: HarnessId,
         conversation_id: &'a str,
         policy: &'a privacy::PreparedPolicy,
@@ -793,7 +843,7 @@ impl<'a> HarnessBatch<'a> {
                 )
             })?;
         Ok(Self {
-            grant,
+            grant: Some(grant),
             harness,
             conversation_id,
             policy,
@@ -803,6 +853,28 @@ impl<'a> HarnessBatch<'a> {
             evidence: Vec::new(),
             relations: Vec::new(),
         })
+    }
+
+    /// An empty Claude Code batch for the session conversation
+    /// `conversation_id`, without a grant: only for the 0.7.x-compatible
+    /// Claude Code entry points, whose callers decide capture as they did in
+    /// 0.7.x. Each capture still passes the capture boundary, which refuses
+    /// an unsafe conversation id, exactly as 0.7.x's batch did.
+    pub(crate) fn claude_code_caller_decided(
+        conversation_id: &'a str,
+        policy: &'a privacy::PreparedPolicy,
+    ) -> Self {
+        Self {
+            grant: None,
+            harness: HarnessId::ClaudeCode,
+            conversation_id,
+            policy,
+            captures: Vec::new(),
+            cursor: None,
+            legacy_cursor: None,
+            evidence: Vec::new(),
+            relations: Vec::new(),
+        }
     }
 
     /// The captures to store, each into the batch's conversation.
@@ -819,7 +891,8 @@ impl<'a> HarnessBatch<'a> {
 
     /// Claude Code only: the 0.7.x cursor row, kept written for older
     /// binaries that share this database. It is written exactly when the
-    /// typed cursor is (or when the batch has no typed cursor).
+    /// typed cursor is. A batch with no typed cursor writes it, and keeps the
+    /// typed copy of it as [`CvcStore::capture_claude_code_batch`] does.
     pub fn with_legacy_cursor(mut self, cursor: HarnessCursorUpdate<'a>) -> Self {
         self.legacy_cursor = Some(cursor);
         self
@@ -999,6 +1072,14 @@ fn imported_agent(id: &str) -> Option<HarnessId> {
 /// not Git hooks: they may wait, but never indefinitely.
 const HARNESS_WRITE_RETRY_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long one statement waits for another writer (see [`CvcStore::open`]).
+const BUSY_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// The wait a write is always allowed under [`CvcStore::cap_write_waits`],
+/// even at or past the deadline, so that a write that comes late meets a
+/// brief lock as a short wait rather than as an error.
+const MIN_CAPPED_WAIT: Duration = Duration::from_millis(50);
+
 // ---- capture_source: from an enumerated CHECK to triggers ---------------------
 //
 // cvc 0.6 and 0.7 enumerate the `capture_source` values in a column CHECK, and
@@ -1160,8 +1241,14 @@ const HARNESS_TABLES_SQL: &str = "CREATE TABLE IF NOT EXISTS harness_cursors (ha
 const UPSERT_LEGACY_CURSOR_SQL: &str = "INSERT INTO harness_ingest_cursors(harness,session_id,transcript_path,byte_offset,updated_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(harness,session_id) DO UPDATE SET transcript_path=excluded.transcript_path, byte_offset=excluded.byte_offset, updated_at=excluded.updated_at";
 
 /// The typed copy of a Claude Code cursor that [`UPSERT_LEGACY_CURSOR_SQL`]
-/// wrote: the path and offset change, everything else the row holds stays.
+/// wrote, made or moved forward in its epoch: the path and offset change,
+/// everything else the row holds stays. Run only on no row or a `jsonl`
+/// version 1 row at or before the offset (see `mirror_claude_code_cursor_tx`).
 const MIRROR_CLAUDE_CODE_CURSOR_SQL: &str = "INSERT INTO harness_cursors(harness,cursor_key,kind,version,epoch,state,updated_at) VALUES (?1,?2,'jsonl',1,0,json_object('path',?3,'byte_offset',?4),?5) ON CONFLICT(harness,cursor_key) DO UPDATE SET state=json_set(harness_cursors.state,'$.path',?3,'$.byte_offset',?4), updated_at=?5";
+
+/// The typed copy of a Claude Code cursor row that went back: the next epoch
+/// of a `jsonl` version 1 row ahead of it (see `mirror_claude_code_cursor_tx`).
+const MIRROR_CLAUDE_CODE_CURSOR_NEXT_EPOCH_SQL: &str = "UPDATE harness_cursors SET epoch=epoch+1, state=json_object('path',?3,'byte_offset',?4,'epoch_reason','rewritten'), updated_at=?5 WHERE harness=?1 AND cursor_key=?2 AND kind='jsonl' AND version=1";
 
 impl CvcStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -1199,12 +1286,13 @@ impl CvcStore {
         // hook-driven batch on a slow disk while staying well under what a
         // Git hook may reasonably take; the rewrite inbox still classifies
         // and retries permanent-versus-retryable failures on its own.
-        conn.busy_timeout(std::time::Duration::from_millis(2000))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         enforce_store_permissions(path)?;
 
         let store = Self {
             conn,
             path: path.to_path_buf(),
+            write_deadline: std::cell::Cell::new(None),
         };
         store.init_with(upgrade)?;
         enforce_store_permissions(&store.path)?;
@@ -1225,6 +1313,23 @@ impl CvcStore {
             |row| row.get(0),
         )?;
         Ok(!done)
+    }
+
+    /// Whether the one-time `capture_source` rebuild still has to run here
+    /// and never will in this version: the `interactions` table has columns
+    /// this version does not know, so it is left as it is (nothing in it can
+    /// be lost) and its own constraint keeps refusing the newer harnesses'
+    /// captures. Only a later cvc can upgrade such a store.
+    pub fn capture_source_upgrade_blocked(&self) -> Result<bool> {
+        if !self.needs_capture_source_upgrade()? {
+            return Ok(false);
+        }
+        let columns: Vec<String> = self
+            .conn
+            .prepare("PRAGMA table_info(interactions)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(columns != INTERACTION_COLUMNS)
     }
 
     /// Atomically consumes the exact per-destination share/publication authority,
@@ -2085,15 +2190,31 @@ impl CvcStore {
     /// skipped, never replaced: replacing would drop the commit links an earlier
     /// ingest has earned.
     ///
-    /// The cursor is written to the 0.7.x table exactly as 0.7.x writes it, and
-    /// mirrored into the typed `harness_cursors` row of the same session in the
-    /// same transaction (its path and offset; whatever else the row holds
-    /// stays).
+    /// The cursor is written to the 0.7.x table exactly as 0.7.x writes it,
+    /// and its typed copy in `harness_cursors` is kept in the same
+    /// transaction by the mirror rule (see `mirror_claude_code_cursor_tx`):
+    /// the copy never moves backwards within an epoch (an offset behind it
+    /// opens the next epoch, because only a rewritten transcript moves the
+    /// 0.7.x row back), and a typed row of another codec kind or version is
+    /// never spliced into.
+    ///
+    /// Like 0.7.x's, this batch carries no coverage grant: its caller makes
+    /// the capture decision. Claude Code ingestion itself goes through
+    /// [`Self::capture_harness_batch`].
+    ///
+    /// The cursor is Claude Code's own: one whose `harness` is anything but
+    /// `claude-code` is refused, and nothing is stored.
+    #[deprecated(note = "use harness::engine::ingest")]
     pub fn capture_claude_code_batch(
         &self,
         captures: Vec<crate::privacy::ClaudeCodeCapture>,
         cursor: HarnessCursorUpdate<'_>,
     ) -> Result<HarnessBatchOutcome> {
+        if cursor.harness != HarnessId::ClaudeCode.name() {
+            return Err(DbError::HarnessBatch(
+                "a Claude Code batch keeps Claude Code's cursor only".into(),
+            ));
+        }
         let batch = PreparedHarnessBatch::prepare(
             captures
                 .into_iter()
@@ -2105,9 +2226,7 @@ impl CvcStore {
             let outcome = Self::insert_harness_captures_tx(tx, &batch)?;
             let now = Utc::now().timestamp();
             Self::write_legacy_cursor_tx(tx, &cursor, byte_offset, now)?;
-            if cursor.harness == HarnessId::ClaudeCode.name() {
-                Self::mirror_claude_code_cursor_tx(tx, &cursor, byte_offset, now)?;
-            }
+            Self::mirror_claude_code_cursor_tx(tx, &cursor, byte_offset, now)?;
             Ok(outcome)
         })?;
         outcome.lost = batch.lost.len();
@@ -2135,25 +2254,57 @@ impl CvcStore {
         Ok(())
     }
 
-    /// The typed copy of a Claude Code cursor. A cursor whose state would
-    /// not be within the typed table's limits (a session id or path that is
-    /// not storable) is not copied, and any earlier copy of it is removed: the
-    /// 0.7.x row stays the one that is read.
+    /// The typed copy of a Claude Code cursor row, kept by one rule:
+    ///
+    /// * no typed row yet: one is made, `jsonl` version 1 in epoch 0, holding
+    ///   `{path, byte_offset}`;
+    /// * a `jsonl` version 1 row whose offset is at or before this one: its
+    ///   path and offset follow, in its epoch, and whatever else it holds
+    ///   stays;
+    /// * a `jsonl` version 1 row ahead of this offset: the copy never moves
+    ///   backwards within an epoch, so it moves to the next epoch, holding
+    ///   `{path, byte_offset, epoch_reason: "rewritten"}` (Claude Code moves
+    ///   its 0.7.x row back only for a transcript rewritten or cut short);
+    /// * a row of another codec kind or version: left as it is, never spliced
+    ///   into.
+    ///
+    /// A cursor whose state would not be within the typed table's limits (a
+    /// session id or path that is not storable) is not copied, and an earlier
+    /// `jsonl` version 1 copy of it is removed: the 0.7.x row stays the one
+    /// that is read.
     fn mirror_claude_code_cursor_tx(
         tx: &Transaction<'_>,
         cursor: &HarnessCursorUpdate<'_>,
         byte_offset: i64,
         now: i64,
     ) -> Result<()> {
-        if !Self::is_mirrorable_cursor(cursor.session_id, cursor.transcript_path, byte_offset) {
-            tx.execute(
-                "DELETE FROM harness_cursors WHERE harness=?1 AND cursor_key=?2",
+        let stored: Option<(String, i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT kind, version, json_extract(state,'$.byte_offset') FROM harness_cursors WHERE harness=?1 AND cursor_key=?2",
                 params![cursor.harness, cursor.session_id],
-            )?;
+                |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<i64>>(2).ok().flatten())),
+            )
+            .optional()?;
+        let ours = |kind: &str, version: i64| kind == "jsonl" && version == 1;
+        if !Self::is_mirrorable_cursor(cursor.session_id, cursor.transcript_path, byte_offset) {
+            if matches!(&stored, Some((kind, version, _)) if ours(kind, *version)) {
+                tx.execute(
+                    "DELETE FROM harness_cursors WHERE harness=?1 AND cursor_key=?2",
+                    params![cursor.harness, cursor.session_id],
+                )?;
+            }
             return Ok(());
         }
+        let sql = match &stored {
+            None => MIRROR_CLAUDE_CODE_CURSOR_SQL,
+            Some((kind, version, offset)) if ours(kind, *version) => match offset {
+                Some(offset) if byte_offset >= *offset => MIRROR_CLAUDE_CODE_CURSOR_SQL,
+                _ => MIRROR_CLAUDE_CODE_CURSOR_NEXT_EPOCH_SQL,
+            },
+            Some(_) => return Ok(()),
+        };
         tx.execute(
-            MIRROR_CLAUDE_CODE_CURSOR_SQL,
+            sql,
             params![
                 cursor.harness,
                 cursor.session_id,
@@ -2254,6 +2405,18 @@ impl CvcStore {
         Self::harness_cursor_in(&self.conn, harness.name(), cursor_key)
     }
 
+    /// Every typed cursor `harness` keeps, by key.
+    pub fn harness_cursors(&self, harness: HarnessId) -> Result<Vec<StoredHarnessCursor>> {
+        let keys: Vec<String> = self
+            .conn
+            .prepare("SELECT cursor_key FROM harness_cursors WHERE harness=?1 ORDER BY cursor_key")?
+            .query_map(params![harness.name()], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        keys.iter()
+            .filter_map(|key| Self::harness_cursor_in(&self.conn, harness.name(), key).transpose())
+            .collect()
+    }
+
     fn harness_cursor_in(
         conn: &Connection,
         harness: &str,
@@ -2350,6 +2513,43 @@ impl CvcStore {
             .collect()
     }
 
+    /// [`Self::harness_commit_evidence`], each row with the worktree its
+    /// reporting interaction was captured in (joined through
+    /// `interaction_id`), so that a replayed commit claims only rows of that
+    /// worktree.
+    pub(crate) fn harness_commit_evidence_reported_in(
+        &self,
+        harness: HarnessId,
+        family_root: &str,
+    ) -> Result<Vec<(HarnessCommitEvidence, Option<String>)>> {
+        self.conn
+            .prepare("SELECT e.family_root, e.interaction_id, e.commit_oid, e.response_at, i.capture_worktree FROM harness_commit_evidence e JOIN interactions i ON i.id = e.interaction_id WHERE e.harness=?1 AND e.family_root=?2 ORDER BY e.response_at, e.interaction_id, e.commit_oid")?
+            .query_map(params![harness.name(), family_root], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .map(|row| {
+                let (family_root, interaction, commit, response_at, worktree) = row?;
+                Ok((
+                    HarnessCommitEvidence {
+                        family_root,
+                        interaction_id: interaction.parse().map_err(|_| {
+                            DbError::Migration("stored commit evidence is malformed".into())
+                        })?,
+                        commit: CommitSha::new(commit),
+                        response_at,
+                    },
+                    worktree,
+                ))
+            })
+            .collect()
+    }
+
     /// Every commit-evidence row of `harness` for the family rooted at
     /// `family_root`, ordered by response time, interaction and candidate.
     pub fn harness_commit_evidence(
@@ -2386,7 +2586,14 @@ impl CvcStore {
     /// stand-ins included, exactly as [`Self::capture_claude_code_batch`]
     /// does), the typed cursor (never moved backwards), the Claude Code legacy
     /// cursor, conversation relations and durable commit evidence, in one
-    /// immediate transaction.
+    /// immediate transaction. The batch's coverage grant is consumed with it.
+    ///
+    /// The Claude Code legacy cursor is written exactly when the typed cursor
+    /// is; a batch that carries only the legacy cursor writes it and keeps
+    /// its typed copy by the mirror rule of
+    /// [`Self::capture_claude_code_batch`], so the typed copy never moves
+    /// backwards within an epoch and never splices into a row of another
+    /// codec kind or version.
     ///
     /// Refused as a whole, before anything is stored, when the batch is not
     /// consistent: a coverage grant for another repository, a capture of
@@ -2417,9 +2624,17 @@ impl CvcStore {
             relations,
         } = batch;
         let refuse = |rule: &str| Err(DbError::HarnessBatch(rule.into()));
-        if grant.channel() != harness.channel() || !grant.binds_store(&self.path) {
-            return refuse("the coverage grant is not for this harness and repository");
+        match &grant {
+            Some(grant) => {
+                if grant.channel() != harness.channel() || !grant.binds_store(&self.path) {
+                    return refuse("the coverage grant is not for this harness and repository");
+                }
+            }
+            // Only `HarnessBatch::claude_code_caller_decided` makes one.
+            None if harness == HarnessId::ClaudeCode => {}
+            None => return refuse("a batch without a coverage grant records nothing"),
         }
+        drop(grant);
         if captures
             .iter()
             .any(|c| c.harness() != harness || c.conversation_id() != conversation_id)
@@ -2510,6 +2725,9 @@ impl CvcStore {
                 (&legacy_cursor, legacy_offset, cursor_written)
             {
                 Self::write_legacy_cursor_tx(tx, legacy, offset, now)?;
+                if cursor.is_none() {
+                    Self::mirror_claude_code_cursor_tx(tx, legacy, offset, now)?;
+                }
             }
             // Relations first: the family an evidence row names may be the
             // one a relation of this batch records.
@@ -2672,18 +2890,22 @@ impl CvcStore {
         if !family_bound {
             return Ok(false);
         }
-        let stored: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM interactions WHERE id=?1 AND conversation_id=?2 AND capture_source=?3)",
-            params![
-                evidence.interaction_id.as_str(),
-                conversation_id,
-                harness.capture_source_str()
-            ],
-            |row| row.get(0),
-        )?;
-        if !stored {
+        // The response's time is the stored interaction's, never the
+        // caller's: a replayed commit is bounded by it.
+        let response_at: Option<i64> = tx
+            .query_row(
+                "SELECT timestamp FROM interactions WHERE id=?1 AND conversation_id=?2 AND capture_source=?3",
+                params![
+                    evidence.interaction_id.as_str(),
+                    conversation_id,
+                    harness.capture_source_str()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(response_at) = response_at else {
             return Ok(false);
-        }
+        };
         tx.execute(
             "INSERT OR IGNORE INTO harness_commit_evidence(harness,family_root,interaction_id,commit_oid,response_at) VALUES (?1,?2,?3,?4,?5)",
             params![
@@ -2691,7 +2913,7 @@ impl CvcStore {
                 evidence.family_root,
                 evidence.interaction_id.as_str(),
                 commit,
-                evidence.response_at
+                response_at
             ],
         )?;
         Ok(true)
@@ -2852,17 +3074,56 @@ impl CvcStore {
         Ok(true)
     }
 
+    /// Caps every wait of this store's writes for another writer at
+    /// `deadline`, until the returned guard is dropped: the busy timeout of
+    /// each writing transaction (at most two seconds) and the retries of a
+    /// harness batch (at most five). A write is still allowed
+    /// [`MIN_CAPPED_WAIT`] when the deadline is near or past. A hook's run
+    /// sets its own deadline here, so that a busy database cannot hold it
+    /// past its budget; `None` leaves the waits as they are.
+    pub(crate) fn cap_write_waits(&self, deadline: Option<Instant>) -> WriteWaitCap<'_> {
+        let previous = self.write_deadline.replace(deadline);
+        WriteWaitCap {
+            store: self,
+            previous,
+        }
+    }
+
+    /// The longest `wanted` wait a write may still take now, under
+    /// [`Self::cap_write_waits`].
+    fn capped_wait(&self, wanted: Duration) -> Duration {
+        match self.write_deadline.get() {
+            Some(deadline) => wanted.min(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .max(MIN_CAPPED_WAIT),
+            ),
+            None => wanted,
+        }
+    }
+
+    /// Sets the connection's busy timeout for the next writing transaction:
+    /// [`BUSY_TIMEOUT`], capped by [`Self::cap_write_waits`].
+    fn apply_busy_timeout(&self) -> Result<()> {
+        if self.write_deadline.get().is_some() {
+            self.conn.busy_timeout(self.capped_wait(BUSY_TIMEOUT))?;
+        }
+        Ok(())
+    }
+
     /// Runs `body` inside an immediate transaction, retrying with backoff while
     /// another process holds the write lock, up to a bounded budget. The short
     /// connection-level busy timeout stays as it is because Git hooks must not
-    /// wait; harness ingests may.
+    /// wait; harness ingests may. Both waits are capped by
+    /// [`Self::cap_write_waits`].
     fn with_immediate_write_retry<T>(
         &self,
         mut body: impl FnMut(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        let deadline = Instant::now() + HARNESS_WRITE_RETRY_BUDGET;
+        let deadline = Instant::now() + self.capped_wait(HARNESS_WRITE_RETRY_BUDGET);
         let mut delay = Duration::from_millis(50);
         loop {
+            self.apply_busy_timeout()?;
             let attempt = (|| {
                 let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
                 let value = body(&tx)?;
@@ -3300,7 +3561,65 @@ impl CvcStore {
         self.floating_interactions(Some(capture_worktree))
     }
 
+    /// The interactions [`Self::get_floating_interactions_for_worktree`]
+    /// returns that are in one of `conversations`, of one capture source only
+    /// when `capture_source` names one (a harness family rescue claims only
+    /// its own harness's rows): their id, conversation, time and worktree,
+    /// and none of their captured text. What a family's commit rescue needs
+    /// to choose what to claim, filtered here rather than by its caller.
+    pub(crate) fn floating_family_interactions(
+        &self,
+        capture_worktree: &str,
+        capture_source: Option<&str>,
+        conversations: &[&str],
+    ) -> Result<Vec<FloatingInteraction>> {
+        let conversations = serde_json::to_string(conversations)
+            .map_err(|error| DbError::Migration(error.to_string()))?;
+        self.conn
+            .prepare(
+                "SELECT i.id, i.conversation_id, i.timestamp, i.capture_worktree
+                 FROM interactions i
+                 LEFT JOIN artifact_links al ON i.id = al.interaction_id
+                 WHERE al.interaction_id IS NULL
+                   AND (i.capture_worktree IS NULL OR i.capture_worktree = ?1)
+                   AND (?2 IS NULL OR i.capture_source = ?2)
+                   AND i.conversation_id IN (SELECT value FROM json_each(?3))",
+            )?
+            .query_map(
+                params![capture_worktree, capture_source, conversations],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )?
+            .map(|row| {
+                let (id, conversation_id, timestamp, capture_worktree) = row?;
+                let id = id
+                    .parse()
+                    .map_err(|_| DbError::Migration("stored interaction id is malformed".into()))?;
+                Ok(FloatingInteraction {
+                    id,
+                    conversation_id,
+                    timestamp,
+                    capture_worktree,
+                })
+            })
+            .collect()
+    }
+
     fn floating_interactions(&self, capture_worktree: Option<&str>) -> Result<Vec<Interaction>> {
+        self.floating_interactions_where(capture_worktree, None)
+    }
+
+    fn floating_interactions_where(
+        &self,
+        capture_worktree: Option<&str>,
+        capture_source: Option<&str>,
+    ) -> Result<Vec<Interaction>> {
         // Interactions that are NOT in artifact_links
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.conversation_id, i.parent_id, i.timestamp, i.author, i.user_prompt,
@@ -3308,10 +3627,11 @@ impl CvcStore {
              FROM interactions i
              LEFT JOIN artifact_links al ON i.id = al.interaction_id
              WHERE al.interaction_id IS NULL
-               AND (?1 IS NULL OR i.capture_worktree IS NULL OR i.capture_worktree = ?1)",
+               AND (?1 IS NULL OR i.capture_worktree IS NULL OR i.capture_worktree = ?1)
+               AND (?2 IS NULL OR i.capture_source = ?2)",
         )?;
 
-        let rows = stmt.query_map(params![capture_worktree], |row| {
+        let rows = stmt.query_map(params![capture_worktree, capture_source], |row| {
             let parent_id_str: Option<String> = row.get(2)?;
             let timestamp: i64 = row.get(3)?;
             let author_str: String = row.get(4)?;
@@ -4134,7 +4454,51 @@ impl CvcStore {
             .map_err(|e| DbError::InvalidLink(e.to_string()))?;
         let linked_by = linked_by.as_deref();
 
+        self.apply_busy_timeout()?;
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let inserts =
+            Self::link_automatic_tx(&transaction, links, commit_sha, linked_by, trusted_local)?;
+        transaction.commit()?;
+        Ok(inserts)
+    }
+
+    /// [`Self::link_automatic_interaction_batch_trusted`] for a harness
+    /// family's commit rescue, which is not a Git hook and may wait: the
+    /// transaction is retried while another writer holds the database, up to
+    /// the harness retry budget, capped by [`Self::cap_write_waits`].
+    pub(crate) fn link_rescued_interaction_batch(
+        &self,
+        links: &[(&InteractionId, &str)],
+        commit_sha: &CommitSha,
+        linked_by: Option<&str>,
+    ) -> Result<usize> {
+        if let Some((_, link_type)) = links
+            .iter()
+            .find(|(_, link_type)| !matches!(*link_type, "generated" | "temporal"))
+        {
+            return Err(DbError::InvalidLink((*link_type).to_owned()));
+        }
+        if !is_safe_commit_sha(commit_sha.as_str()) {
+            return Err(DbError::InvalidLink("invalid commit SHA".into()));
+        }
+        let linked_by = linked_by
+            .map(privacy::scrub)
+            .transpose()
+            .map_err(|e| DbError::InvalidLink(e.to_string()))?;
+        let linked_by = linked_by.as_deref();
+        self.with_immediate_write_retry(|tx| {
+            Self::link_automatic_tx(tx, links, commit_sha, linked_by, true)
+        })
+    }
+
+    /// The inserts of an automatic link batch, inside `transaction`.
+    fn link_automatic_tx(
+        transaction: &Transaction<'_>,
+        links: &[(&InteractionId, &str)],
+        commit_sha: &CommitSha,
+        linked_by: Option<&str>,
+        trusted_local: bool,
+    ) -> Result<usize> {
         let mut inserts = 0;
         for (interaction_id, link_type) in links {
             match transaction.execute(
@@ -4195,7 +4559,6 @@ impl CvcStore {
                 transaction.execute("INSERT OR IGNORE INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) VALUES(?1,NULL,?1,'local_api',1)", params![key])?;
             }
         }
-        transaction.commit()?;
         Ok(inserts)
     }
 
@@ -4811,6 +5174,31 @@ mod trusted_api_tests {
     use crate::models::{CaptureSource, Evidence};
     use crate::privacy::{McpCapture, PreparedPolicy};
 
+    /// An upgrade still to run is blocked only when this version will never
+    /// run it: the table has a column it does not know.
+    #[test]
+    fn an_upgrade_is_blocked_only_by_columns_this_version_does_not_know() {
+        let store = CvcStore::open(":memory:").unwrap();
+        assert!(!store.needs_capture_source_upgrade().unwrap());
+        assert!(!store.capture_source_upgrade_blocked().unwrap());
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM cvc_internal_migrations WHERE name=?1",
+                params![CAPTURE_SOURCE_TRIGGERS_MARKER],
+            )
+            .unwrap();
+        assert!(store.needs_capture_source_upgrade().unwrap());
+        assert!(!store.capture_source_upgrade_blocked().unwrap());
+
+        store
+            .conn
+            .execute_batch("ALTER TABLE interactions ADD COLUMN future_column TEXT")
+            .unwrap();
+        assert!(store.capture_source_upgrade_blocked().unwrap());
+    }
+
     /// One thought from `source` into `conversation_id`, carrying `title` for
     /// its conversation, as the source's front would hand it to the store.
     fn fixture_capture(
@@ -5116,6 +5504,7 @@ mod trusted_api_tests {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod harness_batch_tests {
     use super::*;
     use crate::harness::PassiveChannel;
@@ -5124,8 +5513,8 @@ mod harness_batch_tests {
     const WORKTREE: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     /// A grant for `harness`'s channel that binds no repository (tests only).
-    fn grant(harness: HarnessId) -> &'static CoverageGrant {
-        Box::leak(Box::new(CoverageGrant::for_tests(harness.channel())))
+    fn grant(harness: HarnessId) -> CoverageGrant {
+        CoverageGrant::for_tests(harness.channel())
     }
 
     fn policy() -> &'static PreparedPolicy {
@@ -5242,17 +5631,31 @@ mod harness_batch_tests {
 
     #[test]
     fn harness_batches_require_a_grant_for_the_harness_channel() {
-        let codex = grant(HarnessId::Codex);
+        let codex = || grant(HarnessId::Codex);
         assert!(matches!(
-            HarnessBatch::new(codex, HarnessId::OpenCode, "opencode:s", policy()),
+            HarnessBatch::new(codex(), HarnessId::OpenCode, "opencode:s", policy()),
             Err(DbError::HarnessBatch(_))
         ));
-        let vscode: &'static CoverageGrant =
-            Box::leak(Box::new(CoverageGrant::for_tests(PassiveChannel::Vscode)));
+        let vscode = CoverageGrant::for_tests(PassiveChannel::Vscode);
         assert!(HarnessBatch::new(vscode, HarnessId::ClaudeCode, "s1", policy()).is_err());
-        assert!(HarnessBatch::new(codex, HarnessId::Codex, "codex:t", policy()).is_ok());
+        assert!(HarnessBatch::new(codex(), HarnessId::Codex, "codex:t", policy()).is_ok());
         // The conversation id must be one the built-in scrubber leaves as it is.
-        assert!(HarnessBatch::new(codex, HarnessId::Codex, "codex:a b", policy()).is_err());
+        assert!(HarnessBatch::new(codex(), HarnessId::Codex, "codex:a b", policy()).is_err());
+    }
+
+    /// Without a grant only Claude Code's caller-decided batch records, and
+    /// only through its own constructor; any other harness's batch is refused.
+    #[test]
+    fn a_batch_without_a_grant_is_claude_code_caller_decided_only() {
+        let store = CvcStore::open(":memory:").unwrap();
+        let b = HarnessBatch::claude_code_caller_decided("s1", policy())
+            .with_captures(vec![capture(HarnessId::ClaudeCode, "s1", "req_1")]);
+        assert_eq!(store.capture_harness_batch(b).unwrap().inserted, 1);
+        let mut forged = HarnessBatch::claude_code_caller_decided("codex:t", policy())
+            .with_captures(vec![capture(HarnessId::Codex, "codex:t", "resp:a")]);
+        forged.harness = HarnessId::Codex;
+        refused(store.capture_harness_batch(forged));
+        assert!(store.get_conversation("codex:t").unwrap().is_none());
     }
 
     /// A grant given for one repository records nothing into another's store.
@@ -5261,24 +5664,24 @@ mod harness_batch_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
         privacy::acknowledge_capture(&repo).unwrap();
-        let claude = privacy::require_coverage(&repo, HarnessId::ClaudeCode.channel()).unwrap();
+        let claude = || privacy::require_coverage(&repo, HarnessId::ClaudeCode.channel()).unwrap();
 
         let own_path = dir.path().join(".git").join("cvc").join("index.db");
         let own = CvcStore::open(&own_path).unwrap();
-        let b = HarnessBatch::new(&claude, HarnessId::ClaudeCode, "s1", policy())
+        let b = HarnessBatch::new(claude(), HarnessId::ClaudeCode, "s1", policy())
             .unwrap()
             .with_captures(vec![capture(HarnessId::ClaudeCode, "s1", "req_1")]);
         assert_eq!(own.capture_harness_batch(b).unwrap().inserted, 1);
 
         let other = tempfile::TempDir::new().unwrap();
         let other_store = CvcStore::open(other.path().join("cvc").join("index.db")).unwrap();
-        let b = HarnessBatch::new(&claude, HarnessId::ClaudeCode, "s1", policy())
+        let b = HarnessBatch::new(claude(), HarnessId::ClaudeCode, "s1", policy())
             .unwrap()
             .with_captures(vec![capture(HarnessId::ClaudeCode, "s1", "req_2")]);
         refused(other_store.capture_harness_batch(b));
         assert!(other_store.get_conversation("s1").unwrap().is_none());
         let memory = CvcStore::open(":memory:").unwrap();
-        let b = HarnessBatch::new(&claude, HarnessId::ClaudeCode, "s1", policy()).unwrap();
+        let b = HarnessBatch::new(claude(), HarnessId::ClaudeCode, "s1", policy()).unwrap();
         refused(memory.capture_harness_batch(b));
     }
 
@@ -5604,15 +6007,28 @@ mod harness_batch_tests {
             .unwrap()
             .unwrap();
         assert_eq!(typed.updated_at, legacy.updated_at);
-        // What else a later codec keeps in the row stays; the offset follows
-        // the legacy row, even when it goes back (a rewritten transcript).
+        // Forward in its epoch, what else the row holds stays.
         store
             .conn
             .execute(
-                "UPDATE harness_cursors SET state=json_set(state,'$.carry','kept') WHERE cursor_key='s1'",
+                "UPDATE harness_cursors SET state=json_set(state,'$.last_ordinal',7) WHERE cursor_key='s1'",
                 [],
             )
             .unwrap();
+        store
+            .capture_claude_code_batch(Vec::new(), update("/t.jsonl", 12))
+            .unwrap();
+        let typed = store
+            .harness_cursor(HarnessId::ClaudeCode, "s1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (typed.epoch, typed.state["byte_offset"].clone()),
+            (0, 12.into())
+        );
+        assert_eq!(typed.state["last_ordinal"], 7);
+        // Back (a rewritten transcript): never within the epoch; the next
+        // epoch holds the new offset and says why.
         store
             .capture_claude_code_batch(Vec::new(), update("/t.jsonl", 3))
             .unwrap();
@@ -5620,8 +6036,19 @@ mod harness_batch_tests {
             .harness_cursor(HarnessId::ClaudeCode, "s1")
             .unwrap()
             .unwrap();
-        assert_eq!(typed.state["byte_offset"], 3);
-        assert_eq!(typed.state["carry"], "kept");
+        assert_eq!(typed.epoch, 1);
+        assert_eq!(
+            typed.state,
+            serde_json::json!({"path": "/t.jsonl", "byte_offset": 3, "epoch_reason": "rewritten"})
+        );
+        assert_eq!(
+            store
+                .harness_ingest_cursor("claude-code", "s1")
+                .unwrap()
+                .unwrap()
+                .byte_offset,
+            3
+        );
         // A path outside the typed limits is kept in the 0.7.x row only.
         let long = format!("/{}", "p".repeat(MAX_CURSOR_STRING_BYTES));
         store
@@ -5635,7 +6062,100 @@ mod harness_batch_tests {
             .harness_ingest_cursor("claude-code", "s1")
             .unwrap()
             .unwrap();
-        assert_eq!((legacy.transcript_path, legacy.byte_offset), (long, 4));
+        assert_eq!(
+            (legacy.transcript_path.as_str(), legacy.byte_offset),
+            (long.as_str(), 4)
+        );
+
+        // A typed row of another codec kind or version is never spliced into
+        // (nor removed); the 0.7.x row is written as always.
+        for (kind, version) in [("spool", 1), ("jsonl", 2)] {
+            store
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO harness_cursors(harness,cursor_key,kind,version,epoch,state,updated_at) VALUES ('claude-code','s2',?1,?2,0,'{\"assembled_through\":9}',1)",
+                    params![kind, version],
+                )
+                .unwrap();
+            for offset in [50, 1] {
+                store
+                    .capture_claude_code_batch(
+                        Vec::new(),
+                        HarnessCursorUpdate {
+                            session_id: "s2",
+                            ..update("/t.jsonl", offset)
+                        },
+                    )
+                    .unwrap();
+                let typed = store
+                    .harness_cursor(HarnessId::ClaudeCode, "s2")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    (typed.kind.as_str(), typed.version, typed.epoch),
+                    (kind, version, 0)
+                );
+                assert_eq!(typed.state, serde_json::json!({"assembled_through": 9}));
+                assert_eq!(
+                    store
+                        .harness_ingest_cursor("claude-code", "s2")
+                        .unwrap()
+                        .unwrap()
+                        .byte_offset,
+                    offset
+                );
+            }
+        }
+    }
+
+    /// A Claude Code batch keeps Claude Code's cursor and no other harness's.
+    #[test]
+    fn the_claude_code_batch_refuses_another_harness_cursor() {
+        let store = CvcStore::open(":memory:").unwrap();
+        for harness in ["codex", "Claude-Code", ""] {
+            refused(store.capture_claude_code_batch(
+                Vec::new(),
+                HarnessCursorUpdate {
+                    harness,
+                    session_id: "s1",
+                    transcript_path: "/t.jsonl",
+                    byte_offset: 1,
+                },
+            ));
+        }
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM harness_ingest_cursors", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// A harness batch that carries only the Claude Code legacy cursor keeps
+    /// the typed copy by the same rule.
+    #[test]
+    fn a_legacy_only_harness_batch_keeps_the_typed_copy() {
+        let store = CvcStore::open(":memory:").unwrap();
+        let legacy = |offset| HarnessCursorUpdate {
+            harness: "claude-code",
+            session_id: "s1",
+            transcript_path: "/t.jsonl",
+            byte_offset: offset,
+        };
+        for (offset, epoch) in [(10, 0), (20, 0), (5, 1)] {
+            let b = HarnessBatch::claude_code_caller_decided("s1", policy())
+                .with_legacy_cursor(legacy(offset));
+            store.capture_harness_batch(b).unwrap();
+            let typed = store
+                .harness_cursor(HarnessId::ClaudeCode, "s1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (typed.epoch, typed.state["byte_offset"].as_u64()),
+                (epoch, Some(offset))
+            );
+        }
     }
 
     #[test]
@@ -5678,6 +6198,149 @@ mod harness_batch_tests {
             .unwrap()
             .with_evidence(vec![evidence(conv, &a_id, commit(4))]);
         assert_eq!(store.capture_harness_batch(b).unwrap().evidence_skipped, 1);
+    }
+
+    /// The response's time a row records is the stored interaction's, not
+    /// the one the batch passes: a replayed commit is bounded by it.
+    #[test]
+    fn commit_evidence_records_the_stored_responses_time() {
+        let store = CvcStore::open(":memory:").unwrap();
+        let conv = "codex:t1";
+        let a = capture(HarnessId::Codex, conv, "resp:a");
+        let a_id = a.interaction_id().clone();
+        let claimed = HarnessCommitEvidence {
+            response_at: 42,
+            ..evidence(conv, &a_id, commit(1))
+        };
+        store
+            .capture_harness_batch(
+                batch(conv)
+                    .with_captures(vec![a])
+                    .with_evidence(vec![claimed]),
+            )
+            .unwrap();
+        let stored = store
+            .harness_commit_evidence(HarnessId::Codex, conv)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].response_at, 1_700_000_000);
+    }
+
+    /// Every typed cursor of one harness, by key, and none of another's.
+    #[test]
+    fn a_harness_lists_its_own_typed_cursors() {
+        let store = CvcStore::open(":memory:").unwrap();
+        for conv in ["codex:b", "codex:a"] {
+            store
+                .capture_harness_batch(batch(conv).with_cursor(cursor(conv, 0, 1, &forward)))
+                .unwrap();
+        }
+        let keys: Vec<String> = store
+            .harness_cursors(HarnessId::Codex)
+            .unwrap()
+            .into_iter()
+            .map(|cursor| cursor.cursor_key)
+            .collect();
+        assert_eq!(keys, ["codex:a", "codex:b"]);
+        assert!(store
+            .harness_cursors(HarnessId::ClaudeCode)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The rescue's link batch is retried while another writer holds the
+    /// database past the two-second busy timeout a single attempt (the
+    /// linker's, which a Git hook runs) gives up at, and under a deadline it
+    /// gives up by the deadline instead.
+    #[test]
+    fn the_rescues_link_batch_is_retried_and_capped_by_the_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cvc").join("index.db");
+        let store = CvcStore::open(&path).unwrap();
+        let a = capture(HarnessId::Codex, "codex:t1", "resp:a");
+        let id = a.interaction_id().clone();
+        store
+            .capture_harness_batch(batch("codex:t1").with_captures(vec![a]))
+            .unwrap();
+        let links = [(&id, "generated")];
+        let sha = commit(1);
+
+        let holder = {
+            let path = path.clone();
+            let (held, wait) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let other = Connection::open(&path).unwrap();
+                other.execute_batch("BEGIN IMMEDIATE").unwrap();
+                held.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(2600));
+                other.execute_batch("ROLLBACK").unwrap();
+            });
+            wait.recv().unwrap();
+            thread
+        };
+        let started = Instant::now();
+        {
+            let _cap = store.cap_write_waits(Some(started + Duration::from_millis(300)));
+            assert!(matches!(
+                store.link_rescued_interaction_batch(&links, &sha, None),
+                Err(DbError::Sqlite(_))
+            ));
+        }
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert_eq!(
+            store
+                .link_rescued_interaction_batch(&links, &sha, None)
+                .unwrap(),
+            1
+        );
+        assert!(started.elapsed() >= Duration::from_millis(2500));
+        holder.join().unwrap();
+    }
+
+    /// Under a deadline, a batch that meets another writer's lock gives up by
+    /// the deadline (a brief wait at least) rather than after the five
+    /// seconds of retries it would otherwise wait; once the cap is dropped,
+    /// the waits are as before.
+    #[test]
+    fn write_waits_are_capped_by_the_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cvc").join("index.db");
+        let store = CvcStore::open(&path).unwrap();
+        let wants = |store: &CvcStore| store.capped_wait(HARNESS_WRITE_RETRY_BUDGET);
+        assert_eq!(wants(&store), HARNESS_WRITE_RETRY_BUDGET);
+        {
+            let _past = store.cap_write_waits(Some(Instant::now()));
+            assert_eq!(wants(&store), MIN_CAPPED_WAIT);
+        }
+        assert_eq!(wants(&store), HARNESS_WRITE_RETRY_BUDGET);
+
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = Instant::now();
+        let refused = {
+            let _cap = store.cap_write_waits(Some(started + Duration::from_millis(300)));
+            store.capture_harness_batch(batch("codex:t1").with_captures(vec![capture(
+                HarnessId::Codex,
+                "codex:t1",
+                "resp:a",
+            )]))
+        };
+        let took = started.elapsed();
+        assert!(
+            matches!(refused, Err(DbError::Sqlite(_))),
+            "{:?}",
+            refused.map(|_| ())
+        );
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        other.execute_batch("ROLLBACK").unwrap();
+        // Nothing of the batch was stored, and the next one is.
+        assert!(store
+            .capture_harness_batch(batch("codex:t1").with_captures(vec![capture(
+                HarnessId::Codex,
+                "codex:t1",
+                "resp:a"
+            )]),)
+            .is_ok());
     }
 
     /// In an unprefixed Claude Code session, only Claude Code's own

@@ -1,5 +1,6 @@
 use crate::server::{AppState, JsonRpcError};
 use chrono::Utc;
+use cvc_core::harness::{self, HarnessId};
 use cvc_core::models::{Author, Conversation, Interaction, InteractionId};
 use cvc_core::privacy::{self, McpCapture, PreparedPolicy};
 use serde_json::{json, Value};
@@ -12,6 +13,19 @@ use std::sync::Arc;
 /// that conversation does not extend to it.
 const THOUGHTS_STAY_PRIVATE: &str =
     "Thoughts recorded through MCP stay private until shared with `cvc share`.";
+
+/// What `commit_thought` says about a conversation id under a prefix reserved
+/// for an agent harness's own capture, naming every reserved prefix.
+fn reserved_conversation_id_message() -> String {
+    let prefixes: Vec<String> = HarnessId::ALL
+        .iter()
+        .map(|harness| format!("'{}'", harness.reserved_prefix()))
+        .collect();
+    format!(
+        "Invalid 'conversation_id': the prefixes {} (in any letter case) are reserved for the capture of those agent harnesses; choose an id that does not start with one.",
+        prefixes.join(", ")
+    )
+}
 
 pub fn list_tools() -> Value {
     json!({
@@ -200,6 +214,17 @@ async fn commit_thought(args: Value, state: Arc<AppState>) -> Result<Value, Json
             return Err(JsonRpcError {
                 code: -32602,
                 message: "Invalid 'conversation_id': use 1 to 256 ASCII letters, digits, '.', '_', '-' or ':'.".to_string(),
+                data: None,
+            });
+        }
+        // A reserved prefix names the agent harness whose own capture wrote
+        // the conversation, so only that harness (and a pull) may create a
+        // conversation under it. The capture boundary refuses it in any
+        // case; saying so here tells the client which prefixes to avoid.
+        Some(id) if harness::is_reserved_conversation_id(id).is_some() => {
+            return Err(JsonRpcError {
+                code: -32602,
+                message: reserved_conversation_id_message(),
                 data: None,
             });
         }

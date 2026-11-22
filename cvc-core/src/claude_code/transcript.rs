@@ -23,6 +23,12 @@
 //! report can say what was not recorded. `fallback` carries no conversation
 //! content and is skipped outright.
 //!
+//! This is Claude Code's instance of the drift rule every harness parser
+//! follows ([`DRIFT`], see `crate::harness::drift`): the version gate is the
+//! shared [`FormatPin`] check, and placeholders are the shared
+//! [`PlaceholderStyle::Verbatim`] form, `[<type>]` exactly as 0.7.x wrote
+//! them.
+//!
 //! Entry types that carry no conversation content (session bookkeeping such as
 //! `queue-operation` or `last-prompt`) are skipped by design. The conversation
 //! is the `uuid`/`parentUuid` chain, so an entry without a `uuid` is
@@ -58,6 +64,11 @@
 //! with no result block in its response is a failure, like any other
 //! interrupted call. Only a `[<block type>]` placeholder reaches the response
 //! text, never the result's content, which is third-party text.
+use crate::harness::candidate::{
+    CaptureCandidate, Reasoning, SourcePosition, ToolCallRecord, ToolProtocol,
+};
+use crate::harness::drift::{DriftError, DriftRule, FormatPin, MalformedLine, PlaceholderStyle};
+use crate::harness::HarnessId;
 use crate::models::{Author, ContextItem, InteractionId, ToolExecution, ToolStatus};
 use crate::privacy::PreparedPolicy;
 use crate::stimulus::{self, PartKind, StimulusPart};
@@ -74,6 +85,19 @@ use uuid::Uuid;
 pub const HARNESS: &str = "claude-code";
 /// The transcript major version this parser is pinned to.
 pub const SUPPORTED_MAJOR_VERSION: u64 = 2;
+
+/// Claude Code's instance of the shared drift rule: transcript major version
+/// 2 only (verified against the fixtures of these releases), placeholders as
+/// 0.7.x spelled them, and a line that is not an entry fails the read.
+pub const DRIFT: DriftRule = DriftRule {
+    pin: FormatPin {
+        harness: HarnessId::ClaudeCode,
+        supported_major: &[SUPPORTED_MAJOR_VERSION],
+        verified: &["2.1.219", "2.1.260", "2.1.289", "2.1.300"],
+    },
+    placeholders: PlaceholderStyle::Verbatim,
+    malformed: MalformedLine::Fail,
+};
 
 /// A single transcript line larger than this is treated as corruption rather
 /// than buffered; Claude Code writes oversized tool output out of line.
@@ -567,19 +591,16 @@ fn parse_timestamp(value: &str, offset: u64) -> Result<DateTime<Utc>, Transcript
 
 fn check_version(version: Option<&str>, offset: u64) -> Result<(), TranscriptError> {
     let version = version.ok_or_else(|| malformed(offset, "message entry has no version"))?;
-    let major = version
-        .split('.')
-        .next()
-        .and_then(|part| part.parse::<u64>().ok())
-        .ok_or_else(|| malformed(offset, format!("unparsable version {version:?}")))?;
-    if major != SUPPORTED_MAJOR_VERSION {
-        return Err(TranscriptError::UnsupportedVersion {
+    DRIFT.pin.check_major(version).map_err(|error| match error {
+        DriftError::UnparsableVersion { found } => {
+            malformed(offset, format!("unparsable version {found:?}"))
+        }
+        DriftError::UnsupportedMajor { found, .. } => TranscriptError::UnsupportedVersion {
             offset,
-            version: version.to_owned(),
+            version: found,
             supported: SUPPORTED_MAJOR_VERSION,
-        });
-    }
-    Ok(())
+        },
+    })
 }
 
 /// A title entry's payload as a parsed line; empty or placeholder titles are
@@ -638,7 +659,7 @@ fn parse_user_content(
                     "image" => message.texts.push("[image]".to_owned()),
                     "document" => message.texts.push("[document]".to_owned()),
                     other => {
-                        message.texts.push(format!("[{other}]"));
+                        message.texts.push(DRIFT.placeholders.placeholder(other));
                         message.unrecorded.push(other.to_owned());
                     }
                 }
@@ -891,6 +912,43 @@ impl PlannedInteraction {
     }
 }
 
+/// A planned response as every harness's candidates are, losslessly: the
+/// thinking blocks are reasoning as Claude Code exposed it, and each tool
+/// execution is a call of the response itself.
+impl From<PlannedInteraction> for CaptureCandidate {
+    fn from(planned: PlannedInteraction) -> Self {
+        CaptureCandidate {
+            key: planned.response_key,
+            id: planned.id,
+            parent: planned.parent_id,
+            timestamp: planned.timestamp,
+            author: planned.author,
+            stimulus: planned.stimulus,
+            model_name: planned.model_name,
+            reasoning: planned.model_cot.map(Reasoning::exposed),
+            response: planned.model_response,
+            tools: planned
+                .tool_executions
+                .into_iter()
+                .map(|tool| ToolCallRecord {
+                    // The planner writes exactly these three (see `plan`).
+                    protocol: ToolProtocol::from_stored(&tool.tool_protocol)
+                        .unwrap_or(ToolProtocol::Native),
+                    name: tool.tool_name,
+                    arguments: tool.arguments,
+                    status: tool.status,
+                    call_id: None,
+                    within: None,
+                })
+                .collect(),
+            context: planned.context_items,
+            commit_candidates: planned.commit_candidates,
+            unrecorded: planned.unrecorded_blocks,
+            start: SourcePosition::Byte(planned.first_offset),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Plan {
     pub interactions: Vec<PlannedInteraction>,
@@ -1139,7 +1197,7 @@ pub fn plan(lines: &[ParsedLine], window_start: u64, input: &PlanInput<'_>) -> P
 
         let placeholders: Vec<String> = group_blocks()
             .filter_map(|block| match block {
-                AssistantBlock::Unrecorded(kind) => Some(format!("[{kind}]")),
+                AssistantBlock::Unrecorded(kind) => Some(DRIFT.placeholders.placeholder(kind)),
                 _ => None,
             })
             .collect();

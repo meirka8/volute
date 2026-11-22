@@ -926,6 +926,40 @@ fn capture_coverage_as(
     let state = read_privacy(repo)?;
     Ok(capture_coverage_in(repo, &state, user, channel))
 }
+/// What the capture acknowledgement covers here, channel by channel, from one
+/// read of the consent state: what `cvc privacy status` and `cvc harness
+/// status` show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageSummary {
+    /// The acknowledgement as cvc 0.7.x judged it.
+    pub acknowledgement: CaptureAcknowledgement,
+    /// Every channel in [`PassiveChannel::ALL`] order, with its coverage.
+    pub channels: Vec<(PassiveChannel, CaptureCoverage)>,
+    /// The acknowledgement on record carries a channel list. One without it
+    /// (given by cvc 0.7.2 or earlier, or rewritten by such a cvc, which
+    /// drops the list) covers [`PassiveChannel::LEGACY_COVERED`] only.
+    pub lists_channels: bool,
+}
+
+/// [`CoverageSummary`] for this checkout and the user running this process.
+pub fn capture_coverage_summary(repo: &git2::Repository) -> Result<CoverageSummary> {
+    let state = read_privacy(repo)?;
+    let user = current_user();
+    Ok(CoverageSummary {
+        acknowledgement: capture_acknowledgement_in(repo, &state, user.as_deref()),
+        channels: PassiveChannel::ALL
+            .into_iter()
+            .map(|channel| {
+                (
+                    channel,
+                    capture_coverage_in(repo, &state, user.as_deref(), channel),
+                )
+            })
+            .collect(),
+        lists_channels: state.capture_acknowledged_channels.is_some(),
+    })
+}
+
 /// [`capture_coverage`] is [`CaptureCoverage::Covered`]. For
 /// [`PassiveChannel::Vscode`] this is exactly [`capture_acknowledged`].
 pub fn capture_covers(repo: &git2::Repository, channel: PassiveChannel) -> Result<bool> {
@@ -937,7 +971,11 @@ pub fn capture_covers(repo: &git2::Repository, channel: PassiveChannel) -> Resul
 /// harness batches require it ([`crate::db::HarnessBatch::new`]): a store
 /// records a harness batch only for the channel and the repository the
 /// grant names.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A grant is neither `Clone` nor `Copy`: a batch consumes the one it is
+/// given, so every batch asks again, and a withdrawn acknowledgement stops
+/// the very next batch.
+#[derive(Debug)]
 pub struct CoverageGrant {
     channel: PassiveChannel,
     /// The canonical common Git directory of the repository it was given
@@ -2575,7 +2613,6 @@ capture_type!(
 /// chosen by a front.
 pub struct HarnessCaptureInput(Capture);
 impl HarnessCaptureInput {
-    #[allow(dead_code)] // the first adapter on the generic path arrives with the harness registry
     pub(crate) fn new(
         harness: HarnessId,
         conversation: Conversation,
@@ -3330,6 +3367,55 @@ mod tests {
         assert!(capture_coverage_as(&repo, me, PassiveChannel::Vscode).is_err());
     }
 
+    /// The summary is the gate's own judgement of every channel, and says
+    /// whether the acknowledgement on record carries a list.
+    #[test]
+    fn the_coverage_summary_judges_every_channel_as_the_gate_does() {
+        let (_temp, repo) = repository();
+        let summary = capture_coverage_summary(&repo).unwrap();
+        assert_eq!(
+            summary.acknowledgement,
+            CaptureAcknowledgement::NotAcknowledged
+        );
+        assert!(!summary.lists_channels);
+        assert!(summary
+            .channels
+            .iter()
+            .all(|(_, coverage)| *coverage == CaptureCoverage::NotAcknowledged));
+
+        acknowledge_capture(&repo).unwrap();
+        let summary = capture_coverage_summary(&repo).unwrap();
+        assert_eq!(
+            summary.acknowledgement,
+            CaptureAcknowledgement::Acknowledged
+        );
+        assert!(summary.lists_channels);
+        assert_eq!(
+            summary
+                .channels
+                .iter()
+                .map(|(channel, _)| *channel)
+                .collect::<Vec<_>>(),
+            PassiveChannel::ALL
+        );
+        for (channel, coverage) in &summary.channels {
+            assert_eq!(*coverage, capture_coverage(&repo, *channel).unwrap());
+        }
+
+        let mut state = privacy_value(&repo);
+        state
+            .as_object_mut()
+            .unwrap()
+            .remove("capture_acknowledged_channels");
+        write_privacy_value(&repo, &state);
+        let summary = capture_coverage_summary(&repo).unwrap();
+        assert!(!summary.lists_channels);
+        assert_eq!(
+            summary.acknowledgement,
+            CaptureAcknowledgement::Acknowledged
+        );
+    }
+
     /// A grant comes only from coverage, names its channel and binds the
     /// repository's own store.
     #[test]
@@ -3364,7 +3450,7 @@ mod tests {
     /// a provider summary's marker, whatever the repository's rules match.
     #[test]
     fn reasoning_markers_survive_the_capture_boundary_and_the_final_scrub() {
-        use crate::reasoning::{mark, read, ReasoningKind};
+        use crate::reasoning::{mark, read, ReasoningKind, SealedText};
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
             dir.path().join(".thoughtignore"),
@@ -3376,7 +3462,7 @@ mod tests {
         let marked = mark(
             &id,
             ReasoningKind::ProviderSummary,
-            "a summary of cvc work".into(),
+            SealedText::for_tests("a summary of cvc work"),
         );
         let capture = Capture {
             conversation: Conversation {

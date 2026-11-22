@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Claude Code adapter: transcript parsing, planning, idempotent ingestion,
 //! the capture_source migration, and hook settings installation.
 //!

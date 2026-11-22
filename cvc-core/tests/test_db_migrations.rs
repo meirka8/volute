@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Migrations of the shared index (`<git-common-dir>/cvc/index.db`) from every
 //! schema released versions create, checked against schema-only dumps of
 //! those versions (`fixtures/db/<version>.sql`, generated from the release
