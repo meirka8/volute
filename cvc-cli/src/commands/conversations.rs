@@ -354,11 +354,11 @@ pub async fn run(requested: Option<&str>, limit: Option<usize>, plain: bool) -> 
     }
     match &destination {
         Some((name, fingerprint)) => println!(
-            "Conversations (most recent first); share state for remote '{}' ({}…):",
+            "Conversations (most recent activity first, subagents under their parent); share state for remote '{}' ({}…):",
             sanitize_for_terminal(name),
             &fingerprint[..12]
         ),
-        None => println!("Conversations (most recent first); no remote resolved for share state:"),
+        None => println!("Conversations (most recent activity first, subagents under their parent); no remote resolved for share state:"),
     }
     // Best effort, like the share state: a harness whose cursors cannot be
     // read is named, and its sessions are listed unmarked.

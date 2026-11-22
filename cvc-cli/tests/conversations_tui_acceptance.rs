@@ -41,7 +41,7 @@ use tui_support::*;
 /// spawn order (#187).
 fn the_plain_listing(fixture: &Fixture) -> String {
     format!(
-        "Conversations (most recent first); share state for remote 'origin' ({}…):\n\
+        "Conversations (most recent activity first, subagents under their parent); share state for remote 'origin' ({}…):\n\
          2026-08-10 22:10    3 thought(s),   0 linked  {SESSION}  recorded by Claude Code  [private]\n      {SESSION_TITLE}\n\
          \x20   2026-08-10 22:06    2 thought(s),   0 linked  {}  recorded by Claude Code  [private]\n          {AGENT_A_TITLE}\n\
          \x20   2026-08-10 22:08    1 thought(s),   0 linked  {}  recorded by Claude Code  [private]\n          {AGENT_B_TITLE}\n\
@@ -113,7 +113,8 @@ fn a_terminal_gets_the_view_and_every_other_invocation_gets_the_plain_listing_un
     assert_view_is_up(&view.session);
     let screen = view.flat();
     assert!(screen.contains(SESSION_TITLE), "{screen}");
-    assert!(!screen.contains("Conversations (most recent first)"));
+    assert!(!screen
+        .contains("Conversations (most recent activity first, subagents under their parent)"));
     assert!(!screen.contains("Share one with:"));
     assert!(view.quit().success());
     assert_terminal_restored(&view.session);
