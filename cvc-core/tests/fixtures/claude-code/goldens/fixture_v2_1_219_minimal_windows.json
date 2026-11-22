@@ -1,0 +1,80 @@
+{
+  "final": {
+    "artifact_links": [],
+    "context_items": [],
+    "conversation_share_policy": [],
+    "conversation_shares": [],
+    "conversations": [
+      {"created_at":1788035733,"id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","title":"Hello exchange"}
+    ],
+    "derivation_events": [],
+    "derivation_observations": [],
+    "harness_ingest_cursors": [
+      {"byte_offset":560,"harness":"claude-code","session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","transcript_path":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl","updated_at":"__WALL_CLOCK__"}
+    ],
+    "interaction_shares": [],
+    "interactions": [
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","id":"a78b41ba-0dbd-82a1-98d2-3439eb380ec8","model_cot":null,"model_name":"claude-fixture-1","model_response":"Hello.","parent_id":null,"scrubber_version":1,"source_request_id":"req_01","timestamp":1788035733,"user_prompt":"[prompt ~cvc-833b8095e4f61035] Say hello","visibility":"private"}
+    ],
+    "publications": [],
+    "tombstones": [],
+    "tool_executions": []
+  },
+  "golden": "cvc-core/claude-code-golden/v2",
+  "legend": [
+    "__WORKTREE__: the fixture repository's canonical root, always 240 bytes long",
+    "__TMPDIR__: the temporary directory holding that root",
+    "__WORKTREE_FINGERPRINT__: the capture_worktree hash of that root",
+    "__WALL_CLOCK__: a wall-clock column whose value lies within the test's run",
+    "marker-<n>: the random UUID of a redaction marker, numbered by first appearance",
+    "$long_string: a string over 4096 bytes, as its length, SHA-256, head and tail",
+    "{rows, sha256, first, last}: over 20 rows, by count, SHA-256 of their compact JSON, 3 each end",
+    "same_as_final: a step's rows for a table (or all its changes) are exactly the final rows",
+    "published.files: each file's byte length, SHA-256 and, as one string, its content",
+    "published.files content: every non-node file, and every node (first and last 3 if over 20)"
+  ],
+  "published": {
+    "empty_trees": ["events","ranges"],
+    "files": [
+      {"bytes":1,"content":"5","mode":"100644","path":"FORMAT","sha256":"ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d"},
+      {"bytes":488,"content":"{\n  \"interaction\": {\n    \"id\": \"a78b41ba-0dbd-82a1-98d2-3439eb380ec8\",\n    \"conversation_id\": \"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60\",\n    \"parent_id\": null,\n    \"timestamp\": \"2026-08-29T20:35:33Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-833b8095e4f61035] Say hello\",\n    \"model_name\": \"claude-fixture-1\",\n    \"model_cot\": null,\n    \"model_response\": \"Hello.\",\n    \"source_request_id\": \"req_01\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/a7/a78b41ba-0dbd-82a1-98d2-3439eb380ec8.json","sha256":"d9a022266b30cdbcd474c615891273263ce7272e237ee12d8a8335e34418e7de"}
+    ]
+  },
+  "scenario": "fixture_v2_1_219_minimal_windows",
+  "steps": [
+    {
+      "changes": {
+        "harness_ingest_cursors": {
+          "added": [
+            {"byte_offset":0,"harness":"claude-code","session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","transcript_path":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl","updated_at":"__WALL_CLOCK__"}
+          ]
+        }
+      },
+      "outcome": {"ingest":{"mode":"incremental","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl"},"report":{"already_present":0,"cursor":0,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":0,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},
+      "step": "incremental after 0 complete line(s)"
+    },
+    {"changes":{},"outcome":{"ingest":{"mode":"incremental","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl"},"report":{"already_present":0,"cursor":0,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":280,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"incremental after 0 complete line(s) and 280 byte(s) of line 1"},
+    {"changes":{},"outcome":{"ingest":{"mode":"incremental","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl"},"report":{"already_present":0,"cursor":0,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":560,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"incremental after 1 complete line(s)"},
+    {"changes":{},"outcome":{"ingest":{"mode":"incremental","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl"},"report":{"already_present":0,"cursor":0,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":933,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"incremental after 1 complete line(s) and 373 byte(s) of line 2"},
+    {"changes":{},"outcome":{"ingest":{"mode":"incremental","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl"},"report":{"already_present":0,"cursor":0,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":1,"session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":1306,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"incremental after 2 complete line(s)"},
+    {"changes":{},"outcome":{"ingest":{"mode":"incremental","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl"},"report":{"already_present":0,"cursor":0,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":1,"session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":1337,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"incremental after 2 complete line(s) and 31 byte(s) of line 3"},
+    {"changes":{},"outcome":{"ingest":{"mode":"incremental","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl"},"report":{"already_present":0,"cursor":0,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":1,"session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":1368,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"incremental after all 3 line(s)"},
+    {
+      "changes": {
+        "conversations": {"same_as_final":true},
+        "harness_ingest_cursors": {
+          "added": [
+            {"byte_offset":560,"harness":"claude-code","session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","transcript_path":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl","updated_at":"__WALL_CLOCK__"}
+          ],
+          "removed": [
+            {"byte_offset":0,"harness":"claude-code","session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","transcript_path":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl","updated_at":"__WALL_CLOCK__"}
+          ]
+        },
+        "interactions": {"same_as_final":true}
+      },
+      "outcome": {"ingest":{"mode":"final","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl"},"report":{"already_present":0,"cursor":560,"inserted":1,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":1368,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},
+      "step": "final"
+    },
+    {"changes":{},"outcome":{"ingest":{"mode":"final","rescan":true,"session_id":null,"transcript":"__WORKTREE__/proj/0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60.jsonl"},"report":{"already_present":1,"cursor":560,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"0b7d2c4e-6a1f-4c8d-9e3b-5f2a7c9d1e60","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":1368,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"rescan, final"}
+  ]
+}

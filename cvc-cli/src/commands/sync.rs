@@ -44,8 +44,15 @@ fn open(cwd: &Path) -> Result<(Repository, CvcStore)> {
     let store = CvcStore::open_initialized(layout.db_path())?;
     Ok((layout.into_repository(), store))
 }
+/// [`open`] for a command a person runs and waits for: it also finishes the
+/// store's one-time upgrade, which a hook never runs.
+fn open_upgrading(cwd: &Path) -> Result<(Repository, CvcStore)> {
+    let layout = RepositoryLayout::discover(cwd).context("Failed to discover Git repository")?;
+    let store = CvcStore::open_initialized_upgrading(layout.db_path())?;
+    Ok((layout.into_repository(), store))
+}
 pub async fn privacy_status(requested: Option<&str>) -> Result<()> {
-    let (repo, store) = open(&env::current_dir()?)?;
+    let (repo, store) = open_upgrading(&env::current_dir()?)?;
     let name = remote(&repo, requested)?;
     let destination = privacy::remote_destination(&repo, &name)?;
     sync::adopt_legacy_records(&repo, &store, &destination)?;
@@ -54,7 +61,7 @@ pub async fn privacy_status(requested: Option<&str>) -> Result<()> {
     Ok(())
 }
 pub async fn acknowledge_capture() -> Result<()> {
-    let (repo, _) = open(&env::current_dir()?)?;
+    let (repo, _) = open_upgrading(&env::current_dir()?)?;
     typed_acknowledgement(capture_challenge())?;
     privacy::acknowledge_capture(&repo)?;
     println!("Capture acknowledgement saved locally; it is never synced.");
@@ -1773,6 +1780,8 @@ mod output_tests {
             imported: false,
             held: 0,
             held_published: 0,
+            agent: None,
+            parent: None,
         }
     }
 

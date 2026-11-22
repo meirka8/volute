@@ -587,7 +587,7 @@ fn ingest_into(
     rescan: bool,
     caller: Caller,
 ) -> Result<Option<IngestReport>> {
-    super::harness::require_capture_acknowledged(layout)?;
+    super::harness::require_claude_code_capture_covered(layout)?;
     // Before the store is opened. What is not a regular file (a link, a FIFO,
     // a directory) is refused here, with the error ingestion gives it; a
     // transcript that cannot be opened or read is left to the ingest below,
@@ -605,7 +605,15 @@ fn ingest_into(
     }
     let policy = PreparedPolicy::load(layout.policy_root()?)
         .map_err(|error| anyhow!("CVC capture blocked by .thoughtignore: {error}"))?;
-    let store = CvcStore::open_initialized(layout.db_path())?;
+    // An operator's run also finishes the store's one-time capture-source
+    // upgrade. A hook's open runs it only where it costs nothing or where
+    // cvc 0.7.x would run it in the same open (an empty table, or one from
+    // before 0.7.x that cannot hold Claude Code's value yet); a populated
+    // 0.7.x store waits for an operator command.
+    let store = match caller {
+        Caller::Operator => CvcStore::open_initialized_upgrading(layout.db_path())?,
+        Caller::Hook { .. } => CvcStore::open_initialized(layout.db_path())?,
+    };
     Ok(Some(ingest_with(
         layout,
         &store,

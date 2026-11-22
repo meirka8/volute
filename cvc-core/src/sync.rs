@@ -2098,7 +2098,6 @@ fn import_ref_with_limits(
     if !crate::privacy::is_destination_fingerprint(remote_fingerprint) {
         return Err(SyncError::Ref("invalid destination fingerprint".into()));
     }
-    let remote_fingerprint = Some(remote_fingerprint);
     // 1. Resolve Ref. Only a ref that is really absent means "nothing to pull";
     // any other lookup failure must not be mistaken for an empty remote. The name
     // is validated once the ref exists, as the pre-existing destination path did.

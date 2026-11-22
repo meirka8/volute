@@ -1,0 +1,104 @@
+{
+  "final": {
+    "artifact_links": [],
+    "context_items": [],
+    "conversation_share_policy": [],
+    "conversation_shares": [],
+    "conversations": [
+      {"created_at":1791134401,"id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","title":"My own name"}
+    ],
+    "derivation_events": [],
+    "derivation_observations": [],
+    "harness_ingest_cursors": [
+      {"byte_offset":5738,"harness":"claude-code","session_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","transcript_path":"__WORKTREE__/proj/9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43.jsonl","updated_at":"__WALL_CLOCK__"}
+    ],
+    "interaction_shares": [],
+    "interactions": [
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","id":"19da070f-e26d-8e68-b98f-8da7c008f3c0","model_cot":"Read the roadmap, fix the two critical bugs, then commit quietly.","model_name":"claude-fixture-2","model_response":null,"parent_id":null,"scrubber_version":1,"source_request_id":"req_A","timestamp":1791134401,"user_prompt":"[prompt ~cvc-b7a8c01e9e4e17ed] Fix the critical bugs listed in the roadmap and commit","visibility":"private"},
+      {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","id":"35333406-aa29-81e1-afa0-9bfcff6aca5f","model_cot":null,"model_name":"claude-fixture-2","model_response":"Fixed the two critical bugs and committed.","parent_id":"19da070f-e26d-8e68-b98f-8da7c008f3c0","scrubber_version":1,"source_request_id":"req_B","timestamp":1791134404,"user_prompt":"[tool_result Bash ~cvc-a4ba14b9c1599db6] CVC: Linked 2 thought(s) to commit 0123456789ab.\n0123456 Fix the critical bugs\nfedcba9 Previous work","visibility":"private"},
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","id":"deec93df-d552-8c3f-84a9-71eaae33f290","model_cot":null,"model_name":"claude-fixture-2","model_response":"Done.","parent_id":"35333406-aa29-81e1-afa0-9bfcff6aca5f","scrubber_version":1,"source_request_id":"req_Z","timestamp":1791135001,"user_prompt":"[prompt ~cvc-9637a2ccb9e32788] And one more thing","visibility":"private"}
+    ],
+    "publications": [],
+    "tombstones": [],
+    "tool_executions": [
+      {"arguments":"{\"command\":\"git add -A && git commit -q -F - <<'EOF'\\nFix the critical bugs\\nEOF\\ngit log --oneline -2\"}","id":1,"interaction_id":"19da070f-e26d-8e68-b98f-8da7c008f3c0","status":"success","tool_name":"Bash","tool_protocol":"native"}
+    ]
+  },
+  "golden": "cvc-core/claude-code-golden/v2",
+  "legend": [
+    "__WORKTREE__: the fixture repository's canonical root, always 240 bytes long",
+    "__TMPDIR__: the temporary directory holding that root",
+    "__WORKTREE_FINGERPRINT__: the capture_worktree hash of that root",
+    "__WALL_CLOCK__: a wall-clock column whose value lies within the test's run",
+    "marker-<n>: the random UUID of a redaction marker, numbered by first appearance",
+    "$long_string: a string over 4096 bytes, as its length, SHA-256, head and tail",
+    "{rows, sha256, first, last}: over 20 rows, by count, SHA-256 of their compact JSON, 3 each end",
+    "same_as_final: a step's rows for a table (or all its changes) are exactly the final rows",
+    "published.files: each file's byte length, SHA-256 and, as one string, its content",
+    "published.files content: every non-node file, and every node (first and last 3 if over 20)"
+  ],
+  "published": {
+    "empty_trees": ["events","ranges"],
+    "files": [
+      {"bytes":1,"content":"5","mode":"100644","path":"FORMAT","sha256":"ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d"},
+      {"bytes":905,"content":"{\n  \"interaction\": {\n    \"id\": \"19da070f-e26d-8e68-b98f-8da7c008f3c0\",\n    \"conversation_id\": \"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43\",\n    \"parent_id\": null,\n    \"timestamp\": \"2026-10-04T17:20:01Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-b7a8c01e9e4e17ed] Fix the critical bugs listed in the roadmap and commit\",\n    \"model_name\": \"claude-fixture-2\",\n    \"model_cot\": \"Read the roadmap, fix the two critical bugs, then commit quietly.\",\n    \"model_response\": null,\n    \"source_request_id\": \"req_A\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [\n    {\n      \"id\": 1,\n      \"interaction_id\": \"19da070f-e26d-8e68-b98f-8da7c008f3c0\",\n      \"tool_protocol\": \"native\",\n      \"tool_name\": \"Bash\",\n      \"arguments\": \"{\\\"command\\\":\\\"git add -A && git commit -q -F - <<'EOF'\\\\nFix the critical bugs\\\\nEOF\\\\ngit log --oneline -2\\\"}\",\n      \"status\": \"success\"\n    }\n  ],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/19/19da070f-e26d-8e68-b98f-8da7c008f3c0.json","sha256":"23398ff8871e94107e7cb965ea8715ed2bda4ddd135cfee7f65ad55376067722"},
+      {"bytes":661,"content":"{\n  \"interaction\": {\n    \"id\": \"35333406-aa29-81e1-afa0-9bfcff6aca5f\",\n    \"conversation_id\": \"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43\",\n    \"parent_id\": \"19da070f-e26d-8e68-b98f-8da7c008f3c0\",\n    \"timestamp\": \"2026-10-04T17:20:04Z\",\n    \"author\": \"system\",\n    \"user_prompt\": \"[tool_result Bash ~cvc-a4ba14b9c1599db6] CVC: Linked 2 thought(s) to commit 0123456789ab.\\n0123456 Fix the critical bugs\\nfedcba9 Previous work\",\n    \"model_name\": \"claude-fixture-2\",\n    \"model_cot\": null,\n    \"model_response\": \"Fixed the two critical bugs and committed.\",\n    \"source_request_id\": \"req_B\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/35/35333406-aa29-81e1-afa0-9bfcff6aca5f.json","sha256":"db12734f41cc82747cc7e8af9b0fdb54628009d316052963871f4008c6cd9630"},
+      {"bytes":529,"content":"{\n  \"interaction\": {\n    \"id\": \"deec93df-d552-8c3f-84a9-71eaae33f290\",\n    \"conversation_id\": \"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43\",\n    \"parent_id\": \"35333406-aa29-81e1-afa0-9bfcff6aca5f\",\n    \"timestamp\": \"2026-10-04T17:30:01Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-9637a2ccb9e32788] And one more thing\",\n    \"model_name\": \"claude-fixture-2\",\n    \"model_cot\": null,\n    \"model_response\": \"Done.\",\n    \"source_request_id\": \"req_Z\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/de/deec93df-d552-8c3f-84a9-71eaae33f290.json","sha256":"b89310b30ff8d4fd53073f52d94b33d6d3dcd553ce724f467d1fe9ed3e2c1c55"}
+    ]
+  },
+  "scenario": "titled_custom_title_after_capture",
+  "steps": [
+    {
+      "changes": {
+        "conversations": {
+          "added": [
+            {"created_at":1791134401,"id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","title":"Roadmap bug sweep"}
+          ]
+        },
+        "harness_ingest_cursors": {
+          "added": [
+            {"byte_offset":4083,"harness":"claude-code","session_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","transcript_path":"__WORKTREE__/proj/9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43.jsonl","updated_at":"__WALL_CLOCK__"}
+          ]
+        },
+        "interactions": {
+          "added": [
+            {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","id":"19da070f-e26d-8e68-b98f-8da7c008f3c0","model_cot":"Read the roadmap, fix the two critical bugs, then commit quietly.","model_name":"claude-fixture-2","model_response":null,"parent_id":null,"scrubber_version":1,"source_request_id":"req_A","timestamp":1791134401,"user_prompt":"[prompt ~cvc-b7a8c01e9e4e17ed] Fix the critical bugs listed in the roadmap and commit","visibility":"private"},
+            {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","id":"35333406-aa29-81e1-afa0-9bfcff6aca5f","model_cot":null,"model_name":"claude-fixture-2","model_response":"Fixed the two critical bugs and committed.","parent_id":"19da070f-e26d-8e68-b98f-8da7c008f3c0","scrubber_version":1,"source_request_id":"req_B","timestamp":1791134404,"user_prompt":"[tool_result Bash ~cvc-a4ba14b9c1599db6] CVC: Linked 2 thought(s) to commit 0123456789ab.\n0123456 Fix the critical bugs\nfedcba9 Previous work","visibility":"private"}
+          ]
+        },
+        "tool_executions": {"same_as_final":true}
+      },
+      "outcome": {"ingest":{"mode":"final","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43.jsonl"},"report":{"already_present":0,"cursor":4083,"inserted":2,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":5153,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},
+      "step": "final"
+    },
+    {"changes":{},"outcome":{"ingest":{"mode":"final","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43.jsonl"},"report":{"already_present":1,"cursor":4083,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":5256,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"final, with a custom title appended"},
+    {"changes":{},"outcome":{"ingest":{"mode":"final","rescan":true,"session_id":null,"transcript":"__WORKTREE__/proj/9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43.jsonl"},"report":{"already_present":2,"cursor":4083,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":5256,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"rescan, final"},
+    {
+      "changes": {
+        "conversations": {
+          "added": [
+            {"created_at":1791134401,"id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","title":"My own name"}
+          ],
+          "removed": [
+            {"created_at":1791134401,"id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","title":"Roadmap bug sweep"}
+          ]
+        },
+        "harness_ingest_cursors": {
+          "added": [
+            {"byte_offset":5738,"harness":"claude-code","session_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","transcript_path":"__WORKTREE__/proj/9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43.jsonl","updated_at":"__WALL_CLOCK__"}
+          ],
+          "removed": [
+            {"byte_offset":4083,"harness":"claude-code","session_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","transcript_path":"__WORKTREE__/proj/9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43.jsonl","updated_at":"__WALL_CLOCK__"}
+          ]
+        },
+        "interactions": {
+          "added": [
+            {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","id":"deec93df-d552-8c3f-84a9-71eaae33f290","model_cot":null,"model_name":"claude-fixture-2","model_response":"Done.","parent_id":"35333406-aa29-81e1-afa0-9bfcff6aca5f","scrubber_version":1,"source_request_id":"req_Z","timestamp":1791135001,"user_prompt":"[prompt ~cvc-9637a2ccb9e32788] And one more thing","visibility":"private"}
+          ]
+        }
+      },
+      "outcome": {"ingest":{"mode":"final","rescan":false,"session_id":null,"transcript":"__WORKTREE__/proj/9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43.jsonl"},"report":{"already_present":1,"cursor":5738,"inserted":1,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"9d4b2e7f-6a1c-4e3b-8f5d-2c7a9b1e0d43","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":6410,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},
+      "step": "final, after another response"
+    }
+  ]
+}

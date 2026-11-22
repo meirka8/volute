@@ -1,0 +1,109 @@
+{
+  "final": {
+    "artifact_links": [],
+    "context_items": [
+      {"dirty_patch":null,"end_line":2147483647,"file_path":"src/a.rs","git_blob_sha":null,"id":1,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","start_line":2147483647},
+      {"dirty_patch":null,"end_line":2147483647,"file_path":"src/a.rs","git_blob_sha":null,"id":2,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","start_line":1},
+      {"dirty_patch":null,"end_line":null,"file_path":"src/a.rs","git_blob_sha":null,"id":3,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","start_line":null},
+      {"dirty_patch":null,"end_line":29,"file_path":"src/a.rs","git_blob_sha":null,"id":4,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","start_line":10}
+    ],
+    "conversation_share_policy": [],
+    "conversation_shares": [],
+    "conversations": [
+      {"created_at":1790848802,"id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","title":"Read it all"}
+    ],
+    "derivation_events": [],
+    "derivation_observations": [],
+    "harness_ingest_cursors": [
+      {"byte_offset":8735,"harness":"claude-code","session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript_path":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl","updated_at":"__WALL_CLOCK__"}
+    ],
+    "interaction_shares": [],
+    "interactions": [
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"2a350447-7771-8b4e-8fa5-0627983aa754","model_cot":null,"model_name":"claude-fixture-1","model_response":null,"parent_id":null,"scrubber_version":1,"source_request_id":"req_A","timestamp":1790848802,"user_prompt":"[prompt ~cvc-f3902419cc9f3a5e] Read it all","visibility":"private"},
+      {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da","model_cot":null,"model_name":"claude-fixture-1","model_response":"Read it.","parent_id":"2a350447-7771-8b4e-8fa5-0627983aa754","scrubber_version":1,"source_request_id":"req_B","timestamp":1790848804,"user_prompt":"[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok","visibility":"private"},
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"a9c8913d-5601-817e-9dc3-8cedf9891c2d","model_cot":null,"model_name":"claude-fixture-1","model_response":"You are welcome.","parent_id":"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da","scrubber_version":1,"source_request_id":"req_C","timestamp":1790848806,"user_prompt":"[prompt ~cvc-08a08f9f607d5eef] Thanks","visibility":"private"},
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"a2435a4b-92fa-8658-bca9-03e44d2ce930","model_cot":null,"model_name":"claude-fixture-1","model_response":"Done.","parent_id":"a9c8913d-5601-817e-9dc3-8cedf9891c2d","scrubber_version":1,"source_request_id":"req_Z","timestamp":1790848808,"user_prompt":"[prompt ~cvc-412a80f93a779ea2] One more thing","visibility":"private"}
+    ],
+    "publications": [],
+    "tombstones": [],
+    "tool_executions": [
+      {"arguments":"{\"file_path\":\"__WORKTREE__/src/a.rs\",\"limit\":9223372036854775807,\"offset\":9223372036854775807}","id":1,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Read","tool_protocol":"native"},
+      {"arguments":"{\"file_path\":\"__WORKTREE__/src/a.rs\",\"limit\":9223372036854775807,\"offset\":1}","id":2,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Read","tool_protocol":"native"},
+      {"arguments":"{\"file_path\":\"__WORKTREE__/src/a.rs\",\"limit\":1,\"offset\":9223372036854775807}","id":3,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Read","tool_protocol":"native"},
+      {"arguments":"{\"file_path\":\"__WORKTREE__/src/a.rs\",\"limit\":-9223372036854775808,\"offset\":-9223372036854775808}","id":4,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Read","tool_protocol":"native"},
+      {"arguments":"{\"file_path\":\"__WORKTREE__/src/a.rs\",\"limit\":0,\"offset\":0}","id":5,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Read","tool_protocol":"native"},
+      {"arguments":"{\"file_path\":\"__WORKTREE__/src/a.rs\",\"limit\":3,\"offset\":-7}","id":6,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Read","tool_protocol":"native"},
+      {"arguments":"{\"file_path\":\"__WORKTREE__/src/a.rs\",\"limit\":3000000000,\"offset\":3000000000}","id":7,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Read","tool_protocol":"native"},
+      {"arguments":"{\"file_path\":\"__WORKTREE__/src/a.rs\",\"limit\":20,\"offset\":10}","id":8,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Read","tool_protocol":"native"},
+      {"arguments":"{\"file_path\":\"__WORKTREE__/src/a.rs\",\"limit\":18446744073709551615,\"offset\":18446744073709551615}","id":9,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Read","tool_protocol":"native"},
+      {"arguments":"{\"file_path\":\"__WORKTREE__/src/a.rs\",\"limit\":1e+300,\"offset\":1.5}","id":10,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Read","tool_protocol":"native"},
+      {"arguments":"{\"file_path\":\"__WORKTREE__/src/a.rs\",\"limit\":null,\"offset\":\"ten\"}","id":11,"interaction_id":"2a350447-7771-8b4e-8fa5-0627983aa754","status":"success","tool_name":"Read","tool_protocol":"native"}
+    ]
+  },
+  "golden": "cvc-core/claude-code-golden/v2",
+  "legend": [
+    "__WORKTREE__: the fixture repository's canonical root, always 240 bytes long",
+    "__TMPDIR__: the temporary directory holding that root",
+    "__WORKTREE_FINGERPRINT__: the capture_worktree hash of that root",
+    "__WALL_CLOCK__: a wall-clock column whose value lies within the test's run",
+    "marker-<n>: the random UUID of a redaction marker, numbered by first appearance",
+    "$long_string: a string over 4096 bytes, as its length, SHA-256, head and tail",
+    "{rows, sha256, first, last}: over 20 rows, by count, SHA-256 of their compact JSON, 3 each end",
+    "same_as_final: a step's rows for a table (or all its changes) are exactly the final rows",
+    "published.files: each file's byte length, SHA-256 and, as one string, its content",
+    "published.files content: every non-node file, and every node (first and last 3 if over 20)"
+  ],
+  "published": {
+    "empty_trees": ["events","ranges"],
+    "files": [
+      {"bytes":1,"content":"5","mode":"100644","path":"FORMAT","sha256":"ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d"},
+      {"bytes":7040,"content":{"$long_string":{"bytes":4532,"head":"{\n  \"interaction\": {\n    \"id\": \"2a350447-7771-8b4e-8fa5-0627983aa754\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": null,\n    \"timestamp\": \"2026-10-01T10:00:02Z\",\n    \"author\": \"human\",\n    \"user_prompt\": ","sha256":"43321ab28a653dcdb6ca8e770ecfd1420b7da139b13d97b036e307871a11e39d","tail":"-8fa5-0627983aa754\",\n      \"tool_protocol\": \"native\",\n      \"tool_name\": \"Read\",\n      \"arguments\": \"{\\\"file_path\\\":\\\"__WORKTREE__/src/a.rs\\\",\\\"limit\\\":null,\\\"offset\\\":\\\"ten\\\"}\",\n      \"status\": \"success\"\n    }\n  ],\n  \"artifact_links\": []\n}"}},"mode":"100644","path":"nodes/2a/2a350447-7771-8b4e-8fa5-0627983aa754.json","sha256":"43321ab28a653dcdb6ca8e770ecfd1420b7da139b13d97b036e307871a11e39d"},
+      {"bytes":997,"content":"{\n  \"interaction\": {\n    \"id\": \"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": \"2a350447-7771-8b4e-8fa5-0627983aa754\",\n    \"timestamp\": \"2026-10-01T10:00:04Z\",\n    \"author\": \"system\",\n    \"user_prompt\": \"[tool_result Read ~cvc-2efe3a0eb89804cc] ok\\n\\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\\n\\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\\n\\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\\n\\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\\n\\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\\n\\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\\n\\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\\n\\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\\n\\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\\n\\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\",\n    \"model_name\": \"claude-fixture-1\",\n    \"model_cot\": null,\n    \"model_response\": \"Read it.\",\n    \"source_request_id\": \"req_B\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/72/723dd8dc-8f19-8f67-8f4a-4c1f53cec0da.json","sha256":"73741f8ec5c7a3930b128501813d299dba71c06c07b441ea8078f8ddf29244d8"},
+      {"bytes":525,"content":"{\n  \"interaction\": {\n    \"id\": \"a2435a4b-92fa-8658-bca9-03e44d2ce930\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": \"a9c8913d-5601-817e-9dc3-8cedf9891c2d\",\n    \"timestamp\": \"2026-10-01T10:00:08Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-412a80f93a779ea2] One more thing\",\n    \"model_name\": \"claude-fixture-1\",\n    \"model_cot\": null,\n    \"model_response\": \"Done.\",\n    \"source_request_id\": \"req_Z\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/a2/a2435a4b-92fa-8658-bca9-03e44d2ce930.json","sha256":"3524fb81a21a42c62e06024505cbdcdd0404e97a702e2e9b850ea4fc3b6f992a"},
+      {"bytes":528,"content":"{\n  \"interaction\": {\n    \"id\": \"a9c8913d-5601-817e-9dc3-8cedf9891c2d\",\n    \"conversation_id\": \"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a\",\n    \"parent_id\": \"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da\",\n    \"timestamp\": \"2026-10-01T10:00:06Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-08a08f9f607d5eef] Thanks\",\n    \"model_name\": \"claude-fixture-1\",\n    \"model_cot\": null,\n    \"model_response\": \"You are welcome.\",\n    \"source_request_id\": \"req_C\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/a9/a9c8913d-5601-817e-9dc3-8cedf9891c2d.json","sha256":"2df3c4da9994b4450c724f8bd102c23f2825fde88b5b0e16c25263edc457f23c"}
+    ]
+  },
+  "scenario": "stimulus_extreme_read_ranges",
+  "steps": [
+    {
+      "changes": {
+        "context_items": {"same_as_final":true},
+        "conversations": {"same_as_final":true},
+        "harness_ingest_cursors": {
+          "added": [
+            {"byte_offset":7570,"harness":"claude-code","session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript_path":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl","updated_at":"__WALL_CLOCK__"}
+          ]
+        },
+        "interactions": {
+          "added": [
+            {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"2a350447-7771-8b4e-8fa5-0627983aa754","model_cot":null,"model_name":"claude-fixture-1","model_response":null,"parent_id":null,"scrubber_version":1,"source_request_id":"req_A","timestamp":1790848802,"user_prompt":"[prompt ~cvc-f3902419cc9f3a5e] Read it all","visibility":"private"},
+            {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da","model_cot":null,"model_name":"claude-fixture-1","model_response":"Read it.","parent_id":"2a350447-7771-8b4e-8fa5-0627983aa754","scrubber_version":1,"source_request_id":"req_B","timestamp":1790848804,"user_prompt":"[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok\n\n[tool_result Read ~cvc-2efe3a0eb89804cc] ok","visibility":"private"},
+            {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"a9c8913d-5601-817e-9dc3-8cedf9891c2d","model_cot":null,"model_name":"claude-fixture-1","model_response":"You are welcome.","parent_id":"723dd8dc-8f19-8f67-8f4a-4c1f53cec0da","scrubber_version":1,"source_request_id":"req_C","timestamp":1790848806,"user_prompt":"[prompt ~cvc-08a08f9f607d5eef] Thanks","visibility":"private"}
+          ]
+        },
+        "tool_executions": {"same_as_final":true}
+      },
+      "outcome": {"ingest":{"mode":"final","rescan":false,"session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl"},"report":{"already_present":0,"cursor":7570,"inserted":3,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":8257,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},
+      "step": "final"
+    },
+    {
+      "changes": {
+        "harness_ingest_cursors": {
+          "added": [
+            {"byte_offset":8735,"harness":"claude-code","session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript_path":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl","updated_at":"__WALL_CLOCK__"}
+          ],
+          "removed": [
+            {"byte_offset":7570,"harness":"claude-code","session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript_path":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl","updated_at":"__WALL_CLOCK__"}
+          ]
+        },
+        "interactions": {
+          "added": [
+            {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","id":"a2435a4b-92fa-8658-bca9-03e44d2ce930","model_cot":null,"model_name":"claude-fixture-1","model_response":"Done.","parent_id":"a9c8913d-5601-817e-9dc3-8cedf9891c2d","scrubber_version":1,"source_request_id":"req_Z","timestamp":1790848808,"user_prompt":"[prompt ~cvc-412a80f93a779ea2] One more thing","visibility":"private"}
+          ]
+        }
+      },
+      "outcome": {"ingest":{"mode":"final","rescan":false,"session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","transcript":"__WORKTREE__/proj/5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a.jsonl"},"report":{"already_present":1,"cursor":8735,"inserted":1,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"5b3d7f19-8c2a-4e6b-9a1d-3f5c7e9b1d2a","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":0,"transcript_len":9411,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},
+      "step": "final, after a later turn"
+    }
+  ]
+}
