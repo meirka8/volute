@@ -60,7 +60,7 @@ Keep a committed fixture small (256 KiB at most). A record that needs to be larg
 
 - the built-in scrubber would change a line of one, or its whole text (so a private key split across lines counts). A JSON line or document is also scrubbed as JSON, where a credential-keyed value is replaced. A scrub that fails, or whose JSON output no longer parses, counts as a change.
 - a personal path appears in one, other than an invented placeholder name such as `someone`. It looks for `/home/<name>`, `/Users/<name>`, `/var/home/<name>`, `/export/home/<name>`, `/mnt/c/Users/<name>`, `C:\Users\<name>` and `C:/Users/<name>` (`Users` in any letter case), also inside a `file://` URL, percent-encoded, or with JSON-escaped slashes.
-- an e-mail address outside `example.invalid` and `example.com` appears in one. An SSH-style address such as `git@github.com:owner/repo.git` counts too: use `git@example.invalid:owner/repo.git`.
+- an e-mail address outside `example.invalid` and `example.com` appears in one. An SSH-style address (`git@<host>:owner/repo.git`) counts too: use `git@example.invalid:owner/repo.git`.
 - a file is not UTF-8 text, or is a link.
 - a harness's directory holds a subdirectory not named `v<agent version>`, other than the documented exceptions, or a plain file other than `README.md` (put scenarios in a version directory).
 
