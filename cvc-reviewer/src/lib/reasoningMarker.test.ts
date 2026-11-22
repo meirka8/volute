@@ -20,6 +20,12 @@ const A = '6b1f0c0e-1111-4aaa-8bbb-000000000001';
 const WORDS = "provider summary of the model's reasoning";
 
 describe('the shared vectors', () => {
+  it('are exactly what the independent generator writes (its --check)', async () => {
+    const { execFileSync } = await import('node:child_process');
+    // Throws, with the script's message, when the committed file differs from what it would write.
+    execFileSync(process.execPath, ['scripts/reasoning-marker-vectors.mjs', '--check'], { stdio: 'pipe' });
+  });
+
   it('are the version this reader knows, and cover both outcomes', () => {
     expect(fixture.version).toBe(1);
     expect(fixture.vectors.length).toBeGreaterThanOrEqual(30);

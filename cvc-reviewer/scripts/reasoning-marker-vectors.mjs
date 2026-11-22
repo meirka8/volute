@@ -102,6 +102,16 @@ add('text that imitates the marker: no space before the token', A, `[cvc: ${WORD
 add('text that imitates the marker: a plain sentence', A, "Here is a provider summary of the model's reasoning: it looked at the loop.");
 add('text that imitates the marker: a full marker line with no separator', A, `[cvc: ${WORDS} ${tA(0)}]summary`);
 
+// The token slot holds 21 characters in JavaScript and 21 bytes in Rust: a multi-byte character in it must
+// not make either reader take a different slice as the token.
+add('a multi-byte character inside the token slot', A, `${marker(`${tA(0).slice(0, 20)}é`)}summary`);
+// U+200B is not Unicode White_Space (Rust's trim keeps it), so the body is not blank.
+add('a body of a zero-width space is not blank (not white space in Rust)', A, `${marker(tA(0))}​`);
+// The separator is exactly two newlines; a third belongs to the body.
+add('three newlines after the marker: the body keeps a leading newline', A, `${marker(tA(0))}\nsummary`);
+// "Contains the token" is a substring test: a longer hex run that starts with the token counts.
+add('the token as the prefix of a longer hex run in the body', A, `${marker(tA(0))}see ${tA(0)}0f1e`);
+
 // Every candidate taken: the writer marks with candidate 0 anyway, and the marker does not verify.
 const crowded = [...Array(CANDIDATES).keys()].map((c) => tA(c)).join(' ');
 add('every candidate taken', A, mark(A, crowded));

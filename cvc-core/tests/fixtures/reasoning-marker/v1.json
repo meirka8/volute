@@ -200,6 +200,34 @@
       "body": "[cvc: provider summary of the model's reasoning ~cvc-9efd89357b2592bb]summary"
     },
     {
+      "name": "a multi-byte character inside the token slot",
+      "id": "6b1f0c0e-1111-4aaa-8bbb-000000000001",
+      "text": "[cvc: provider summary of the model's reasoning ~cvc-9efd89357b2592bé]\n\nsummary",
+      "kind": "unverified",
+      "body": "[cvc: provider summary of the model's reasoning ~cvc-9efd89357b2592bé]\n\nsummary"
+    },
+    {
+      "name": "a body of a zero-width space is not blank (not white space in Rust)",
+      "id": "6b1f0c0e-1111-4aaa-8bbb-000000000001",
+      "text": "[cvc: provider summary of the model's reasoning ~cvc-9efd89357b2592bb]\n\n​",
+      "kind": "provider_summary",
+      "body": "​"
+    },
+    {
+      "name": "three newlines after the marker: the body keeps a leading newline",
+      "id": "6b1f0c0e-1111-4aaa-8bbb-000000000001",
+      "text": "[cvc: provider summary of the model's reasoning ~cvc-9efd89357b2592bb]\n\n\nsummary",
+      "kind": "provider_summary",
+      "body": "\nsummary"
+    },
+    {
+      "name": "the token as the prefix of a longer hex run in the body",
+      "id": "6b1f0c0e-1111-4aaa-8bbb-000000000001",
+      "text": "[cvc: provider summary of the model's reasoning ~cvc-9efd89357b2592bb]\n\nsee ~cvc-9efd89357b2592bb0f1e",
+      "kind": "unverified",
+      "body": "[cvc: provider summary of the model's reasoning ~cvc-9efd89357b2592bb]\n\nsee ~cvc-9efd89357b2592bb0f1e"
+    },
+    {
       "name": "every candidate taken",
       "id": "6b1f0c0e-1111-4aaa-8bbb-000000000001",
       "text": "[cvc: provider summary of the model's reasoning ~cvc-9efd89357b2592bb]\n\n~cvc-9efd89357b2592bb ~cvc-bf9652f2cd51e732 ~cvc-f5d36902b6072b4d ~cvc-51e3b9f71143b89f ~cvc-dcc9960599a785dd ~cvc-e7d33f8921c25f70 ~cvc-cd0a077da767da21 ~cvc-e3ef51b5bfaa85cc ~cvc-d3b52a03961cae3c ~cvc-1ca56bc91b2e4da1 ~cvc-855bafc1f560c16d ~cvc-a6c88667c887d7ee ~cvc-65343667e6bda3d0 ~cvc-0d2e291f48d4e6fa ~cvc-c2017037bf29905e ~cvc-136f522b95dd16ba ~cvc-c364a3121606f9e9 ~cvc-c1c1e2527615d36b ~cvc-a83519c218dd6cfe ~cvc-18549e766bc23f2d ~cvc-4ccbbdb2ff2cf550 ~cvc-7f991983fe950142 ~cvc-df946ec17cb1464a ~cvc-70308368a26eeff8 ~cvc-d395fe80978cbc04 ~cvc-dcdb7a9e75857806 ~cvc-861ef5ec9224f77a ~cvc-44b87a91c422113c ~cvc-e90968d77ff6ed85 ~cvc-4181d611c78c9b2b ~cvc-77878ead45eb8fdf ~cvc-81e1e210e6bea486 ~cvc-b45a02b8519cd996 ~cvc-3190e81cc500dbde ~cvc-84b0cd1b692c75ef ~cvc-ad3f5921c130b2f9 ~cvc-5fc4698bca9dc50c ~cvc-f1c8a2349f7d39b5 ~cvc-14fdd80792bdfc31 ~cvc-a966a28398a2319e ~cvc-071e4afa3c8b20a3 ~cvc-c6e9b86fbe30e1c9 ~cvc-08c3a58e57a85d1e ~cvc-05d7f5e2fbef18e1 ~cvc-d5797d146e5a6a4a ~cvc-ded9e2edb1eb72d2 ~cvc-8385487edb690c55 ~cvc-4bc0934de3dcc60f ~cvc-1fb84f43f1b3bb88 ~cvc-b5c6d9f5e5e45833 ~cvc-84c7266af61c45f3 ~cvc-8ff9d3ab61ce4c46 ~cvc-4bb4aa79720b08ba ~cvc-ae1526db62ba0bf9 ~cvc-531907429a63ef4f ~cvc-ad86e945b12241da ~cvc-3fc42e6e1edebc04 ~cvc-3a24a5bc29222dde ~cvc-6f79fd58c704a872 ~cvc-3bc58522617c1e7c ~cvc-ac81183f7b4f03ef ~cvc-0a5c09eb11a9500c ~cvc-5f6eb4891694ea36 ~cvc-9f98dc8ee998520a",
