@@ -61,6 +61,20 @@ pub struct Entry {
     pub kind: Kind,
 }
 
+impl Entry {
+    /// The parent this entry claims but is not listed under: an orphan's, and
+    /// also a parent's whose own claimed parent is not listed (or is itself
+    /// listed under another), so that it still says whose subagent it is.
+    /// `None` for an entry listed under its parent and for one that claims
+    /// none.
+    pub fn unlisted_parent(&self) -> Option<&str> {
+        match self.kind {
+            Kind::Child { .. } => None,
+            _ => claimed_parent(&self.summary),
+        }
+    }
+}
+
 /// The listed conversations and the order of their groups.
 #[derive(Clone, Debug, Default)]
 pub struct Tree {
@@ -451,6 +465,27 @@ pub(crate) mod tests {
             Some(root)
         );
         assert_eq!(kind_of(&tree, "s"), Kind::Plain);
+    }
+
+    #[test]
+    fn a_parent_whose_own_parent_is_not_listed_still_names_it() {
+        let tree = Tree::build(&[
+            child_of("codex:mid", "codex:gone", 100, 200),
+            child_of("codex:leaf", "codex:mid", 110, 120),
+            conversation("s", 100, 200, 1),
+            conversation("s:agent-a", 110, 120, 1),
+        ]);
+        let unlisted = |id: &str| {
+            tree.entries[tree.position(id).unwrap()]
+                .unlisted_parent()
+                .map(str::to_owned)
+        };
+        assert!(matches!(kind_of(&tree, "codex:mid"), Kind::Parent { .. }));
+        assert_eq!(unlisted("codex:mid").as_deref(), Some("codex:gone"));
+        // Listed under its parent: nothing to say. A root claims none.
+        assert_eq!(unlisted("codex:leaf"), None);
+        assert_eq!(unlisted("s:agent-a"), None);
+        assert_eq!(unlisted("s"), None);
     }
 
     #[test]

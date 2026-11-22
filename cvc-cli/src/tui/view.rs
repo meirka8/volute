@@ -1957,9 +1957,42 @@ mod tests {
         };
         let text = dump(&rendered(&model));
         assert!(
-            text.contains("Subagent. Parent session is not captured on this machine."),
+            text.contains("Subagent of lonely, listed on its own"),
             "{text}"
         );
+    }
+
+    /// A subagent whose parent is not listed keeps saying whose it is when it
+    /// has agents of its own: its row keeps the agent tag, and the strip and
+    /// the details name the parent.
+    #[test]
+    fn a_parent_that_is_itself_an_unlisted_subagent_says_so() {
+        let mut mid = conversation("codex:mid", 100, 900, 2);
+        mid.parent = Some("codex:gone".to_owned());
+        let mut leaf = conversation("codex:leaf", 200, 300, 1);
+        leaf.parent = Some("codex:mid".to_owned());
+        let mut model = model_of(
+            vec![mid, leaf],
+            vec![remote("origin")],
+            (100, 30),
+            Glyphs::UNICODE,
+        );
+        let lines = rendered(&model);
+        let row = first_row(&lines);
+        assert!(row.starts_with("▸ "), "a parent: {row}");
+        assert!(row.contains(" agent"), "{row}");
+        assert!(
+            contains(&lines, "Subagent of codex:gone, listed on its own."),
+            "{}",
+            dump(&lines)
+        );
+        model.handle_key(key(KeyCode::Enter));
+        let text = dump(&rendered(&model));
+        assert!(
+            text.contains("Kind             Subagent of codex:gone, listed on its own"),
+            "{text}"
+        );
+        assert!(text.contains("Subagents        1 conversation"), "{text}");
     }
 
     #[test]

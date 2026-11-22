@@ -1,6 +1,6 @@
 use crate::commands::sync::SUMMARY_SCAN_LIMIT;
 use crate::terminal_text::sanitize_for_terminal;
-use crate::tui::tree::{claimed_parent, Kind, Tree};
+use crate::tui::tree::{Kind, Tree};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use cvc_core::claude_code;
@@ -96,7 +96,8 @@ pub(crate) fn render_line(summary: &ConversationSummary, with_destination: bool)
 struct Marks<'a> {
     /// Listed under its parent: both lines are indented.
     nested: bool,
-    /// A subagent whose parent is not listed: the parent's id.
+    /// A subagent that is not listed under its parent, with or without agents
+    /// of its own: the parent's id.
     orphan_of: Option<&'a str>,
     /// A hook run left the session unread to the end.
     backlog: bool,
@@ -189,10 +190,7 @@ fn listing_lines(
         behind.extend(harness);
         let marks = Marks {
             nested: matches!(entry.kind, Kind::Child { .. }),
-            orphan_of: match entry.kind {
-                Kind::Orphan => claimed_parent(summary),
-                _ => None,
-            },
+            orphan_of: entry.unlisted_parent(),
             backlog: harness.is_some(),
         };
         lines.push(render_entry(summary, with_destination, &marks));
@@ -705,12 +703,18 @@ mod tests {
         codex_root.agent = Some(HarnessId::Codex);
         let mut orphan = conversation("codex:t-lost", 1_700_000_050);
         orphan.parent = Some("codex:t-gone".into());
+        let mut lost_parent = conversation("codex:t-lost-parent", 1_700_000_040);
+        lost_parent.parent = Some("codex:t-gone-2".into());
+        let mut lost_kid = conversation("codex:t-lost-kid", 1_700_000_030);
+        lost_kid.parent = Some("codex:t-lost-parent".into());
         let summaries = vec![
             codex_child,
             conversation("s:agent-a", 1_700_000_200),
             codex_root,
             conversation("s", 1_700_000_000),
             orphan,
+            lost_parent,
+            lost_kid,
             // No thoughts: the plain listing still lists it.
             ConversationSummary {
                 thoughts: 0,
@@ -744,6 +748,15 @@ mod tests {
                 .ends_with("codex:t-lost  subagent of codex:t-gone  [private]"),
             "{lines:#?}"
         );
+        // So does one with agents of its own, which are listed under it.
+        assert!(
+            firsts[at("codex:t-lost-parent")]
+                .ends_with("codex:t-lost-parent  subagent of codex:t-gone-2  [private]"),
+            "{lines:#?}"
+        );
+        assert_eq!(at("codex:t-lost-kid"), at("codex:t-lost-parent") + 1);
+        assert!(firsts[at("codex:t-lost-kid")].starts_with("    2023-"));
+        assert!(!firsts[at("codex:t-lost-kid")].contains("subagent of"));
         assert!(at("empty") > at("codex:t-lost"));
         // The backlog mark, once, and the hint for its harness.
         assert!(

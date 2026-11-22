@@ -258,6 +258,17 @@ pub enum When {
     OrphanAt(i64),
 }
 
+/// What the first column of an entry's row holds: an agent listed under its
+/// parent is marked as one; an agent that is not, whether or not it has agents
+/// of its own, keeps its date and the agent tag.
+fn when_of(entry: &Entry) -> When {
+    match (&entry.kind, entry.unlisted_parent()) {
+        (Kind::Child { .. }, _) => When::Agent,
+        (_, Some(_)) => When::OrphanAt(entry.summary.last_activity),
+        (_, None) => When::At(entry.summary.last_activity),
+    }
+}
+
 /// The text of a first-column cell: the main part, and a dim tag after it.
 pub fn when_cell(when: When, short: bool, g: &Glyphs) -> (String, Option<String>) {
     match when {
@@ -743,11 +754,7 @@ impl Model {
             }
             _ => (Disclosure::None, None),
         };
-        let when = match entry.kind {
-            Kind::Child { .. } => When::Agent,
-            Kind::Orphan => When::OrphanAt(summary.last_activity),
-            _ => When::At(summary.last_activity),
-        };
+        let when = when_of(entry);
         RowView {
             id: text::sanitize(&summary.id),
             disclosure,
@@ -789,11 +796,7 @@ impl Model {
         for &index in &self.visible {
             let entry = &self.tree.entries[index];
             let summary = &entry.summary;
-            let when = match entry.kind {
-                Kind::Child { .. } => When::Agent,
-                Kind::Orphan => When::OrphanAt(summary.last_activity),
-                _ => When::At(summary.last_activity),
-            };
+            let when = when_of(entry);
             let cell = |short| {
                 let (main, tag) = when_cell(when, short, &g);
                 text::width(&main) + tag.map_or(0, |tag| text::width(&tag))
@@ -899,12 +902,12 @@ impl Model {
         entry: &'a Entry,
         info: Option<&'a RowInfo>,
     ) -> DetailsInput<'a> {
-        let lineage = match entry.kind {
-            Kind::Child { parent } => {
-                Lineage::AgentOf(text::title(&self.tree.entries[parent].summary.title))
+        let lineage = match (&entry.kind, entry.unlisted_parent()) {
+            (Kind::Child { parent }, _) => {
+                Lineage::AgentOf(text::title(&self.tree.entries[*parent].summary.title))
             }
-            Kind::Orphan => Lineage::OrphanAgent,
-            _ => Lineage::None,
+            (_, Some(parent)) => Lineage::OrphanAgent(text::sanitize(parent)),
+            (_, None) => Lineage::None,
         };
         // The numbers read for this row just now beat the ones the list was
         // loaded with.

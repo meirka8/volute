@@ -1574,8 +1574,10 @@ pub enum Lineage {
     None,
     /// An agent listed under this parent (its sanitized title).
     AgentOf(String),
-    /// An agent whose parent is not in the list.
-    OrphanAgent,
+    /// An agent that is not listed under its parent (its parent is not in the
+    /// list, or is itself listed under another), with the parent's sanitized
+    /// id. It may have agents of its own.
+    OrphanAgent(String),
 }
 
 /// What the details of one conversation are built from.
@@ -1655,8 +1657,8 @@ pub fn details_page(input: &DetailsInput, g: &Glyphs) -> Vec<Page> {
             Some(format!("Subagent of \"{parent}\", imported from a remote"))
         }
         (Lineage::AgentOf(parent), false) => Some(format!("Subagent of \"{parent}\"")),
-        (Lineage::OrphanAgent, imported) => Some(format!(
-            "Subagent{}. Parent session is not captured on this machine.",
+        (Lineage::OrphanAgent(parent), imported) => Some(format!(
+            "Subagent of {parent}{}, listed on its own",
             if imported {
                 ", imported from a remote"
             } else {
@@ -1839,8 +1841,8 @@ pub fn strip_lines(input: &DetailsInput, g: &Glyphs) -> Vec<String> {
     }
     match (&input.lineage, summary.imported) {
         (Lineage::AgentOf(parent), _) => lines.push(format!("Subagent of \"{parent}\".")),
-        (Lineage::OrphanAgent, _) => {
-            lines.push("Parent session is not captured on this machine.".to_owned());
+        (Lineage::OrphanAgent(parent), _) => {
+            lines.push(format!("Subagent of {parent}, listed on its own."));
         }
         (Lineage::None, true) => lines.push(IMPORTED_IS_READ_ONLY.to_owned()),
         (Lineage::None, false) => {}
@@ -3812,8 +3814,8 @@ mod tests {
             Some("Kind: Subagent of \"Refactor\"")
         );
         assert_eq!(
-            kind(Lineage::OrphanAgent, false).as_deref(),
-            Some("Kind: Subagent. Parent session is not captured on this machine.")
+            kind(Lineage::OrphanAgent("s-1".to_owned()), false).as_deref(),
+            Some("Kind: Subagent of s-1, listed on its own")
         );
     }
 
@@ -3917,7 +3919,7 @@ mod tests {
             &DetailsInput {
                 summary: &summary,
                 details: Some(&details),
-                lineage: Lineage::OrphanAgent,
+                lineage: Lineage::OrphanAgent("s-1".to_owned()),
                 agents: 0,
                 remote: None,
                 backlog: None,
@@ -3925,10 +3927,7 @@ mod tests {
             &U,
         );
         assert_eq!(without.len(), 3);
-        assert_eq!(
-            without[2],
-            "Parent session is not captured on this machine."
-        );
+        assert_eq!(without[2], "Subagent of s-1, listed on its own.");
         summary.imported = true;
         let remote = overview("origin");
         let imported = strip_lines(
