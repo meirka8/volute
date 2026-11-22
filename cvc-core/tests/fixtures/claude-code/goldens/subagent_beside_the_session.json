@@ -1,0 +1,54 @@
+{
+  "final": {
+    "artifact_links": [],
+    "context_items": [],
+    "conversation_share_policy": [],
+    "conversation_shares": [],
+    "conversations": [
+      {"created_at":1786399441,"id":"0f773b11-7a20-427d-bd9d-208729c5fd87","title":"Delegate to a subagent"},
+      {"created_at":1786399467,"id":"0f773b11-7a20-427d-bd9d-208729c5fd87:agent-a0bd78e0693c35eed","title":"ux-psychologist: Design the keymap"}
+    ],
+    "derivation_events": [],
+    "derivation_observations": [],
+    "harness_ingest_cursors": [
+      {"byte_offset":247,"harness":"claude-code","session_id":"0f773b11-7a20-427d-bd9d-208729c5fd87","transcript_path":"__WORKTREE__/proj/0f773b11-7a20-427d-bd9d-208729c5fd87.jsonl","updated_at":"__WALL_CLOCK__"},
+      {"byte_offset":778,"harness":"claude-code","session_id":"0f773b11-7a20-427d-bd9d-208729c5fd87:agent-a0bd78e0693c35eed","transcript_path":"__WORKTREE__/proj/0f773b11-7a20-427d-bd9d-208729c5fd87/subagents/agent-a0bd78e0693c35eed.jsonl","updated_at":"__WALL_CLOCK__"}
+    ],
+    "interaction_shares": [],
+    "interactions": [
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"0f773b11-7a20-427d-bd9d-208729c5fd87","id":"240e6ddc-8308-8c33-a67b-6cc1a968f20e","model_cot":null,"model_name":"m","model_response":"Delegating.","parent_id":null,"scrubber_version":1,"source_request_id":"req_A","timestamp":1786399441,"user_prompt":"[prompt ~cvc-c6c18e5c1f06f15a] Delegate to a subagent","visibility":"private"},
+      {"author":"human","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"0f773b11-7a20-427d-bd9d-208729c5fd87:agent-a0bd78e0693c35eed","id":"9a5448d3-5010-8cc3-b02a-7f58386258bc","model_cot":"Subagent reasoning here.","model_name":"m","model_response":null,"parent_id":null,"scrubber_version":1,"source_request_id":"req_S","timestamp":1786399467,"user_prompt":"[task ~cvc-528cef9bc0275d11] You are the subagent; do the task.","visibility":"private"},
+      {"author":"system","capture_source":"claude_code","capture_worktree":"__WORKTREE_FINGERPRINT__","conversation_id":"0f773b11-7a20-427d-bd9d-208729c5fd87:agent-a0bd78e0693c35eed","id":"a6d051db-bf1a-84a6-a3a3-2d6f0360e13a","model_cot":null,"model_name":"m","model_response":"Subagent done.","parent_id":"9a5448d3-5010-8cc3-b02a-7f58386258bc","scrubber_version":1,"source_request_id":"req_S2","timestamp":1786399468,"user_prompt":"[no stimulus recorded]","visibility":"private"}
+    ],
+    "publications": [],
+    "tombstones": [],
+    "tool_executions": []
+  },
+  "golden": "cvc-core/claude-code-golden/v2",
+  "legend": [
+    "__WORKTREE__: the fixture repository's canonical root, always 240 bytes long",
+    "__TMPDIR__: the temporary directory holding that root",
+    "__WORKTREE_FINGERPRINT__: the capture_worktree hash of that root",
+    "__WALL_CLOCK__: a wall-clock column whose value lies within the test's run",
+    "marker-<n>: the random UUID of a redaction marker, numbered by first appearance",
+    "$long_string: a string over 4096 bytes, as its length, SHA-256, head and tail",
+    "{rows, sha256, first, last}: over 20 rows, by count, SHA-256 of their compact JSON, 3 each end",
+    "same_as_final: a step's rows for a table (or all its changes) are exactly the final rows",
+    "published.files: each file's byte length, SHA-256 and, as one string, its content",
+    "published.files content: every non-node file, and every node (first and last 3 if over 20)"
+  ],
+  "published": {
+    "empty_trees": ["events","ranges"],
+    "files": [
+      {"bytes":1,"content":"5","mode":"100644","path":"FORMAT","sha256":"ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d"},
+      {"bytes":490,"content":"{\n  \"interaction\": {\n    \"id\": \"240e6ddc-8308-8c33-a67b-6cc1a968f20e\",\n    \"conversation_id\": \"0f773b11-7a20-427d-bd9d-208729c5fd87\",\n    \"parent_id\": null,\n    \"timestamp\": \"2026-08-10T22:04:01Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[prompt ~cvc-c6c18e5c1f06f15a] Delegate to a subagent\",\n    \"model_name\": \"m\",\n    \"model_cot\": null,\n    \"model_response\": \"Delegating.\",\n    \"source_request_id\": \"req_A\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/24/240e6ddc-8308-8c33-a67b-6cc1a968f20e.json","sha256":"600833433351838471fac9425a56a2b017ecc4b867708f0cc15130fc6daa82df"},
+      {"bytes":537,"content":"{\n  \"interaction\": {\n    \"id\": \"9a5448d3-5010-8cc3-b02a-7f58386258bc\",\n    \"conversation_id\": \"0f773b11-7a20-427d-bd9d-208729c5fd87:agent-a0bd78e0693c35eed\",\n    \"parent_id\": null,\n    \"timestamp\": \"2026-08-10T22:04:27Z\",\n    \"author\": \"human\",\n    \"user_prompt\": \"[task ~cvc-528cef9bc0275d11] You are the subagent; do the task.\",\n    \"model_name\": \"m\",\n    \"model_cot\": \"Subagent reasoning here.\",\n    \"model_response\": null,\n    \"source_request_id\": \"req_S\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/9a/9a5448d3-5010-8cc3-b02a-7f58386258bc.json","sha256":"43064d1bc18c80c045ebeabaf02798c7654eae058a4116be31d2ee2e4d843f52"},
+      {"bytes":522,"content":"{\n  \"interaction\": {\n    \"id\": \"a6d051db-bf1a-84a6-a3a3-2d6f0360e13a\",\n    \"conversation_id\": \"0f773b11-7a20-427d-bd9d-208729c5fd87:agent-a0bd78e0693c35eed\",\n    \"parent_id\": \"9a5448d3-5010-8cc3-b02a-7f58386258bc\",\n    \"timestamp\": \"2026-08-10T22:04:28Z\",\n    \"author\": \"system\",\n    \"user_prompt\": \"[no stimulus recorded]\",\n    \"model_name\": \"m\",\n    \"model_cot\": null,\n    \"model_response\": \"Subagent done.\",\n    \"source_request_id\": \"req_S2\"\n  },\n  \"context_items\": [],\n  \"tool_executions\": [],\n  \"artifact_links\": []\n}","mode":"100644","path":"nodes/a6/a6d051db-bf1a-84a6-a3a3-2d6f0360e13a.json","sha256":"1af5a1b53c8f020c2273ea3d02cb7ddd354c86a6a6045e59a18e35e9f035bcf0"}
+    ]
+  },
+  "scenario": "subagent_beside_the_session",
+  "steps": [
+    {"changes":{"same_as_final":true},"outcome":{"ingest":{"mode":"final","rescan":false,"session_id":"0f773b11-7a20-427d-bd9d-208729c5fd87","transcript":"__WORKTREE__/proj/0f773b11-7a20-427d-bd9d-208729c5fd87.jsonl"},"report":{"already_present":0,"cursor":247,"inserted":1,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"0f773b11-7a20-427d-bd9d-208729c5fd87","subagent_inserted":2,"subagent_linked":0,"subagent_sessions":1,"transcript_len":667,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"final"},
+    {"changes":{},"outcome":{"ingest":{"mode":"final","rescan":false,"session_id":"0f773b11-7a20-427d-bd9d-208729c5fd87","transcript":"__WORKTREE__/proj/0f773b11-7a20-427d-bd9d-208729c5fd87.jsonl"},"report":{"already_present":1,"cursor":247,"inserted":0,"linked_from_commits":0,"lost":0,"omitted_context_items":0,"omitted_tool_calls":0,"pending_responses":0,"session_id":"0f773b11-7a20-427d-bd9d-208729c5fd87","subagent_inserted":0,"subagent_linked":0,"subagent_sessions":1,"transcript_len":667,"unrecorded_block_types":[],"unrecorded_blocks":0,"withheld":0,"withheld_reasons":[]}},"step":"final again"}
+  ]
+}

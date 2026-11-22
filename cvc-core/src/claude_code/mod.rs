@@ -28,7 +28,8 @@ pub mod settings;
 pub mod transcript;
 
 pub use ingest::{
-    ingest, ingest_waiting, ingest_with, IngestError, IngestMode, IngestOptions, IngestReport,
+    ingest, ingest_waiting, ingest_with, sniff_first_entry, IngestError, IngestMode, IngestOptions,
+    IngestReport,
 };
 pub use session_lock::SESSION_LOCK_WAIT;
-pub use transcript::HARNESS;
+pub use transcript::{FirstEntry, HARNESS};

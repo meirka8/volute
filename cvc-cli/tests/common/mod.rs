@@ -800,24 +800,24 @@ impl VirtualScreen {
                 let (row, column) = (grid.row, grid.column);
                 match mode {
                     0 => {
-                        for c in column..columns {
-                            grid.cells[row][c] = ' ';
+                        for cell in grid.cells[row].iter_mut().take(columns).skip(column) {
+                            *cell = ' ';
                         }
-                        for r in row + 1..rows {
-                            grid.cells[r] = vec![' '; columns];
+                        for line in grid.cells.iter_mut().take(rows).skip(row + 1) {
+                            *line = vec![' '; columns];
                         }
                     }
                     1 => {
-                        for r in 0..row {
-                            grid.cells[r] = vec![' '; columns];
+                        for line in grid.cells.iter_mut().take(row) {
+                            *line = vec![' '; columns];
                         }
-                        for c in 0..=column.min(columns - 1) {
-                            grid.cells[row][c] = ' ';
+                        for cell in grid.cells[row].iter_mut().take(column.min(columns - 1) + 1) {
+                            *cell = ' ';
                         }
                     }
                     2 => {
-                        for r in 0..rows {
-                            grid.cells[r] = vec![' '; columns];
+                        for line in grid.cells.iter_mut().take(rows) {
+                            *line = vec![' '; columns];
                         }
                     }
                     _ => {}

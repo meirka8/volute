@@ -444,6 +444,114 @@ pub fn parse_line(
     }))
 }
 
+/// How much of a transcript, from its first byte, [`first_entry`] looks at to
+/// find the first complete entry. Claude Code usually begins a transcript with
+/// a short bookkeeping entry (`queue-operation`, `custom-title`, `ai-title`,
+/// ...), so this is far more than a first line needs, and small enough for
+/// every hook run to read.
+pub const FIRST_ENTRY_BYTES: usize = 1024 * 1024;
+
+/// What a transcript's first complete entry says about who wrote the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstEntry {
+    /// The first complete line is a Claude Code entry (see
+    /// [`is_claude_code_entry`]). Whether this parser supports its version is
+    /// the parser's question, and it answers it loudly.
+    ClaudeCode,
+    /// The first complete line positively has another agent's shape (see
+    /// [`is_other_agents_entry`]): the file is that agent's.
+    NotClaudeCode,
+    /// The file is empty, or holds only blank lines and a first line that is
+    /// not newline-terminated yet: a transcript that is still being started.
+    NoCompleteEntry,
+    /// Nothing is concluded: no line ends within [`FIRST_ENTRY_BYTES`], or the
+    /// first complete line is neither a Claude Code entry nor another known
+    /// agent's (not JSON, cut short, not an object, a `type` that is not a
+    /// string). The parser, which reports what it finds, decides.
+    Undetermined,
+}
+
+/// Classifies the start of a transcript, `start` being at least its first
+/// [`FIRST_ENTRY_BYTES`] + 1 bytes, or all of it up to and including its first
+/// non-blank complete line, or all of it if shorter. Blank lines are passed
+/// over, as the parser passes over them.
+pub fn first_entry(start: &[u8]) -> FirstEntry {
+    let bounded = &start[..start.len().min(FIRST_ENTRY_BYTES)];
+    let mut rest = bounded;
+    while let Some(newline) = rest.iter().position(|b| *b == b'\n') {
+        let line = &rest[..newline];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if !line.iter().all(|b| b.is_ascii_whitespace()) {
+            return classify_line(line);
+        }
+        rest = &rest[newline + 1..];
+    }
+    if start.len() > FIRST_ENTRY_BYTES {
+        FirstEntry::Undetermined
+    } else {
+        FirstEntry::NoCompleteEntry
+    }
+}
+
+/// One complete, non-blank line. Another agent's shape is checked first, so a
+/// line that has it is never taken for Claude Code's.
+fn classify_line(line: &[u8]) -> FirstEntry {
+    let Ok(entry) = serde_json::from_slice::<serde_json::Map<String, Value>>(line) else {
+        return FirstEntry::Undetermined;
+    };
+    if is_other_agents_entry(&entry) {
+        FirstEntry::NotClaudeCode
+    } else if has_entry_type(&entry) {
+        FirstEntry::ClaudeCode
+    } else {
+        FirstEntry::Undetermined
+    }
+}
+
+/// Whether `line` is a Claude Code entry: a JSON object whose top-level `type`
+/// is a non-empty string, and which does not have another agent's shape (see
+/// [`is_other_agents_entry`]).
+///
+/// A `type` is what every entry kind in the Claude Code 2.x transcripts CVC
+/// supports carries, and the one field [`parse_line`] requires of every line
+/// before anything else: message entries (`user`, `assistant`), titles
+/// (`custom-title`, `ai-title`, `summary`), chained bookkeeping (`system`,
+/// `attachment`) and chain-less bookkeeping (`queue-operation`,
+/// `file-history-snapshot`, `api-request-blob`, ...). Other fields come and go
+/// with the kind and the version (titles and `queue-operation` have no `uuid`
+/// or `version`), so none of them is asked for: an entry of a version this
+/// parser does not support must still count as Claude Code's, so that the
+/// version pinning reports it rather than a caller passing it over.
+pub fn is_claude_code_entry(line: &[u8]) -> bool {
+    classify_line(line) == FirstEntry::ClaudeCode
+}
+
+/// Whether a transcript line, a JSON object, positively has the shape of
+/// another agent's transcript, which no Claude Code entry has:
+///
+/// * Cursor's agent transcripts: a top-level `role` and no `type` key;
+/// * Antigravity's steps: a top-level `step_index`;
+/// * Codex's rollout files: the `{timestamp, type, payload}` envelope with
+///   `type` `session_meta` and an object `payload`, which is how they begin.
+///
+/// Only a positive match counts. Anything else that is not a Claude Code entry
+/// is left to the parser, which reports it, so that a damaged Claude Code
+/// transcript is never passed over in silence.
+pub fn is_other_agents_entry(entry: &serde_json::Map<String, Value>) -> bool {
+    let cursor = !entry.contains_key("type") && entry.contains_key("role");
+    let antigravity = entry.contains_key("step_index");
+    let codex = entry.get("type").and_then(Value::as_str) == Some("session_meta")
+        && entry.get("payload").is_some_and(Value::is_object);
+    cursor || antigravity || codex
+}
+
+fn has_entry_type(entry: &serde_json::Map<String, Value>) -> bool {
+    entry
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| !kind.is_empty())
+}
+
 fn malformed(offset: u64, reason: impl Into<String>) -> TranscriptError {
     TranscriptError::Malformed {
         offset,
@@ -2090,5 +2198,177 @@ mod tests {
             abandoned.interactions[0].tool_executions[0].status,
             ToolStatus::Failure
         );
+    }
+
+    // ---- whose transcript it is: the first complete entry --------------------------
+
+    /// Every fixture, each recorded from (or shaped like) the Claude Code
+    /// version its directory names.
+    const FIXTURES: [(&str, &str); 5] = [
+        (
+            "v2.1.219/minimal",
+            include_str!("../../tests/fixtures/claude-code/v2.1.219/minimal.jsonl"),
+        ),
+        (
+            "v2.1.260/basic",
+            include_str!("../../tests/fixtures/claude-code/v2.1.260/basic.jsonl"),
+        ),
+        (
+            "v2.1.289/titled",
+            include_str!("../../tests/fixtures/claude-code/v2.1.289/titled.jsonl"),
+        ),
+        (
+            "v2.1.300/cached-requests",
+            include_str!("../../tests/fixtures/claude-code/v2.1.300/cached-requests.jsonl"),
+        ),
+        (
+            "v2.1.300/server-tools",
+            include_str!("../../tests/fixtures/claude-code/v2.1.300/server-tools.jsonl"),
+        ),
+    ];
+
+    /// Shaped like the lines of a Cursor agent transcript: a role and a
+    /// message, and nothing Claude Code's entries carry.
+    const CURSOR_LINE: &str =
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"Say hello"}]}}"#;
+
+    #[test]
+    fn every_fixture_begins_with_a_claude_code_entry() {
+        for (name, content) in FIXTURES {
+            assert_eq!(
+                first_entry(content.as_bytes()),
+                FirstEntry::ClaudeCode,
+                "{name}"
+            );
+            let first = content.lines().next().unwrap();
+            assert!(is_claude_code_entry(first.as_bytes()), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_claude_code_entry_of_any_version_or_kind_counts() {
+        for line in [
+            // A major version this parser refuses: it must still reach the
+            // parser, which says so.
+            r#"{"type":"user","uuid":"00000000-0000-4000-8000-000000000001","sessionId":"00000000-0000-4000-8000-000000000002","timestamp":"2026-01-01T00:00:00Z","version":"3.0.0","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","version":"9.9.9"}"#,
+            // Bookkeeping that carries neither a uuid nor a version.
+            r#"{"type":"queue-operation","operation":"enqueue","sessionId":"00000000-0000-4000-8000-000000000002"}"#,
+            r#"{"type":"file-history-snapshot","messageId":"m1","snapshot":{}}"#,
+            r#"{"type":"summary","summary":"A title","leafUuid":"u1"}"#,
+            // A kind this parser has never seen.
+            r#"{"type":"something-new"}"#,
+        ] {
+            assert!(is_claude_code_entry(line.as_bytes()), "{line}");
+            assert_eq!(
+                first_entry(format!("{line}\n").as_bytes()),
+                FirstEntry::ClaudeCode,
+                "{line}"
+            );
+        }
+    }
+
+    /// The shapes of other agents' transcripts, each positively told; the
+    /// values are made up.
+    const OTHER_AGENTS_LINES: [&str; 5] = [
+        CURSOR_LINE,
+        r#"{"role":"assistant","message":{"content":"hello"}}"#,
+        // Antigravity's steps.
+        r#"{"step_index":0,"source":"USER","content":"Say hello"}"#,
+        r#"{"step_index":3,"type":"PLANNER_RESPONSE"}"#,
+        // Codex's rollout envelope, as its files begin.
+        r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"00000000-0000-4000-8000-0000000000d1","cwd":"/work/example"}}"#,
+    ];
+
+    #[test]
+    fn another_agents_line_is_not_claude_codes() {
+        for line in OTHER_AGENTS_LINES {
+            assert!(!is_claude_code_entry(line.as_bytes()), "{line}");
+            assert_eq!(
+                first_entry(format!("{line}\n").as_bytes()),
+                FirstEntry::NotClaudeCode,
+                "{line}"
+            );
+        }
+        // Only the first entry decides: a Claude Code entry after it changes
+        // nothing.
+        let mixed = format!("{CURSOR_LINE}\n{{\"type\":\"user\"}}\n");
+        assert_eq!(first_entry(mixed.as_bytes()), FirstEntry::NotClaudeCode);
+    }
+
+    /// What is neither a Claude Code entry nor another agent's is the parser's
+    /// to report, so that a damaged Claude Code transcript is never passed over.
+    #[test]
+    fn a_line_of_nobody_known_is_left_to_the_parser() {
+        for line in [
+            // A `type` that is not a non-empty string, and no `role`.
+            r#"{"type":""}"#,
+            r#"{"type":7,"uuid":"u1"}"#,
+            r#"{"type":null}"#,
+            r#"{"type":null,"role":"user"}"#,
+            // A `type` only below the top level.
+            r#"{"message":{"type":"user"}}"#,
+            r#"[{"type":"user"}]"#,
+            r#""user""#,
+            "42",
+            "null",
+            "not json at all",
+            // A Claude Code entry cut short, and one after a byte order mark.
+            r#"{"type":"user","uui"#,
+            "\u{feff}{\"type\":\"user\"}",
+        ] {
+            assert!(!is_claude_code_entry(line.as_bytes()), "{line}");
+            assert_eq!(
+                first_entry(format!("{line}\n").as_bytes()),
+                FirstEntry::Undetermined,
+                "{line}"
+            );
+        }
+        // Only the whole Codex envelope is Codex's: `session_meta` without an
+        // object payload, or another `type` with one, is a `type` like any
+        // other, and Claude Code's.
+        for line in [
+            r#"{"type":"session_meta","payload":"x"}"#,
+            r#"{"type":"session_meta"}"#,
+            r#"{"type":"user","payload":{}}"#,
+        ] {
+            assert!(is_claude_code_entry(line.as_bytes()), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_transcript_without_a_complete_first_line_is_not_judged() {
+        assert_eq!(first_entry(b""), FirstEntry::NoCompleteEntry);
+        assert_eq!(first_entry(b"\n \r\n\t\n"), FirstEntry::NoCompleteEntry);
+        // A first line still being written is not judged, whoever writes it.
+        assert_eq!(
+            first_entry(CURSOR_LINE.as_bytes()),
+            FirstEntry::NoCompleteEntry
+        );
+        assert_eq!(
+            first_entry(br#"{"type":"user","uui"#),
+            FirstEntry::NoCompleteEntry
+        );
+        // Blank lines are passed over, and a CRLF ending is a line ending.
+        assert_eq!(
+            first_entry(b"\n\r\n{\"type\":\"ai-title\"}\r\n"),
+            FirstEntry::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn a_first_line_longer_than_the_bound_is_left_to_the_parser() {
+        let mut long = br#"{"role":"user","message":{"content":""#.to_vec();
+        long.resize(FIRST_ENTRY_BYTES + 10, b'x');
+        long.extend_from_slice(b"\"}}\n");
+        assert_eq!(first_entry(&long), FirstEntry::Undetermined);
+        // The bound is on where the line ends: one that ends just inside it
+        // is judged.
+        let mut fits = br#"{"type":"user","pad":""#.to_vec();
+        fits.resize(FIRST_ENTRY_BYTES - 3, b'x');
+        fits.extend_from_slice(b"\"}\n");
+        assert_eq!(fits.len(), FIRST_ENTRY_BYTES);
+        fits.extend_from_slice(b"more");
+        assert_eq!(first_entry(&fits), FirstEntry::ClaudeCode);
     }
 }

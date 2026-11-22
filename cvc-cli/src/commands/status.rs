@@ -15,8 +15,8 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let store =
-        CvcStore::open_initialized(layout.db_path()).context("Failed to open CVC database")?;
+    let store = CvcStore::open_initialized_upgrading(layout.db_path())
+        .context("Failed to open CVC database")?;
 
     let all_ids = store.get_all_interaction_ids()?;
     let floating = store.get_floating_interactions()?;

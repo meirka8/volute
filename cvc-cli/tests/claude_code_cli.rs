@@ -25,6 +25,15 @@ const SESSION: &str = "7c1e9f5a-2b2f-4f4e-9c3b-0f2e7a1d5b60";
 /// the test sets them itself.
 const CLAUDE_CODE_ENV: [&str; 3] = ["CLAUDECODE", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR"];
 
+/// Cursor exports this to the hooks it runs, and the processes of its
+/// integrated terminal may inherit it (not verified), so a test run from there
+/// may too. Hook mode reads
+/// it (public issue 189: it silences a payload without a session, and a
+/// transcript with no complete entry yet), so, as with Claude Code's, no
+/// command a test spawns may see it unless the test sets it itself. It is the
+/// only `CURSOR_*` variable `cvc` reads.
+const CURSOR_ENV: [&str; 1] = ["CURSOR_VERSION"];
+
 struct Fixture {
     temp: TempDir,
     home: PathBuf,
@@ -62,7 +71,7 @@ impl Fixture {
                 command.env_remove(name);
             }
         }
-        for name in CLAUDE_CODE_ENV {
+        for name in CLAUDE_CODE_ENV.into_iter().chain(CURSOR_ENV) {
             command.env_remove(name);
         }
         command
@@ -2011,4 +2020,1017 @@ fn hook_mode_goes_on_past_a_path_the_scrubber_cannot_take() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     assert_eq!(fixture.interaction_count(), 4);
+}
+
+// ---- Public issue 189: other agents run Claude Code's hooks -----------------
+//
+// Cursor loads Claude Code's hook settings by default (and sets
+// `CLAUDE_PROJECT_DIR` itself), and Antigravity's CLI can import Claude Code
+// plugins, so their sessions run `cvc ingest claude-code --hook` with their own
+// payloads and transcripts. Those runs exit 0 and say nothing, and a payload
+// with a top-level key that Claude Code does not send is set aside before any
+// repository is looked for.
+
+/// What a Cursor agent transcript's lines look like: a role and a message, and
+/// none of the fields of a Claude Code entry. The text is made up.
+const CURSOR_TRANSCRIPT: &str = concat!(
+    r#"{"role":"user","message":{"content":[{"type":"text","text":"Say hello"}]}}"#,
+    "\n",
+    r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}"#,
+    "\n",
+);
+
+/// A made-up value for Cursor's `CURSOR_VERSION` and `cursor_version`.
+const CURSOR_VERSION: &str = "0.0.0-test";
+
+/// A made-up conversation id for the other agents' payloads.
+const OTHER_CONVERSATION: &str = "00000000-0000-4000-8000-0000000000c1";
+
+/// Where hook mode fails once it opens the store of a repository that
+/// [`Fixture::make_store_unopenable`] was run on.
+const STORE_UNOPENABLE: &str = "CVC database is not an owned regular file";
+
+/// A directory's own modification time, and [`snapshot`] of what is in it.
+type DirectoryState = (
+    Option<SystemTime>,
+    BTreeMap<PathBuf, (u64, Option<SystemTime>)>,
+);
+
+impl Fixture {
+    /// A transcript shaped like Cursor's, where Cursor keeps them.
+    fn write_cursor_transcript(&self) -> PathBuf {
+        let dir = self.home.join(".cursor/projects/example/agent-transcripts");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{OTHER_CONVERSATION}.jsonl"));
+        fs::write(&path, CURSOR_TRANSCRIPT).unwrap();
+        path
+    }
+
+    /// A transcript named `name` beside the session's own, with `content`
+    /// as it is: one whose name does not name the session, say.
+    fn write_transcript_named(&self, name: &str, content: &str) -> PathBuf {
+        let dir = self.temp.path().join("transcripts");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// The repository's CVC directory, and everything in it with its size and
+    /// modification time: equal before and after means no run created,
+    /// removed or wrote anything there (the store, its journal, a session lock
+    /// or the consent state). Only CVC's directory: Git's own background
+    /// maintenance may still be writing under `.git/objects` after a commit.
+    fn cvc_state(&self) -> DirectoryState {
+        let cvc = self.repo.join(".git").join("cvc");
+        let own = fs::symlink_metadata(&cvc).unwrap().modified().ok();
+        (own, snapshot(&cvc))
+    }
+
+    /// Puts a directory where the repository's store belongs, so that a run
+    /// that opens the store fails visibly ([`STORE_UNOPENABLE`]): a run that
+    /// is silent in this repository never opened it. The consent state is a
+    /// file of its own and is not touched.
+    fn make_store_unopenable(&self) {
+        let cvc = self.repo.join(".git").join("cvc");
+        for name in ["index.db", "index.db-wal", "index.db-shm"] {
+            match fs::remove_file(cvc.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot remove {name}: {error}"),
+            }
+        }
+        fs::create_dir(cvc.join("index.db")).unwrap();
+    }
+}
+
+/// Hook payloads as Cursor sends them when it runs Claude Code's hooks, for a
+/// session in `workspace` whose transcript is `transcript`: its own keys,
+/// snake_case like Claude Code's, and no `session_id` or `cwd`. Under each of
+/// the event names Cursor might give, and with either of its own keys alone.
+fn cursor_payloads(workspace: &Path, transcript: &Path) -> Vec<(String, String)> {
+    let full = serde_json::json!({
+        "conversation_id": OTHER_CONVERSATION,
+        "generation_id": "00000000-0000-4000-8000-0000000000c2",
+        "model": "example-model",
+        "hook_event_name": "stop",
+        "cursor_version": CURSOR_VERSION,
+        "workspace_roots": [workspace.to_str().unwrap()],
+        "user_email": null,
+        "transcript_path": transcript.to_str().unwrap(),
+    });
+    let mut payloads = Vec::new();
+    for event in [
+        "postToolUse",
+        "stop",
+        "sessionEnd",
+        "PostToolUse",
+        "Stop",
+        "SessionEnd",
+    ] {
+        let mut payload = full.clone();
+        payload["hook_event_name"] = event.into();
+        payloads.push((format!("Cursor's {event}"), payload.to_string()));
+    }
+    for (only, left_out) in [
+        ("cursor_version", "conversation_id"),
+        ("conversation_id", "cursor_version"),
+    ] {
+        let mut payload = full.clone();
+        payload.as_object_mut().unwrap().remove(left_out);
+        payloads.push((format!("Cursor's, with {only} only"), payload.to_string()));
+    }
+    // Present is enough, whatever the value.
+    let mut payload = full.clone();
+    payload["conversation_id"] = serde_json::Value::Null;
+    payload.as_object_mut().unwrap().remove("cursor_version");
+    payloads.push((
+        "Cursor's, with a null conversation_id only".into(),
+        payload.to_string(),
+    ));
+    payloads
+}
+
+/// Hook payloads shaped as Antigravity's: camelCase keys, which Claude Code's
+/// payloads never have at the top level. The keys its changelog documents
+/// (`hookEventName`, `toolCall`, `lastUserInput`) as it would send them, then
+/// every key of Antigravity's that hook mode knows, all together and each
+/// alone.
+fn antigravity_payloads(workspace: &Path, transcript: &Path) -> Vec<(String, String)> {
+    let mut payloads = Vec::new();
+    for event in ["PostToolUse", "Stop", "SessionStart"] {
+        let payload = serde_json::json!({
+            "hookEventName": event,
+            "cwd": workspace.to_str().unwrap(),
+            "toolCall": {"name": "run_command", "args": {"command": "true"}},
+        });
+        payloads.push((
+            format!("Antigravity's documented {event}"),
+            payload.to_string(),
+        ));
+    }
+    let full = serde_json::json!({
+        "hookEventName": "postToolUse",
+        "toolCall": {"name": "run_command"},
+        "lastUserInput": "Say hello",
+        "conversationId": OTHER_CONVERSATION,
+        "transcriptPath": transcript.to_str().unwrap(),
+        "workspacePaths": [workspace.to_str().unwrap()],
+    });
+    payloads.push(("Antigravity's, every key".into(), full.to_string()));
+    for (key, value) in full.as_object().unwrap() {
+        let payload = serde_json::json!({ key: value });
+        payloads.push((
+            format!("Antigravity's, with {key} only"),
+            payload.to_string(),
+        ));
+    }
+    payloads
+}
+
+/// Runs each of another agent's `payloads` through hook mode in three places,
+/// each of which makes a run fail visibly once it gets past a given step: a
+/// CVC repository without the capture acknowledgement (the consent check), an
+/// acknowledged one whose store cannot be opened (the store), and a project
+/// directory Git cannot open (looking for the repository). A Claude Code
+/// payload is run in each first, to show that it does fail there. Every one of
+/// the other agent's runs must exit 0 in silence and leave CVC's directory as
+/// it was, with and without the variables Cursor sets.
+fn assert_ignored_before_any_repository_is_looked_for(
+    payloads: fn(&Path, &Path) -> Vec<(String, String)>,
+) {
+    let unacknowledged = Fixture::new();
+    unacknowledged.cvc_ok(&["init"]);
+    let unopenable = Fixture::new();
+    unopenable.cvc_ok(&["init"]);
+    unopenable.acknowledge_capture();
+    unopenable.make_store_unopenable();
+    let broken = unacknowledged.temp.path().join("broken");
+    fs::create_dir_all(broken.join(".git")).unwrap();
+
+    // Each place speaks once a Claude Code run gets that far.
+    for (fixture, needle) in [
+        (&unacknowledged, "consent-required"),
+        (&unopenable, STORE_UNOPENABLE),
+    ] {
+        let transcript = fixture.write_transcript(BASIC);
+        let payload = fixture.hook_payload(&transcript, "Stop", "");
+        let project = [("CLAUDE_PROJECT_DIR", fixture.repo.to_str().unwrap())];
+        let output = fixture.hook(&fixture.repo, payload.as_bytes(), &project);
+        assert_visible_failure(&output, needle, &format!("a Claude Code run ({needle})"));
+    }
+    let transcript = unacknowledged.write_transcript(BASIC);
+    let payload = unacknowledged.hook_payload_in(&broken, &transcript, "Stop", "");
+    let project = [("CLAUDE_PROJECT_DIR", broken.to_str().unwrap())];
+    assert_visible_failure(
+        &unacknowledged.hook(&broken, payload.as_bytes(), &project),
+        "Failed to discover Git repository",
+        "a Claude Code run in a project Git cannot open",
+    );
+
+    // The other agent's runs get past none of them.
+    for fixture in [&unacknowledged, &unopenable] {
+        let transcript = fixture.write_cursor_transcript();
+        let repo = fixture.repo.to_str().unwrap();
+        let before = fixture.cvc_state();
+        for env in [
+            &[][..],
+            &[("CLAUDE_PROJECT_DIR", repo)][..],
+            &[
+                ("CLAUDE_PROJECT_DIR", repo),
+                ("CURSOR_VERSION", CURSOR_VERSION),
+            ][..],
+        ] {
+            for (label, payload) in payloads(&fixture.repo, &transcript) {
+                let output = fixture.hook(&fixture.repo, payload.as_bytes(), env);
+                assert_silent_success(&output, &format!("{label}, {env:?}"));
+            }
+        }
+        assert_eq!(
+            fixture.cvc_state(),
+            before,
+            "nothing was created, removed or written in CVC's directory"
+        );
+    }
+    assert_eq!(unacknowledged.interaction_count(), 0);
+
+    let transcript = unacknowledged.write_cursor_transcript();
+    let broken_project = broken.to_str().unwrap();
+    let before = snapshot(&broken);
+    for (cwd, env) in [
+        (&broken, &[][..]),
+        (
+            &unacknowledged.repo,
+            &[("CLAUDE_PROJECT_DIR", broken_project)][..],
+        ),
+        (
+            &unacknowledged.repo,
+            &[
+                ("CLAUDE_PROJECT_DIR", broken_project),
+                ("CURSOR_VERSION", CURSOR_VERSION),
+            ][..],
+        ),
+    ] {
+        for (label, payload) in payloads(&broken, &transcript) {
+            let output = unacknowledged.hook(cwd, payload.as_bytes(), env);
+            assert_silent_success(
+                &output,
+                &format!("{label}, a project Git cannot open, {env:?}"),
+            );
+        }
+    }
+    assert_eq!(snapshot(&broken), before);
+}
+
+/// Cursor's payload (`cursor_version`, `conversation_id` without `session_id`,
+/// `workspace_roots`)
+/// naming Cursor's transcript: exit 0 in silence before any repository is
+/// looked for, so before the consent check and without opening the store.
+#[test]
+fn hook_mode_ignores_a_cursor_run_before_it_looks_for_a_repository() {
+    assert_ignored_before_any_repository_is_looked_for(cursor_payloads);
+}
+
+/// The same for Antigravity's camelCase payload (`hookEventName`, `toolCall`,
+/// `lastUserInput`, `conversationId`, `transcriptPath`, `workspacePaths`).
+#[test]
+fn hook_mode_ignores_an_antigravity_run_before_it_looks_for_a_repository() {
+    assert_ignored_before_any_repository_is_looked_for(antigravity_payloads);
+}
+
+/// Transcripts that begin with a line of another agent's, positively told:
+/// Cursor's (a role, no type), Antigravity's steps (`step_index`) and Codex's
+/// rollout envelope (`session_meta` with an object payload). The text and ids
+/// are made up.
+fn other_agents_transcripts() -> Vec<(&'static str, String)> {
+    vec![
+        ("Cursor's lines", CURSOR_TRANSCRIPT.to_owned()),
+        ("after blank lines", format!("\n \r\n{CURSOR_TRANSCRIPT}")),
+        (
+            "with CRLF line ends",
+            CURSOR_TRANSCRIPT.replace('\n', "\r\n"),
+        ),
+        (
+            "followed by Claude Code's entries",
+            format!("{CURSOR_TRANSCRIPT}{BASIC}"),
+        ),
+        (
+            "Antigravity's steps",
+            "{\"step_index\":0,\"source\":\"USER\",\"content\":\"Say hello\"}\n".to_owned(),
+        ),
+        (
+            "Codex's rollout",
+            "{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"00000000-0000-4000-8000-0000000000d1\"}}\n".to_owned(),
+        ),
+    ]
+}
+
+/// A payload shaped as Claude Code's that names a transcript that begins with
+/// another agent's line: after the consent check, the hook reads the
+/// transcript's first complete line. When something else corroborates that
+/// the run is not Claude Code's own (the file is not named for the payload's
+/// session, as Claude Code's `<session>.jsonl` is, or `CURSOR_VERSION` is
+/// set), it exits 0 in silence without opening the store, so nothing is
+/// recorded and no cursor or lock is written. When nothing does, so that a
+/// foreign line put at the top of a session's own transcript cannot silence
+/// it, the hook fails visibly, `not a Claude Code transcript`, again without
+/// opening the store. Without the acknowledgement it is the visible
+/// `consent-required` any run there is.
+#[test]
+fn hook_mode_passes_over_a_transcript_that_does_not_begin_with_a_claude_code_entry() {
+    let transcripts = other_agents_transcripts();
+    let run_all = |fixture: &Fixture| {
+        let repo = fixture.repo.to_str().unwrap();
+        let without = [&[][..], &[("CLAUDE_PROJECT_DIR", repo)][..]];
+        let under_cursor = [
+            ("CLAUDE_PROJECT_DIR", repo),
+            ("CURSOR_VERSION", CURSOR_VERSION),
+        ];
+        for (label, content) in &transcripts {
+            for event in ["PostToolUse", "Stop", "SessionEnd"] {
+                // Not named for the session: silent, with or without Cursor.
+                let elsewhere =
+                    fixture.write_transcript_named(&format!("{OTHER_CONVERSATION}.jsonl"), content);
+                let payload = fixture.hook_payload(&elsewhere, event, "");
+                for env in without.iter().copied().chain([&under_cursor[..]]) {
+                    let output = fixture.hook(&fixture.repo, payload.as_bytes(), env);
+                    assert_silent_success(
+                        &output,
+                        &format!("{label}, {event}, not the session's file, {env:?}"),
+                    );
+                }
+                // The session's own file: silent only under Cursor.
+                let own = fixture.write_transcript_named(&format!("{SESSION}.jsonl"), content);
+                let payload = fixture.hook_payload(&own, event, "");
+                let output = fixture.hook(&fixture.repo, payload.as_bytes(), &under_cursor);
+                assert_silent_success(
+                    &output,
+                    &format!("{label}, {event}, the session's file, under Cursor"),
+                );
+                for env in without {
+                    let output = fixture.hook(&fixture.repo, payload.as_bytes(), env);
+                    let what = format!("{label}, {event}, the session's file, {env:?}");
+                    assert_visible_failure(&output, "not a Claude Code transcript", &what);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(stderr.contains(own.to_str().unwrap()), "{what}: {stderr}");
+                }
+            }
+        }
+    };
+
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let before = fixture.cvc_state();
+    run_all(&fixture);
+    assert_eq!(
+        fixture.cvc_state(),
+        before,
+        "nothing was created, removed or written in CVC's directory"
+    );
+    assert_eq!(fixture.interaction_count(), 0);
+    assert_eq!(fixture.cursor(), None);
+    assert_eq!(ingest_lock_files(&fixture.repo), Vec::<String>::new());
+
+    // The store is not opened for any of them, silent or not.
+    let unopenable = Fixture::new();
+    unopenable.cvc_ok(&["init"]);
+    unopenable.acknowledge_capture();
+    unopenable.make_store_unopenable();
+    let transcript = unopenable.write_transcript(BASIC);
+    let payload = unopenable.hook_payload(&transcript, "Stop", "");
+    assert_visible_failure(
+        &unopenable.hook(&unopenable.repo, payload.as_bytes(), &[]),
+        STORE_UNOPENABLE,
+        "a Claude Code transcript opens the store",
+    );
+    let before = unopenable.cvc_state();
+    run_all(&unopenable);
+    assert_eq!(unopenable.cvc_state(), before);
+
+    // The consent check comes first, whoever's transcript it is.
+    let unacknowledged = Fixture::new();
+    unacknowledged.cvc_ok(&["init"]);
+    let repo = unacknowledged.repo.to_str().unwrap();
+    for transcript in [
+        unacknowledged.write_transcript_named(&format!("{SESSION}.jsonl"), CURSOR_TRANSCRIPT),
+        unacknowledged
+            .write_transcript_named(&format!("{OTHER_CONVERSATION}.jsonl"), CURSOR_TRANSCRIPT),
+    ] {
+        for env in [
+            &[][..],
+            &[("CLAUDE_PROJECT_DIR", repo)][..],
+            &[
+                ("CLAUDE_PROJECT_DIR", repo),
+                ("CURSOR_VERSION", CURSOR_VERSION),
+            ][..],
+        ] {
+            let payload = unacknowledged.hook_payload(&transcript, "Stop", "");
+            let output = unacknowledged.hook(&unacknowledged.repo, payload.as_bytes(), env);
+            assert_visible_failure(
+                &output,
+                "consent-required",
+                &format!("{transcript:?}, {env:?}"),
+            );
+        }
+    }
+    assert_eq!(unacknowledged.interaction_count(), 0);
+
+    // A first line that does not end within 1 MiB is not judged: the parser
+    // is, and it refuses it visibly, never with the blocking status, and
+    // records nothing.
+    let long = Fixture::new();
+    long.cvc_ok(&["init"]);
+    long.acknowledge_capture();
+    let line = format!(
+        "{{\"role\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n",
+        "x".repeat(1024 * 1024)
+    );
+    let transcript = long.write_transcript(&line);
+    let payload = long.hook_payload(&transcript, "Stop", "");
+    assert_visible_failure(
+        &long.hook(&long.repo, payload.as_bytes(), &[]),
+        "entry has no type",
+        "a first line longer than the bound",
+    );
+    assert_eq!(long.interaction_count(), 0);
+}
+
+/// A first line that is neither a Claude Code entry nor another known agent's
+/// (not JSON, cut short, after a byte order mark, not an object, an empty
+/// `type`) is never passed over, even with every corroboration there is (a file
+/// not named for the session, `CURSOR_VERSION` set): it goes on to the store
+/// and the parser, which report it. A damaged Claude Code transcript therefore
+/// stays loud.
+#[test]
+fn hook_mode_leaves_a_first_line_of_nobody_known_to_the_parser() {
+    let cut_short = format!("{}\n{BASIC}", &BASIC[..20]);
+    let after_a_bom = format!("\u{feff}{BASIC}");
+    let nobodys = [
+        ("a first line cut short, then continued", cut_short.clone()),
+        ("a byte order mark", after_a_bom.clone()),
+        ("a JSON array", "[{\"type\":\"user\"}]\n".to_owned()),
+        ("an empty type", "{\"type\":\"\"}\n".to_owned()),
+        (
+            "a null type beside a role",
+            "{\"type\":null,\"role\":\"user\"}\n".to_owned(),
+        ),
+        ("not JSON", "not json at all\n".to_owned()),
+    ];
+    let unopenable = Fixture::new();
+    unopenable.cvc_ok(&["init"]);
+    unopenable.acknowledge_capture();
+    unopenable.make_store_unopenable();
+    let repo = unopenable.repo.to_str().unwrap();
+    let under_cursor = [
+        ("CLAUDE_PROJECT_DIR", repo),
+        ("CURSOR_VERSION", CURSOR_VERSION),
+    ];
+    for (label, content) in &nobodys {
+        let transcript =
+            unopenable.write_transcript_named(&format!("{OTHER_CONVERSATION}.jsonl"), content);
+        let payload = unopenable.hook_payload(&transcript, "Stop", "");
+        assert_visible_failure(
+            &unopenable.hook(&unopenable.repo, payload.as_bytes(), &under_cursor),
+            STORE_UNOPENABLE,
+            label,
+        );
+    }
+
+    // Where the store opens, a damaged Claude Code transcript is the parser's
+    // visible error, and nothing is recorded.
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let repo = fixture.repo.to_str().unwrap();
+    for (label, content) in [("cut short", &cut_short), ("a BOM", &after_a_bom)] {
+        let transcript = fixture.write_transcript(content);
+        for env in [
+            &[("CLAUDE_PROJECT_DIR", repo)][..],
+            &[
+                ("CLAUDE_PROJECT_DIR", repo),
+                ("CURSOR_VERSION", CURSOR_VERSION),
+            ][..],
+        ] {
+            for event in ["PostToolUse", "Stop"] {
+                let payload = fixture.hook_payload(&transcript, event, "");
+                assert_visible_failure(
+                    &fixture.hook(&fixture.repo, payload.as_bytes(), env),
+                    "not a JSON transcript entry",
+                    &format!("{label}, {event}, {env:?}"),
+                );
+            }
+        }
+    }
+    assert_eq!(fixture.interaction_count(), 0);
+}
+
+/// Waits up to 20 s for `child` and returns its output, or kills it and fails.
+fn wait_with_timeout(mut child: std::process::Child, what: &str) -> Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what}: the hook did not finish within 20 s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The first-line check opens the transcript once, and neither follows a link
+/// (one to another agent's transcript, from a file not named for the session
+/// and under Cursor, would otherwise be passed over in silence) nor waits for
+/// a writer at a FIFO. What is not a regular file (a link, a FIFO, a directory)
+/// is refused there, visibly, with the error ingestion gives it, and before the
+/// store is opened: in a repository whose store cannot be opened the refusal is
+/// the same, and CVC's directory is left as it was.
+#[test]
+fn hook_mode_neither_follows_a_link_nor_waits_on_a_fifo_at_the_transcript_path() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let unopenable = Fixture::new();
+    unopenable.cvc_ok(&["init"]);
+    unopenable.acknowledge_capture();
+    unopenable.make_store_unopenable();
+    // The trap works: a Claude Code transcript opens the store.
+    let transcript = unopenable.write_transcript(BASIC);
+    let payload = unopenable.hook_payload(&transcript, "Stop", "");
+    assert_visible_failure(
+        &unopenable.hook(&unopenable.repo, payload.as_bytes(), &[]),
+        STORE_UNOPENABLE,
+        "a Claude Code transcript opens the store",
+    );
+
+    for fixture in [&fixture, &unopenable] {
+        let repo = fixture.repo.to_str().unwrap();
+        let under_cursor = [
+            ("CLAUDE_PROJECT_DIR", repo),
+            ("CURSOR_VERSION", CURSOR_VERSION),
+        ];
+        let without = [("CLAUDE_PROJECT_DIR", repo)];
+        let dir = fixture.temp.path().join("transcripts");
+        fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("linked.jsonl");
+        std::os::unix::fs::symlink(fixture.write_cursor_transcript(), &link).unwrap();
+        let fifo = dir.join("fifo.jsonl");
+        let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(status.success(), "mkfifo");
+        let directory = dir.join("directory.jsonl");
+        fs::create_dir(&directory).unwrap();
+
+        let before = fixture.cvc_state();
+        for (label, path) in [
+            ("a link to another agent's transcript", &link),
+            ("a FIFO", &fifo),
+            ("a directory", &directory),
+        ] {
+            for env in [&under_cursor[..], &without[..]] {
+                for event in ["PostToolUse", "Stop"] {
+                    let what = format!("{label}, {event}, {env:?}");
+                    let payload = fixture.hook_payload(path, event, "");
+                    let mut child = fixture.spawn_hook(&fixture.repo, env);
+                    child
+                        .stdin
+                        .take()
+                        .unwrap()
+                        .write_all(payload.as_bytes())
+                        .unwrap();
+                    let output = wait_with_timeout(child, &what);
+                    assert_visible_failure(&output, "is not a regular file", &what);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(stderr.contains(path.to_str().unwrap()), "{what}: {stderr}");
+                    assert!(!stderr.contains(STORE_UNOPENABLE), "{what}: {stderr}");
+                }
+            }
+        }
+        assert_eq!(
+            fixture.cvc_state(),
+            before,
+            "nothing was created, removed or written in CVC's directory"
+        );
+    }
+    assert_eq!(fixture.interaction_count(), 0);
+    assert_eq!(fixture.cursor(), None);
+}
+
+/// Under Cursor, a payload that could not be read whole within the 1 MiB
+/// bound (a `PostToolUse` whose tool output is large, say) or that is not the
+/// JSON Claude Code sends is taken for Cursor's own, and the hook exits 0 in
+/// silence, without opening the store; nothing could be ingested from it in
+/// any case. Without `CURSOR_VERSION` each is the visible failure it always
+/// was.
+#[test]
+fn under_cursor_an_oversize_or_unparsable_payload_is_silent() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let transcript = fixture.write_transcript(BASIC);
+    let oversize = fixture.hook_payload(
+        &transcript,
+        "PostToolUse",
+        &format!(
+            ",\"tool_name\":\"Bash\",\"tool_input\":{{\"command\":\"true\"}},\"tool_response\":{{\"stdout\":\"{}\"}}",
+            "x".repeat(1024 * 1024 + 512 * 1024)
+        ),
+    );
+    assert!(oversize.len() > 1024 * 1024);
+    let payloads = [
+        (
+            "an oversize payload",
+            oversize,
+            "hook payload exceeds 1 MiB",
+        ),
+        (
+            "a JSON array",
+            "[1,2,3]".to_owned(),
+            "hook payload is not the JSON Claude Code delivers on stdin",
+        ),
+        (
+            "a JSON string",
+            "\"stop\"".to_owned(),
+            "hook payload is not the JSON Claude Code delivers on stdin",
+        ),
+        (
+            "not JSON",
+            "not json at all".to_owned(),
+            "hook payload is not the JSON Claude Code delivers on stdin",
+        ),
+        (
+            "an object of the wrong shape",
+            format!(
+                "{{\"session_id\":7,\"cwd\":\"{}\"}}",
+                fixture.repo.display()
+            ),
+            "hook payload is not the JSON Claude Code delivers on stdin",
+        ),
+    ];
+
+    let unopenable = Fixture::new();
+    unopenable.cvc_ok(&["init"]);
+    unopenable.acknowledge_capture();
+    unopenable.make_store_unopenable();
+    for fixture in [&fixture, &unopenable] {
+        let repo = fixture.repo.to_str().unwrap();
+        let under_cursor = [
+            ("CLAUDE_PROJECT_DIR", repo),
+            ("CURSOR_VERSION", CURSOR_VERSION),
+        ];
+        let without = [("CLAUDE_PROJECT_DIR", repo)];
+        let empty_version = [("CLAUDE_PROJECT_DIR", repo), ("CURSOR_VERSION", "")];
+        let before = fixture.cvc_state();
+        for (label, payload, message) in &payloads {
+            assert_silent_success(
+                &fixture.hook(&fixture.repo, payload.as_bytes(), &under_cursor),
+                &format!("{label}, under Cursor"),
+            );
+            for env in [&without[..], &empty_version[..]] {
+                assert_visible_failure(
+                    &fixture.hook(&fixture.repo, payload.as_bytes(), env),
+                    message,
+                    &format!("{label}, {env:?}"),
+                );
+            }
+        }
+        assert_eq!(
+            fixture.cvc_state(),
+            before,
+            "nothing was created, removed or written in CVC's directory"
+        );
+    }
+    assert_eq!(fixture.interaction_count(), 0);
+    assert_eq!(fixture.cursor(), None);
+}
+
+/// Claude Code run in Cursor's integrated terminal may inherit `CURSOR_VERSION`
+/// (not verified), and so may its hooks, along with the `CLAUDE_PROJECT_DIR`
+/// Claude Code sets.
+/// That never stops a well-formed Claude Code run from being recorded, nor a
+/// transcript of a Claude Code version this cvc does not support from being
+/// reported.
+#[test]
+fn cursor_version_in_the_environment_never_silences_a_claude_code_run() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let full = BASIC.to_owned();
+    let cut = full.find("\"uuid\":\"s7\"").unwrap();
+    let first_part = full[..full[..cut].rfind('\n').unwrap() + 1].to_owned();
+    let repo = fixture.repo.to_str().unwrap();
+    let under_cursor = [
+        ("CLAUDE_PROJECT_DIR", repo),
+        ("CURSOR_VERSION", CURSOR_VERSION),
+    ];
+    for (event, content, recorded) in [
+        ("PostToolUse", &first_part, 3),
+        ("Stop", &full, 7),
+        // Once more: nothing new, nothing twice.
+        ("SessionEnd", &full, 7),
+    ] {
+        let transcript = fixture.write_transcript(content);
+        let payload = fixture.hook_payload(&transcript, event, "");
+        let output = fixture.hook(&fixture.repo, payload.as_bytes(), &under_cursor);
+        assert_silent_success(&output, event);
+        assert_eq!(fixture.interaction_count(), recorded, "{event}");
+    }
+    assert!(fixture.cursor().is_some());
+
+    // A Claude Code transcript of another major version is Claude Code's, and
+    // its version is what is reported.
+    let future = Fixture::new();
+    future.cvc_ok(&["init"]);
+    future.acknowledge_capture();
+    let content = BASIC.replace("\"2.1.260\"", "\"3.0.0\"");
+    assert_ne!(content, BASIC);
+    let transcript = future.write_transcript(&content);
+    let repo = future.repo.to_str().unwrap();
+    for env in [
+        &[("CLAUDE_PROJECT_DIR", repo)][..],
+        &[
+            ("CLAUDE_PROJECT_DIR", repo),
+            ("CURSOR_VERSION", CURSOR_VERSION),
+        ][..],
+    ] {
+        for event in ["PostToolUse", "Stop"] {
+            let payload = future.hook_payload(&transcript, event, "");
+            let output = future.hook(&future.repo, payload.as_bytes(), env);
+            assert_visible_failure(
+                &output,
+                "this cvc supports transcript major version 2 only",
+                &format!("{event}, {env:?}"),
+            );
+        }
+    }
+    assert_eq!(future.interaction_count(), 0);
+}
+
+/// What `CURSOR_VERSION` does silence: a payload without a session or a
+/// transcript, which Claude Code never sends, and a transcript with no complete
+/// line yet, which the next event reads. Without the variable, or with it
+/// empty, the first is the failure it always was and the second goes on to the
+/// store.
+#[test]
+fn under_cursor_a_payload_without_a_session_and_a_transcript_not_begun_are_silent() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let transcript = fixture.write_transcript(BASIC);
+    let transcript = transcript.to_str().unwrap();
+    let repo = fixture.repo.to_str().unwrap();
+    let under_cursor = [
+        ("CLAUDE_PROJECT_DIR", repo),
+        ("CURSOR_VERSION", CURSOR_VERSION),
+    ];
+    let empty_version = [("CLAUDE_PROJECT_DIR", repo), ("CURSOR_VERSION", "")];
+    let without = [("CLAUDE_PROJECT_DIR", repo)];
+
+    let incomplete = [
+        (
+            "no session_id",
+            serde_json::json!({"transcript_path": transcript, "cwd": repo, "hook_event_name": "Stop"}),
+            "hook payload has no session_id",
+        ),
+        (
+            "an empty session_id",
+            serde_json::json!({"session_id": "", "transcript_path": transcript, "cwd": repo, "hook_event_name": "Stop"}),
+            "hook payload has no session_id",
+        ),
+        (
+            "no transcript_path",
+            serde_json::json!({"session_id": SESSION, "cwd": repo, "hook_event_name": "Stop"}),
+            "hook payload has no transcript_path",
+        ),
+        (
+            "an empty transcript_path",
+            serde_json::json!({"session_id": SESSION, "transcript_path": "", "cwd": repo, "hook_event_name": "Stop"}),
+            "hook payload has no transcript_path",
+        ),
+        (
+            "neither, as a payload of Cursor's without its own keys might be",
+            serde_json::json!({"hook_event_name": "stop", "workspace_roots": [repo]}),
+            "hook payload has no session_id",
+        ),
+    ];
+    for (label, payload, message) in &incomplete {
+        let payload = payload.to_string();
+        assert_silent_success(
+            &fixture.hook(&fixture.repo, payload.as_bytes(), &under_cursor),
+            &format!("{label}, under Cursor"),
+        );
+        assert_visible_failure(
+            &fixture.hook(&fixture.repo, payload.as_bytes(), &without),
+            message,
+            &format!("{label}, without CURSOR_VERSION"),
+        );
+        assert_visible_failure(
+            &fixture.hook(&fixture.repo, payload.as_bytes(), &empty_version),
+            message,
+            &format!("{label}, with CURSOR_VERSION empty"),
+        );
+    }
+    assert_eq!(fixture.interaction_count(), 0);
+
+    // A transcript with no complete line yet is passed over without opening
+    // the store; without the variable the run opens it, which says so here.
+    let cursor_first_line = CURSOR_TRANSCRIPT.lines().next().unwrap().to_owned();
+    let claude_code_first_line = BASIC.lines().next().unwrap().to_owned();
+    let not_begun = [
+        ("an empty transcript", String::new()),
+        ("only blank lines", "\n \r\n".to_owned()),
+        (
+            "Cursor's first line, still being written",
+            cursor_first_line,
+        ),
+        (
+            "Claude Code's first line, still being written",
+            claude_code_first_line,
+        ),
+    ];
+    let unopenable = Fixture::new();
+    unopenable.cvc_ok(&["init"]);
+    unopenable.acknowledge_capture();
+    unopenable.make_store_unopenable();
+    let repo = unopenable.repo.to_str().unwrap();
+    let under_cursor = [
+        ("CLAUDE_PROJECT_DIR", repo),
+        ("CURSOR_VERSION", CURSOR_VERSION),
+    ];
+    let without = [("CLAUDE_PROJECT_DIR", repo)];
+    for (label, content) in &not_begun {
+        let transcript = unopenable.write_transcript(content);
+        for event in ["PostToolUse", "Stop"] {
+            let payload = unopenable.hook_payload(&transcript, event, "");
+            assert_silent_success(
+                &unopenable.hook(&unopenable.repo, payload.as_bytes(), &under_cursor),
+                &format!("{label}, {event}, under Cursor"),
+            );
+            assert_visible_failure(
+                &unopenable.hook(&unopenable.repo, payload.as_bytes(), &without),
+                STORE_UNOPENABLE,
+                &format!("{label}, {event}, without CURSOR_VERSION"),
+            );
+        }
+    }
+
+    // Where the store opens, such a run records nothing and writes no cursor.
+    let begun = Fixture::new();
+    begun.cvc_ok(&["init"]);
+    begun.acknowledge_capture();
+    let transcript = begun.write_transcript("");
+    let payload = begun.hook_payload(&transcript, "PostToolUse", "");
+    let repo = begun.repo.to_str().unwrap();
+    let before = begun.cvc_state();
+    assert_silent_success(
+        &begun.hook(
+            &begun.repo,
+            payload.as_bytes(),
+            &[
+                ("CLAUDE_PROJECT_DIR", repo),
+                ("CURSOR_VERSION", CURSOR_VERSION),
+            ],
+        ),
+        "an empty transcript, under Cursor",
+    );
+    assert_eq!(begun.cvc_state(), before);
+    assert_eq!(begun.interaction_count(), 0);
+    assert_eq!(begun.cursor(), None);
+}
+
+/// Only top-level keys tell another agent's payload. A tool's input and output
+/// are the model's and the tool's to fill, and may carry any key, the other
+/// agents' own among them: a Claude Code payload with such keys below the top
+/// level is recorded as any other.
+#[test]
+fn hook_mode_records_a_claude_code_payload_whose_tool_input_carries_another_agents_keys() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let full = BASIC.to_owned();
+    let cut = full.find("\"uuid\":\"s7\"").unwrap();
+    let first_part = full[..full[..cut].rfind('\n').unwrap() + 1].to_owned();
+    let others = serde_json::json!({
+        "hookEventName": "PostToolUse",
+        "toolCall": {"name": "run_command"},
+        "lastUserInput": "Say hello",
+        "transcriptPath": "/example.invalid/transcript.jsonl",
+        "conversationId": OTHER_CONVERSATION,
+        "workspacePaths": ["/example.invalid/workspace"],
+        "cursor_version": CURSOR_VERSION,
+        "conversation_id": OTHER_CONVERSATION,
+        "nested": {"conversationId": OTHER_CONVERSATION, "transcriptPath": "/x"},
+    });
+    let mut tool_input = others.clone();
+    tool_input["command"] = "true".into();
+    let tool = format!(
+        ",\"tool_name\":\"Bash\",\"tool_input\":{tool_input},\"tool_response\":[{others}],\"tool_use_id\":\"toolu_1\""
+    );
+    let repo = fixture.repo.to_str().unwrap();
+    for (event, content, recorded) in [("PostToolUse", &first_part, 3), ("Stop", &full, 7)] {
+        let transcript = fixture.write_transcript(content);
+        let payload = fixture.hook_payload(&transcript, event, &tool);
+        assert!(payload.contains("\"transcriptPath\""), "{payload}");
+        serde_json::from_str::<serde_json::Value>(&payload).expect("the payload is JSON");
+        let output = fixture.hook(
+            &fixture.repo,
+            payload.as_bytes(),
+            &[("CLAUDE_PROJECT_DIR", repo)],
+        );
+        assert_silent_success(&output, event);
+        assert_eq!(fixture.interaction_count(), recorded, "{event}");
+    }
+}
+
+/// By hand, a file that is not a Claude Code transcript is an error that says
+/// so (exit 1), raised after the consent check and before the session lock or
+/// the store is touched, and told apart from a Claude Code transcript of a
+/// version this cvc does not support.
+#[test]
+fn ingest_transcript_refuses_a_file_that_is_not_a_claude_code_transcript() {
+    let fixture = Fixture::new();
+    fixture.cvc_ok(&["init"]);
+    fixture.acknowledge_capture();
+    let transcript = fixture.write_transcript(CURSOR_TRANSCRIPT);
+    let path = transcript.to_str().unwrap();
+    let before = fixture.cvc_state();
+    for args in [
+        vec!["ingest", "claude-code", "--transcript", path],
+        vec![
+            "ingest",
+            "claude-code",
+            "--transcript",
+            path,
+            "--session",
+            SESSION,
+        ],
+        vec!["ingest", "claude-code", "--transcript", path, "--rescan"],
+    ] {
+        let output = fixture.cvc(&args);
+        assert_visible_failure(
+            &output,
+            "not a Claude Code transcript",
+            &format!("{args:?}"),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(path), "{args:?}: {stderr}");
+    }
+    assert_eq!(
+        fixture.cvc_state(),
+        before,
+        "nothing was created, removed or written in CVC's directory"
+    );
+    assert_eq!(fixture.interaction_count(), 0);
+    assert_eq!(fixture.cursor(), None);
+    assert_eq!(ingest_lock_files(&fixture.repo), Vec::<String>::new());
+
+    // A Claude Code transcript of another major version is reported as that.
+    fixture.write_transcript(&BASIC.replace("\"2.1.260\"", "\"3.0.0\""));
+    let output = fixture.cvc(&["ingest", "claude-code", "--transcript", path]);
+    assert_visible_failure(
+        &output,
+        "this cvc supports transcript major version 2 only",
+        "another major version",
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("not a Claude Code transcript"));
+    assert_eq!(fixture.interaction_count(), 0);
+
+    // The store is not opened for it.
+    let unopenable = Fixture::new();
+    unopenable.cvc_ok(&["init"]);
+    unopenable.acknowledge_capture();
+    unopenable.make_store_unopenable();
+    let transcript = unopenable.write_transcript(BASIC);
+    let path = transcript.to_str().unwrap();
+    assert_visible_failure(
+        &unopenable.cvc(&["ingest", "claude-code", "--transcript", path]),
+        STORE_UNOPENABLE,
+        "a Claude Code transcript opens the store",
+    );
+    unopenable.write_transcript(CURSOR_TRANSCRIPT);
+    let output = unopenable.cvc(&["ingest", "claude-code", "--transcript", path]);
+    assert_visible_failure(
+        &output,
+        "not a Claude Code transcript",
+        "with a store that cannot be opened",
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(STORE_UNOPENABLE));
+
+    // Consent comes first.
+    let unacknowledged = Fixture::new();
+    unacknowledged.cvc_ok(&["init"]);
+    let transcript = unacknowledged.write_transcript(CURSOR_TRANSCRIPT);
+    assert_visible_failure(
+        &unacknowledged.cvc(&[
+            "ingest",
+            "claude-code",
+            "--transcript",
+            transcript.to_str().unwrap(),
+        ]),
+        "consent-required",
+        "capture not acknowledged",
+    );
+    assert_eq!(unacknowledged.interaction_count(), 0);
 }
