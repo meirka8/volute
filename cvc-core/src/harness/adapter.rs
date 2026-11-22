@@ -221,8 +221,9 @@ pub trait HookCaller {
     /// subagent's payload, whose parent's run ingests the family.
     fn wants(&self, request: &HookRequest) -> bool;
     fn finality(&self, event: Option<&str>) -> Finality;
-    /// How long a run for `event` may take, from the process's start. The
-    /// engine does not enforce it yet (#149).
+    /// How long a run for `event` may take, from the process's start: well
+    /// below the timeout the harness kills a hook at, so that a run stops
+    /// between batches on its own terms ([`crate::harness::engine`]).
     fn budget(&self, event: Option<&str>) -> Duration;
     fn contract(&self, event: Option<&str>) -> OutputContract;
     /// What follows a `consent-required` message: how to stop the hooks.
@@ -254,10 +255,20 @@ pub struct Located<S> {
 }
 
 /// What a bounded read is allowed to take. [`ReadLimit::WHOLE`] reads to the
-/// end of the record, as every ingest does until batching (#149).
+/// end of the record, as an operator's run does; a hook's run reads in
+/// batches ([`crate::harness::engine`]).
+///
+/// A read that honours a limit takes whole records only (whole lines of a
+/// JSONL file), as many as fit, and says when it stopped at the limit before
+/// the end of the record ([`Read::limited`]). When not even one record fits,
+/// it returns none: the engine then reads again with a larger limit. An
+/// adapter whose records are not counted in bytes maps `bytes` onto its own
+/// records' encoded size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadLimit {
+    /// The most bytes of the record one read takes, from where it starts.
     pub bytes: Option<u64>,
+    /// The most records one read takes.
     pub units: Option<usize>,
 }
 
@@ -300,6 +311,13 @@ pub struct Read<W, C> {
     pub replaced: Option<EpochReason>,
     /// How long the record is, as far as this read saw, for reports.
     pub record_len: Option<u64>,
+    /// The read stopped at its [`ReadContext::limit`] before the end of the
+    /// record as it stood: more of it can be read now. `false` for a read
+    /// that reached the end, and for every read of an adapter that does not
+    /// honour limits. The engine plans a limited window as
+    /// [`Finality::Incremental`] whatever the run's finality, so that a
+    /// response the limit cut is not closed early.
+    pub limited: bool,
     /// Where the conversation's own history begins in the record, when the
     /// reader found that the record starts with history inherited from
     /// another conversation (Codex `history_base` or `forked_from_id`, a

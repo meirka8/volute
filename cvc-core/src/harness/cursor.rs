@@ -94,6 +94,17 @@ pub trait CursorCodec: Clone + Sized {
     fn in_epoch(self, _epoch: u64, _reason: EpochReason) -> Option<Self> {
         None
     }
+    /// What the engine carries between batches and runs ([`Carry`]). A kind
+    /// that stores none starts every run with the default.
+    fn carry(&self) -> Carry {
+        Carry::default()
+    }
+    /// The same position carrying `carry`. A kind that stores no carry keeps
+    /// nothing of it: its title rank, backlog flag and grown window start
+    /// again with every run.
+    fn with_carry(self, _carry: Carry) -> Self {
+        self
+    }
 
     /// The cursor a stored row holds, when the row is of this codec's kind.
     fn decode_stored(stored: &crate::db::StoredHarnessCursor) -> Result<Self, CursorError> {
@@ -117,20 +128,26 @@ pub struct FileId {
     pub len: u64,
 }
 
-/// Planner state that must survive between batches and runs.
+/// State the engine keeps with a cursor, between batches and runs
+/// ([`crate::harness::engine`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Carry {
-    /// The rank of the title the conversation holds, so a title the person
-    /// set is never replaced by a generated one from a later window. Used
-    /// from PR 4 of #187 (the batched ingest of #149); written by nothing
-    /// yet.
+    /// [`TitleRank::UserSet`](crate::harness::candidate::TitleRank::UserSet)
+    /// once the conversation holds a title the person set, so that a later
+    /// window holding only a generated title does not replace it. `None`
+    /// otherwise: a generated title is replaced by any later one, as one
+    /// read of the whole record would.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_rank: Option<crate::harness::candidate::TitleRank>,
-    /// A final event ran out of time before it reached the end.
+    /// Kept on the family root's cursor: a final event (the agent stopped,
+    /// or its session ended) ran out of time before every record of the
+    /// family was read to its end, so what is left may be read by no later
+    /// event. Cleared by the next run that reads them all to their end.
     #[serde(default, skip_serializing_if = "is_false")]
     pub backlog: bool,
-    /// The read window, grown across runs while a response stays open.
+    /// The read window in bytes, grown while a response stays open past the
+    /// end of a smaller one, so that the next batch or run starts with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_window: Option<u64>,
     /// Adapter-defined positions (a step hash, a regime), at most 4 KiB.
@@ -291,6 +308,14 @@ impl CursorCodec for JsonlCursor {
             epoch_reason: Some(reason),
             ..self
         })
+    }
+
+    fn carry(&self) -> Carry {
+        self.carry.clone()
+    }
+
+    fn with_carry(self, carry: Carry) -> Self {
+        Self { carry, ..self }
     }
 }
 

@@ -4,7 +4,7 @@
 //! machine's already-shared projection: this is first-party local capture.
 //!
 //! Every harness goes through the registry ([`cvc_core::harness::with_adapter`])
-//! and the shared engine ([`cvc_core::harness::engine::ingest_until`]), gated by
+//! and the shared engine ([`cvc_core::harness::engine::ingest`]), gated by
 //! the capture acknowledgement's coverage of the harness's own channel:
 //!
 //! * `--hook` is the hook-mode shell ([`shell`]), one code path for every
@@ -24,7 +24,7 @@ use cvc_core::db::{CvcStore, DbError};
 use cvc_core::harness::adapter::{HarnessAdapter, Located};
 use cvc_core::harness::candidate::Finality;
 use cvc_core::harness::engine::{self, EngineError, EngineOptions};
-use cvc_core::harness::{self, AdapterVisitor, HarnessId, SESSION_LOCK_WAIT};
+use cvc_core::harness::{self, AdapterVisitor, HarnessId};
 use cvc_core::privacy::{PreparedPolicy, PrivacyError};
 use std::env;
 use std::path::PathBuf;
@@ -157,18 +157,13 @@ impl AdapterVisitor for Operator {
         let store = CvcStore::open_initialized_upgrading(layout.db_path())?;
         let mut lines = Vec::new();
         for located in located {
-            let report = engine::ingest_until(
+            let report = engine::ingest(
                 adapter,
                 &layout,
                 &store,
                 &policy,
                 located,
-                EngineOptions {
-                    finality: Finality::Final,
-                    rescan: self.rescan,
-                    lock_wait: SESSION_LOCK_WAIT,
-                },
-                None,
+                EngineOptions::operator(Finality::Final, self.rescan),
             )
             .map_err(|error| explain(error, &store, A::ID, adapter.stop_hint()))?;
             lines.extend(report::lines(&report::Summary::new(A::ID, report)));

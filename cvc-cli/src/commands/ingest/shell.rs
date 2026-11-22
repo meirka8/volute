@@ -59,11 +59,13 @@
 //!    is corroborated, and refused visibly otherwise.
 //! 9. The policy is loaded, the store opened, the adapter records the event
 //!    itself where the payload is its record ([`cvc_core::harness::adapter::RecordSource::record_event`],
-//!    with the coverage grant held), and the engine ingests, by the deadline
-//!    of the run's start plus the harness's budget. A hook that is still
-//!    waiting for another run on the session when the lock wait ends does
-//!    nothing, as in 5: that run is making progress, and the next event
-//!    catches up from the cursor.
+//!    with the coverage grant held), and the engine ingests in batches, by
+//!    the deadline of the run's start plus the harness's budget
+//!    ([`EngineOptions::hook`]). A hook that is still waiting for another run
+//!    on the session when its lock wait ends does nothing, as in 5: that run
+//!    is making progress, and the next event catches up from the cursor. A
+//!    run the deadline stopped between batches exits 0 too, and the next
+//!    event goes on from the cursors.
 use super::{explain, load_policy};
 use anyhow::{anyhow, bail, Context, Result};
 use cvc_core::db::CvcStore;
@@ -73,7 +75,7 @@ use cvc_core::harness::adapter::{
 };
 use cvc_core::harness::candidate::Finality;
 use cvc_core::harness::engine::{self, EngineError, EngineOptions};
-use cvc_core::harness::{self, AdapterVisitor, HarnessId, SESSION_LOCK_WAIT};
+use cvc_core::harness::{self, AdapterVisitor, HarnessId};
 use cvc_core::privacy::CoverageGrant;
 use cvc_core::repository::{RepositoryLayout, RepositoryLayoutError};
 use git2::ErrorCode;
@@ -181,6 +183,9 @@ pub(crate) enum Captured {
     PassedOver,
     /// Another run held the session's lock for the whole wait.
     Busy,
+    /// The deadline came before every record of the family was read to its
+    /// end.
+    CutShort,
 }
 
 /// The real thing: the adapter's own screening and event, then the engine.
@@ -213,21 +218,21 @@ impl<A: HarnessAdapter> Capture<A> for EngineCapture {
             },
         )?;
         drop(run.grant);
-        match engine::ingest_until(
+        // The hook reads from the cursor, always (only an operator rescans),
+        // in batches, and is over by the deadline: the lock wait, the
+        // database's waits and every batch are bounded by it.
+        match engine::ingest(
             adapter,
             run.layout,
             &store,
             &policy,
             located,
-            EngineOptions {
-                finality: run.finality,
-                // The hook reads from the cursor, always: only an operator
-                // rescans.
-                rescan: false,
-                lock_wait: SESSION_LOCK_WAIT,
-            },
-            Some(run.deadline),
+            EngineOptions::hook(run.finality, run.deadline),
         ) {
+            // The deadline came first: the next event goes on from the
+            // cursors. A final event's run leaves the backlog flag that
+            // `cvc harness status` shows; a hook prints nothing of it.
+            Ok(report) if report.cut_short => Ok(Captured::CutShort),
             Ok(_) => Ok(Captured::Recorded),
             // Another run holds this session's lock and has held it for the
             // whole wait. It is making progress, and whatever it does not

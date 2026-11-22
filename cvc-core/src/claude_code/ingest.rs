@@ -352,9 +352,8 @@ pub fn ingest_with(
         policy,
         located,
         EngineOptions {
-            finality: mode.into(),
-            rescan: options.rescan,
             lock_wait: options.lock_wait,
+            ..EngineOptions::operator(mode.into(), options.rescan)
         },
     )?;
     Ok(report.into())

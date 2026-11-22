@@ -309,6 +309,7 @@ mod tests {
             omitted_context_items: 5,
             relations_recorded: 0,
             relations_skipped: 0,
+            cut_short: false,
         }
     }
 
@@ -328,6 +329,8 @@ mod tests {
                 members: 3,
             },
             rescue_skipped: false,
+            cut_short: false,
+            backlog: false,
         };
         let summary = Summary::new(HarnessId::ClaudeCode, run);
         assert_eq!(summary.session_id, "s");

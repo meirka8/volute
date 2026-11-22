@@ -223,6 +223,7 @@ impl RecordSource for Fake {
             trusted: from.clone(),
             replaced: None,
             record_len: Some(bytes.len() as u64),
+            limited: false,
             own_history_start,
         })
     }
@@ -457,9 +458,8 @@ impl Fixture {
 
     fn options(rescan: bool) -> EngineOptions {
         EngineOptions {
-            finality: Finality::Final,
-            rescan,
             lock_wait: Duration::from_secs(5),
+            ..EngineOptions::operator(Finality::Final, rescan)
         }
     }
 

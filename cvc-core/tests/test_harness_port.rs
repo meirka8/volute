@@ -148,6 +148,7 @@ impl<const CLAUDE: bool> RecordSource for Outsider<CLAUDE> {
             trusted: from.clone(),
             replaced: None,
             record_len: None,
+            limited: false,
             own_history_start: None,
         })
     }
@@ -301,9 +302,8 @@ impl Fixture {
 
 fn options() -> EngineOptions {
     EngineOptions {
-        finality: Finality::Final,
-        rescan: false,
         lock_wait: Duration::from_secs(5),
+        ..EngineOptions::operator(Finality::Final, false)
     }
 }
 

@@ -159,6 +159,28 @@ pub struct FamilyLinks {
     pub members: usize,
 }
 
+/// The full id and time of the commit `candidate` names, when it names one
+/// whose time is plausible for a response made at `response_at` (seconds):
+/// not before it beyond clock skew, nor in the future. `None` for anything
+/// else. These are the only checks a commit passes before the family's
+/// evidence records it ([`crate::harness::engine`]) and again before it is
+/// linked.
+pub fn resolve_commit(
+    repo: &Repository,
+    candidate: &str,
+    response_at: i64,
+    now: i64,
+) -> Option<(String, i64)> {
+    let skew = MAX_CLOCK_SKEW_SECS;
+    let object = repo.revparse_single(candidate).ok()?;
+    let commit = object.as_commit()?;
+    let commit_time = commit.time().seconds();
+    if commit_time > now + skew || commit_time < response_at - skew {
+        return None;
+    }
+    Some((commit.id().to_string(), commit_time))
+}
+
 /// Links floating responses of `family` to the commits any of its records
 /// reported creating, and returns the new links. Fail-closed: an
 /// unresolvable or implausibly timed candidate is skipped, and only
@@ -174,40 +196,101 @@ pub fn link_family_commits(
     responses: &[CommitBearingResponse],
     linked_by: Option<&str>,
 ) -> Result<FamilyLinks, DbError> {
-    if responses.is_empty() {
+    link_family_evidence(
+        repo,
+        store,
+        family,
+        worktree_fingerprint,
+        responses,
+        &[],
+        linked_by,
+    )
+}
+
+/// A commit the family's evidence recorded in an earlier batch or run
+/// ([`CvcStore::harness_commit_evidence`]), replayed by a later rescue. It
+/// links only responses made within `window_secs` before the commit's own
+/// time (`cvc.linkWindow`), so that a commit recorded long ago does not claim
+/// what a much later run records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayedCommit {
+    /// The full commit id, as stored.
+    pub commit: String,
+    /// The stored response's time, in seconds.
+    pub response_at: i64,
+    pub window_secs: u64,
+}
+
+/// [`link_family_commits`] over this run's `responses` and the family's
+/// `replayed` evidence. A commit both name is this run's, and unbounded.
+pub(crate) fn link_family_evidence(
+    repo: &Repository,
+    store: &CvcStore,
+    family: &Family,
+    worktree_fingerprint: &str,
+    responses: &[CommitBearingResponse],
+    replayed: &[ReplayedCommit],
+    linked_by: Option<&str>,
+) -> Result<FamilyLinks, DbError> {
+    if responses.is_empty() && replayed.is_empty() {
         return Ok(FamilyLinks::default());
     }
     let now = Utc::now().timestamp();
-    let skew = MAX_CLOCK_SKEW_SECS;
 
     // Resolve each candidate to a real commit and keep only those whose time is
     // plausible for the response that reported them: a commit cannot precede
     // the reasoning that made it (beyond clock skew), nor sit in the future.
-    let mut verified: Vec<(String, i64)> = Vec::new();
+    // Each commit has the earliest response time it may claim: none for this
+    // run's own evidence, as before durable evidence; the link window before
+    // it for a replayed one.
+    struct Verified {
+        sha: String,
+        time: i64,
+        earliest: Option<i64>,
+    }
+    let mut verified: Vec<Verified> = Vec::new();
+    let mut add = |sha: String, time: i64, earliest: Option<i64>| match verified
+        .iter_mut()
+        .find(|commit| commit.sha == sha)
+    {
+        Some(commit) => {
+            commit.earliest = match (commit.earliest, earliest) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                _ => None,
+            }
+        }
+        None => verified.push(Verified {
+            sha,
+            time,
+            earliest,
+        }),
+    };
     for response in responses {
         let response_ts = response.timestamp.timestamp();
         for candidate in &response.candidates {
-            let Ok(object) = repo.revparse_single(candidate) else {
-                continue;
-            };
-            let Some(commit) = object.as_commit() else {
-                continue;
-            };
-            let commit_time = commit.time().seconds();
-            if commit_time > now + skew || commit_time < response_ts - skew {
-                continue;
-            }
-            let full = commit.id().to_string();
-            if !verified.iter().any(|(sha, _)| sha == &full) {
-                verified.push((full, commit_time));
+            if let Some((sha, time)) = resolve_commit(repo, candidate, response_ts, now) {
+                add(sha, time, None);
             }
         }
+    }
+    for commit in replayed {
+        // A replayed commit is a full id the store holds; it is resolved
+        // again, as every commit is before anything is linked to it.
+        let Some((sha, time)) = resolve_commit(repo, &commit.commit, commit.response_at, now)
+        else {
+            continue;
+        };
+        if sha != commit.commit || commit.window_secs == 0 {
+            continue;
+        }
+        let window = i64::try_from(commit.window_secs).unwrap_or(i64::MAX);
+        add(sha, time, Some(time.saturating_sub(window)));
     }
     if verified.is_empty() {
         return Ok(FamilyLinks::default());
     }
     // Earliest commit first, so each claims only the reasoning since the last.
-    verified.sort_by_key(|(_, time)| *time);
+    verified.sort_by_key(|commit| commit.time);
 
     // Floating (unlinked) interactions of this worktree, family and source,
     // oldest first. Anything already linked is excluded here and left
@@ -218,20 +301,20 @@ pub fn link_family_commits(
         root: bool,
     }
     let mut floating: Vec<Floating> = store
-        .floating_interactions_of_source(worktree_fingerprint, family.claimed_source())?
+        .floating_interaction_times_of_source(worktree_fingerprint, family.claimed_source())?
         .into_iter()
-        .filter(|interaction| family.contains(&interaction.conversation_id))
-        .map(|interaction| Floating {
-            root: family.is_root(&interaction.conversation_id),
-            ts: interaction.timestamp.timestamp(),
-            id: interaction.id,
+        .filter(|(_, conversation_id, _)| family.contains(conversation_id))
+        .map(|(id, conversation_id, ts)| Floating {
+            root: family.is_root(&conversation_id),
+            ts,
+            id,
         })
         .collect();
     floating.sort_by_key(|response| response.ts);
 
     let mut claimed = vec![false; floating.len()];
     let mut total = FamilyLinks::default();
-    for (sha, commit_time) in &verified {
+    for commit in &verified {
         // A commit can only have been produced by reasoning at or before it, so
         // responses after it belong to a later commit, not this one. No skew on
         // this bound: the committing response is written before its tool runs,
@@ -239,7 +322,12 @@ pub fn link_family_commits(
         let mut ids: Vec<&InteractionId> = Vec::new();
         let mut root_ids = 0usize;
         for (index, response) in floating.iter().enumerate() {
-            if !claimed[index] && response.ts <= *commit_time {
+            if !claimed[index]
+                && response.ts <= commit.time
+                && commit
+                    .earliest
+                    .is_none_or(|earliest| response.ts >= earliest)
+            {
                 claimed[index] = true;
                 ids.push(&response.id);
                 root_ids += usize::from(response.root);
@@ -256,7 +344,7 @@ pub fn link_family_commits(
         // meantime can never make the two figures add up to more than was made.
         let inserted = store.link_automatic_interaction_batch_trusted(
             &links,
-            &CommitSha::new(sha),
+            &CommitSha::new(&commit.sha),
             linked_by,
         )?;
         let to_root = inserted.min(root_ids);

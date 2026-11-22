@@ -287,6 +287,27 @@ fn map_interaction_row(row: &Row) -> rusqlite::Result<Interaction> {
 pub struct CvcStore {
     conn: Connection,
     path: PathBuf,
+    /// When set, no write waits for another writer past it (see
+    /// [`CvcStore::cap_write_waits`]).
+    write_deadline: std::cell::Cell<Option<Instant>>,
+}
+
+/// The cap [`CvcStore::cap_write_waits`] set, in force while this lives.
+pub(crate) struct WriteWaitCap<'a> {
+    store: &'a CvcStore,
+    previous: Option<Instant>,
+}
+
+impl Drop for WriteWaitCap<'_> {
+    fn drop(&mut self) {
+        self.store.write_deadline.set(self.previous);
+        // Best effort: a connection whose timeout cannot be set keeps the
+        // one it has, which is never longer than the default.
+        let _ = self
+            .store
+            .conn
+            .busy_timeout(self.store.capped_wait(BUSY_TIMEOUT));
+    }
 }
 
 /// Observable result of best-effort SQLite cleanup.  This reports database
@@ -673,7 +694,8 @@ pub struct HarnessCommitEvidence {
     pub interaction_id: InteractionId,
     /// The resolved commit id.
     pub commit: CommitSha,
-    /// When the response was made, in seconds.
+    /// When the response was made, in seconds. The store records the stored
+    /// interaction's own time, whatever a batch passes here.
     pub response_at: i64,
 }
 
@@ -1037,6 +1059,14 @@ fn imported_agent(id: &str) -> Option<HarnessId> {
 /// not Git hooks: they may wait, but never indefinitely.
 const HARNESS_WRITE_RETRY_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long one statement waits for another writer (see [`CvcStore::open`]).
+const BUSY_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// The wait a write is always allowed under [`CvcStore::cap_write_waits`],
+/// even at or past the deadline, so that a write that comes late meets a
+/// brief lock as a short wait rather than as an error.
+const MIN_CAPPED_WAIT: Duration = Duration::from_millis(50);
+
 // ---- capture_source: from an enumerated CHECK to triggers ---------------------
 //
 // cvc 0.6 and 0.7 enumerate the `capture_source` values in a column CHECK, and
@@ -1243,12 +1273,13 @@ impl CvcStore {
         // hook-driven batch on a slow disk while staying well under what a
         // Git hook may reasonably take; the rewrite inbox still classifies
         // and retries permanent-versus-retryable failures on its own.
-        conn.busy_timeout(std::time::Duration::from_millis(2000))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         enforce_store_permissions(path)?;
 
         let store = Self {
             conn,
             path: path.to_path_buf(),
+            write_deadline: std::cell::Cell::new(None),
         };
         store.init_with(upgrade)?;
         enforce_store_permissions(&store.path)?;
@@ -2361,6 +2392,18 @@ impl CvcStore {
         Self::harness_cursor_in(&self.conn, harness.name(), cursor_key)
     }
 
+    /// Every typed cursor `harness` keeps, by key.
+    pub fn harness_cursors(&self, harness: HarnessId) -> Result<Vec<StoredHarnessCursor>> {
+        let keys: Vec<String> = self
+            .conn
+            .prepare("SELECT cursor_key FROM harness_cursors WHERE harness=?1 ORDER BY cursor_key")?
+            .query_map(params![harness.name()], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        keys.iter()
+            .filter_map(|key| Self::harness_cursor_in(&self.conn, harness.name(), key).transpose())
+            .collect()
+    }
+
     fn harness_cursor_in(
         conn: &Connection,
         harness: &str,
@@ -2797,18 +2840,22 @@ impl CvcStore {
         if !family_bound {
             return Ok(false);
         }
-        let stored: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM interactions WHERE id=?1 AND conversation_id=?2 AND capture_source=?3)",
-            params![
-                evidence.interaction_id.as_str(),
-                conversation_id,
-                harness.capture_source_str()
-            ],
-            |row| row.get(0),
-        )?;
-        if !stored {
+        // The response's time is the stored interaction's, never the
+        // caller's: a replayed commit is bounded by it.
+        let response_at: Option<i64> = tx
+            .query_row(
+                "SELECT timestamp FROM interactions WHERE id=?1 AND conversation_id=?2 AND capture_source=?3",
+                params![
+                    evidence.interaction_id.as_str(),
+                    conversation_id,
+                    harness.capture_source_str()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(response_at) = response_at else {
             return Ok(false);
-        }
+        };
         tx.execute(
             "INSERT OR IGNORE INTO harness_commit_evidence(harness,family_root,interaction_id,commit_oid,response_at) VALUES (?1,?2,?3,?4,?5)",
             params![
@@ -2816,7 +2863,7 @@ impl CvcStore {
                 evidence.family_root,
                 evidence.interaction_id.as_str(),
                 commit,
-                evidence.response_at
+                response_at
             ],
         )?;
         Ok(true)
@@ -2977,17 +3024,56 @@ impl CvcStore {
         Ok(true)
     }
 
+    /// Caps every wait of this store's writes for another writer at
+    /// `deadline`, until the returned guard is dropped: the busy timeout of
+    /// each writing transaction (at most two seconds) and the retries of a
+    /// harness batch (at most five). A write is still allowed
+    /// [`MIN_CAPPED_WAIT`] when the deadline is near or past. A hook's run
+    /// sets its own deadline here, so that a busy database cannot hold it
+    /// past its budget; `None` leaves the waits as they are.
+    pub(crate) fn cap_write_waits(&self, deadline: Option<Instant>) -> WriteWaitCap<'_> {
+        let previous = self.write_deadline.replace(deadline);
+        WriteWaitCap {
+            store: self,
+            previous,
+        }
+    }
+
+    /// The longest `wanted` wait a write may still take now, under
+    /// [`Self::cap_write_waits`].
+    fn capped_wait(&self, wanted: Duration) -> Duration {
+        match self.write_deadline.get() {
+            Some(deadline) => wanted.min(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .max(MIN_CAPPED_WAIT),
+            ),
+            None => wanted,
+        }
+    }
+
+    /// Sets the connection's busy timeout for the next writing transaction:
+    /// [`BUSY_TIMEOUT`], capped by [`Self::cap_write_waits`].
+    fn apply_busy_timeout(&self) -> Result<()> {
+        if self.write_deadline.get().is_some() {
+            self.conn.busy_timeout(self.capped_wait(BUSY_TIMEOUT))?;
+        }
+        Ok(())
+    }
+
     /// Runs `body` inside an immediate transaction, retrying with backoff while
     /// another process holds the write lock, up to a bounded budget. The short
     /// connection-level busy timeout stays as it is because Git hooks must not
-    /// wait; harness ingests may.
+    /// wait; harness ingests may. Both waits are capped by
+    /// [`Self::cap_write_waits`].
     fn with_immediate_write_retry<T>(
         &self,
         mut body: impl FnMut(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        let deadline = Instant::now() + HARNESS_WRITE_RETRY_BUDGET;
+        let deadline = Instant::now() + self.capped_wait(HARNESS_WRITE_RETRY_BUDGET);
         let mut delay = Duration::from_millis(50);
         loop {
+            self.apply_busy_timeout()?;
             let attempt = (|| {
                 let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
                 let value = body(&tx)?;
@@ -3425,15 +3511,41 @@ impl CvcStore {
         self.floating_interactions(Some(capture_worktree))
     }
 
-    /// [`Self::get_floating_interactions_for_worktree`], of one capture
-    /// source only when `capture_source` names one (a harness family rescue
-    /// claims only its own harness's rows).
-    pub(crate) fn floating_interactions_of_source(
+    /// The id, conversation and time of each interaction
+    /// [`Self::get_floating_interactions_for_worktree`] returns, of one
+    /// capture source only when `capture_source` names one (a harness family
+    /// rescue claims only its own harness's rows), and nothing else: what a
+    /// family's commit rescue, which runs at the end of every harness run,
+    /// needs to choose what to claim, without reading any captured text.
+    pub(crate) fn floating_interaction_times_of_source(
         &self,
         capture_worktree: &str,
         capture_source: Option<&str>,
-    ) -> Result<Vec<Interaction>> {
-        self.floating_interactions_where(Some(capture_worktree), capture_source)
+    ) -> Result<Vec<(InteractionId, String, i64)>> {
+        self.conn
+            .prepare(
+                "SELECT i.id, i.conversation_id, i.timestamp
+                 FROM interactions i
+                 LEFT JOIN artifact_links al ON i.id = al.interaction_id
+                 WHERE al.interaction_id IS NULL
+                   AND (i.capture_worktree IS NULL OR i.capture_worktree = ?1)
+                   AND (?2 IS NULL OR i.capture_source = ?2)",
+            )?
+            .query_map(params![capture_worktree, capture_source], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .map(|row| {
+                let (id, conversation_id, timestamp) = row?;
+                let id = id
+                    .parse()
+                    .map_err(|_| DbError::Migration("stored interaction id is malformed".into()))?;
+                Ok((id, conversation_id, timestamp))
+            })
+            .collect()
     }
 
     fn floating_interactions(&self, capture_worktree: Option<&str>) -> Result<Vec<Interaction>> {
@@ -4279,6 +4391,7 @@ impl CvcStore {
             .map_err(|e| DbError::InvalidLink(e.to_string()))?;
         let linked_by = linked_by.as_deref();
 
+        self.apply_busy_timeout()?;
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let mut inserts = 0;
         for (interaction_id, link_type) in links {

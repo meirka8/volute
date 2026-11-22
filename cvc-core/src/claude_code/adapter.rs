@@ -24,6 +24,9 @@
 //!   the id.
 //! * The planner is [`super::transcript::plan`], unchanged; its output
 //!   converts losslessly into candidates.
+//! * A read honours a byte limit by whole lines (a hook's run reads in
+//!   batches, see [`crate::harness::engine`]); an operator's run reads the
+//!   transcript to its end, as 0.7.x does.
 use super::ingest::{open_transcript_start, read_to_first_entry, IngestError};
 use super::settings;
 use super::transcript::{self, FirstEntry, ParsedLine, TitleSource, HARNESS};
@@ -508,11 +511,28 @@ impl RecordSource for Adapter {
         let offset = if context.rescan { 0 } else { trusted };
         file.seek(SeekFrom::Start(offset))?;
         let mut bytes = Vec::new();
-        file.take(MAX_READ_BYTES + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_READ_BYTES {
-            return Err(IngestError::TooLarge);
-        }
-        let record_len = offset + bytes.len() as u64;
+        // A limit is honoured in bytes; one at or past the most a read ever
+        // buffers is a read of the whole.
+        let (bytes, limited) = match context.limit.bytes.filter(|limit| *limit < MAX_READ_BYTES) {
+            None => {
+                file.take(MAX_READ_BYTES + 1).read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > MAX_READ_BYTES {
+                    return Err(IngestError::TooLarge);
+                }
+                (bytes, false)
+            }
+            Some(limit) => {
+                file.take(limit + 1).read_to_end(&mut bytes)?;
+                let limited = bytes.len() as u64 > limit;
+                (whole_lines(bytes, limit), limited)
+            }
+        };
+        // A limited read saw where the file ended when it was opened.
+        let record_len = if limited {
+            len.max(offset + bytes.len() as u64)
+        } else {
+            offset + bytes.len() as u64
+        };
         let lines = transcript::parse_window(&bytes, offset, &file_session, include_sidechain)?;
         let aliases = path_aliases(&lines.lines, context.worktree_root);
         Ok(Read {
@@ -525,6 +545,7 @@ impl RecordSource for Adapter {
             trusted: from.at(trusted),
             replaced: (trusted != saved).then_some(EpochReason::Rewritten),
             record_len: Some(record_len),
+            limited,
             // A Claude Code transcript holds the session's own history only.
             own_history_start: None,
         })
@@ -742,6 +763,25 @@ fn only_checkout(scope: InstallScope) -> anyhow::Result<()> {
         anyhow::bail!("Claude Code's hooks are installed per checkout only");
     }
     Ok(())
+}
+
+/// Of `bytes`, read up to one past a limit of `limit`, the whole lines that
+/// fit the limit: all of it when it is within the limit (its last line may
+/// be unfinished, as for a read to the end), else up to the last newline
+/// within the limit, and nothing when no line ends there.
+fn whole_lines(mut bytes: Vec<u8>, limit: u64) -> Vec<u8> {
+    let Ok(limit) = usize::try_from(limit) else {
+        return bytes;
+    };
+    if bytes.len() <= limit {
+        return bytes;
+    }
+    let end = bytes[..limit]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    bytes.truncate(end);
+    bytes
 }
 
 /// The stored cursor is trusted only when it still lands on a line boundary
