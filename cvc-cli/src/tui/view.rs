@@ -15,8 +15,8 @@ use ratatui::widgets::{Block, Clear, Widget};
 use ratatui::Frame;
 
 use super::model::{
-    layout_page, when_cell, Columns, Disclosure, Model, Overlay, PageLine, PageLineKind, RowView,
-    FIELD_LABEL_WIDTH, HEADER_ROWS, OVERLAY_MAX_WIDTH,
+    agent_cell, layout_page, when_cell, Columns, Disclosure, Model, Overlay, PageLine,
+    PageLineKind, RowView, AGENT_HEAD, FIELD_LABEL_WIDTH, HEADER_ROWS, OVERLAY_MAX_WIDTH,
 };
 use super::text::{self, Glyphs};
 use super::words::{Emph, RemoteRow, Seg, Tone};
@@ -122,6 +122,8 @@ pub struct Plan {
     pub show_linked: bool,
     pub when: usize,
     pub title: usize,
+    /// The agent column after the title; 0 when it is not drawn.
+    pub agent: usize,
     pub thoughts: usize,
     pub linked: usize,
     pub state: usize,
@@ -129,18 +131,21 @@ pub struct Plan {
 
 impl Plan {
     /// The title takes all the width the other columns leave. On a narrow
-    /// terminal `linked` goes first, then the year of the date; `thoughts` is
-    /// never dropped, and the state column is cut only as a last resort.
+    /// terminal `linked` goes first, then the agent column (the strip and the
+    /// details still name the agent), then the year of the date; `thoughts`
+    /// is never dropped, and the state column is cut only as a last resort.
     pub fn of(width: usize, columns: &Columns) -> Self {
-        let build = |show_linked: bool, short_date: bool, state: usize| {
+        let build = |show_linked: bool, show_agent: bool, short_date: bool, state: usize| {
             let when = if short_date {
                 columns.when_short
             } else {
                 columns.when_full
             };
+            let agent = if show_agent { columns.agent } else { 0 };
             let fixed = MARK
                 + when
                 + GAP
+                + if agent > 0 { agent + GAP } else { 0 }
                 + GAP
                 + columns.thoughts
                 + if show_linked { GAP + columns.linked } else { 0 }
@@ -151,18 +156,19 @@ impl Plan {
                 show_linked,
                 when,
                 title: width.saturating_sub(fixed),
+                agent,
                 thoughts: columns.thoughts,
                 linked: columns.linked,
                 state,
             }
         };
-        for (show_linked, short_date) in [(true, false), (false, false)] {
-            let plan = build(show_linked, short_date, columns.state);
+        for (show_linked, show_agent) in [(true, true), (false, true), (false, false)] {
+            let plan = build(show_linked, show_agent, false, columns.state);
             if plan.title >= COMFORTABLE_TITLE {
                 return plan;
             }
         }
-        let plan = build(false, true, columns.state);
+        let plan = build(false, false, true, columns.state);
         if plan.title >= MIN_TITLE {
             return plan;
         }
@@ -173,7 +179,7 @@ impl Plan {
             .state
             .saturating_sub(missing)
             .max(MIN_STATE.min(columns.state));
-        build(false, true, state)
+        build(false, false, true, state)
     }
 }
 
@@ -337,6 +343,10 @@ impl Canvas<'_> {
         x += (plan.when + GAP) as u16;
         self.put(x, y, "title", plan.title, dim);
         x += (plan.title + GAP) as u16;
+        if plan.agent > 0 {
+            self.put(x, y, AGENT_HEAD, plan.agent, dim);
+            x += (plan.agent + GAP) as u16;
+        }
         self.put(
             x,
             y,
@@ -430,6 +440,17 @@ impl Canvas<'_> {
             );
         }
         x += (plan.title + GAP) as u16;
+
+        if plan.agent > 0 {
+            // The agent, then the backlog tag in the waiting tone.
+            let (main, tag) = agent_cell(row.agent, row.backlog);
+            let after = self.put(x, y, &main, plan.agent, base);
+            if let Some(tag) = tag {
+                let room = (x as usize + plan.agent).saturating_sub(after as usize);
+                self.put(after, y, &tag, room, base.patch(self.tone(Tone::Waiting)));
+            }
+            x += (plan.agent + GAP) as u16;
+        }
 
         self.put(
             x,
@@ -786,6 +807,7 @@ mod tests {
                     published: 2,
                     unconfirmed: 0,
                 }),
+                backlog: Default::default(),
             },
             None,
             settings(glyphs),
@@ -1120,6 +1142,7 @@ mod tests {
                 summaries: conversations(),
                 remotes,
                 counts: None,
+                backlog: Default::default(),
             },
             requested,
             settings(Glyphs::UNICODE),
@@ -1325,6 +1348,7 @@ mod tests {
             thoughts: 8,
             linked: 6,
             state: 20,
+            agent: 0,
         }
     }
 
@@ -1734,6 +1758,135 @@ mod tests {
             assert!(text.contains(expected), "missing {expected:?} in\n{text}");
         }
         assert!(lines.last().unwrap().contains("esc close"));
+    }
+
+    /// The spec's conversations recorded by Claude Code, a Codex session with
+    /// a subagent it recorded as a relation, and a backlog on `session-1`.
+    fn agents_model(size: (u16, u16)) -> Model {
+        use cvc_core::harness::HarnessId;
+        let mut summaries = conversations();
+        for summary in &mut summaries {
+            summary.agent = Some(HarnessId::ClaudeCode);
+        }
+        // The imported one names no agent.
+        summaries[4].agent = None;
+        let mut root = conversation("codex:t-root", 1_791_000_000, 1_791_100_000, 3);
+        root.title = "Port the parser".to_owned();
+        root.agent = Some(HarnessId::Codex);
+        let mut child = conversation("codex:t-child", 1_791_050_000, 1_791_060_000, 1);
+        child.title = "Review the port".to_owned();
+        child.agent = Some(HarnessId::Codex);
+        child.parent = Some("codex:t-root".to_owned());
+        summaries.extend([root, child]);
+        let mut model = Model::new(
+            Data {
+                summaries,
+                remotes: vec![remote("origin")],
+                counts: None,
+                backlog: [("session-1".to_owned(), HarnessId::ClaudeCode)].into(),
+            },
+            None,
+            settings(Glyphs::UNICODE),
+        );
+        model.set_size(size.0, size.1);
+        model
+    }
+
+    #[test]
+    fn rows_name_their_agent_and_a_backlog_and_relations_nest() {
+        let mut model = agents_model((130, 30));
+        let lines = rendered(&model);
+        let head = lines.iter().find(|l| l.contains("when (UTC)")).unwrap();
+        assert!(head.contains("recorded by"), "{head}");
+        let parent = first_row(&lines);
+        assert!(parent.contains("Claude Code backlog"), "{}", dump(&lines));
+        let codex = lines
+            .iter()
+            .find(|l| l.contains("Port the parser"))
+            .unwrap();
+        assert!(codex.contains("Codex"), "{codex}");
+        assert!(codex.starts_with("▸ "), "a parent: {codex}");
+        assert!(!contains(&lines, "Review the port"));
+        let imported = lines
+            .iter()
+            .find(|l| l.contains("Imported from a teammate"))
+            .unwrap();
+        assert!(!imported.contains("Codex") && !imported.contains("Claude"));
+        assert!(imported.trim_end().ends_with("imported"), "{imported}");
+
+        // Open the Codex session: its subagent is under it.
+        while !model.selected_id().is_some_and(|id| id == "codex:t-root") {
+            model.handle_key(key(KeyCode::Down));
+        }
+        model.handle_key(key(KeyCode::Right));
+        let lines = rendered(&model);
+        let child = lines
+            .iter()
+            .find(|l| l.contains("Review the port"))
+            .unwrap();
+        assert!(child.contains("└─ agent"), "{child}");
+        assert!(child.contains("Codex"), "{child}");
+        model.handle_key(key(KeyCode::Down));
+        model.handle_key(key(KeyCode::Enter));
+        let text = dump(&rendered(&model));
+        assert!(
+            text.contains("Kind             Subagent of \"Port the parser\""),
+            "{text}"
+        );
+        assert!(text.contains("Recorded by      Codex"), "{text}");
+    }
+
+    #[test]
+    fn the_strip_and_the_details_name_the_agent_and_the_catch_up_command() {
+        let mut model = agents_model((130, 30));
+        let lines = rendered(&model);
+        assert!(
+            contains(&lines, "Claude Code: 27 thoughts, 26 linked to commits"),
+            "{}",
+            dump(&lines)
+        );
+        assert!(
+            contains(
+                &lines,
+                "A hook run left this session unread to the end. For the catch-up command, run `cvc harness status claude-code`."
+            ),
+            "{}",
+            dump(&lines)
+        );
+        model.handle_key(key(KeyCode::Enter));
+        let text = dump(&rendered(&model));
+        assert!(text.contains("Recorded by      Claude Code"), "{text}");
+        assert!(
+            text.contains("Backlog          A hook run left this session unread to the end."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_terminal_drops_the_agent_column_before_the_year() {
+        let wide = agents_model((130, 30));
+        assert!(Plan::of(130, wide.columns()).agent > 0);
+        let columns = Columns {
+            agent: 19,
+            ..columns()
+        };
+        // linked goes first, then the agent, then the year.
+        let plan = Plan::of(120, &columns);
+        assert!(plan.show_linked && plan.agent == 19, "{plan:?}");
+        let plan = Plan::of(106, &columns);
+        assert!(
+            !plan.show_linked && plan.agent == 19 && !plan.short_date,
+            "{plan:?}"
+        );
+        let plan = Plan::of(90, &columns);
+        assert!(plan.agent == 0 && !plan.short_date, "{plan:?}");
+        assert!(plan.title >= COMFORTABLE_TITLE);
+        let plan = Plan::of(80, &columns);
+        assert!(plan.agent == 0 && plan.short_date, "{plan:?}");
+        // No agent known anywhere: no column, and the plan is as before.
+        let quiet = model_of(conversations(), vec![], (130, 30), Glyphs::UNICODE);
+        assert_eq!(quiet.columns().agent, 0);
+        assert!(!contains(&rendered(&quiet), "recorded by"));
     }
 
     #[test]

@@ -11,6 +11,7 @@
 
 use chrono::{TimeZone, Utc};
 use cvc_core::db::{ConversationDetails, ConversationSummary, UnshareCheck};
+use cvc_core::harness::HarnessId;
 use cvc_core::models::FutureSharePolicy;
 use cvc_core::privacy::CaptureAcknowledgement;
 
@@ -1588,6 +1589,29 @@ pub struct DetailsInput<'a> {
     pub agents: usize,
     /// The selected remote, when it can be a destination.
     pub remote: Option<&'a RemoteOverview>,
+    /// The harness whose hook run left this session unread to the end, when
+    /// one did.
+    pub backlog: Option<HarnessId>,
+}
+
+/// Which agent recorded the conversation, for the details: `None` when that is
+/// not known (an unknown agent, or more than one source). An imported
+/// conversation's agent is only what its id names.
+fn recorded_by(summary: &ConversationSummary) -> Option<String> {
+    let agent = summary.agent?.display();
+    Some(if summary.imported {
+        format!("{agent}, as its imported id says; not verified here")
+    } else {
+        agent.to_owned()
+    })
+}
+
+/// What a backlog means, and where the catch-up command is.
+fn backlog_words(harness: HarnessId) -> String {
+    format!(
+        "A hook run left this session unread to the end. For the catch-up command, run `{}`.",
+        crate::commands::conversations::backlog_hint(harness)
+    )
 }
 
 /// `Share covers 29 thoughts: 27 already shared, 2 new`, and its other forms.
@@ -1658,6 +1682,18 @@ pub fn details_page(input: &DetailsInput, g: &Glyphs) -> Vec<Page> {
         page.push(Page::Field {
             label: "Kind",
             value: lineage,
+        });
+    }
+    if let Some(agent) = recorded_by(summary) {
+        page.push(Page::Field {
+            label: "Recorded by",
+            value: agent,
+        });
+    }
+    if let Some(harness) = input.backlog {
+        page.push(Page::Field {
+            label: "Backlog",
+            value: backlog_words(harness),
         });
     }
     page.push(Page::Field {
@@ -1765,13 +1801,17 @@ pub fn strip_lines(input: &DetailsInput, g: &Glyphs) -> Vec<String> {
     } else {
         format!("{} linked to commits", summary.linked)
     };
+    let counts = format!(
+        "{}, {linked}, {}",
+        thoughts(summary.thoughts),
+        activity(summary.first_activity, summary.last_activity, g)
+    );
     let mut lines = vec![
         text::title(&summary.title),
-        format!(
-            "{}, {linked}, {}",
-            thoughts(summary.thoughts),
-            activity(summary.first_activity, summary.last_activity, g)
-        ),
+        match summary.agent {
+            Some(agent) => format!("{}: {counts}", agent.display()),
+            None => counts,
+        },
     ];
     if input.remote.is_some() && !summary.imported {
         if let Some(details) = input.details {
@@ -1805,6 +1845,9 @@ pub fn strip_lines(input: &DetailsInput, g: &Glyphs) -> Vec<String> {
                 }
             ));
         }
+    }
+    if let Some(harness) = input.backlog {
+        lines.push(backlog_words(harness));
     }
     match (&input.lineage, summary.imported) {
         (Lineage::AgentOf(parent), _) => lines.push(format!("Subagent of \"{parent}\".")),
@@ -3648,6 +3691,7 @@ mod tests {
                     lineage: Lineage::None,
                     agents,
                     remote: None,
+                    backlog: None,
                 },
                 &U,
             );
@@ -3684,6 +3728,7 @@ mod tests {
                     lineage: Lineage::None,
                     agents: 0,
                     remote: Some(&remote),
+                    backlog: None,
                 },
                 &U,
             );
@@ -3715,6 +3760,7 @@ mod tests {
                 lineage: Lineage::None,
                 agents: 2,
                 remote: Some(&remote),
+                backlog: None,
             },
             &U,
         );
@@ -3760,6 +3806,7 @@ mod tests {
                     lineage,
                     agents: 0,
                     remote: None,
+                    backlog: None,
                 },
                 &U,
             );
@@ -3807,6 +3854,7 @@ mod tests {
                 lineage: Lineage::None,
                 agents: 0,
                 remote: Some(&remote),
+                backlog: None,
             },
             &U,
         );
@@ -3832,6 +3880,7 @@ mod tests {
                 lineage: Lineage::AgentOf(text::sanitize("par\u{1b}ent")),
                 agents: 0,
                 remote: None,
+                backlog: None,
             },
             &U,
         );
@@ -3857,6 +3906,7 @@ mod tests {
                 lineage: Lineage::None,
                 agents: 0,
                 remote: Some(&remote),
+                backlog: None,
             },
             &U,
         );
@@ -3882,6 +3932,7 @@ mod tests {
                 lineage: Lineage::OrphanAgent,
                 agents: 0,
                 remote: None,
+                backlog: None,
             },
             &U,
         );
@@ -3899,6 +3950,7 @@ mod tests {
                 lineage: Lineage::None,
                 agents: 0,
                 remote: Some(&remote),
+                backlog: None,
             },
             &U,
         );

@@ -1,12 +1,16 @@
 use crate::commands::sync::SUMMARY_SCAN_LIMIT;
 use crate::terminal_text::sanitize_for_terminal;
+use crate::tui::tree::{claimed_parent, Kind, Tree};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use cvc_core::claude_code;
 use cvc_core::db::{ConversationSummary, CvcStore};
+use cvc_core::harness::engine::{self, Backlog};
+use cvc_core::harness::{with_adapter, AdapterVisitor, HarnessAdapter, HarnessId};
 use cvc_core::privacy;
 use cvc_core::repository::RepositoryLayout;
 use git2::Repository;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 
 /// How many conversations the plain listing shows when `--limit` is absent.
@@ -50,6 +54,23 @@ fn share_state(summary: &ConversationSummary) -> String {
     }
 }
 
+/// Which agent recorded a conversation, as a listing line says it, or `None`
+/// when that is not known: an agent that is unknown, or a conversation that
+/// more than one source wrote to (a Claude Code session that also holds MCP
+/// thoughts, say). For an imported conversation the agent is what its id names,
+/// the publisher's claim, and the words say so.
+pub(crate) fn agent_words(summary: &ConversationSummary) -> Option<String> {
+    let agent = summary.agent?;
+    Some(if summary.imported {
+        format!(
+            "recorded by {} (as its imported id says)",
+            sanitize_for_terminal(agent.display())
+        )
+    } else {
+        format!("recorded by {}", sanitize_for_terminal(agent.display()))
+    })
+}
+
 /// Renders one summary line. Kept width-stable so the picker and the listing
 /// read identically.
 ///
@@ -61,6 +82,25 @@ fn share_state(summary: &ConversationSummary) -> String {
 /// title cannot redraw the lines above it, and a title with a line break stays
 /// one title. Text without such characters is printed as it is.
 pub(crate) fn render_line(summary: &ConversationSummary, with_destination: bool) -> String {
+    render_entry(summary, with_destination, &Marks::default())
+}
+
+/// What the listing adds to a line beyond the summary itself.
+#[derive(Default)]
+struct Marks<'a> {
+    /// Listed under its parent: both lines are indented.
+    nested: bool,
+    /// A subagent whose parent is not listed: the parent's id.
+    orphan_of: Option<&'a str>,
+    /// A hook run left the session unread to the end.
+    backlog: bool,
+}
+
+/// The first line is `<when>  <counts>  <id>`, then what is known of the
+/// conversation (its agent, the parent of an orphaned subagent, a backlog),
+/// and the share state last, so that a script reading the last bracket of the
+/// line still reads the share state.
+fn render_entry(summary: &ConversationSummary, with_destination: bool, marks: &Marks) -> String {
     let when = |seconds: i64| {
         Utc.timestamp_opt(seconds, 0)
             .single()
@@ -72,15 +112,96 @@ pub(crate) fn render_line(summary: &ConversationSummary, with_destination: bool)
     } else {
         format!("  {}", share_state(summary))
     };
+    let agent = agent_words(summary)
+        .map(|words| format!("  {words}"))
+        .unwrap_or_default();
+    let orphan = marks
+        .orphan_of
+        .map(|parent| format!("  subagent of {}", sanitize_for_terminal(parent)))
+        .unwrap_or_default();
+    let backlog = if marks.backlog { BACKLOG_MARK } else { "" };
+    let indent = if marks.nested { NESTED_INDENT } else { "" };
     format!(
-        "{}  {:>3} thought(s), {:>3} linked  {}{}\n      {}",
+        "{indent}{}  {:>3} thought(s), {:>3} linked  {}{agent}{orphan}{backlog}{state}\n{indent}      {}",
         when(summary.last_activity),
         summary.thoughts,
         summary.linked,
         sanitize_for_terminal(&summary.id),
-        state,
         sanitize_for_terminal(&summary.title),
     )
+}
+
+/// How far the plain listing indents a subagent listed under its parent.
+const NESTED_INDENT: &str = "    ";
+
+/// What ends the first line of a conversation whose session has a backlog.
+const BACKLOG_MARK: &str = "  [backlog]";
+
+/// The family roots that a hook run left unread to the end and that no run has
+/// read to the end since (`harness::engine::backlog`), by conversation id, for
+/// every harness this build can capture. Read-only: it reads the stored cursors
+/// and writes nothing.
+pub(crate) fn read_backlog(store: &CvcStore) -> Result<BTreeMap<String, HarnessId>> {
+    struct Read<'a>(&'a CvcStore);
+    impl AdapterVisitor for Read<'_> {
+        type Output = Result<Vec<Backlog>>;
+        fn visit<A: HarnessAdapter>(self, _: &A) -> Self::Output {
+            Ok(engine::backlog::<A>(self.0)?)
+        }
+    }
+    let mut sessions = BTreeMap::new();
+    for harness in HarnessId::ALL {
+        if let Some(backlog) = with_adapter(harness, Read(store)) {
+            for session in backlog? {
+                sessions.insert(session.conversation_id, harness);
+            }
+        }
+    }
+    Ok(sessions)
+}
+
+/// The command that names the catch-up command for a harness's backlog.
+pub(crate) fn backlog_hint(harness: HarnessId) -> String {
+    format!("cvc harness status {}", harness.name())
+}
+
+/// The plain listing's lines, one entry (two lines) per conversation, most
+/// recent group first, each subagent indented under its parent (see
+/// [`Tree`]), then what a `[backlog]` mark means when one is shown.
+fn listing_lines(
+    summaries: &[ConversationSummary],
+    with_destination: bool,
+    backlog: &BTreeMap<String, HarnessId>,
+) -> Vec<String> {
+    let tree = Tree::build_with_empty(summaries);
+    let mut lines = Vec::new();
+    let mut behind = BTreeSet::new();
+    for index in tree.visible(|_| true) {
+        let entry = &tree.entries[index];
+        let summary = &entry.summary;
+        let harness = backlog.get(&summary.id).copied();
+        behind.extend(harness);
+        let marks = Marks {
+            nested: matches!(entry.kind, Kind::Child { .. }),
+            orphan_of: match entry.kind {
+                Kind::Orphan => claimed_parent(summary),
+                _ => None,
+            },
+            backlog: harness.is_some(),
+        };
+        lines.push(render_entry(summary, with_destination, &marks));
+    }
+    if !behind.is_empty() {
+        let hints: Vec<String> = behind
+            .iter()
+            .map(|harness| format!("`{}`", backlog_hint(*harness)))
+            .collect();
+        lines.push(format!(
+            "\n[backlog]: a hook run left the session unread to the end, and no run has read it to the end since. For the catch-up command, run {}.",
+            hints.join(" or ")
+        ));
+    }
+    lines
 }
 
 /// Moves, for every remote of the repository, the records an earlier version
@@ -210,8 +331,17 @@ pub async fn run(requested: Option<&str>, limit: Option<usize>, plain: bool) -> 
         ),
         None => println!("Conversations (most recent first); no remote resolved for share state:"),
     }
-    for summary in &summaries {
-        println!("{}", render_line(summary, destination.is_some()));
+    // Best effort, like the share state: a listing that cannot tell which
+    // sessions are behind says so and lists them unmarked.
+    let backlog = read_backlog(&store).unwrap_or_else(|error| {
+        eprintln!(
+            "warning: cannot read which sessions a hook left unread: {}",
+            sanitize_for_terminal(&format!("{error:#}"))
+        );
+        BTreeMap::new()
+    });
+    for line in listing_lines(&summaries, destination.is_some(), &backlog) {
+        println!("{line}");
     }
     println!(
         "\nShare one with: cvc share <conversation-id> --remote <name>  (or run `cvc share` interactively)"
@@ -520,6 +650,172 @@ mod tests {
                 ordinary.title
             )
         );
+    }
+
+    #[test]
+    fn a_line_names_the_agent_only_when_one_recorded_it_all() {
+        // Unknown or mixed: nothing.
+        assert!(!render_line(&summary(), true).contains("recorded by"));
+        let mut codex = summary();
+        codex.agent = Some(HarnessId::Codex);
+        let line = render_line(&codex, true);
+        assert!(
+            line.contains("c-1  recorded by Codex  [private]\n"),
+            "{line}"
+        );
+        // Without a destination too, and still without a bracket.
+        let line = render_line(&codex, false);
+        assert!(line.contains("c-1  recorded by Codex\n"), "{line}");
+        assert!(!line.contains('['), "{line}");
+        // Imported: its state as before, and the agent as the id's claim.
+        let mut imported = held(1, 0);
+        imported.imported = true;
+        imported.agent = Some(HarnessId::OpenCode);
+        let line = render_line(&imported, true);
+        assert!(
+            line.contains(
+                "c-1  recorded by OpenCode (as its imported id says)  [published, not shared here]\n"
+            ),
+            "{line}"
+        );
+    }
+
+    fn conversation(id: &str, last: i64) -> ConversationSummary {
+        ConversationSummary {
+            id: id.into(),
+            title: format!("title of {id}"),
+            first_activity: last,
+            last_activity: last,
+            ..summary()
+        }
+    }
+
+    #[test]
+    fn the_listing_nests_subagents_and_marks_and_explains_a_backlog() {
+        let mut codex_child = conversation("codex:t-child", 1_700_000_300);
+        codex_child.parent = Some("codex:t-root".into());
+        codex_child.agent = Some(HarnessId::Codex);
+        let mut codex_root = conversation("codex:t-root", 1_700_000_100);
+        codex_root.agent = Some(HarnessId::Codex);
+        let mut orphan = conversation("codex:t-lost", 1_700_000_050);
+        orphan.parent = Some("codex:t-gone".into());
+        let summaries = vec![
+            codex_child,
+            conversation("s:agent-a", 1_700_000_200),
+            codex_root,
+            conversation("s", 1_700_000_000),
+            orphan,
+            // No thoughts: the plain listing still lists it.
+            ConversationSummary {
+                thoughts: 0,
+                ..conversation("empty", 1_600_000_000)
+            },
+        ];
+        let backlog = BTreeMap::from([("s".to_owned(), HarnessId::ClaudeCode)]);
+        let lines = listing_lines(&summaries, true, &backlog);
+        let firsts: Vec<&str> = lines
+            .iter()
+            .filter_map(|entry| entry.lines().next())
+            .collect();
+        let at = |id: &str| {
+            firsts
+                .iter()
+                .position(|line| line.contains(&format!(" {id}  ")))
+                .unwrap_or_else(|| panic!("{id} not listed: {lines:#?}"))
+        };
+        // Groups by their newest member, each child right after its parent.
+        assert!(at("codex:t-root") < at("codex:t-child"));
+        assert_eq!(at("codex:t-child"), at("codex:t-root") + 1);
+        assert!(at("codex:t-child") < at("s"));
+        assert_eq!(at("s:agent-a"), at("s") + 1);
+        assert!(firsts[at("codex:t-child")].starts_with("    2023-"));
+        assert!(firsts[at("s:agent-a")].starts_with("    2023-"));
+        assert!(lines[at("s:agent-a")].ends_with("\n          title of s:agent-a"));
+        assert!(firsts[at("s")].starts_with("2023-"));
+        // An orphan says whose subagent it is.
+        assert!(
+            firsts[at("codex:t-lost")]
+                .ends_with("codex:t-lost  subagent of codex:t-gone  [private]"),
+            "{lines:#?}"
+        );
+        assert!(at("empty") > at("codex:t-lost"));
+        // The backlog mark, once, and the hint for its harness.
+        assert!(
+            firsts[at("s")].ends_with("  [backlog]  [private]"),
+            "{lines:#?}"
+        );
+        assert_eq!(firsts.iter().filter(|l| l.contains("[backlog]")).count(), 1);
+        let hint = lines.last().unwrap();
+        assert!(
+            hint.contains("run `cvc harness status claude-code`."),
+            "{hint}"
+        );
+        // Without a backlog, no hint.
+        let lines = listing_lines(&summaries, true, &BTreeMap::new());
+        assert!(!lines.iter().any(|line| line.contains("backlog")));
+    }
+
+    #[test]
+    fn a_parent_id_from_the_store_cannot_act_on_the_terminal() {
+        let mut orphan = summary();
+        orphan.parent = Some("p\u{1b}[2J".into());
+        let lines = listing_lines(&[orphan], true, &BTreeMap::new());
+        assert!(!acts_on_a_terminal(&lines[0]), "{:?}", lines[0]);
+        assert!(
+            lines[0].contains("subagent of p?[2J  [private]\n"),
+            "{:?}",
+            lines[0]
+        );
+    }
+
+    /// The backlog is read from the stored cursors, for every harness, and
+    /// reading it writes nothing.
+    #[test]
+    fn the_backlog_is_read_from_the_cursors_without_writing() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("index.db");
+        let store = CvcStore::open(&path).unwrap();
+        assert!(read_backlog(&store).unwrap().is_empty());
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let cursor = |key: &str, backlog: bool| {
+            raw.execute(
+                "INSERT INTO harness_cursors(harness,cursor_key,kind,version,epoch,state,updated_at) VALUES('claude-code',?1,'jsonl',1,0,?2,1)",
+                rusqlite::params![
+                    key,
+                    serde_json::json!({
+                        "byte_offset": 10,
+                        "path": "/transcripts/x.jsonl",
+                        "carry": { "backlog": backlog },
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        };
+        cursor("behind", true);
+        cursor("caught-up", false);
+        let changes = || -> i64 {
+            raw.query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = (changes(), store_dump(&raw));
+        assert_eq!(
+            read_backlog(&store).unwrap(),
+            BTreeMap::from([("behind".to_owned(), HarnessId::ClaudeCode)])
+        );
+        assert_eq!((changes(), store_dump(&raw)), before);
+    }
+
+    fn store_dump(raw: &rusqlite::Connection) -> Vec<String> {
+        let mut statement = raw
+            .prepare("SELECT harness||'|'||cursor_key||'|'||state FROM harness_cursors ORDER BY 1")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .unwrap();
+        rows
     }
 
     #[test]

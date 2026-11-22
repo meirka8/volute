@@ -35,19 +35,21 @@ use tui_support::*;
 // 1. Mode selection
 // ---------------------------------------------------------------------------
 
-/// What `cvc conversations` printed before the view existed, for the session
-/// `ingest_the_session` captures.
+/// What `cvc conversations` prints for the session `ingest_the_session`
+/// captures: the plain listing of before the view, with each line naming the
+/// agent that recorded it, and the session's subagents indented under it in
+/// spawn order (#187).
 fn the_plain_listing(fixture: &Fixture) -> String {
     format!(
         "Conversations (most recent first); share state for remote 'origin' ({}…):\n\
-         2026-08-10 22:10    3 thought(s),   0 linked  {SESSION}  [private]\n      {SESSION_TITLE}\n\
-         2026-08-10 22:08    1 thought(s),   0 linked  {}  [private]\n      {AGENT_B_TITLE}\n\
-         2026-08-10 22:06    2 thought(s),   0 linked  {}  [private]\n      {AGENT_A_TITLE}\n\
+         2026-08-10 22:10    3 thought(s),   0 linked  {SESSION}  recorded by Claude Code  [private]\n      {SESSION_TITLE}\n\
+         \x20   2026-08-10 22:06    2 thought(s),   0 linked  {}  recorded by Claude Code  [private]\n          {AGENT_A_TITLE}\n\
+         \x20   2026-08-10 22:08    1 thought(s),   0 linked  {}  recorded by Claude Code  [private]\n          {AGENT_B_TITLE}\n\
          \n\
          Share one with: cvc share <conversation-id> --remote <name>  (or run `cvc share` interactively)\n",
         &fingerprint(fixture, "origin")[..12],
-        agent_b(),
         agent_a(),
+        agent_b(),
     )
 }
 

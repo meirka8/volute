@@ -13,11 +13,12 @@
 //! - Where consent actions are not available (the platform cannot keep type-
 //!   ahead from answering a challenge), no bar that leads to a flow opens.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cvc_core::db::{
     ConversationDetails, ConversationSummary, DestinationPublicationCounts, UnshareCheck,
 };
+use cvc_core::harness::HarnessId;
 use cvc_core::models::FutureSharePolicy;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -53,6 +54,10 @@ pub struct Data {
     /// Shared and published thoughts of the selected remote, over all
     /// conversations; `None` without a usable remote.
     pub counts: Option<DestinationPublicationCounts>,
+    /// The sessions a hook run left unread to the end, by the conversation id
+    /// of the family's root, with the harness whose `cvc harness status` names
+    /// the catch-up command (`conversations::read_backlog`).
+    pub backlog: BTreeMap<String, HarnessId>,
 }
 
 /// What is read about the selected conversation each time it matters: the
@@ -265,6 +270,24 @@ pub fn when_cell(when: When, short: bool, g: &Glyphs) -> (String, Option<String>
     }
 }
 
+/// The header of the column that names the agent.
+pub const AGENT_HEAD: &str = "recorded by";
+
+/// The text of an agent cell: the agent that recorded the conversation, and a
+/// tag after it when its session has a backlog. Both empty when neither is
+/// known.
+pub fn agent_cell(agent: Option<HarnessId>, backlog: bool) -> (String, Option<String>) {
+    let main = agent.map_or_else(String::new, |agent| agent.display().to_owned());
+    let tag = backlog.then(|| {
+        if main.is_empty() {
+            "backlog".to_owned()
+        } else {
+            " backlog".to_owned()
+        }
+    });
+    (main, tag)
+}
+
 /// One row of the list as drawn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowView {
@@ -272,6 +295,10 @@ pub struct RowView {
     pub disclosure: Disclosure,
     pub when: When,
     pub title: String,
+    /// The agent that recorded it ([`ConversationSummary::agent`]).
+    pub agent: Option<HarnessId>,
+    /// A hook run left its session unread to the end.
+    pub backlog: bool,
     pub thoughts: i64,
     pub linked: i64,
     pub state: String,
@@ -291,6 +318,9 @@ pub struct Columns {
     pub thoughts: usize,
     pub linked: usize,
     pub state: usize,
+    /// The agent column; 0 when no listed row has an agent or a backlog, and
+    /// the column is not drawn.
+    pub agent: usize,
 }
 
 /// What an overlay holds.
@@ -309,6 +339,8 @@ pub struct Model {
     /// The selected remote's name; `None` when none is selected.
     remote: Option<String>,
     tree: Tree,
+    /// See [`Data::backlog`].
+    backlog: BTreeMap<String, HarnessId>,
     expanded: HashSet<String>,
     /// Indices into the tree's entries, in the order they are shown.
     visible: Vec<usize>,
@@ -356,6 +388,7 @@ impl Model {
             counts: data.counts,
             remote,
             tree: Tree::build(&data.summaries),
+            backlog: data.backlog,
             expanded: HashSet::new(),
             visible: Vec::new(),
             columns: Columns::default(),
@@ -385,6 +418,7 @@ impl Model {
         self.remotes = data.remotes;
         self.counts = data.counts;
         self.tree = Tree::build(&data.summaries);
+        self.backlog = data.backlog;
         // The old indices point into the old tree.
         self.visible.clear();
         self.info.clear();
@@ -717,6 +751,8 @@ impl Model {
             disclosure,
             when,
             title: text::title(&summary.title),
+            agent: summary.agent,
+            backlog: self.backlog.contains_key(&summary.id),
             thoughts: summary.thoughts,
             linked: summary.linked,
             state,
@@ -746,6 +782,7 @@ impl Model {
             thoughts: 8,
             linked: 6,
             state: 0,
+            agent: 0,
         };
         for &index in &self.visible {
             let entry = &self.tree.entries[index];
@@ -765,6 +802,11 @@ impl Model {
             columns.linked = columns.linked.max(summary.linked.to_string().len());
             let (state, _) = words::state_label(summary, has_destination, &g);
             columns.state = columns.state.max(text::width(&state));
+            let (agent, tag) = agent_cell(summary.agent, self.backlog.contains_key(&summary.id));
+            let agent = text::width(&agent) + tag.map_or(0, |tag| text::width(&tag));
+            if agent > 0 {
+                columns.agent = columns.agent.max(agent).max(text::width(AGENT_HEAD));
+            }
         }
         self.columns = columns;
     }
@@ -873,6 +915,7 @@ impl Model {
                 _ => 0,
             },
             remote: self.usable_remote(),
+            backlog: self.backlog.get(&entry.summary.id).copied(),
         }
     }
 
@@ -1383,6 +1426,7 @@ mod tests {
                 published: 2,
                 unconfirmed: 0,
             }),
+            backlog: BTreeMap::new(),
         }
     }
 
