@@ -36,7 +36,6 @@ describe('the agent label', () => {
     ['opencode:ses_1', 'OpenCode'],
     ['cursor:c1', 'Cursor'],
     ['antigravity:a1', 'Antigravity'],
-    ['claude-code:4f2a9c1e-0000-4000-8000-000000000001', 'Claude Code'],
   ])('shows %s as %s, as recorded by the publisher', (conversation, label) => {
     const el = card({ ...promptStep, conversation_id: conversation });
     const badge = within(el).getByText(label);
@@ -55,8 +54,14 @@ describe('the agent label', () => {
     expect(badge.closest('button')).toHaveTextContent(/Codex \(as recorded by the publisher\)/);
   });
 
-  it('shows no agent for an unprefixed id', () => {
-    for (const conversation of ['4f2a9c1e-0000-4000-8000-000000000001', '4f2a9c1e-0000-4000-8000-000000000001:agent-a1b2', 'conv-example-1']) {
+  it('shows no agent for an unprefixed id, a bare prefix or the never-written claude-code: prefix', () => {
+    for (const conversation of [
+      '4f2a9c1e-0000-4000-8000-000000000001',
+      '4f2a9c1e-0000-4000-8000-000000000001:agent-a1b2',
+      'conv-example-1',
+      'codex:',
+      'claude-code:4f2a9c1e-0000-4000-8000-000000000001',
+    ]) {
       const el = card({ ...promptStep, conversation_id: conversation });
       expect(el.querySelector('[data-agent]')).toBeNull();
       cleanup();

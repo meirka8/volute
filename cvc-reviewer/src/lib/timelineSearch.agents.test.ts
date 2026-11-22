@@ -19,7 +19,8 @@ describe('conversation names for the agents of 0.8.0 (#187)', () => {
 
   it('names a conversation that is not in the list from its id alone', () => {
     expect(conversationNameOf('cursor:abc')).toBe('Cursor session abc');
-    expect(conversationNameOf('antigravity:')).toBe('Antigravity session');
+    // A bare prefix names no agent, as in cvc-core: it is an ordinary id.
+    expect(conversationNameOf('antigravity:')).toBe('Session antigravity:');
     // Only the lowercase prefix is one.
     expect(conversationNameOf('Codex:abc')).toBe('Session Codex:abc');
   });

@@ -1067,7 +1067,7 @@ export function conversationNameOf(id: string): string {
  * and says nothing of where they came from.
  *
  * - `<session>:agent-<agent>` is "Subagent <agent>", with the session it belongs to as its note ("of session <session>");
- * - `<harness>:<id>` (codex, opencode, cursor, antigravity, claude-code: see `agentLabel.ts`) is "<Agent> session <id>", with
+ * - `<harness>:<id>` (codex, opencode, cursor or antigravity, and something after the colon: see `agentLabel.ts`) is "<Agent> session <id>", with
  *   the note that the agent is as the publisher recorded it; a subagent of such an agent is a conversation of its own;
  * - every other conversation is "Session <id>": a Claude Code session, or the conversation of the MCP server, the
  *   editor or `cvc run`, whose ids are their own.

@@ -7,7 +7,6 @@ describe('agentOfConversation', () => {
     ['opencode:ses_1', 'OpenCode', 'ses_1'],
     ['cursor:abc', 'Cursor', 'abc'],
     ['antigravity:x:y', 'Antigravity', 'x:y'],
-    ['claude-code:4f2a9c1e-0000-4000-8000-000000000001', 'Claude Code', '4f2a9c1e-0000-4000-8000-000000000001'],
   ])('%s is %s', (id, label, rest) => {
     const agent = agentOfConversation(id);
     expect(agent?.label).toBe(label);
@@ -18,6 +17,20 @@ describe('agentOfConversation', () => {
     for (const id of ['4f2a9c1e-0000-4000-8000-000000000001', '4f2a9c1e-0000-4000-8000-000000000001:agent-a1b2', 'vscode-1', '', 'mcp']) {
       expect(agentOfConversation(id)).toBeNull();
     }
+  });
+
+  it('says nothing for the claude-code: prefix, which cvc reserves but never writes', () => {
+    for (const id of ['claude-code:4f2a9c1e-0000-4000-8000-000000000001', 'claude-code:x', 'claude-code:']) {
+      expect(agentOfConversation(id)).toBeNull();
+    }
+  });
+
+  it('says nothing for a bare prefix with nothing after it', () => {
+    for (const id of ['codex:', 'opencode:', 'cursor:', 'antigravity:']) {
+      expect(agentOfConversation(id)).toBeNull();
+    }
+    // One character after it is enough, as in cvc-core.
+    expect(agentOfConversation('codex::')?.rest).toBe(':');
   });
 
   it('matches the lowercase prefix exactly', () => {
