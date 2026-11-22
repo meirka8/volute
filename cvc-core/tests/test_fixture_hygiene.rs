@@ -1,12 +1,20 @@
-//! Every committed fixture under `cvc-core/tests/fixtures/` is checked for
+//! Every committed fixture under `cvc-core/tests/fixtures/`, and the
+//! Reviewer's shared test data (`cvc-reviewer/src/test/*.ts`), is checked for
 //! what the sanitising checklist in `fixtures/README.md` forbids:
 //!
-//! - a string the built-in scrubber would change (vendor-token shapes,
-//!   private keys, credential-keyed JSON values);
-//! - a personal path, `/home/<name>/`, `/Users/<name>/` or `C:\Users\<name>\`,
-//!   other than an invented placeholder name;
-//! - an e-mail address outside `example.invalid` and `example.com`;
-//! - a harness's fixture directory that is not named `v<agent version>`.
+//! - a string the built-in scrubber would change, line by line and in the
+//!   whole text (vendor-token shapes, private keys, also split across lines,
+//!   and credential-keyed JSON values); a scrub that fails, or whose JSON no
+//!   longer parses, is a finding too;
+//! - a personal path, other than an invented placeholder name: `/home/<name>`,
+//!   `/Users/<name>`, `/var/home/<name>`, `/export/home/<name>`,
+//!   `/mnt/c/Users/<name>`, `C:\Users\<name>` or `C:/Users/<name>` (`Users`
+//!   in any case), also as a `file://` URL, percent-encoded or JSON-escaped;
+//! - an e-mail address outside `example.invalid` and `example.com`, which
+//!   includes an SSH-style `git@host:` address;
+//! - a file that is not UTF-8 text, or is a link;
+//! - in a harness's directory, a subdirectory that is not named
+//!   `v<agent version>` or a file other than `README.md`.
 //!
 //! It is a safety net, not a guarantee: the scrubber finds only what it has a
 //! detector for, and a personal name in prose is not looked for. A fixture
@@ -27,7 +35,27 @@ const NOT_VERSIONS: &[(&str, &str)] = &[
 ];
 
 /// User names a fixture may put in a home path because they are invented.
-const PLACEHOLDER_USERS: &[&str] = &["someone", "user", "example", "__HOME__", "__USER__"];
+/// `dev` is the Reviewer's search fixtures' documented placeholder
+/// (`/home/dev/work/shop`).
+const PLACEHOLDER_USERS: &[&str] = &["someone", "user", "example", "dev", "__HOME__", "__USER__"];
+
+/// Lines the scrubber rule does not read, each exact and with why: code whose
+/// variable names match a detector, not data. Keep it short.
+const SCRUB_EXCEPTIONS: &[(&str, &str)] = &[
+    // The generic `token = <value>` detector matches the variable that holds
+    // a computed boundary token.
+    (
+        "cvc-reviewer/src/test/stimulusWriter.ts",
+        "const token = boundaryToken(id, shape, candidate);",
+    ),
+];
+
+/// Whether line `line` of `path` is one of the [`SCRUB_EXCEPTIONS`].
+fn scrub_exception(path: &Path, line: &str) -> bool {
+    SCRUB_EXCEPTIONS
+        .iter()
+        .any(|(file, exact)| path == Path::new(file) && line.trim() == *exact)
+}
 
 /// Mail domains that are reserved for examples.
 const EXAMPLE_MAIL_DOMAINS: &[&str] = &["example.invalid", "example.com"];
@@ -59,23 +87,49 @@ fn files_below(dir: &Path, into: &mut Vec<PathBuf>) {
     }
 }
 
+/// The Reviewer's shared test data (`cvc-reviewer/src/test/*.ts`), which is
+/// committed to the same public repository and is read by the same rules.
+fn reviewer_test_data() -> Vec<PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../cvc-reviewer/src/test");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        // A crate packaged without the rest of the repository.
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "ts"))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Every file the content rules read, with a path to report it by: the
+/// fixtures (relative to the fixtures root) and the Reviewer's test data.
 fn fixtures() -> Vec<(PathBuf, String)> {
     let root = fixtures_root();
     let mut paths = Vec::new();
     files_below(&root, &mut paths);
     assert!(!paths.is_empty(), "no fixtures under {}", root.display());
+    let reviewer = reviewer_test_data();
     paths
         .into_iter()
         .map(|path| {
-            let bytes = fs::read(&path).unwrap();
             let relative = path.strip_prefix(&root).unwrap().to_path_buf();
+            (path, relative)
+        })
+        .chain(reviewer.into_iter().map(|path| {
+            let shown = Path::new("cvc-reviewer/src/test").join(path.file_name().unwrap());
+            (path, shown)
+        }))
+        .map(|(path, shown)| {
+            let bytes = fs::read(&path).unwrap();
             let text = String::from_utf8(bytes).unwrap_or_else(|_| {
                 panic!(
                     "{}: not UTF-8 text; a fixture is text (a database is a SQL dump)",
-                    relative.display()
+                    shown.display()
                 )
             });
-            (relative, text)
+            (shown, text)
         })
         .collect()
 }
@@ -101,13 +155,28 @@ fn scrub_finding(policy: &PreparedPolicy, line: &str) -> Option<String> {
     // under a credential-shaped key are replaced too.
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     match policy.scrub_json(line) {
-        Ok(scrubbed) => {
-            let scrubbed: serde_json::Value = serde_json::from_str(&scrubbed).ok()?;
-            (scrubbed != value)
-                .then(|| "the built-in JSON scrubber would change a value in this line".into())
-        }
+        // Fails closed: output that is no longer JSON is not "unchanged".
+        Ok(scrubbed) => match serde_json::from_str::<serde_json::Value>(&scrubbed) {
+            Ok(scrubbed) => (scrubbed != value)
+                .then(|| "the built-in JSON scrubber would change a value in this line".into()),
+            Err(_) => Some("the built-in JSON scrubber's output for this line is not JSON".into()),
+        },
         Err(error) => Some(format!(
             "the built-in JSON scrubber refuses this line: {error}"
+        )),
+    }
+}
+
+/// What the scrubber would do to a file's whole text, or `None` when it keeps
+/// it; a refusal (a text too large to scrub) is a finding too.
+fn whole_text_finding(policy: &PreparedPolicy, text: &str) -> Option<String> {
+    match policy.scrub(text) {
+        Ok(scrubbed) if scrubbed == text => None,
+        Ok(_) => {
+            Some("the built-in scrubber would change the file's text (across its lines)".into())
+        }
+        Err(error) => Some(format!(
+            "the built-in scrubber refuses the file's text: {error}"
         )),
     }
 }
@@ -118,11 +187,29 @@ fn no_fixture_holds_anything_the_built_in_scrubber_would_change() {
     let mut findings = Vec::new();
     for (path, text) in fixtures() {
         for (number, line) in text.lines().enumerate() {
+            if scrub_exception(&path, line) {
+                continue;
+            }
             if let Some(what) = scrub_finding(&policy, line) {
                 findings.push(format!("{}:{}: {what}", path.display(), number + 1));
             }
         }
-        // A whole JSON document too, for what spans its lines.
+        // The whole text too, for what spans its lines (a PEM key, say),
+        // with the excepted lines left empty.
+        let read: String = text
+            .split_inclusive('\n')
+            .map(|line| {
+                if scrub_exception(&path, line) {
+                    "\n"
+                } else {
+                    line
+                }
+            })
+            .collect();
+        if let Some(what) = whole_text_finding(&policy, &read) {
+            findings.push(format!("{}: {what}", path.display()));
+        }
+        // And a whole JSON document as JSON.
         if serde_json::from_str::<serde_json::Value>(&text).is_ok() && text.lines().count() > 1 {
             let document: serde_json::Value = serde_json::from_str(&text).unwrap();
             let compact = document.to_string();
@@ -135,17 +222,53 @@ fn no_fixture_holds_anything_the_built_in_scrubber_would_change() {
 }
 
 fn home_paths() -> Regex {
-    // The name after a home directory at the root of a POSIX path, or in a
-    // Windows one (with its backslashes as written, or escaped once in JSON).
+    // The name after a home directory:
+    // - at the root of a POSIX path (`/home`, `/Users`, `/var/home`,
+    //   `/export/home`), alone or after `file://`, but not inside another path
+    //   such as `/srv/home`;
+    // - under a WSL mount of a Windows drive (`/mnt/c/Users`);
+    // - on a Windows drive, with either slash (`C:\Users`, `C:/Users`).
+    // `Users` in any letter case. Matched on normalised text (see
+    // `normalised`), so escaped and percent-encoded forms count too.
     Regex::new(
-        r#"(?:(?:^|[^A-Za-z0-9._~/-])(?:/home/|/Users/)|[A-Za-z]:(?:\\\\|\\)Users(?:\\\\|\\))([^/\\\s"'`<>]+)"#,
+        r#"(?x)
+        (?:
+            (?: ^ | [^A-Za-z0-9._~/-] | file:// )
+            (?: (?: /var | /export )? /home | /(?i:users) | /mnt/[A-Za-z]/(?i:users) ) /
+          | [A-Za-z]: [\\/]+ (?i:users) [\\/]+
+        )
+        ([^/\\\s"'`<>:;,()\[\]{}]+)"#,
     )
     .unwrap()
 }
 
+/// `text` with percent-encoding decoded (as in a `file://` URL) and the JSON
+/// escapes of slashes undone (`\/` and `\\`), so that a path cannot pass the
+/// path rule by being spelled differently.
+fn normalised(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                decoded.push((high * 16 + low) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&decoded)
+        .replace(r"\/", "/")
+        .replace(r"\\", r"\")
+}
+
 fn personal_paths(text: &str) -> Vec<String> {
     home_paths()
-        .captures_iter(text)
+        .captures_iter(&normalised(text))
         .map(|found| found[1].to_owned())
         .filter(|name| !PLACEHOLDER_USERS.contains(&name.as_str()))
         .collect()
@@ -271,6 +394,17 @@ fn the_rules_catch_what_they_are_for() {
     ]
     .concat();
     assert!(scrub_finding(&policy, &private_key).is_some());
+    // Split across lines, no one line holds it; the whole text does.
+    let split_key = [
+        "-----BEGIN ",
+        "PRIVATE KEY-----\n",
+        "MIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n",
+        "-----END ",
+        "PRIVATE KEY-----\n",
+    ]
+    .concat();
+    assert!(whole_text_finding(&policy, &split_key).is_some());
+    assert_eq!(whole_text_finding(&policy, "line one\nline two\n"), None);
     assert_eq!(
         scrub_finding(&policy, r#"{"cwd":"__WORKTREE__","text":"Add a greeting"}"#),
         None
@@ -283,6 +417,24 @@ fn the_rules_catch_what_they_are_for() {
     assert_eq!(personal_paths(r"C:\Users\dave\x"), vec!["dave"]);
     assert!(personal_paths("/home/someone/x /Users/user/y /home/__HOME__/z").is_empty());
     assert!(personal_paths("__WORKTREE__/src/lib.rs and /srv/home/x").is_empty());
+    // As a file URL, percent-encoded, or with JSON-escaped slashes.
+    assert_eq!(personal_paths("file:///home/erin/notes.md"), vec!["erin"]);
+    assert_eq!(personal_paths("see file:///Users/frank/x"), vec!["frank"]);
+    assert_eq!(personal_paths("file:///home/gr%61ce/x"), vec!["grace"]);
+    assert_eq!(
+        personal_paths("file:%2F%2F%2Fhome%2Fheidi%2Fx"),
+        vec!["heidi"]
+    );
+    assert_eq!(personal_paths(r#""\/home\/ivan\/x""#), vec!["ivan"]);
+    // WSL, forward slashes and a lower-case `users` on Windows.
+    assert_eq!(personal_paths("/mnt/c/Users/judy/x"), vec!["judy"]);
+    assert_eq!(personal_paths("C:/Users/karl/x"), vec!["karl"]);
+    assert_eq!(personal_paths(r"c:\users\liam\x"), vec!["liam"]);
+    assert_eq!(personal_paths("file:///C:/Users/mona/x"), vec!["mona"]);
+    assert_eq!(personal_paths("cd /users/nick"), vec!["nick"]);
+    // Other home roots.
+    assert_eq!(personal_paths("/var/home/olga/x"), vec!["olga"]);
+    assert_eq!(personal_paths("/export/home/pete/x"), vec!["pete"]);
 
     // The mail rule.
     assert_eq!(
