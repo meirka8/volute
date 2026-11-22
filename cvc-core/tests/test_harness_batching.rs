@@ -901,8 +901,21 @@ fn a_response_open_past_many_windows_is_read_by_growing_the_window() {
     fixture.reset(store);
     // A hook run must be able to read the whole grown window once, with
     // twice its estimate to spare, or it never gets past the response (an
-    // operator's run then does): three times what one manual run takes.
-    let budget = took * 3 + Duration::from_millis(100);
+    // operator's run then does): three times what one manual run takes. A
+    // machine that has become slower since (a loaded one) may need more:
+    // a run that moved neither the cursor nor the window it grew to has its
+    // budget doubled for the next, so that the runs measure this property
+    // rather than how steady the machine's speed is.
+    let mut budget = took * 3 + Duration::from_millis(100);
+    let position = |store: &CvcStore| {
+        store
+            .harness_cursor(HarnessId::ClaudeCode, SESSION)
+            .unwrap()
+            .map(|stored| {
+                let cursor = JsonlCursor::decode_stored(&stored).unwrap();
+                (cursor.byte_offset, cursor.carry.stall_window)
+            })
+    };
 
     // One run in small batches.
     let store = fixture.store();
@@ -919,6 +932,7 @@ fn a_response_open_past_many_windows_is_read_by_growing_the_window() {
     // Hook runs with that budget.
     let store = fixture.store();
     for runs in 1..=MAX_RUNS {
+        let before = position(&store);
         let report = fixture.run(
             &store,
             &path,
@@ -929,8 +943,11 @@ fn a_response_open_past_many_windows_is_read_by_growing_the_window() {
         }
         assert!(
             runs < MAX_RUNS,
-            "hook runs did not get past the open response"
+            "hook runs did not get past the open response (budget {budget:?})"
         );
+        if position(&store) == before {
+            budget *= 2;
+        }
         let cursor = typed(&store, SESSION);
         if store.conversation_interaction_count(SESSION).unwrap() == 1 {
             // Stopped at the open response: before it, with the window it

@@ -39,6 +39,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use git2::{Repository, Signature, Time};
 use rusqlite::{params, Connection};
 use serde_json::{json, Map, Value};
+use std::cell::RefCell;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,18 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 // ---- the fake adapter ---------------------------------------------------------------
+
+thread_local! {
+    /// When each read of the fake on this thread began and ended: the
+    /// engine runs on its caller's thread, so a test reads the batches its
+    /// own run started, and what a delay made each cost, from here.
+    static READS: RefCell<Vec<(Instant, Instant)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The reads this thread's fake made since the last call, in order.
+fn take_reads() -> Vec<(Instant, Instant)> {
+    READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
+}
 
 /// The fake record's format, pinned to major version 1.
 const FAKE_DRIFT: DriftRule = DriftRule {
@@ -183,10 +196,26 @@ impl RecordSource for Fake {
         Ok(FamilyRead { family, members })
     }
     /// Honours a byte limit by whole lines. A `delay-ms` file beside the
-    /// record makes every read take that long: a test's slow disk.
+    /// record makes every read take at least that long: a test's slow disk.
+    /// Each read that returns a window is logged ([`take_reads`]).
     fn read(
         &self,
         source: &mut PathBuf,
+        from: &JsonlCursor,
+        context: &ReadContext<'_>,
+    ) -> Result<Read<FakeWindow, JsonlCursor>, FakeError> {
+        let began = Instant::now();
+        let read = self.read_window(source, from, context)?;
+        READS.with(|reads| reads.borrow_mut().push((began, Instant::now())));
+        Ok(read)
+    }
+}
+
+impl Fake {
+    /// [`RecordSource::read`], unlogged.
+    fn read_window(
+        &self,
+        source: &Path,
         from: &JsonlCursor,
         context: &ReadContext<'_>,
     ) -> Result<Read<FakeWindow, JsonlCursor>, FakeError> {
@@ -194,7 +223,7 @@ impl RecordSource for Fake {
             std::thread::sleep(Duration::from_millis(delay.trim().parse().unwrap()));
         }
         let mut bytes = Vec::new();
-        fs::File::open(&*source)?.read_to_end(&mut bytes)?;
+        fs::File::open(source)?.read_to_end(&mut bytes)?;
         let start = if context.rescan { 0 } else { from.byte_offset };
         let end = context.limit.bytes.map_or(bytes.len(), |limit| {
             bytes.len().min(start as usize + limit as usize)
@@ -1047,32 +1076,68 @@ fn forty(fixture: &Fixture) -> (PathBuf, u64) {
 /// committed, the cursor after it and the backlog flag set, since a final
 /// event may be the session's last. The next run goes on from the cursor:
 /// nothing twice, nothing lost, and the flag goes.
+///
+/// What holds whatever the machine's load is checked on the batches the run
+/// started, from the fake's log of its reads, not on how many there were: a
+/// read takes at least the delay, so every batch after the first starts only
+/// with room beyond the reserve for twice that, and the run stops between
+/// batches. That the run is over by its deadline also needs its last batch
+/// to cost no more than its estimate allows: the delay is long against the
+/// rest of a batch's work, so that a loaded machine would have to slow that
+/// work by over half a second in the last batch to miss it.
 #[test]
 fn a_two_second_budget_stops_between_batches_and_the_next_run_goes_on() {
     let fixture = Fixture::new(Ack::WithCodex);
     let (path, line) = forty(&fixture);
-    // Every read takes 150 ms, and a batch reads two responses: twenty
-    // batches would take three seconds.
-    fs::write(fixture.root.join("delay-ms"), "150").unwrap();
+    // Every read takes at least 330 ms, and a batch reads two responses:
+    // twenty batches would take over six seconds. Four batches fit (three
+    // on a machine that adds 25 ms to each); a run that started a fifth,
+    // with room for only one more batch's cost, would start it 230 ms too
+    // late for twice the fourth's, far more than the slack below.
+    let delay = Duration::from_millis(330);
+    fs::write(fixture.root.join("delay-ms"), delay.as_millis().to_string()).unwrap();
+    let budget = Duration::from_secs(2);
+    // The engine keeps an eighth of a run's time this short in reserve.
+    let reserve = budget / 8;
+    take_reads();
     let started = Instant::now();
+    let deadline = started + budget;
     let report = fixture
         .ingest_options(
             &path,
             "t1",
-            batched(
-                Some(started + Duration::from_secs(2)),
-                2 * line + 5,
-                Finality::Final,
-            ),
+            batched(Some(deadline), 2 * line + 5, Finality::Final),
         )
         .unwrap();
     let took = started.elapsed();
-    assert!(took < Duration::from_secs(2), "{took:?}");
+    let reads = take_reads();
+    let log: Vec<(Duration, Duration)> = reads
+        .iter()
+        .map(|(began, ended)| (*began - started, *ended - started))
+        .collect();
+    // Whole batches, the cursor after the last, more of the record left.
     assert!(report.cut_short && report.root.cut_short, "{report:?}");
     let first = report.root.inserted;
-    assert!((4..40).contains(&first), "{first}");
-    assert_eq!(first % 2, 0, "whole batches only");
+    assert_eq!(first, 2 * reads.len(), "whole batches only: {log:?}");
+    assert!(first < 40, "{log:?}");
     assert_eq!(report.root.cursor.byte_offset, first as u64 * line);
+    // The first batch, timed, leaves room for at least one more: it fits as
+    // long as the first takes under 580 ms.
+    assert!(reads.len() >= 2, "{log:?}");
+    // Every batch after the first started only with room beyond the reserve
+    // for twice the one before it, which took at least the delay. (The read
+    // begins a little after the engine decides: the coverage check comes
+    // between, which the slack is generous for.)
+    let slack = Duration::from_millis(100);
+    for (number, (began, _)) in reads.iter().enumerate().skip(1) {
+        assert!(
+            *began + 2 * delay <= deadline - reserve + slack,
+            "batch {} started without room for it: {log:?}",
+            number + 1
+        );
+    }
+    // And the run was over by its deadline.
+    assert!(took < budget, "{took:?}: {log:?}");
     assert!(report.backlog);
     assert_eq!(
         engine::backlog::<Fake>(&fixture.store).unwrap(),
@@ -1182,6 +1247,13 @@ fn a_grown_window_carries_over_to_the_next_run() {
 /// Codex's `SessionEnd` waits a quarter of a second for a lock another run
 /// holds, then ends as busy, which a hook takes for success: the holder is
 /// making progress.
+///
+/// The wait is an eighth of what is left of the budget when the run begins
+/// to wait (the engine's own unit tests pin the numbers with an injected
+/// clock). Here it is checked against bounds that hold however late a loaded
+/// machine starts the wait: never above a quarter of a second, never below
+/// an eighth of the least the run can have had left when it began to wait,
+/// and waited out in full before the run gives up, well inside the budget.
 #[test]
 fn a_two_second_budget_waits_a_quarter_second_for_the_lock() {
     let fixture = Fixture::new(Ack::WithCodex);
@@ -1194,28 +1266,34 @@ fn a_two_second_budget_waits_a_quarter_second_for_the_lock() {
     )
     .unwrap()
     .unwrap();
+    let budget = Duration::from_secs(2);
+    take_reads();
     let started = Instant::now();
     let result = fixture.ingest_options(
         &path,
         "t1",
-        batched(
-            Some(started + Duration::from_secs(2)),
-            1024,
-            Finality::Final,
-        ),
+        batched(Some(started + budget), 1024, Finality::Final),
     );
     let took = started.elapsed();
-    match result {
-        Err(EngineError::Busy { waited, .. }) => assert!(
-            waited <= Duration::from_millis(250) && waited >= Duration::from_millis(240),
-            "{waited:?}"
-        ),
+    let waited = match result {
+        Err(EngineError::Busy { waited, .. }) => waited,
         other => panic!("{:?}", other.map(|_| ())),
-    }
+    };
+    assert!(waited <= budget / 8, "{waited:?}");
+    // The wait began at the latest `took - waited` into the budget, so at
+    // least the rest of it was left then (a millisecond for rounding).
+    let least_left = budget.saturating_sub(took.saturating_sub(waited));
     assert!(
-        took >= Duration::from_millis(240) && took < Duration::from_secs(1),
-        "{took:?}"
+        waited + Duration::from_millis(1) >= least_left / 8,
+        "waited {waited:?} of {least_left:?} left (took {took:?})"
     );
+    assert!(
+        took >= waited,
+        "gave up before its wait: {took:?} {waited:?}"
+    );
+    assert!(took < budget, "{took:?}");
+    // No batch was read.
+    assert!(take_reads().is_empty());
     assert_eq!(fixture.count("SELECT COUNT(*) FROM interactions"), 0);
 }
 
