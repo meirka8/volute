@@ -46,6 +46,116 @@ With `--remote`, the command requires the displayed `I AUTHORIZE RANGE <base> <t
 
 `post-rewrite` accepts only Git's exact `amend` (one old/new pair) and `rebase` pair stream. It validates and writes recoverable input to `$(git rev-parse --git-common-dir)/cvc/rewrite-inbox` before replaying it; permanent malformed entries are quarantined and retryable entries remain for later replay. It derives only from locally observed source provenance—never author/message/file-set heuristics—and does not guarantee a relink if the range, source evidence, or required Git objects are absent. `post-commit` scans its branch cursor; `post-merge` and `cvc pull` pull first and then run a longer pending squash scan. All hook failures are warnings and never fail the Git operation.
 
+## Capturing agent sessions
+
+CVC records an AI agent's sessions from the agent's own local record, through the agent's lifecycle hooks, with no cooperation from the model. The commands are the same for every agent (a *harness*, in CVC's terms):
+
+```text
+cvc ingest <harness> [--hook | --transcript <path> [--session <id>] | --session <id> | --scan] [--rescan]
+cvc harness install|uninstall|status <harness>
+```
+
+`<harness>` is `claude-code`, `codex`, `opencode`, `cursor` or `antigravity`. This build can capture **Claude Code** only (the VS Code extension is a separate channel, with no `cvc ingest` command). The other four are planned (issues [#190](https://github.com/meirka8/volute/issues/190) for Codex, [#194](https://github.com/meirka8/volute/issues/194) for OpenCode, [#198](https://github.com/meirka8/volute/issues/198) for Cursor and [#202](https://github.com/meirka8/volute/issues/202) for Antigravity). Naming one of them is refused, and records nothing:
+
+```text
+cvc <version> cannot capture Codex yet
+```
+
+(`<version>` is the version of the `cvc` that printed it.) With `--hook` the refusal still reads the agent's payload off the pipe and writes the output that agent requires, so a hook does not break the agent.
+
+### Choosing what to read
+
+| Flag | Reads | Claude Code |
+| --- | --- | --- |
+| `--hook` | The hook payload on stdin, then the record it names, from the saved cursor. Silent on success. Cannot be combined with any other flag. | Supported. |
+| `--transcript <path>` | One record file, whole. `--session <id>` names the conversation it is recorded under (default: the file name). | Supported. |
+| `--session <id>` alone | The agent's own session with that id, found through the agent's own store. | Refused: `--session without --transcript is not supported for claude-code; pass --transcript`. |
+| `--scan` | Every session of this repository the agent keeps. | Refused: `--scan is not supported for claude-code; pass --transcript`. |
+| `--rescan` | With a source, reads every record from its start and derives the commit links again (see [Ingestion](#ingestion)). Cannot be combined with `--hook`. | Supported with `--transcript`. |
+
+`--rescan` needs a source (`--transcript`, `--session` or `--scan`); without one, `cvc` stops with a usage error. A refusal for a way of finding sessions that the agent does not offer is the same from any directory.
+
+An operator's run (`--transcript`, `--session`, `--scan`) checks what it was given before it opens the CVC database. `--transcript` refuses a file that is not a regular file (a link, a pipe, a directory) and a transcript in another agent's format (`not a Claude Code transcript`), and records nothing. A `--session` id must be a safe identifier: 1 to 256 ASCII letters, digits, `.`, `_`, `-` or `:`. An id that starts with another agent's [reserved prefix](#conversation-ids-and-reserved-prefixes) is refused when it is recorded.
+
+### What `cvc harness status` shows
+
+```bash
+cvc harness status claude-code
+```
+
+prints one `key: value` per line, for example:
+
+```text
+harness: Claude Code
+checkout_hooks_installed: yes
+note: hooks from the cvc Claude Code plugin or from other Claude Code settings files also record here while capture is covered; cvc does not check for them (see /plugin)
+binary_for_new_worktrees: /opt/cvc/bin/cvc
+capture_covered: true
+capture_covers: VS Code, Claude Code
+capture_unavailable_in_this_cvc: Codex, OpenCode, Cursor, Antigravity
+```
+
+- `harness:` is the agent's name.
+- `<scope>_hooks_installed: yes|no` says whether cvc's own hook entries are present in that scope, one line per scope cvc installs the agent's hooks in (`checkout_` for Claude Code). It cannot see hooks that come from elsewhere, so for Claude Code it adds a `note:` that the plugin's hooks, or entries in other Claude Code settings files, also record while capture is covered.
+- `binary_for_new_worktrees:` is the binary the recorded install runs in new worktrees, when there is one.
+- `capture_covered: true|false` says whether the repository's capture acknowledgement covers this agent's channel. When it is `false`, a `note:` says why and which command to run.
+- `problem:` lines name something that stops the hooks from working, or that `status` could not read.
+- `capture_covers:`, `capture_not_covered:` and `capture_unavailable_in_this_cvc:` are the same lines `cvc privacy status` prints (see [Privacy acknowledgement and destination consent](#privacy-acknowledgement-and-destination-consent)).
+- When a hook run left a session unread to its end and no run has read it since, these lines follow (see [Batches and the backlog](#batches-and-the-backlog)):
+
+```text
+backlog: 1 session(s) that a hook run left unread to the end, and that no run has read to the end since; catch up with `cvc ingest claude-code --transcript ~/.claude/projects/<workspace>/<id>.jsonl`
+backlog_session: <session id>
+backlog_transcript: <path of the session's transcript>
+backlog_more: <count>
+```
+
+`backlog_session:` and `backlog_transcript:` are listed for up to ten sessions, and `backlog_more:` counts the rest. A repository with no backlog prints none of these lines. A hook run never prints them.
+
+### Installing hooks
+
+`cvc harness install <harness>` needs the capture acknowledgement to cover that harness's channel here (a Claude Code install needs the acknowledgement to stand, as before) and refuses, changing nothing, when it does not. It also finishes the one-time database upgrade (see [The one-time database upgrade](#the-one-time-database-upgrade)), so that the hooks it installs can record. `cvc harness uninstall <harness>` removes this checkout's entries; the capture acknowledgement stays.
+
+### Batches and the backlog
+
+An agent kills a hook that runs past its timeout (30 seconds for the entries cvc writes), and a killed run that had committed nothing made no progress, however many events came after it. So a hook run commits as it goes:
+
+- It reads the record in windows, 4 MiB at first, and commits each window in its own transaction together with its cursor. A run that ends between windows (stopped, failed or killed) has lost nothing and recorded nothing twice: the next event goes on from the cursor, which never moves backwards.
+- It stops starting new windows before its deadline, the hook's start plus the agent's budget (20 seconds for Claude Code, within its 30 second timeout), and keeps a short reserve for linking commits. A run that stops early exits 0 and prints nothing; the next event continues.
+- Only a window that reaches the end of the record is read as final. A response that a window cut, or whose tool results lie beyond it, stays open and is read whole in a later window. A response is never closed early at a window cut, and a missing tool result is never recorded as a failure.
+- A window in which no response closes is read again twice as large, up to 512 MiB, and the grown size is kept with the cursor for the next run. Only window sizes carry over between runs, never content.
+- An operator's run (`--transcript`, `--session`, `--scan`) has no deadline and reads each record whole, in one batch.
+
+Hook runs therefore catch up on a long backlog across a few events instead of never. A response that no hook budget can afford to read (one so large that the window needed to read it does not fit) waits for an operator's run.
+
+**The backlog.** A hook run that the deadline stopped before it had read a session to its end marks that session's backlog, because that event may have been the session's last. A later run that reads the whole session (and its subagents) to its end clears it. While it stands, `cvc harness status <harness>` lists the session with the path of its record and the command that catches up, `cvc ingest claude-code --transcript <file>`. The mark is kept with the cursor, so it stays when the record is gone; the status then lists the session without a path. A hook never prints the backlog.
+
+**Commit links.** Each batch stores, with the thoughts it records, the commits that its responses reported (full commit ids and the time of the response, no text). A later run orders every commit it knows, read in this run or stored by an earlier one, by time, and each claims only the family's still-floating responses after the previous commit, up to its own, in the worktree the commit was reported in. A stored commit that HEAD, a branch, a remote-tracking branch and a tag no longer reach (a rebase or an amend left it behind) claims nothing. `cvc.linkWindow` governs the time-window linker, not this rescue, as before. Hook runs thus reach the links that one `--transcript` run reaches, including a subagent recorded in a later batch than the commit its session made. The rescue waits until the whole family has been read, so a family member that keeps failing to ingest blocks that family's rescue until it is fixed: the failure is shown on every event, and nothing is linked wrongly in the meantime. A stored commit that `git gc` has removed no longer bounds the segments either.
+
+### Conversation ids and reserved prefixes
+
+A conversation's id says who recorded it:
+
+- Claude Code's ids are the session id, unprefixed, as in every earlier version.
+- The ids of the planned agents will be `codex:<id>`, `opencode:<id>`, `cursor:<id>` and `antigravity:<id>`.
+- The prefixes `claude-code:`, `codex:`, `opencode:`, `cursor:` and `antigravity:` are **reserved**, in any letter case. Only that agent's own ingestion, and `cvc pull`, may create a conversation under one. The MCP `commit_thought` tool, `cvc run` and the VS Code extension are refused if they try, including to add to a conversation that an earlier version created under one.
+
+`cvc conversations` and the interactive view show which agent recorded each conversation, and nest an agent's subagent conversations under their parent, using the parent that the agent's own record named (for Claude Code, also the `<session>:agent-<id>` form of the subagent's id). A conversation with a hook backlog is marked as such. The agent shown is what CVC recorded in this clone, or, for a conversation imported by `cvc pull`, the label the publisher's data carries: that label is the publisher's claim, not proof of who recorded it.
+
+### The one-time database upgrade
+
+cvc 0.8 rebuilds the `interactions` table in the local database once, so that a later version can add an agent without another rebuild. It runs on the first command a person runs and waits for: `cvc status`, `cvc init`, `cvc privacy acknowledge-capture` or `cvc privacy status`, `cvc ingest` without `--hook`, or `cvc harness install`. In testing it took about 5 seconds on a 50,000-thought, 406 MiB store in memory-backed storage and 24 to 53 seconds on a spinning disk. Hooks, the language server and MCP never run it on a populated store, so they stay quick; until it has run, Claude Code capture keeps working and capture by an agent this build did not have before is refused:
+
+```text
+CVC cannot record <Agent> sessions until its database is upgraded: run `cvc status` once to finish upgrading CVC's database. Nothing was recorded.
+```
+
+If the database was changed by another cvc build and has columns this version does not know, this version will not upgrade it, and says so:
+
+```text
+CVC cannot record <Agent> sessions in this repository: its database was changed by another cvc build and has columns this version does not know, so this version will not upgrade it. Nothing was recorded; a cvc that knows the database can record <Agent> here.
+```
+
 ## Agent harness capture (Claude Code)
 
 Claude Code writes every session to a local JSONL transcript and runs documented lifecycle hooks. CVC turns that into deterministic capture: the hooks call `cvc`, which reads the transcript incrementally and records each completed assistant response as a private thought, with no cooperation needed from the model. This is first-party local capture; it is unrelated to sync ingestion (`cvc pull`), which imports another machine's already-shared projection.
@@ -161,19 +271,19 @@ Windows is untested for the Claude Code path (public issue [#97](https://github.
 
 ### Ingestion
 
-Each hook runs `cvc ingest claude-code --hook`, which reads Claude Code's JSON payload from stdin, finds the session's repository (see below), and ingests the transcript from the session's stored cursor.
+Each hook runs `cvc ingest claude-code --hook`, which reads Claude Code's JSON payload from stdin, finds the session's repository (see below), and ingests the transcript from the session's stored cursor, in batches (see [Batches and the backlog](#batches-and-the-backlog)). Claude Code's hook mode is the general hook-mode shell that every agent will share: it reads stdin and the environment first, and decides in a fixed order what to do next, as the sections below and [Privacy.md](../Privacy.md) describe.
 
 A session is recorded in the repository it was started in: the repository that contains Claude Code's project directory (`CLAUDE_PROJECT_DIR`, which Claude Code gives every hook); any of its worktrees counts, and so does any subdirectory. The session is recorded there in full, including work it does in other directories (`/add-dir` folders, other repositories it moves into) and its end, wherever its working directory is by then. The hook's working directory only decides which of that repository's worktrees a response is attributed to. A session started outside an initialized repository (in a parent folder, or in another project) is not recorded, even when it later works inside one. Another repository that a session visits receives nothing. If Claude Code provides no `CLAUDE_PROJECT_DIR` (older Claude Code versions, or a manual run), the hook's working directory decides; if it is set but empty, nothing is recorded. This is the same scope the per-checkout install has, since Claude Code loads a checkout's settings only for sessions started there. Open Claude Code in the repository, or one of its worktrees, rather than in a folder above it.
 
 Hook runs are silent on success. They are also silent when the session was not started in a CVC-initialized repository: Claude Code's project directory is not in a Git repository, is in a repository where `cvc init` was never run, is in a bare repository, no longer exists, or is in a repository owned by another user (Git itself refuses those). There `cvc ingest claude-code --hook` exits 0 and prints nothing, which keeps a user-scoped Claude Code plugin quiet in unrelated projects. Each hook event in such a session still starts a short `cvc` process. Claude Code passes it the hook's JSON input on stdin; for `PostToolUse` that input includes the tool's arguments and output, which can contain file contents and command output from that project. `cvc` reads up to 1 MiB of it into memory to find the working directory, then checks whether the session was started in a CVC-initialized repository. When it was not, it exits 0 and prints nothing: it reads no transcript, opens no CVC database, writes no file and uses no network, and the input is discarded when it exits. A `.git` entry that Git cannot open (for example a dangling gitfile) still reports an error that names the path, without blocking the session. An initialized repository without the capture acknowledgement still fails visibly with `consent-required: …`, a message that ends "…(or stop the hooks: `/plugin disable cvc@volute` for the Claude Code plugin, `cvc harness uninstall claude-code` for this checkout's hooks)". When the acknowledgement on record was given for another checkout or user, or by an older cvc, the message says so (see [Privacy acknowledgement and destination consent](#privacy-acknowledgement-and-destination-consent)). Other failures in an initialized repository still surface; the status is never the blocking status 2.
 
-Hook mode also ignores runs by other agents that load Claude Code's hooks: Cursor (by default) and Antigravity's CLI (which can import Claude Code plugins). An input with a top-level key that Claude Code does not send (`cursor_version`, or `conversation_id` without `session_id`; `hookEventName`, `toolCall`, `lastUserInput`, `conversationId`, `transcriptPath` or `workspacePaths`) exits 0 silently before any repository is looked for. Otherwise the hook reads the transcript up to its first complete line, at most 1 MiB, in memory, discarded on exit, before it opens the CVC database, and only a first line in another agent's format (Cursor's, Antigravity's steps, Codex's rollout) counts as foreign; anything else goes on to the parser, so a Claude Code transcript of an unsupported version, or a damaged one, still fails visibly. A foreign first line is passed over silently only when `CURSOR_VERSION` is set or the transcript's file name does not name the payload's `session_id` (Claude Code names its transcripts `<session_id>.jsonl`); otherwise the hook fails visibly with `not a Claude Code transcript`. `CURSOR_VERSION` in the environment does not silence a well-formed Claude Code run, such as one in Cursor's integrated terminal, which may inherit it (not verified); besides a foreign first line, it only silences an input that is over 1 MiB, unreadable or not the JSON Claude Code sends, an input without `session_id` or `transcript_path`, and a transcript with no complete line yet. Manual mode (`--transcript`) reports another agent's transcript as `not a Claude Code transcript`, exit 1, and records nothing.
+Hook mode also ignores runs by other agents that load Claude Code's hooks: Cursor (by default) and Antigravity's CLI (which can import Claude Code plugins). An input with a top-level key that Claude Code does not send (`cursor_version`, or `conversation_id` without `session_id`; `hookEventName`, `toolCall`, `lastUserInput`, `conversationId`, `transcriptPath` or `workspacePaths`) exits 0 silently before any repository is looked for. Otherwise the hook reads the transcript up to its first complete line, at most 1 MiB, in memory, discarded on exit, before it opens the CVC database, and only a first line in another agent's format (Cursor's, Antigravity's steps, Codex's rollout) counts as foreign; anything else goes on to the parser, so a Claude Code transcript of an unsupported version, or a damaged one, still fails visibly. A foreign first line is passed over silently only when `CURSOR_VERSION` is set or the transcript's file name does not name the payload's `session_id` (Claude Code names its transcripts `<session_id>.jsonl`); otherwise the hook fails visibly with `not a Claude Code transcript`. `CURSOR_VERSION` in the environment does not silence a well-formed Claude Code run, such as one in Cursor's integrated terminal, which may inherit it (not verified); besides a foreign first line, it only silences an input that is over 1 MiB, unreadable or not the JSON Claude Code sends, an input without `session_id` or `transcript_path`, and a transcript with no complete line yet. Manual mode (`--transcript`) refuses another agent's transcript (`not a Claude Code transcript`, exit 1) or a file that is not a regular file, before the CVC database is opened, and records nothing.
 
 Hooks from the plugin and from a per-checkout install can both run for the same event, in parallel. CVC serializes ingestion of a session with a per-session lock in the repository's CVC directory, so the second run finds nothing new: ids are deterministic and the cursor has advanced. If a lock wait times out in hook mode, that run exits quietly and the next event catches up. On a filesystem that cannot take the per-session lock (some network filesystems), CVC proceeds without it, since ingestion is idempotent.
 
 A hook run has the hook's 30 second budget: it commits the transcript in batches and stops before the budget runs out, and the next event continues from its cursor. A very large transcript, roughly tens of megabytes on first ingestion (for example when you resume an old, long session after installing the plugin), therefore takes several events. If the session ends before they have read it all, `cvc harness status claude-code` lists it; record the rest with `cvc ingest claude-code --transcript <file>`.
 
-A transcript this version does not understand (another major version, or an entry whose shape is unknown) fails loudly with a non-zero status that Claude Code shows in the session without blocking it; CVC never returns the blocking status, and a failed run writes nothing. A content block whose type is merely unfamiliar, which Claude Code adds within a major version (its `fallback` model-switch marker, for example), does not fail the session: the block is kept as a bracketed placeholder naming its type, never its content, and `cvc ingest claude-code` reports how many such blocks it kept and their types. `PostToolUse` keeps ingestion near-real-time so a commit made mid-session can still link the reasoning that preceded it; `Stop` and `SessionEnd` close the final response of a turn or session. When a response runs `git commit`, ingest reads the commit's hash from the command's recorded output in four exact shapes: git's own `[branch sha]` summary line, the `CVC: Linked … to commit <sha>.` line the post-commit hook prints into the same output (which is how a quiet `git commit -q` still names its commit), a hash at the start of a line as `git log --oneline` or `git rev-parse --short HEAD` print, and a full 40-character hash. Every candidate must resolve to a commit in this repository whose time is consistent with the response, so output that merely mentions older commits links nothing. The verified commit then links that response and the reasoning before it directly, since the time-window linker cannot reach a response written before its commit existed. Subagent (Agent tool) transcripts stored beside the session are ingested in the same pass, each as its own conversation named `<session>:agent-<id>`; subagent hook invocations themselves are ignored because the parent session's hooks cover them. A session and its subagents share one rescue, because a subagent seldom commits itself and the session usually commits what a subagent wrote: a commit that the session or any of its subagents created links the still-floating responses of all of them in the same worktree, up to that commit and after the previous one. That is exact evidence within one Claude Code session, not a timing guess, and it only ever considers this session's own transcripts, so another session's or another worktree's thoughts are never linked. A subagent still running when the session commits has its earlier responses linked to that commit. If a subagent transcript fails, the thoughts of the others are still linked before the error is shown.
+A transcript this version does not understand (another major version, or an entry whose shape is unknown) fails loudly with a non-zero status that Claude Code shows in the session without blocking it; CVC never returns the blocking status, and a failed run writes nothing. A content block whose type is merely unfamiliar, which Claude Code adds within a major version (its `fallback` model-switch marker, for example), does not fail the session: the block is kept as a bracketed placeholder naming its type, never its content, and `cvc ingest claude-code` reports how many such blocks it kept and their types. `PostToolUse` keeps ingestion near-real-time so a commit made mid-session can still link the reasoning that preceded it; `Stop` and `SessionEnd` close the final response of a turn or session. When a response runs `git commit`, ingest reads the commit's hash from the command's recorded output in four exact shapes: git's own `[branch sha]` summary line, the `CVC: Linked … to commit <sha>.` line the post-commit hook prints into the same output (which is how a quiet `git commit -q` still names its commit), a hash at the start of a line as `git log --oneline` or `git rev-parse --short HEAD` print, and a full 40-character hash. Every candidate must resolve to a commit in this repository whose time is consistent with the response, so output that merely mentions older commits links nothing. The verified commit then links that response and the reasoning before it directly, since the time-window linker cannot reach a response written before its commit existed. Subagent (Agent tool) transcripts stored beside the session are ingested in the same pass, each as its own conversation named `<session>:agent-<id>`; subagent hook invocations themselves are ignored because the parent session's hooks cover them. A session and its subagents share one rescue, because a subagent seldom commits itself and the session usually commits what a subagent wrote: a commit that the session or any of its subagents created links the still-floating responses of all of them in the same worktree, up to that commit and after the previous one. That is exact evidence within one Claude Code session, not a timing guess, and it only ever considers this session's own transcripts, so another session's or another worktree's thoughts are never linked. A subagent still running when the session commits has its earlier responses linked to that commit. If a subagent transcript fails, the error is shown on that run and on every later event until it is fixed, and the family's commit rescue waits meanwhile: it runs only once the whole family has been read, so that a commit in what is left unread is not passed over.
 
 Record a finished session, or one that ran before the hooks were installed, explicitly:
 
@@ -187,7 +297,7 @@ A session captured by an earlier version shows `linked 0` for its subagents in `
 cvc ingest claude-code --transcript ~/.claude/projects/<workspace>/<session>.jsonl --rescan
 ```
 
-`--rescan` ignores the saved cursors of the session and of its subagents and reads every file from byte 0, then derives the commit links again for every commit in them. It records nothing that is already recorded and brings back nothing you deleted, links only responses that have no link yet, and leaves every cursor where a normal run would end, so running it again changes nothing. It needs `--transcript`, cannot be combined with `--hook`, and is never done by the hooks.
+`--rescan` ignores the saved cursors of the session and of its subagents and reads every file from byte 0, then derives the commit links again for every commit in them. It records nothing that is already recorded and brings back nothing you deleted, links only responses that have no link yet, and leaves every cursor where a normal run would end, so running it again changes nothing. It needs a source (`--transcript` for Claude Code, which supports no other), cannot be combined with `--hook`, and is never done by the hooks. A hook run does reach most of the links a rescan derives, because it stores the commits each batch reports (see [Batches and the backlog](#batches-and-the-backlog)); run `--rescan` to repair a session that was captured before that.
 
 Ingestion is idempotent: every assistant response has a deterministic id within its session, so re-running never duplicates or replaces a thought, and never disturbs commit links it has already earned. One thought is recorded per assistant response: the prompt or tool results it reacted to become the prompt, its exposed thinking becomes `model_cot`, its text becomes the response, and its tool calls become tool executions carrying the status of their results. Paths the session read or edited inside the worktree become file context, subject to `.thoughtignore` `path:` rules; tool output is rendered into the following thought's prompt with bounded size. The conversation id is the Claude Code session id, so `cvc conversations` and `cvc share` work on it directly, and its title follows Claude Code's own: a title you set yourself outranks the generated one, and the first prompt stands in until either exists. Captures follow the usual boundaries: private by default, scrubbed on the way in, shared only per conversation and destination (a session's thoughts include the prompts it gave its agents and the results they returned, so sharing a session shares those, while each agent's own conversation is shared separately), and attributed to the worktree the hook ran in, so parallel checkouts cannot claim each other's thoughts.
 
@@ -199,7 +309,7 @@ Inspect the local status for the selected remote (or the default remote):
 cvc privacy status --remote origin
 ```
 
-Passive collection (VS Code chat-session watching and Claude Code transcript ingestion, including its hook-driven form) is disabled until the repository owner completes:
+Passive collection (VS Code chat-session watching, and `cvc ingest <harness>` for each agent this build can capture, which today is Claude Code, including its hook-driven form) is disabled until the repository owner completes:
 
 ```bash
 cvc privacy acknowledge-capture
@@ -208,6 +318,45 @@ cvc privacy acknowledge-capture
 This requires an interactive TTY and typing exactly `I UNDERSTAND LOCAL CAPTURE <nonce>`, where `<nonce>` is the five characters the prompt shows after the phrase (see the paragraph on non-interactive input below). The acknowledgement remains local and is never synced. It is per repository, and neither way of installing the Claude Code hooks grants it: `cvc harness install claude-code` refuses to run without it, and the Claude Code plugin's hooks never run the acknowledgement, share or publish commands, and installing it changes no consent state. Those commands accept their phrase only at an interactive terminal, which is a confirmation step, not a security boundary (see [Privacy.md](../Privacy.md) and the paragraph on non-interactive input below). Hooks in a repository that has not granted it fail visibly with `consent-required` and record nothing.
 
 The acknowledgement is bound to the checkout and the user that gave it: with the notice version, it records a SHA-256 hash of the canonical path of the repository's common Git directory together with the user (the numeric user id on Unix, `USERNAME` on Windows), and passive capture runs only where both match. Linked worktrees share the common directory, so one acknowledgement covers all of them. A repository copied together with its `.git` (an archive, `cp -a` or `rsync -a`, a backup restore, a container or VM image) carries the privacy state, but at another path, or for another user, the copy asks again; so does a repository that was moved. Run `cvc privacy acknowledge-capture` in the copy to turn capture on there; the original keeps its own. Until then, `cvc privacy status` prints `capture_acknowledged: false` followed by ``note: capture was acknowledged for another checkout or user, or by an older cvc; run `cvc privacy acknowledge-capture` here``, and the hooks, `cvc ingest claude-code` and `cvc harness install claude-code` refuse with ``consent-required: …; capture was acknowledged for another checkout or user, or by an older cvc; run `cvc privacy acknowledge-capture` here (or stop the hooks: …)``. The binding uses no host name, machine id, device or inode number, so a copy restored at the same path for a user with the same identity (an unchanged disk or container image) still counts as acknowledged. A repository opened at two paths, such as a directory mounted into a container at another path, keeps only the acknowledgement given last.
+
+**What the acknowledgement covers.** Before it asks for the phrase, `cvc privacy acknowledge-capture` prints a notice with one entry for each passive channel this build can capture through, saying what that channel reads and records. The acknowledgement it records lists exactly those channels. In this version:
+
+```text
+Once you type the phrase below, CVC records without asking each time, privately, in this repository's local CVC store (inside .git, shared by all its worktrees; git push does not carry it):
+  VS Code: the CVC extension reads the GitHub Copilot chat session files that VS Code keeps for this workspace, and records each chat request: your prompt, Copilot's response, the reasoning the chat exposes and the model's name.
+  Claude Code: CVC's hooks, and `cvc ingest claude-code`, read the transcript of each Claude Code session started in this repository, with its subagents' transcripts and their .meta.json descriptions, and record each response: prompts, the tool output Claude read (file contents, command output), responses, the reasoning the transcript exposes, tool calls with their arguments, the paths they touched and the session's title. A session is recorded whole, including its work in other folders and repositories.
+This acknowledgement covers VS Code and Claude Code, in this repository and all its worktrees, at this location and for this user. It covers no agent that a later version of cvc adds.
+Text is scrubbed for likely secrets before it is stored, but scrubbing is defense in depth, not a guarantee: what is stored can still contain secrets and personal data. Nothing is shared until you share it with `cvc share`.
+Acknowledging installs nothing, but it turns on what is already installed: the VS Code extension records once it sees the acknowledgement, and Claude Code hooks already in place (the cvc plugin, or `cvc harness install claude-code`) record from their next event.
+```
+
+The list is stored as `capture_acknowledged_channels` in `privacy.json`, beside the binding. Its rules:
+
+- An acknowledgement that has no list (recorded by cvc 0.7.2 or earlier, or rewritten since by such a cvc) covers VS Code and Claude Code only, the two channels those versions asked about. Every acknowledgement covers at least those two.
+- A channel name this version does not know grants nothing.
+- An agent that a later cvc adds is not covered by an earlier acknowledgement. Run `cvc privacy acknowledge-capture` again with a cvc that can capture that agent, and read what its notice says. Until then, that agent's hooks fail with `consent-required: the capture acknowledgement here does not cover <Agent>: …; run `cvc privacy acknowledge-capture` again` and record nothing. Running the command again covers every channel the running cvc can capture through.
+- Coverage never moves to another checkout, another user or another repository: it is part of the acknowledgement that the binding above ties to one location and user.
+- Installing an agent's hooks stays a separate step, and `cvc harness install <harness>` refuses when the channel is not covered.
+- Mixed versions: any cvc 0.7.x command that rewrites the privacy state drops the list, among them the move of consent records that `cvc privacy status` and `cvc conversations` do for a push URL with user information. Capture by agents other than VS Code and Claude Code then stops with `consent-required`, which is the safe direction; run `cvc privacy acknowledge-capture` again with the newer cvc.
+
+Once an acknowledgement stands, `cvc privacy status` ends with the coverage, channel by channel:
+
+```text
+capture_acknowledged: true
+sharing_consented: false
+auto_push: false
+remote: origin
+destination_fingerprint: <64 hexadecimal digits>
+capture_covers: VS Code, Claude Code
+capture_unavailable_in_this_cvc: Codex, OpenCode, Cursor, Antigravity
+```
+
+- `capture_covers:` lists the channels the acknowledgement covers here (`none` if it covers none).
+- `capture_not_covered:` appears when this build can capture through a channel that the acknowledgement does not cover.
+- `capture_unavailable_in_this_cvc:` lists the agents that this build cannot capture at all. They cannot be acknowledged yet.
+- For an acknowledgement with no list, a `note:` line says so: ``note: this acknowledgement was recorded without a list of what it covers (by cvc 0.7.2 or earlier, or rewritten by such a cvc since), so it covers VS Code and Claude Code only. An agent added by a later cvc needs `cvc privacy acknowledge-capture` run with that cvc.``
+
+`cvc harness status <harness>` prints the same lines for one agent (see [Capturing agent sessions](#capturing-agent-sessions)).
 
 Upgrading from v0.7.0: v0.7.0 and earlier recorded the acknowledgement without a binding, and it counts as not given. Run `cvc privacy acknowledge-capture` once more in each repository you capture, before `cvc harness install claude-code`, which needs it. Until you do, passive capture stays off there, and Claude Code hooks report the `consent-required` message above.
 
@@ -399,4 +548,7 @@ If credentials may have been exposed, rotate them first. Git-host support/remova
 - A long or resumed Claude Code session is missing, for example an old session you resumed right after installing the plugin. A hook run has the hook's 30 second budget and commits in batches, and the next event continues from its cursor, so a very large transcript (roughly tens of megabytes on first ingestion) takes several events; `cvc harness status claude-code` lists a session that ended before they read it all. Record the rest with `cvc ingest claude-code --transcript <file>`.
 - Every Claude Code hook event is slow, in every project, or the first event after installing or upgrading CVC takes long. If you installed CVC with npm and the npm launcher is the `cvc` found first on the `PATH`, every event starts the Node launcher first, and the first event after an install or upgrade may download a release within the hook's 30 second budget. Put `~/.cvc/bin` on Claude Code's `PATH` ahead of npm's global bin directory and run `cvc --version` once after each npm install or upgrade.
 - A new worktree has no Claude Code hooks. This is about the per-checkout install; the Claude Code plugin needs no per-worktree install. If `git worktree add` printed a `CVC: Claude Code hooks not installed in this worktree: ...` line, it says why. If it printed nothing, there are four likely causes: there is no record (run `cvc harness install claude-code` in the main checkout and read its output); the worktree was made with `--no-checkout`; the client that made it created the worktree without running Git's hooks; or a hook of yours that `post-checkout` was appended to exits before the CVC block is reached. To give a worktree that missed out the hooks, run `cvc harness install claude-code` inside it.
+- A hook or `cvc ingest` says `CVC cannot record <Agent> sessions until its database is upgraded`. Run `cvc status` once, and wait for it: it finishes the one-time database upgrade (see [The one-time database upgrade](#the-one-time-database-upgrade)). Nothing was recorded, and the next event or run records normally.
+- A hook or `cvc harness install` says `consent-required: the capture acknowledgement here does not cover <Agent>`. The acknowledgement on record was given by a cvc that could not capture that agent, or an older cvc rewrote it since. Run `cvc privacy acknowledge-capture` again with a cvc that can capture that agent, and `cvc privacy status` shows what it covers.
+- `cvc <version> cannot capture <Agent> yet`. This build has no capture for that agent; see [Capturing agent sessions](#capturing-agent-sessions) for what is available.
 - Secret scrubbing is defense in depth, not a guarantee that all sensitive material is detected or removed.
