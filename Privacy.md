@@ -99,7 +99,7 @@ backlog_transcript: <path of the session's transcript>
 backlog_more: <count of sessions not listed>
 ```
 
-The mark lives with the session's cursor, so it persists when the record has gone; the status still shows the path the cursor last read, even when the file is gone. `cvc conversations` marks such a conversation too. The catch-up command is an operator's run, which reads from the cursor to the end.
+The mark lives with the session's cursor, so it persists when the record has gone; the status still shows the path the cursor last read, even when the file is gone. `cvc conversations` marks such a conversation too (`[backlog]` in the plain listing, `backlog` in the interactive view) and names `cvc harness status <agent>` for the catch-up command; reading the mark writes nothing. The catch-up command is an operator's run, which reads from the cursor to the end.
 
 ### Durable commit evidence and the rescue
 
@@ -147,7 +147,7 @@ The rebuild keeps `secure_delete` on, copies every row unchanged, and records th
 
 The conversation ids that an agent's ingestion creates say who recorded them. Claude Code's ids stay unprefixed (a session id, as in 0.7.x). The prefixes `claude-code:`, `codex:`, `opencode:`, `cursor:` and `antigravity:` are **reserved**, in any letter case (`Codex:` and `CODEX:` count). Only that agent's own ingestion may create conversations under them, and the MCP `commit_thought` tool, `cvc run` and the VS Code extension are refused if they name an id under one. The reservation keeps a client that is not the agent from presenting its records as that agent's.
 
-It is not proof of provenance. FORMAT 5 carries no field for the agent: a reader takes it from the id's prefix, and the label that the Reviewer, or `cvc conversations` for a pulled conversation, shows is the publisher's claim, not proof of provenance.
+It is not proof of provenance. FORMAT 5 carries no field for the agent: a reader takes it from the id's prefix, and the label that the Reviewer, or `cvc conversations` for a pulled conversation (`recorded by <Agent> (as its imported id says)`), shows is the publisher's claim.
 
 ### Reasoning
 
