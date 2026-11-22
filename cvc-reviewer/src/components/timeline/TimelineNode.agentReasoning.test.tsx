@@ -43,6 +43,18 @@ describe('the agent label', () => {
     expect(badge).toHaveAttribute('title', `Agent: ${label}, as recorded by the publisher`);
   });
 
+  it('says "as recorded by the publisher" to screen readers and keyboard users too, not only in the tooltip', () => {
+    const el = card({ ...promptStep, conversation_id: 'codex:thr_1' });
+    const badge = el.querySelector('[data-agent]')!;
+    // Hidden from sight, not from assistive technology (sr-only, not display:none or aria-hidden).
+    const note = within(badge as HTMLElement).getByText('(as recorded by the publisher)');
+    expect(note).toHaveClass('sr-only');
+    expect(note.closest('[aria-hidden="true"]')).toBeNull();
+    // The visible text stays short, and the header button the keyboard reaches is named with the note.
+    expect(badge.firstChild?.textContent).toBe('Codex');
+    expect(badge.closest('button')).toHaveTextContent(/Codex \(as recorded by the publisher\)/);
+  });
+
   it('shows no agent for an unprefixed id', () => {
     for (const conversation of ['4f2a9c1e-0000-4000-8000-000000000001', '4f2a9c1e-0000-4000-8000-000000000001:agent-a1b2', 'conv-example-1']) {
       const el = card({ ...promptStep, conversation_id: conversation });

@@ -1,4 +1,4 @@
-import { agentLabelTitle, type ConversationAgent } from '../../lib/agentLabel';
+import { AGENT_LABEL_NOTE, agentLabelTitle, type ConversationAgent } from '../../lib/agentLabel';
 import { BADGE_NEUTRAL } from './styles';
 
 /**
@@ -11,6 +11,8 @@ export function AgentBadge({ agent }: { agent: ConversationAgent | null }) {
     <>
       <span className={BADGE_NEUTRAL} title={agentLabelTitle(agent)} data-agent={agent.harness}>
         {agent.label}
+        {/* The title is a mouse tooltip: the note also reaches screen readers (and the header button's name) as hidden text. */}
+        <span className="sr-only"> ({AGENT_LABEL_NOTE})</span>
       </span>{' '}
     </>
   );
