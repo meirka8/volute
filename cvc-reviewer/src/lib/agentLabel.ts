@@ -8,8 +8,6 @@
  *
  * The label is the publisher's claim, not proof: anyone who can write to the ref can write an id with
  * any prefix. Wherever it is drawn with a title, the title says so (`agentLabelTitle`).
- *
- * A `remote:<fingerprint>:` namespace is local to a machine and never on the wire, so it is not handled.
  */
 
 const HARNESSES = {
