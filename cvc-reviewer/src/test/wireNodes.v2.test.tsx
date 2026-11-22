@@ -233,7 +233,7 @@ describe('what the capture cut or withheld, in the Reviewer\'s own words', () =>
     expect(node.model_cot).toBe('[cvc: withheld 7690 bytes that could not be scrubbed]');
     expect(node.model_response).toBe('[cvc: withheld 7690 bytes that could not be scrubbed]');
     const { card } = renderNode(node);
-    const reasoning = within(card).getByText('Reasoning').parentElement!;
+    const reasoning = within(card).getByText('Withheld').parentElement!;
     const response = within(card).getByText('Response').parentElement!;
     expect(within(reasoning).getByText('Withheld: 7,690 bytes could not be scrubbed.')).toBeInTheDocument();
     expect(within(response).getByText('Withheld: 7,690 bytes could not be scrubbed.')).toBeInTheDocument();
