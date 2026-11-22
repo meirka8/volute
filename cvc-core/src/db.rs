@@ -6095,6 +6095,100 @@ mod harness_batch_tests {
         assert_eq!(store.capture_harness_batch(b).unwrap().evidence_skipped, 1);
     }
 
+    /// The response's time a row records is the stored interaction's, not
+    /// the one the batch passes: a replayed commit is bounded by it.
+    #[test]
+    fn commit_evidence_records_the_stored_responses_time() {
+        let store = CvcStore::open(":memory:").unwrap();
+        let conv = "codex:t1";
+        let a = capture(HarnessId::Codex, conv, "resp:a");
+        let a_id = a.interaction_id().clone();
+        let claimed = HarnessCommitEvidence {
+            response_at: 42,
+            ..evidence(conv, &a_id, commit(1))
+        };
+        store
+            .capture_harness_batch(
+                batch(conv)
+                    .with_captures(vec![a])
+                    .with_evidence(vec![claimed]),
+            )
+            .unwrap();
+        let stored = store
+            .harness_commit_evidence(HarnessId::Codex, conv)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].response_at, 1_700_000_000);
+    }
+
+    /// Every typed cursor of one harness, by key, and none of another's.
+    #[test]
+    fn a_harness_lists_its_own_typed_cursors() {
+        let store = CvcStore::open(":memory:").unwrap();
+        for conv in ["codex:b", "codex:a"] {
+            store
+                .capture_harness_batch(batch(conv).with_cursor(cursor(conv, 0, 1, &forward)))
+                .unwrap();
+        }
+        let keys: Vec<String> = store
+            .harness_cursors(HarnessId::Codex)
+            .unwrap()
+            .into_iter()
+            .map(|cursor| cursor.cursor_key)
+            .collect();
+        assert_eq!(keys, ["codex:a", "codex:b"]);
+        assert!(store
+            .harness_cursors(HarnessId::ClaudeCode)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Under a deadline, a batch that meets another writer's lock gives up by
+    /// the deadline (a brief wait at least) rather than after the five
+    /// seconds of retries it would otherwise wait; once the cap is dropped,
+    /// the waits are as before.
+    #[test]
+    fn write_waits_are_capped_by_the_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cvc").join("index.db");
+        let store = CvcStore::open(&path).unwrap();
+        let wants = |store: &CvcStore| store.capped_wait(HARNESS_WRITE_RETRY_BUDGET);
+        assert_eq!(wants(&store), HARNESS_WRITE_RETRY_BUDGET);
+        {
+            let _past = store.cap_write_waits(Some(Instant::now()));
+            assert_eq!(wants(&store), MIN_CAPPED_WAIT);
+        }
+        assert_eq!(wants(&store), HARNESS_WRITE_RETRY_BUDGET);
+
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = Instant::now();
+        let refused = {
+            let _cap = store.cap_write_waits(Some(started + Duration::from_millis(300)));
+            store.capture_harness_batch(batch("codex:t1").with_captures(vec![capture(
+                HarnessId::Codex,
+                "codex:t1",
+                "resp:a",
+            )]))
+        };
+        let took = started.elapsed();
+        assert!(
+            matches!(refused, Err(DbError::Sqlite(_))),
+            "{:?}",
+            refused.map(|_| ())
+        );
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        other.execute_batch("ROLLBACK").unwrap();
+        // Nothing of the batch was stored, and the next one is.
+        assert!(store
+            .capture_harness_batch(batch("codex:t1").with_captures(vec![capture(
+                HarnessId::Codex,
+                "codex:t1",
+                "resp:a"
+            )]),)
+            .is_ok());
+    }
+
     /// In an unprefixed Claude Code session, only Claude Code's own
     /// interactions carry evidence; the family root is the session itself,
     /// or the session its `<session>:agent-<id>` subagent id names.

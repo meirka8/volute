@@ -643,6 +643,36 @@ mod tests {
         assert_eq!(other.progress(&one), Progress::Backward);
     }
 
+    /// A JSONL cursor carries what the engine keeps between runs, and a
+    /// cursor with nothing to carry encodes as before; a kind that stores no
+    /// carry keeps none.
+    #[test]
+    fn the_carry_goes_with_a_jsonl_cursor_and_with_no_other_kind() {
+        let carry = Carry {
+            title_rank: Some(crate::harness::candidate::TitleRank::UserSet),
+            backlog: true,
+            stall_window: Some(1 << 23),
+            extra: None,
+        };
+        let cursor = JsonlCursor::start("/p/s1.jsonl")
+            .at(42)
+            .with_carry(carry.clone());
+        assert_eq!(cursor.carry(), carry);
+        assert_eq!(
+            cursor.encode(),
+            json!({"path": "/p/s1.jsonl", "byte_offset": 42, "carry": {"title_rank": "user_set", "backlog": true, "stall_window": 8388608}})
+        );
+        assert_eq!(JsonlCursor::decode(1, 0, &cursor.encode()).unwrap(), cursor);
+        let cleared = cursor.with_carry(Carry::default());
+        assert_eq!(
+            cleared.encode(),
+            json!({"path": "/p/s1.jsonl", "byte_offset": 42})
+        );
+        let spool = SpoolCursor::new("spool-1", 3).with_carry(carry);
+        assert_eq!(spool.carry(), Carry::default());
+        assert_eq!(spool, SpoolCursor::new("spool-1", 3));
+    }
+
     #[test]
     fn a_stored_row_of_another_kind_is_not_read() {
         let stored = crate::db::StoredHarnessCursor {

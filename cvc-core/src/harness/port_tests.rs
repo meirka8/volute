@@ -15,7 +15,7 @@ use crate::db::{CvcStore, DbError, RelationEvidence, RelationKind, StoredHarness
 use crate::harness::adapter::{
     CallerVerdict, FamilyRead, HarnessStatus, HookCaller, HookEnv, HookRequest, InstallContext,
     InstallOutcome, InstallScope, Installer, Located, OutputContract, PayloadError, Planner, Read,
-    ReadContext, RecordSource, Sniff, StartLocation, UninstallOutcome,
+    ReadContext, ReadLimit, RecordSource, Sniff, StartLocation, UninstallOutcome,
 };
 use crate::harness::candidate::{
     CaptureCandidate, ChildRef, ConversationRole, Finality, Plan, PlanInput, Reasoning,
@@ -27,7 +27,10 @@ use crate::harness::drift::{
 };
 use crate::harness::engine::{self, EngineError, EngineOptions, EngineReport};
 use crate::harness::family::Family;
-use crate::harness::{derived_interaction_id, test_registry, HarnessId, PassiveChannel};
+use crate::harness::lock::FamilyLock;
+use crate::harness::{
+    derived_interaction_id, test_registry, HarnessId, PassiveChannel, SESSION_LOCK_WAIT,
+};
 use crate::models::Author;
 use crate::privacy::{self, CaptureCoverage, PreparedPolicy, PrivacyError};
 use crate::reasoning::{self, ReasoningView};
@@ -39,7 +42,7 @@ use serde_json::{json, Map, Value};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 // ---- the fake adapter ---------------------------------------------------------------
@@ -179,19 +182,27 @@ impl RecordSource for Fake {
             .collect();
         Ok(FamilyRead { family, members })
     }
+    /// Honours a byte limit by whole lines. A `delay-ms` file beside the
+    /// record makes every read take that long: a test's slow disk.
     fn read(
         &self,
         source: &mut PathBuf,
         from: &JsonlCursor,
         context: &ReadContext<'_>,
     ) -> Result<Read<FakeWindow, JsonlCursor>, FakeError> {
+        if let Ok(delay) = fs::read_to_string(source.parent().unwrap().join("delay-ms")) {
+            std::thread::sleep(Duration::from_millis(delay.trim().parse().unwrap()));
+        }
         let mut bytes = Vec::new();
         fs::File::open(&*source)?.read_to_end(&mut bytes)?;
         let start = if context.rescan { 0 } else { from.byte_offset };
+        let end = context.limit.bytes.map_or(bytes.len(), |limit| {
+            bytes.len().min(start as usize + limit as usize)
+        });
         let mut lines = Vec::new();
         let mut own_history_start = None;
         let mut offset = start as usize;
-        while let Some(newline) = bytes[offset..].iter().position(|b| *b == b'\n') {
+        while let Some(newline) = bytes[offset..end].iter().position(|b| *b == b'\n') {
             let line = &bytes[offset..offset + newline];
             let value: Value =
                 serde_json::from_slice(line).map_err(|_| FakeError::Malformed(offset as u64))?;
@@ -223,7 +234,7 @@ impl RecordSource for Fake {
             trusted: from.clone(),
             replaced: None,
             record_len: Some(bytes.len() as u64),
-            limited: false,
+            limited: bytes[offset..].contains(&b'\n'),
             own_history_start,
         })
     }
@@ -477,6 +488,15 @@ impl Fixture {
         agent_id: &str,
         rescan: bool,
     ) -> Result<EngineReport<JsonlCursor>, EngineError<FakeError>> {
+        self.ingest_options(path, agent_id, Self::options(rescan))
+    }
+
+    fn ingest_options(
+        &self,
+        path: &Path,
+        agent_id: &str,
+        options: EngineOptions,
+    ) -> Result<EngineReport<JsonlCursor>, EngineError<FakeError>> {
         let located = Fake.locate_file(path, Some(agent_id)).unwrap();
         engine::ingest(
             &Fake,
@@ -484,7 +504,7 @@ impl Fixture {
             &self.store,
             &self.policy,
             located,
-            Self::options(rescan),
+            options,
         )
     }
 
@@ -995,4 +1015,314 @@ fn inherited_history_is_skipped_from_where_the_reader_says_it_ends() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(keys, ["resp:own"]);
+}
+
+// ---- batches and the time budget (#149) ---------------------------------------------
+
+/// A hook's run of `finality` in batches of `bytes`, over by `deadline`.
+fn batched(deadline: Option<Instant>, bytes: u64, finality: Finality) -> EngineOptions {
+    EngineOptions {
+        finality,
+        rescan: false,
+        lock_wait: SESSION_LOCK_WAIT,
+        deadline,
+        batch: ReadLimit {
+            bytes: Some(bytes),
+            units: None,
+        },
+    }
+}
+
+/// Forty responses of the same length, a second apart, and that length.
+fn forty(fixture: &Fixture) -> (PathBuf, u64) {
+    let lines: Vec<Value> = (0..40)
+        .map(|n| response(&format!("resp:{n:02}"), n))
+        .collect();
+    let line = format!("{}\n", lines[0]).len() as u64;
+    (fixture.record("t1", &lines), line)
+}
+
+/// Codex's `SessionEnd` has two seconds (its cap is three): a run on a slow
+/// record stops between batches before its deadline, with what it read
+/// committed, the cursor after it and the backlog flag set, since a final
+/// event may be the session's last. The next run goes on from the cursor:
+/// nothing twice, nothing lost, and the flag goes.
+#[test]
+fn a_two_second_budget_stops_between_batches_and_the_next_run_goes_on() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let (path, line) = forty(&fixture);
+    // Every read takes 150 ms, and a batch reads two responses: twenty
+    // batches would take three seconds.
+    fs::write(fixture.root.join("delay-ms"), "150").unwrap();
+    let started = Instant::now();
+    let report = fixture
+        .ingest_options(
+            &path,
+            "t1",
+            batched(
+                Some(started + Duration::from_secs(2)),
+                2 * line + 5,
+                Finality::Final,
+            ),
+        )
+        .unwrap();
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert!(report.cut_short && report.root.cut_short, "{report:?}");
+    let first = report.root.inserted;
+    assert!((4..40).contains(&first), "{first}");
+    assert_eq!(first % 2, 0, "whole batches only");
+    assert_eq!(report.root.cursor.byte_offset, first as u64 * line);
+    assert!(report.backlog);
+    assert_eq!(
+        engine::backlog::<Fake>(&fixture.store).unwrap(),
+        ["codex:t1"]
+    );
+
+    fs::remove_file(fixture.root.join("delay-ms")).unwrap();
+    let rest = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!(rest.root.inserted, 40 - first);
+    assert_eq!(rest.root.already_present, 0);
+    assert!(!rest.cut_short && !rest.backlog, "{rest:?}");
+    assert!(engine::backlog::<Fake>(&fixture.store).unwrap().is_empty());
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM interactions"), 40);
+    assert_eq!(rest.root.cursor.byte_offset, 40 * line);
+}
+
+/// A run whose deadline is already past reads nothing. A final one leaves
+/// the backlog flag, an incremental one does not, and neither takes the flag
+/// away; a run that reads everything does.
+#[test]
+fn only_a_final_run_out_of_time_sets_the_backlog_flag() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let (path, _) = forty(&fixture);
+    let past = |finality| batched(Some(Instant::now()), 1024, finality);
+    let incremental = fixture
+        .ingest_options(&path, "t1", past(Finality::Incremental))
+        .unwrap();
+    assert!(incremental.cut_short && !incremental.backlog);
+    assert_eq!(incremental.root.inserted, 0);
+    // Nothing was written: no cursor, no flag.
+    assert!(fixture
+        .store
+        .harness_cursor(HarnessId::Codex, "codex:t1")
+        .unwrap()
+        .is_none());
+    let final_run = fixture
+        .ingest_options(&path, "t1", past(Finality::Final))
+        .unwrap();
+    assert!(final_run.cut_short && final_run.backlog);
+    assert_eq!(final_run.root.inserted, 0);
+    assert_eq!(
+        engine::backlog::<Fake>(&fixture.store).unwrap(),
+        ["codex:t1"]
+    );
+    let again = fixture
+        .ingest_options(&path, "t1", past(Finality::Incremental))
+        .unwrap();
+    assert!(again.backlog, "an incremental run keeps the flag");
+    let done = fixture
+        .ingest_options(&path, "t1", batched(None, 1024, Finality::Incremental))
+        .unwrap();
+    assert!(!done.cut_short && !done.backlog);
+    assert_eq!(done.root.inserted, 40);
+    assert!(engine::backlog::<Fake>(&fixture.store).unwrap().is_empty());
+}
+
+/// R9: a response much larger than the window. Each run with a short budget
+/// grows the window as far as its time allows and leaves the grown window
+/// with the cursor; the next run starts from it, so short runs get past the
+/// response. Runs that started again from the base window every time would
+/// never get past it.
+#[test]
+fn a_grown_window_carries_over_to_the_next_run() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let mut big = response("resp:big", 2);
+    big["text"] = json!("x".repeat(40_000));
+    let path = fixture.record("t1", &[response("resp:a", 1), big, response("resp:z", 3)]);
+    // Every read takes 60 ms, whatever it reads.
+    fs::write(fixture.root.join("delay-ms"), "60").unwrap();
+    let base = 512;
+    let mut windows = Vec::new();
+    let mut runs = 0;
+    loop {
+        runs += 1;
+        assert!(
+            runs <= 10,
+            "short runs did not get past the response: {windows:?}"
+        );
+        let report = fixture
+            .ingest_options(
+                &path,
+                "t1",
+                batched(
+                    Some(Instant::now() + Duration::from_millis(500)),
+                    base,
+                    Finality::Incremental,
+                ),
+            )
+            .unwrap();
+        let carried = report.root.cursor.carry.stall_window;
+        if !report.cut_short {
+            assert_eq!(carried, None);
+            break;
+        }
+        let grown = carried.expect("a run cut short while the window grew keeps it");
+        assert!(grown > base, "{grown}");
+        // Never back to the base window, and further with every run.
+        if let Some(last) = windows.last() {
+            assert!(grown > *last, "{windows:?} then {grown}");
+        }
+        windows.push(grown);
+    }
+    assert!(!windows.is_empty(), "one run read it all");
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM interactions"), 3);
+}
+
+/// Codex's `SessionEnd` waits a quarter of a second for a lock another run
+/// holds, then ends as busy, which a hook takes for success: the holder is
+/// making progress.
+#[test]
+fn a_two_second_budget_waits_a_quarter_second_for_the_lock() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let (path, _) = forty(&fixture);
+    let _held = FamilyLock::acquire(
+        &fixture.layout.cvc_dir(),
+        HarnessId::Codex.name(),
+        "codex:t1",
+        Duration::ZERO,
+    )
+    .unwrap()
+    .unwrap();
+    let started = Instant::now();
+    let result = fixture.ingest_options(
+        &path,
+        "t1",
+        batched(
+            Some(started + Duration::from_secs(2)),
+            1024,
+            Finality::Final,
+        ),
+    );
+    let took = started.elapsed();
+    match result {
+        Err(EngineError::Busy { waited, .. }) => assert!(
+            waited <= Duration::from_millis(250) && waited >= Duration::from_millis(240),
+            "{waited:?}"
+        ),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    assert!(
+        took >= Duration::from_millis(240) && took < Duration::from_secs(1),
+        "{took:?}"
+    );
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM interactions"), 0);
+}
+
+/// A run that fails between batches, as one killed there would, keeps every
+/// batch before the failure, with the commits their responses reported. The
+/// next run goes on from the cursor and never reads the committing response
+/// again, yet its rescue links the responses before the commit from the
+/// stored evidence, as one run of the whole record does.
+#[test]
+fn a_run_that_fails_between_batches_loses_nothing_and_the_next_run_links_its_commit() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let sha = fixture.commit(100);
+    let mut lines: Vec<Value> = (0..10)
+        .map(|n| response(&format!("resp:{n:02}"), 10 * n))
+        .collect();
+    lines[1]["commit"] = json!(sha);
+    let path = fixture.record("t1", &lines);
+    let text = fs::read_to_string(&path).unwrap();
+    // The seventh line cannot be read until it is repaired.
+    let broken: String = text
+        .lines()
+        .enumerate()
+        .map(|(index, line)| match index {
+            6 => format!("{}\n", "x".repeat(line.len())),
+            _ => format!("{line}\n"),
+        })
+        .collect();
+    fs::write(&path, &broken).unwrap();
+    let error = fixture
+        .ingest_options(&path, "t1", batched(None, 400, Finality::Final))
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::Adapter(FakeError::Malformed(_))),
+        "{error:?}"
+    );
+    let first = fixture.count("SELECT COUNT(*) FROM interactions");
+    assert!((2..=6).contains(&first), "{first}");
+    assert_eq!(
+        fixture
+            .store
+            .harness_commit_evidence(HarnessId::Codex, "codex:t1")
+            .unwrap()
+            .len(),
+        1
+    );
+    // Like a killed run, it linked nothing.
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM artifact_links"), 0);
+
+    fs::write(&path, &text).unwrap();
+    let report = fixture
+        .ingest_options(&path, "t1", batched(None, 400, Finality::Final))
+        .unwrap();
+    assert_eq!(report.root.inserted as i64, 10 - first);
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM interactions"), 10);
+    assert_eq!(report.linked.root, 10);
+    for n in 0..10 {
+        assert!(fixture.linked("codex:t1", &format!("resp:{n:02}")), "{n}");
+    }
+}
+
+/// A commit replayed from the store links only responses within the link
+/// window before it, and none when the window is 0; the commits a run reads
+/// itself are not bounded, as before.
+#[test]
+fn a_replayed_commit_links_only_within_the_link_window() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let sha = fixture.commit(100_000);
+    let set_window = |seconds: &str| {
+        fixture
+            .layout
+            .repository()
+            .config()
+            .unwrap()
+            .set_str("cvc.linkWindow", seconds)
+            .unwrap()
+    };
+    set_window("3600");
+    let mut committing = response("resp:c", 99_990);
+    committing["commit"] = json!(sha);
+    let old = response("resp:old", 100_000 - 4000);
+    let path = fixture.record("t1", &[old.clone(), committing.clone()]);
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!(report.linked.root, 2, "its own run's commit is not bounded");
+
+    // Responses recorded after the committing one was read, which the next
+    // run never reads again: only the one in the window before the commit
+    // is linked, from the stored evidence.
+    let mut lines = vec![
+        old,
+        committing,
+        response("resp:older", 100_000 - 5000),
+        response("resp:near", 100_000 - 600),
+        response("resp:after", 100_010),
+    ];
+    let path = fixture.record("t1", &lines);
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!(report.root.inserted, 3);
+    assert_eq!(report.linked.root, 1);
+    assert!(fixture.linked("codex:t1", "resp:near"));
+    assert!(!fixture.linked("codex:t1", "resp:older"));
+    assert!(!fixture.linked("codex:t1", "resp:after"));
+
+    // At 0, the link window links nothing from the store at all.
+    set_window("0");
+    lines.push(response("resp:late", 100_000 - 60));
+    let path = fixture.record("t1", &lines);
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!((report.root.inserted, report.linked.root), (1, 0));
+    assert!(!fixture.linked("codex:t1", "resp:late"));
 }

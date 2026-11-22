@@ -1211,6 +1211,60 @@ mod tests {
             .is_ok());
     }
 
+    /// A limited read takes the whole lines that fit its limit, and nothing
+    /// of a line that does not end within it; a read within its limit keeps
+    /// all it read, an unfinished last line included, as a read to the end
+    /// does.
+    #[test]
+    fn a_limited_read_takes_whole_lines_only() {
+        // Each read is of up to one byte past the limit.
+        assert_eq!(whole_lines(b"ab\ncd\nef".to_vec(), 10), b"ab\ncd\nef");
+        assert_eq!(whole_lines(b"ab\ncd\n".to_vec(), 5), b"ab\n");
+        assert_eq!(whole_lines(b"ab\ncd\ne".to_vec(), 6), b"ab\ncd\n");
+        assert_eq!(whole_lines(b"abcd".to_vec(), 3), b"");
+    }
+
+    /// Through the adapter: a limited read says it stopped at its limit,
+    /// starts where it was asked to, and reports the file's length; one that
+    /// reaches the end does not.
+    #[test]
+    fn a_read_says_whether_it_stopped_at_its_limit() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let session = "00000000-0000-4000-8000-0000000000a1";
+        let path = temp.path().join(format!("{session}.jsonl"));
+        let title = |n: usize| {
+            format!("{{\"type\":\"ai-title\",\"aiTitle\":\"t{n}\",\"sessionId\":\"{session}\"}}\n")
+        };
+        let text: String = (0..4).map(title).collect();
+        fs::write(&path, &text).unwrap();
+        let line = title(0).len() as u64;
+        let adapter = Adapter;
+        let mut located = adapter.locate_file(&path, Some(session)).unwrap();
+        let read = |located: &mut Located<Source>, from: u64, bytes: Option<u64>| {
+            adapter
+                .read(
+                    &mut located.source,
+                    &JsonlCursor::start(path.to_string_lossy()).at(from),
+                    &ReadContext {
+                        worktree_root: temp.path(),
+                        rescan: false,
+                        limit: crate::harness::adapter::ReadLimit { bytes, units: None },
+                    },
+                )
+                .unwrap()
+        };
+        let first = read(&mut located, 0, Some(2 * line + 3));
+        assert!(first.limited);
+        assert_eq!(first.window.lines.lines.len(), 2);
+        assert_eq!(first.record_len, Some(4 * line));
+        let rest = read(&mut located, 2 * line, Some(2 * line + 3));
+        assert!(!rest.limited);
+        assert_eq!(rest.window.lines.lines.len(), 2);
+        let whole = read(&mut located, 0, None);
+        assert!(!whole.limited);
+        assert_eq!(whole.window.lines.lines.len(), 4);
+    }
+
     #[test]
     fn the_start_is_the_project_directory() {
         let adapter = Adapter;
