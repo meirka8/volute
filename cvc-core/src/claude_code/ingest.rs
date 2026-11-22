@@ -12,7 +12,9 @@
 use super::fields;
 use super::links;
 use super::session_lock::{SessionLock, SESSION_LOCK_WAIT};
-use super::transcript::{self, ParsedLine, PlanInput, TranscriptError, HARNESS};
+use super::transcript::{
+    self, FirstEntry, ParsedLine, PlanInput, TranscriptError, FIRST_ENTRY_BYTES, HARNESS,
+};
 use crate::db::{CvcStore, DbError, HarnessCursorUpdate, HARNESS_REASONS_SHOWN};
 use crate::models::{Conversation, Interaction, InteractionId};
 use crate::privacy::{self, ClaudeCodeCapture, PreparedPolicy};
@@ -21,7 +23,7 @@ use crate::stimulus;
 use chrono::Utc;
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -70,6 +72,13 @@ pub enum IngestError {
     Transcript(#[from] TranscriptError),
     #[error("transcript {0:?} is not a regular file")]
     NotRegularFile(PathBuf),
+    /// The transcript's first complete entry is in another agent's format
+    /// (see [`transcript::is_other_agents_entry`]): the file is that agent's.
+    /// Unlike [`TranscriptError`], which is a Claude Code transcript this
+    /// parser does not support or a damaged one, nothing in it is read past
+    /// that entry.
+    #[error("not a Claude Code transcript: {0:?} begins with an entry in another agent's format")]
+    NotClaudeCode(PathBuf),
     #[error("transcript exceeds the supported size")]
     TooLarge,
     #[error("session id {0:?} is not a safe identifier")]
@@ -244,6 +253,12 @@ pub fn ingest_with(
     mode: IngestMode,
     options: IngestOptions,
 ) -> Result<IngestReport, IngestError> {
+    // Before anything else, the lock included, so that another agent's file
+    // leaves nothing behind. A transcript that cannot be read here is reported
+    // by the read below, as before.
+    if let Ok(FirstEntry::NotClaudeCode) = sniff_first_entry(transcript_path) {
+        return Err(IngestError::NotClaudeCode(transcript_path.to_path_buf()));
+    }
     let session = session_id
         .map(str::to_owned)
         .or_else(|| {
@@ -308,6 +323,77 @@ pub fn ingest_with(
     report.linked_from_commits = linked.parent;
     report.subagent_linked = linked.subagents;
     Ok(report)
+}
+
+/// Classifies the first complete entry of the transcript at `path` (see
+/// [`transcript::first_entry`]), reading from its start only up to its first
+/// non-blank line, and never more than [`FIRST_ENTRY_BYTES`] + 1 bytes.
+///
+/// The file is opened once, and what was opened is inspected: on Unix without
+/// following a link, without blocking (a FIFO opens at once instead of waiting
+/// for a writer) and without becoming a controlling terminal, then refused
+/// unless the handle is a regular file; elsewhere, a link or anything but a
+/// regular file at `path` is refused before it is opened. A refusal is
+/// [`IngestError::NotRegularFile`], the error ingestion itself gives such a
+/// path; any other failure to open or read is [`IngestError::Io`].
+pub fn sniff_first_entry(path: &Path) -> Result<FirstEntry, IngestError> {
+    let file = open_transcript_start(path)?;
+    let start = read_to_first_entry(file)?;
+    Ok(transcript::first_entry(&start))
+}
+
+#[cfg(unix)]
+fn open_transcript_start(path: &Path) -> Result<fs::File, IngestError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path);
+    let file = match opened {
+        Ok(file) => file,
+        // `O_NOFOLLOW` refuses a link as the last component with `ELOOP`,
+        // which a loop of links earlier in the path also gives: only the
+        // first is a link where the transcript belongs.
+        Err(error)
+            if error.raw_os_error() == Some(libc::ELOOP)
+                && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_symlink()) =>
+        {
+            return Err(IngestError::NotRegularFile(path.to_path_buf()))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(IngestError::NotRegularFile(path.to_path_buf()));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_transcript_start(path: &Path) -> Result<fs::File, IngestError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(IngestError::NotRegularFile(path.to_path_buf()));
+    }
+    Ok(fs::File::open(path)?)
+}
+
+/// The start of `source`, up to and including its first non-blank complete
+/// line, or up to [`FIRST_ENTRY_BYTES`] + 1 bytes, or to its end, whichever
+/// comes first: what [`transcript::first_entry`] needs, and no more.
+fn read_to_first_entry(source: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut reader = BufReader::new(source.take(FIRST_ENTRY_BYTES as u64 + 1));
+    let mut start = Vec::new();
+    loop {
+        let line_start = start.len();
+        if reader.read_until(b'\n', &mut start)? == 0 {
+            return Ok(start);
+        }
+        let line = &start[line_start..];
+        let complete = line.ends_with(b"\n");
+        if !complete || !line.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(start);
+        }
+    }
 }
 
 /// Ingests the subagent transcripts stored beside `transcript_path`. Subagents
@@ -901,5 +987,93 @@ mod tests {
             },
         );
         plan.interactions[0].id.clone()
+    }
+
+    /// A reader that counts what is taken from it.
+    struct Counting<R> {
+        inner: R,
+        taken: u64,
+    }
+
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.inner.read(buffer)?;
+            self.taken += count as u64;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn the_sniff_reads_to_the_first_non_blank_line_and_no_further() {
+        let first = b"\n\r\n{\"type\":\"ai-title\"}\n";
+        let mut source = Counting {
+            inner: first.chain(std::io::repeat(b'x').take(8 * 1024 * 1024)),
+            taken: 0,
+        };
+        let start = read_to_first_entry(&mut source).unwrap();
+        assert_eq!(start, first);
+        // One buffer's worth past the line, not the bound.
+        assert!(source.taken <= 64 * 1024, "{}", source.taken);
+        assert_eq!(transcript::first_entry(&start), FirstEntry::ClaudeCode);
+
+        // Without a line end, the bound and one byte more.
+        let mut source = Counting {
+            inner: std::io::repeat(b'x').take(8 * 1024 * 1024),
+            taken: 0,
+        };
+        let start = read_to_first_entry(&mut source).unwrap();
+        assert_eq!(start.len(), FIRST_ENTRY_BYTES + 1);
+        assert_eq!(source.taken, FIRST_ENTRY_BYTES as u64 + 1);
+        assert_eq!(transcript::first_entry(&start), FirstEntry::Undetermined);
+
+        // A short file is read to its end.
+        assert_eq!(read_to_first_entry(&b"\n{\"ty"[..]).unwrap(), b"\n{\"ty");
+        assert_eq!(read_to_first_entry(&b""[..]).unwrap(), b"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sniff_follows_no_link_and_waits_for_no_writer() {
+        let temp = TempDir::new().unwrap();
+        let cursor = temp.path().join("cursor.jsonl");
+        fs::write(
+            &cursor,
+            "{\"role\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            sniff_first_entry(&cursor).unwrap(),
+            FirstEntry::NotClaudeCode
+        );
+
+        let refused = |path: &Path| match sniff_first_entry(path) {
+            Err(IngestError::NotRegularFile(named)) => assert_eq!(named, path),
+            other => panic!("{path:?}: {other:?}"),
+        };
+        let link = temp.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&cursor, &link).unwrap();
+        refused(&link);
+
+        let fifo = temp.path().join("fifo.jsonl");
+        let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `name` is a valid, NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        refused(&fifo);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        refused(temp.path());
+        // A failure to open is not a refusal: ingestion reports it.
+        assert!(matches!(
+            sniff_first_entry(&temp.path().join("absent")),
+            Err(IngestError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        // Nor is a loop of links before the last component.
+        let looped = temp.path().join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        assert!(matches!(
+            sniff_first_entry(&looped.join("x.jsonl")),
+            Err(IngestError::Io(_))
+        ));
     }
 }

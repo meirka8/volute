@@ -4,14 +4,18 @@
 //! machine's already-shared projection: this is first-party local capture.
 use crate::terminal_text::sanitize_for_terminal;
 use anyhow::{anyhow, bail, Context, Result};
-use cvc_core::claude_code::{ingest_with, IngestError, IngestMode, IngestOptions, IngestReport};
+use cvc_core::claude_code::{
+    ingest_with, sniff_first_entry, FirstEntry, IngestError, IngestMode, IngestOptions,
+    IngestReport,
+};
 use cvc_core::db::CvcStore;
 use cvc_core::privacy::PreparedPolicy;
 use cvc_core::repository::{RepositoryLayout, RepositoryLayoutError};
 use git2::ErrorCode;
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -24,6 +28,28 @@ const MAX_DRAINED_HOOK_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// Claude Code exports this to every hook it runs: the directory the session
 /// was started in.
 const PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
+/// Cursor exports this to the hooks it runs. Claude Code run in Cursor's
+/// integrated terminal, and so its hooks, may inherit it too (not verified).
+const CURSOR_VERSION_ENV: &str = "CURSOR_VERSION";
+/// The top-level key every Cursor hook input carries, per Cursor's
+/// documentation, and Claude Code does not send.
+const CURSOR_VERSION_KEY: &str = "cursor_version";
+/// Cursor's conversation id. Taken for Cursor's only in a payload without
+/// Claude Code's `session_id` (see [`classify_hook_caller`]).
+const CURSOR_CONVERSATION_KEY: &str = "conversation_id";
+/// Top-level keys of Antigravity's hook input that Claude Code does not send:
+/// the three its changelog documents (`hookEventName`, `toolCall`,
+/// `lastUserInput`) and three more in its camelCase style. An explicit list,
+/// never a rule such as "any camelCase key", which a future Claude Code key
+/// could match, silently ending all capture.
+const ANTIGRAVITY_PAYLOAD_KEYS: [&str; 6] = [
+    "hookEventName",
+    "toolCall",
+    "lastUserInput",
+    "conversationId",
+    "transcriptPath",
+    "workspacePaths",
+];
 
 /// The subset of Claude Code's hook payload this command relies on.
 #[derive(Deserialize)]
@@ -33,6 +59,78 @@ struct HookPayload {
     cwd: Option<String>,
     hook_event_name: Option<String>,
     agent_id: Option<String>,
+}
+
+/// Who ran the hook, as far as its payload and environment tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookCaller {
+    /// Another agent that loads Claude Code's hook configuration, told by a
+    /// top-level key that Claude Code does not send. Not CVC's Claude Code
+    /// channel: ignored.
+    Foreign(ForeignAgent),
+    /// Claude Code, as far as the payload tells. `cursor_env` is
+    /// `CURSOR_VERSION` in the environment, which a Claude Code session in
+    /// Cursor's integrated terminal may inherit too, so it never turns a
+    /// well-formed Claude Code run into a no-op: it only silences what would
+    /// otherwise be an error about a payload or transcript that is not Claude
+    /// Code's, or a no-op (see [`run_hook`]).
+    ClaudeCode { cursor_env: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForeignAgent {
+    Cursor,
+    Antigravity,
+}
+
+/// Classifies the caller of a hook from the payload's top-level keys (never
+/// nested ones: a tool's input can carry any key) and the value of
+/// `CURSOR_VERSION`. `CLAUDE_PROJECT_DIR` is not looked at: Cursor sets it too.
+///
+/// `cursor_version` alone means Cursor. `conversation_id` means Cursor only in
+/// a payload without `session_id`, so that a key of that name Claude Code may
+/// one day add never silences its own runs.
+fn classify_hook_caller(
+    payload: &Map<String, Value>,
+    cursor_version: Option<&OsStr>,
+) -> HookCaller {
+    if payload.contains_key(CURSOR_VERSION_KEY)
+        || (payload.contains_key(CURSOR_CONVERSATION_KEY) && !payload.contains_key("session_id"))
+    {
+        return HookCaller::Foreign(ForeignAgent::Cursor);
+    }
+    if ANTIGRAVITY_PAYLOAD_KEYS
+        .iter()
+        .any(|key| payload.contains_key(*key))
+    {
+        return HookCaller::Foreign(ForeignAgent::Antigravity);
+    }
+    HookCaller::ClaudeCode {
+        cursor_env: cursor_version.is_some_and(|value| !value.is_empty()),
+    }
+}
+
+/// Who runs an ingest, which decides what a transcript that is not Claude
+/// Code's, or not yet anyone's, comes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caller {
+    /// `--hook`: another agent's transcript is passed over in silence when
+    /// that is corroborated (see [`first_entry_verdict`]), and is an error
+    /// otherwise.
+    Hook { cursor_env: bool },
+    /// `--transcript`: another agent's transcript is an error.
+    Operator,
+}
+
+/// What a run does with a transcript, given how it begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Ingest it: the parser's own checks report whatever they find.
+    Ingest,
+    /// Do nothing, in silence, without opening the store.
+    PassOver,
+    /// Fail with [`IngestError::NotClaudeCode`], without opening the store.
+    Refuse,
 }
 
 pub async fn claude_code(
@@ -141,13 +239,22 @@ fn left_out_lines(report: &IngestReport) -> Vec<String> {
 ///
 /// The same command is run by the checkout's own hook entries and by the cvc
 /// Claude Code plugin, which is installed for the user and so fires in every
-/// project they open, CVC-initialized or not. It therefore decides, in this
-/// order:
+/// project they open, CVC-initialized or not. Other agents run it too: Cursor
+/// loads Claude Code's hook settings by default, and Antigravity's CLI can
+/// import Claude Code plugins, and each hands it its own payload. It therefore
+/// decides, in this order:
 ///
 /// 1. The payload is read from stdin, bounded at 1 MiB. Nothing in it is
 ///    validated yet. A larger one is read on, unused, up to a cap, so that the
 ///    writer does not meet a closed pipe.
-/// 2. The repository is chosen (see [`recording_repository`]): a session is
+/// 2. A payload that is a JSON object with a top-level key that Claude Code
+///    does not send is another agent's run (see [`classify_hook_caller`]):
+///    Cursor's `cursor_version` (or its `conversation_id` without a
+///    `session_id`), or one of Antigravity's `hookEventName`, `toolCall`,
+///    `lastUserInput`, `conversationId`, `transcriptPath`, `workspacePaths`.
+///    Exit 0 with nothing on stdout or stderr, before any repository is looked
+///    for or any file read.
+/// 3. The repository is chosen (see [`recording_repository`]): a session is
 ///    recorded, in full, in the repository it was started in, which Claude
 ///    Code exports to every hook as `CLAUDE_PROJECT_DIR`. The hook's working
 ///    directory (the payload's `cwd`) only picks which of that repository's
@@ -156,7 +263,7 @@ fn left_out_lines(report: &IngestReport) -> Vec<String> {
 ///    the variable (an older Claude Code, a manual run) the working directory
 ///    chooses the repository; with it empty, the session was not started in
 ///    any repository that can be named.
-/// 3. Unless that repository can be established as CVC-initialized, the hook
+/// 4. Unless that repository can be established as CVC-initialized, the hook
 ///    does nothing: exit 0 with nothing on stdout or stderr, whatever the
 ///    payload held. "Established" means the directory exists and is a Git
 ///    working tree with a CVC directory; one that does not exist, is in no
@@ -165,20 +272,50 @@ fn left_out_lines(report: &IngestReport) -> Vec<String> {
 ///    [`is_not_cvcs_business`]). Any other discovery failure (an unreadable or
 ///    corrupt repository, a `cvc` entry that is not a directory) may hide
 ///    capture loss in an initialized repository, and fails visibly.
-/// 4. Only then the payload must be valid (a session id and a transcript
-///    path), or the hook fails; subagent payloads are ignored, since the
-///    parent session's hooks ingest that transcript; capture must be
-///    acknowledged, or the hook fails with `consent-required`; and the
-///    transcript is ingested, under the session's lock. A hook that is still
-///    waiting for another run on the session when the wait ends does nothing,
-///    as in 3: that run is making progress, and the next event catches up
-///    from the cursor.
+/// 5. Only then the payload must be valid (read whole within the bound, the
+///    JSON Claude Code sends, with a session id and a transcript path), or the
+///    hook fails, unless `CURSOR_VERSION` is set, when a payload that is not
+///    is taken for one of Cursor's and the hook does nothing.
+///    Subagent payloads are ignored, since the parent session's hooks ingest
+///    that transcript; and capture must be acknowledged, or the hook fails
+///    with `consent-required`.
+/// 6. Before the CVC database is opened, the transcript is read from its
+///    start up to its first complete line (at most 1 MiB; see
+///    [`first_entry_verdict`]). A first entry with another agent's shape
+///    (Cursor's, Antigravity's, Codex's) is passed over in silence when that
+///    is corroborated: `CURSOR_VERSION` is set, or the transcript's file name
+///    does not name the payload's session, as Claude Code's `<session>.jsonl`
+///    does. Otherwise the hook fails, `not a Claude Code transcript`, so that
+///    a foreign line put at the top of a session's own transcript cannot
+///    silence it. With `CURSOR_VERSION` set, a transcript with no complete
+///    entry yet is passed over too; the next event reads it. Anything else
+///    (a Claude Code entry of a version this cvc does not support, a first
+///    line that is damaged or of nobody known, a transcript that cannot be
+///    read) goes on to the parser, which reports it as before.
+/// 7. The transcript is ingested, under the session's lock. A hook that is
+///    still waiting for another run on the session when the wait ends does
+///    nothing, as in 4: that run is making progress, and the next event
+///    catches up from the cursor.
 fn run_hook() -> Result<()> {
     let input = read_payload(io::stdin().lock());
     // Parsed leniently here: a payload that is not usable is reported below,
     // once the repository is known to be CVC's.
-    let parsed = (input.read.is_ok() && !input.oversize)
-        .then(|| serde_json::from_slice::<HookPayload>(&input.raw));
+    let object = (input.read.is_ok() && !input.oversize)
+        .then(|| serde_json::from_slice::<Map<String, Value>>(&input.raw));
+    // Read whatever the payload is, so that it also covers one that could not
+    // be read or parsed (see step 5).
+    let cursor_version = env::var_os(CURSOR_VERSION_ENV);
+    let cursor_env = cursor_version
+        .as_deref()
+        .is_some_and(|value| !value.is_empty());
+    if let Some(Ok(object)) = object.as_ref() {
+        if let HookCaller::Foreign(_) = classify_hook_caller(object, cursor_version.as_deref()) {
+            return Ok(());
+        }
+    }
+    let parsed = object.map(|object| {
+        object.and_then(|object| serde_json::from_value::<HookPayload>(Value::Object(object)))
+    });
 
     let payload_cwd = parsed
         .as_ref()
@@ -190,6 +327,13 @@ fn run_hook() -> Result<()> {
         return Ok(());
     };
 
+    // Under Cursor, a payload that could not be read whole, or that is not the
+    // JSON Claude Code sends, is taken for Cursor's own (a `PostToolUse` whose
+    // tool output went past the bound, say). Nothing could be ingested from
+    // it in any case.
+    if cursor_env && (input.read.is_err() || input.oversize || !matches!(parsed, Some(Ok(_)))) {
+        return Ok(());
+    }
     input
         .read
         .context("could not read the hook payload from stdin")?;
@@ -204,21 +348,32 @@ fn run_hook() -> Result<()> {
         // parent session's own hooks ingest it.
         return Ok(());
     }
-    let session = payload
-        .session_id
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("hook payload has no session_id"))?;
+    let session = payload.session_id.filter(|value| !value.is_empty());
     let transcript = payload
         .transcript_path
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("hook payload has no transcript_path"))?;
+        .map(PathBuf::from);
+    let (session, transcript) = match (session, transcript) {
+        (Some(session), Some(transcript)) => (session, transcript),
+        // Claude Code always sends both; under Cursor, a payload without them
+        // is taken for Cursor's own.
+        _ if cursor_env => return Ok(()),
+        (None, _) => bail!("hook payload has no session_id"),
+        (Some(_), None) => bail!("hook payload has no transcript_path"),
+    };
     let mode = match payload.hook_event_name.as_deref() {
         Some("Stop") | Some("SessionEnd") => IngestMode::Final,
         _ => IngestMode::Incremental,
     };
     // The hook reads from the cursor, always: only an operator rescans.
-    match ingest_into(&layout, &transcript, Some(&session), mode, false) {
+    match ingest_into(
+        &layout,
+        &transcript,
+        Some(&session),
+        mode,
+        false,
+        Caller::Hook { cursor_env },
+    ) {
         Ok(_) => Ok(()),
         // Another run holds this session's lock and has held it for the whole
         // wait. It is making progress, and whatever it does not reach, the next
@@ -417,21 +572,41 @@ fn run(
     rescan: bool,
 ) -> Result<IngestReport> {
     let layout = super::harness::discover_initialized_at(repository_path)?;
-    ingest_into(&layout, transcript, session, mode, rescan)
+    // An operator's run passes nothing over: see `first_entry_verdict`.
+    ingest_into(&layout, transcript, session, mode, rescan, Caller::Operator)?
+        .ok_or_else(|| anyhow!("the transcript was passed over"))
 }
 
+/// Ingests `transcript` into `layout`'s store, or returns `None` when a hook
+/// passed it over (see [`first_entry_verdict`]).
 fn ingest_into(
     layout: &RepositoryLayout,
     transcript: &Path,
     session: Option<&str>,
     mode: IngestMode,
     rescan: bool,
-) -> Result<IngestReport> {
+    caller: Caller,
+) -> Result<Option<IngestReport>> {
     super::harness::require_capture_acknowledged(layout)?;
+    // Before the store is opened. What is not a regular file (a link, a FIFO,
+    // a directory) is refused here, with the error ingestion gives it; a
+    // transcript that cannot be opened or read is left to the ingest below,
+    // which reports it as before.
+    match sniff_first_entry(transcript) {
+        Ok(first) => match first_entry_verdict(caller, first, transcript, session) {
+            Verdict::Ingest => {}
+            Verdict::PassOver => return Ok(None),
+            Verdict::Refuse => {
+                return Err(IngestError::NotClaudeCode(transcript.to_path_buf()).into())
+            }
+        },
+        Err(refused @ IngestError::NotRegularFile(_)) => return Err(refused.into()),
+        Err(_) => {}
+    }
     let policy = PreparedPolicy::load(layout.policy_root()?)
         .map_err(|error| anyhow!("CVC capture blocked by .thoughtignore: {error}"))?;
     let store = CvcStore::open_initialized(layout.db_path())?;
-    Ok(ingest_with(
+    Ok(Some(ingest_with(
         layout,
         &store,
         &policy,
@@ -442,7 +617,47 @@ fn ingest_into(
             rescan,
             ..IngestOptions::default()
         },
-    )?)
+    )?))
+}
+
+/// What a run by `caller` does with `transcript`, for `session`, given that
+/// it begins as `first` says.
+///
+/// An operator's run refuses another agent's transcript and ingests anything
+/// else. A hook passes another agent's transcript over in silence only when
+/// something besides its first line says the run is not Claude Code's own:
+/// `CURSOR_VERSION` is set, or the file is not named for the session, as
+/// Claude Code names its transcripts `<session_id>.jsonl`. Otherwise it
+/// refuses it, visibly, so that a foreign-shaped line put at the top of a
+/// session's own transcript cannot silence that session. Under Cursor, a hook
+/// also passes over a transcript with no complete entry yet, which the next
+/// event reads. Everything else is ingested, so that the parser's own checks
+/// (the version pinning among them) report what they find.
+fn first_entry_verdict(
+    caller: Caller,
+    first: FirstEntry,
+    transcript: &Path,
+    session: Option<&str>,
+) -> Verdict {
+    match (caller, first) {
+        (Caller::Operator, FirstEntry::NotClaudeCode) => Verdict::Refuse,
+        (Caller::Operator, _) => Verdict::Ingest,
+        (Caller::Hook { cursor_env }, FirstEntry::NotClaudeCode) => {
+            if cursor_env || !named_for_session(transcript, session) {
+                Verdict::PassOver
+            } else {
+                Verdict::Refuse
+            }
+        }
+        (Caller::Hook { cursor_env: true }, FirstEntry::NoCompleteEntry) => Verdict::PassOver,
+        (Caller::Hook { .. }, _) => Verdict::Ingest,
+    }
+}
+
+/// Whether `transcript` is named `<session>.<extension>`, as Claude Code names
+/// a session's transcript.
+fn named_for_session(transcript: &Path, session: Option<&str>) -> bool {
+    session.is_some_and(|session| transcript.file_stem() == Some(OsStr::new(session)))
 }
 
 #[cfg(test)]
@@ -700,5 +915,298 @@ mod tests {
             ..clean_report()
         });
         assert_eq!(only_omitted.len(), 1);
+    }
+
+    fn object(json: Value) -> Map<String, Value> {
+        match json {
+            Value::Object(object) => object,
+            other => panic!("not an object: {other}"),
+        }
+    }
+
+    /// A `PostToolUse` payload as Claude Code sends it; ids are made up.
+    fn claude_code_payload() -> Value {
+        serde_json::json!({
+            "session_id": "00000000-0000-4000-8000-0000000000a1",
+            "transcript_path": "/home/someone/.claude/projects/-x/00000000-0000-4000-8000-0000000000a1.jsonl",
+            "cwd": "/work/example",
+            "permission_mode": "default",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "true"},
+            "tool_response": {"stdout": ""},
+            "tool_use_id": "tool-use-1"
+        })
+    }
+
+    const NO_CURSOR_ENV: Option<&OsStr> = None;
+
+    #[test]
+    fn a_payload_with_cursors_keys_is_cursors() {
+        // `cursor_version`, which every Cursor hook input carries, alone.
+        let mut payload = object(claude_code_payload());
+        payload.insert("cursor_version".into(), Value::String("1.0.0".into()));
+        assert_eq!(
+            classify_hook_caller(&payload, NO_CURSOR_ENV),
+            HookCaller::Foreign(ForeignAgent::Cursor)
+        );
+        // `conversation_id` in a payload without `session_id`.
+        let mut payload = object(claude_code_payload());
+        payload.remove("session_id");
+        payload.insert("conversation_id".into(), Value::String("c1".into()));
+        assert_eq!(
+            classify_hook_caller(&payload, NO_CURSOR_ENV),
+            HookCaller::Foreign(ForeignAgent::Cursor)
+        );
+        // Present is enough, whatever the value.
+        let payload = object(serde_json::json!({
+            "conversation_id": null,
+            "hook_event_name": "stop",
+            "transcript_path": "/home/someone/.cursor/projects/x/agent-transcripts/y.jsonl"
+        }));
+        assert_eq!(
+            classify_hook_caller(&payload, Some(OsStr::new("1.0.0"))),
+            HookCaller::Foreign(ForeignAgent::Cursor)
+        );
+    }
+
+    #[test]
+    fn a_camel_case_payload_is_antigravitys() {
+        for key in ANTIGRAVITY_PAYLOAD_KEYS {
+            let payload = object(serde_json::json!({ key: "x" }));
+            assert_eq!(
+                classify_hook_caller(&payload, NO_CURSOR_ENV),
+                HookCaller::Foreign(ForeignAgent::Antigravity),
+                "{key}"
+            );
+        }
+        for payload in [
+            serde_json::json!({
+                "conversationId": "00000000-0000-4000-8000-0000000000b1",
+                "transcriptPath": "/x/y.jsonl",
+                "workspacePaths": ["/work/example"]
+            }),
+            // Only the keys Antigravity's changelog documents.
+            serde_json::json!({
+                "hookEventName": "PostToolUse",
+                "cwd": "/work/example",
+                "toolCall": {"name": "run_command", "args": {"command": "true"}}
+            }),
+            serde_json::json!({"hookEventName": "Stop", "lastUserInput": "Say hello"}),
+        ] {
+            assert_eq!(
+                classify_hook_caller(&object(payload.clone()), NO_CURSOR_ENV),
+                HookCaller::Foreign(ForeignAgent::Antigravity),
+                "{payload}"
+            );
+        }
+    }
+
+    /// A tool's input and output are the model's and the tool's to fill, so a
+    /// key below the top level says nothing about the caller.
+    #[test]
+    fn keys_below_the_top_level_do_not_count() {
+        let mut payload = object(claude_code_payload());
+        payload.insert(
+            "tool_input".into(),
+            serde_json::json!({
+                "conversationId": "x",
+                "transcriptPath": "/x",
+                "workspacePaths": ["/x"],
+                "cursor_version": "1",
+                "conversation_id": "x",
+                "nested": {"conversationId": "x"}
+            }),
+        );
+        payload.insert(
+            "tool_response".into(),
+            serde_json::json!([{"cursor_version": "1"}]),
+        );
+        assert_eq!(
+            classify_hook_caller(&payload, NO_CURSOR_ENV),
+            HookCaller::ClaudeCode { cursor_env: false }
+        );
+    }
+
+    #[test]
+    fn a_claude_code_payload_is_claude_codes_whatever_the_environment_says() {
+        let payload = object(claude_code_payload());
+        assert_eq!(
+            classify_hook_caller(&payload, None),
+            HookCaller::ClaudeCode { cursor_env: false }
+        );
+        // Claude Code run in Cursor's integrated terminal may inherit the
+        // variable (not verified): that alone never makes its run another
+        // agent's.
+        assert_eq!(
+            classify_hook_caller(&payload, Some(OsStr::new("2.0.0"))),
+            HookCaller::ClaudeCode { cursor_env: true }
+        );
+        assert_eq!(
+            classify_hook_caller(&payload, Some(OsStr::new(""))),
+            HookCaller::ClaudeCode { cursor_env: false }
+        );
+        // Nor does it with a payload that names nothing at all (the plugin's
+        // probe sends only a working directory).
+        let probe = object(serde_json::json!({"cwd": "/nonexistent/cvc-plugin-probe"}));
+        assert_eq!(
+            classify_hook_caller(&probe, Some(OsStr::new("2.0.0"))),
+            HookCaller::ClaudeCode { cursor_env: true }
+        );
+        assert_eq!(
+            classify_hook_caller(&Map::new(), None),
+            HookCaller::ClaudeCode { cursor_env: false }
+        );
+    }
+
+    const SESSION_ID: &str = "00000000-0000-4000-8000-0000000000a1";
+
+    #[test]
+    fn a_hook_passes_another_agents_transcript_over_only_when_corroborated() {
+        let own = Path::new("/x/00000000-0000-4000-8000-0000000000a1.jsonl");
+        let elsewhere =
+            Path::new("/x/agent-transcripts/00000000-0000-4000-8000-0000000000c1.jsonl");
+        let hook = Caller::Hook { cursor_env: false };
+        let under_cursor = Caller::Hook { cursor_env: true };
+        let verdict =
+            |caller, first, path| first_entry_verdict(caller, first, path, Some(SESSION_ID));
+
+        // Corroborated: the variable, or a file not named for the session.
+        assert_eq!(
+            verdict(hook, FirstEntry::NotClaudeCode, elsewhere),
+            Verdict::PassOver
+        );
+        assert_eq!(
+            verdict(under_cursor, FirstEntry::NotClaudeCode, elsewhere),
+            Verdict::PassOver
+        );
+        assert_eq!(
+            verdict(under_cursor, FirstEntry::NotClaudeCode, own),
+            Verdict::PassOver
+        );
+        // The session's own file, with nothing else to go by: visible.
+        assert_eq!(
+            verdict(hook, FirstEntry::NotClaudeCode, own),
+            Verdict::Refuse
+        );
+        assert_eq!(
+            verdict(
+                hook,
+                FirstEntry::NotClaudeCode,
+                Path::new("/x/00000000-0000-4000-8000-0000000000a1")
+            ),
+            Verdict::Refuse,
+            "a stem with no extension"
+        );
+
+        for caller in [hook, under_cursor] {
+            for path in [own, elsewhere] {
+                // A Claude Code transcript, and one only the parser can judge,
+                // reach the parser, whose version pinning must stay loud.
+                assert_eq!(
+                    verdict(caller, FirstEntry::ClaudeCode, path),
+                    Verdict::Ingest
+                );
+                assert_eq!(
+                    verdict(caller, FirstEntry::Undetermined, path),
+                    Verdict::Ingest
+                );
+            }
+        }
+        assert_eq!(
+            verdict(hook, FirstEntry::NoCompleteEntry, own),
+            Verdict::Ingest
+        );
+        assert_eq!(
+            verdict(under_cursor, FirstEntry::NoCompleteEntry, own),
+            Verdict::PassOver
+        );
+
+        for first in [
+            FirstEntry::ClaudeCode,
+            FirstEntry::NoCompleteEntry,
+            FirstEntry::Undetermined,
+        ] {
+            for path in [own, elsewhere] {
+                assert_eq!(
+                    first_entry_verdict(Caller::Operator, first, path, None),
+                    Verdict::Ingest,
+                    "{first:?}"
+                );
+            }
+        }
+        for session in [None, Some(SESSION_ID)] {
+            assert_eq!(
+                first_entry_verdict(
+                    Caller::Operator,
+                    FirstEntry::NotClaudeCode,
+                    elsewhere,
+                    session
+                ),
+                Verdict::Refuse
+            );
+        }
+    }
+
+    /// Every top-level key Claude Code's hook input documents, all at once and
+    /// each alone: none of them makes a run another agent's.
+    #[test]
+    fn claude_codes_documented_payload_keys_are_not_another_agents() {
+        let keys = [
+            "session_id",
+            "transcript_path",
+            "cwd",
+            "permission_mode",
+            "hook_event_name",
+            "tool_name",
+            "tool_input",
+            "tool_response",
+            "tool_use_id",
+            "prompt",
+            "stop_hook_active",
+            "source",
+            "reason",
+            "trigger",
+            "custom_instructions",
+            "message",
+            "agent_id",
+            "agent_type",
+            "agent_transcript_path",
+            "model",
+        ];
+        let all: Map<String, Value> = keys
+            .iter()
+            .map(|key| ((*key).to_owned(), Value::String("x".into())))
+            .collect();
+        assert_eq!(
+            classify_hook_caller(&all, NO_CURSOR_ENV),
+            HookCaller::ClaudeCode { cursor_env: false }
+        );
+        for key in keys {
+            let one: Map<String, Value> =
+                [(key.to_owned(), Value::Bool(true))].into_iter().collect();
+            assert_eq!(
+                classify_hook_caller(&one, NO_CURSOR_ENV),
+                HookCaller::ClaudeCode { cursor_env: false },
+                "{key}"
+            );
+        }
+    }
+
+    /// `conversation_id` is Cursor's only where Claude Code's `session_id` is
+    /// missing; `cursor_version` is Cursor's whatever else is there.
+    #[test]
+    fn a_conversation_id_beside_a_session_id_is_not_cursors() {
+        let mut payload = object(claude_code_payload());
+        payload.insert("conversation_id".into(), Value::String("c1".into()));
+        assert_eq!(
+            classify_hook_caller(&payload, NO_CURSOR_ENV),
+            HookCaller::ClaudeCode { cursor_env: false }
+        );
+        payload.insert("cursor_version".into(), Value::String("1.0.0".into()));
+        assert_eq!(
+            classify_hook_caller(&payload, NO_CURSOR_ENV),
+            HookCaller::Foreign(ForeignAgent::Cursor)
+        );
     }
 }
