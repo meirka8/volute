@@ -373,10 +373,17 @@ impl Planner for Fake {
                 start: SourcePosition::Byte(*offset),
             });
         }
+        // A last response marked `reread` keeps the cursor at its start, as
+        // Claude Code's planner keeps it at the last closed response: the
+        // next read reads it again.
+        let resume = match window.lines.last() {
+            Some((offset, line)) if line.get("reread") == Some(&json!(true)) => *offset,
+            _ => window.end,
+        };
         Plan {
             candidates,
             pending: 0,
-            resume: window.from.at(window.end),
+            resume: window.from.at(resume),
             title,
             first_prompt,
             children,
@@ -653,6 +660,52 @@ impl Fixture {
         repo.reference(head.name().unwrap(), new, true, "amend")
             .unwrap();
         new.to_string()
+    }
+
+    /// A commit made at `T0 + seconds` that no reference reaches, as one a
+    /// rewrite left behind.
+    fn unreferenced_commit(&self, seconds: i64) -> String {
+        let repo = self.layout.repository();
+        let signature = Signature::new(
+            "Fixture",
+            "fixture@example.invalid",
+            &Time::new(T0 + seconds, 0),
+        )
+        .unwrap();
+        let tree = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree).unwrap();
+        repo.commit(None, &signature, &signature, "left behind", &tree, &[])
+            .unwrap()
+            .to_string()
+    }
+
+    /// A linked worktree of the repository, sharing its store.
+    fn linked_worktree(&self) -> RepositoryLayout {
+        let path = self._temp.path().join("other-worktree");
+        self.layout
+            .repository()
+            .worktree("other", &path, None)
+            .unwrap();
+        RepositoryLayout::discover(&path).unwrap()
+    }
+
+    /// [`Self::ingest`], run in the worktree of `layout`.
+    fn ingest_in(
+        &self,
+        layout: &RepositoryLayout,
+        path: &Path,
+        agent_id: &str,
+    ) -> EngineReport<JsonlCursor> {
+        let located = Fake.locate_file(path, Some(agent_id)).unwrap();
+        engine::ingest(
+            &Fake,
+            layout,
+            &self.store,
+            &self.policy,
+            located,
+            Self::options(false),
+        )
+        .unwrap()
     }
 
     /// A floating row of the fake's own source in `conversation`, as one
@@ -1533,6 +1586,221 @@ fn a_rewritten_commit_is_not_replayed() {
     assert_eq!(report.root.inserted, 1);
     assert_eq!((report.linked.root, report.not_replayed), (0, 1));
     assert!(fixture.links_of("codex:t1", "resp:late").is_empty());
+
+    // A later commit, recorded (and so replayed), claims only what follows
+    // the commit left behind, which still bounds it.
+    let c2 = fixture.commit(200);
+    let mut second = response("resp:c2", 190);
+    second["commit"] = json!(c2);
+    second["reread"] = json!(true);
+    lines.push(second);
+    let path = fixture.record("t1", &lines);
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!((report.root.inserted, report.linked.root), (1, 1));
+    assert_eq!(
+        fixture.links_of("codex:t1", "resp:c2"),
+        std::slice::from_ref(&c2)
+    );
+    assert!(fixture.links_of("codex:t1", "resp:late").is_empty());
+
+    // The next run only reads resp:c2 again: nothing new, nothing pending,
+    // so its rescue replays nothing, yet the stored commits still bound the
+    // one it read.
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!((report.root.inserted, report.root.already_present), (0, 1));
+    assert_eq!(report.linked, FamilyLinks::default());
+    assert!(fixture.links_of("codex:t1", "resp:late").is_empty());
+    assert_eq!(fixture.links_of("codex:t1", "resp:c2"), [c2]);
+}
+
+/// A commit reported in another worktree is not replayed here, and yet it
+/// bounds this worktree's later commits, with replay and without: a session
+/// that moves between worktrees never has its reasoning given to the wrong
+/// later commit.
+#[test]
+fn a_commit_reported_in_another_worktree_still_bounds_this_ones() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let c1 = fixture.commit(100);
+    let other = fixture.linked_worktree();
+    let mut committing = response("resp:c1", 90);
+    committing["commit"] = json!(c1);
+    let mut lines = vec![committing];
+    let path = fixture.record("t1", &lines);
+    assert_eq!(fixture.ingest_in(&other, &path, "t1").linked.root, 1);
+
+    // Back here: a response before C1, and a commit after it.
+    let c2 = fixture.commit(200);
+    let mut second = response("resp:c2", 190);
+    second["commit"] = json!(c2);
+    second["reread"] = json!(true);
+    lines.extend([response("resp:early", 80), second]);
+    let path = fixture.record("t1", &lines);
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!(report.root.inserted, 2);
+    assert_eq!((report.linked.root, report.not_replayed), (1, 1));
+    assert_eq!(fixture.links_of("codex:t1", "resp:c2"), [c2]);
+    assert!(fixture.links_of("codex:t1", "resp:early").is_empty());
+    // Without replay, as with it.
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!(report.root.inserted, 0);
+    assert!(fixture.links_of("codex:t1", "resp:early").is_empty());
+}
+
+/// A branch deleted after it was pushed, or a tagged commit, is still
+/// reached: a remote-tracking branch and a tag are tips of the walk, so the
+/// commit is replayed.
+#[test]
+fn a_commit_a_remote_tracking_branch_or_a_tag_reaches_is_replayed() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let repo = fixture.layout.repository();
+    let c1 = fixture.commit(100);
+    let mut committing = response("resp:c1", 90);
+    committing["commit"] = json!(c1);
+    let mut lines = vec![committing];
+    let path = fixture.record("t1", &lines);
+    assert_eq!(fixture.ingest(&path, "t1").unwrap().linked.root, 1);
+    repo.reference(
+        "refs/remotes/origin/feature",
+        git2::Oid::from_str(&c1).unwrap(),
+        true,
+        "pushed",
+    )
+    .unwrap();
+    fixture.amend(101);
+    lines.push(response("resp:late", 80));
+    let path = fixture.record("t1", &lines);
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!((report.linked.root, report.not_replayed), (1, 0));
+    assert_eq!(fixture.links_of("codex:t1", "resp:late"), [c1]);
+
+    let c2 = fixture.commit(200);
+    let mut second = response("resp:c2", 190);
+    second["commit"] = json!(c2);
+    lines.push(second);
+    let path = fixture.record("t1", &lines);
+    assert_eq!(fixture.ingest(&path, "t1").unwrap().linked.root, 1);
+    repo.reference(
+        "refs/tags/kept",
+        git2::Oid::from_str(&c2).unwrap(),
+        true,
+        "tagged",
+    )
+    .unwrap();
+    fixture.amend(201);
+    lines.push(response("resp:later", 150));
+    let path = fixture.record("t1", &lines);
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!((report.linked.root, report.not_replayed), (1, 0));
+    assert_eq!(fixture.links_of("codex:t1", "resp:later"), [c2]);
+}
+
+/// Only the commits from the latest one before the family's oldest floating
+/// response on are considered: the ones before it can claim nothing, so an
+/// old commit left behind is not even walked for (and not counted).
+#[test]
+fn commits_before_the_one_before_the_oldest_floating_response_are_not_considered() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let c0 = fixture.unreferenced_commit(10);
+    let mut first = response("resp:c0", 5);
+    first["commit"] = json!(c0);
+    let mut lines = vec![first];
+    let path = fixture.record("t1", &lines);
+    // A commit this run reads is not walked for: it links.
+    assert_eq!(fixture.ingest(&path, "t1").unwrap().linked.root, 1);
+
+    let c1 = fixture.commit(100);
+    let mut second = response("resp:c1", 90);
+    second["commit"] = json!(c1);
+    lines.push(second);
+    let path = fixture.record("t1", &lines);
+    // resp:c1 floats until this rescue: C0, before it, bounds it and is
+    // walked for, and not reached.
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!((report.linked.root, report.not_replayed), (1, 1));
+
+    lines.push(response("resp:new", 150));
+    let path = fixture.record("t1", &lines);
+    // Now only resp:new floats, after C1: C0 is not considered at all.
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!((report.root.inserted, report.linked.root), (1, 0));
+    assert_eq!(report.not_replayed, 0);
+}
+
+/// A member that fails leaves the members after it unread, and one of them
+/// may hold an earlier commit than the ones read: the rescue is left
+/// pending, so nothing is linked to a later commit that the earlier one
+/// claims in a run of the whole family, and the next run that reads the
+/// whole family links as that run does.
+#[test]
+fn a_failed_member_leaves_the_rescue_to_a_run_that_reads_the_whole_family() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let early = fixture.commit(100);
+    let late = fixture.commit(400);
+    let child = |key: &str, seconds: i64, child: &str| {
+        let mut line = response(key, seconds);
+        line["child"] = json!(child);
+        line
+    };
+    let mut closing = response("resp:rc", 390);
+    closing["commit"] = json!(late);
+    let path = fixture.record(
+        "r1",
+        &[
+            child("resp:r1", 50, "c1"),
+            child("resp:r2", 55, "c2"),
+            child("resp:r3", 56, "c3"),
+            closing,
+        ],
+    );
+    fixture.record("c1.member", &[response("resp:m1", 60)]);
+    fixture.record("c2.member", &[response("resp:m2", 70)]);
+    let mut committing = response("resp:m3", 90);
+    committing["commit"] = json!(early);
+    fixture.record("c3.member", &[committing]);
+    // The second member's batch is refused: its conversation holds another
+    // source's row.
+    let foreign = "6b1f0c0e-1111-4aaa-8bbb-000000000093";
+    fixture.foreign_row("codex:c2", foreign, 5);
+
+    let error = fixture.ingest(&path, "r1").unwrap_err();
+    assert!(
+        matches!(error, EngineError::Db(DbError::HarnessBatch(_))),
+        "{error:?}"
+    );
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM artifact_links"), 0);
+    let stored = fixture
+        .store
+        .harness_cursor(HarnessId::Codex, "codex:r1")
+        .unwrap()
+        .unwrap();
+    assert!(
+        JsonlCursor::decode_stored(&stored)
+            .unwrap()
+            .carry
+            .rescue_pending
+    );
+
+    fixture
+        .conn()
+        .execute("DELETE FROM interactions WHERE id=?1", params![foreign])
+        .unwrap();
+    let report = fixture.ingest(&path, "r1").unwrap();
+    assert!(!report.rescue_pending);
+    for (conversation, key) in [
+        ("codex:r1", "resp:r1"),
+        ("codex:r1", "resp:r2"),
+        ("codex:r1", "resp:r3"),
+        ("codex:c1", "resp:m1"),
+        ("codex:c2", "resp:m2"),
+        ("codex:c3", "resp:m3"),
+    ] {
+        assert_eq!(
+            fixture.links_of(conversation, key),
+            std::slice::from_ref(&early),
+            "{key}"
+        );
+    }
+    assert_eq!(fixture.links_of("codex:r1", "resp:rc"), [late]);
 }
 
 /// A replayed commit claims only rows of the worktree its reporting

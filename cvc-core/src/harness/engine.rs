@@ -26,18 +26,18 @@
 //! 4. One commit rescue over the whole family
 //!    ([`crate::harness::family::link_family_commits`]): from the commits the
 //!    batches of this run reported, and from the family's stored evidence of
-//!    earlier batches and runs (see [Commit evidence](#commit-evidence)). If
-//!    a member fails, the rescue still runs over what was ingested (the
-//!    root's cursor is already past its committing response, which would
-//!    never be read again), and the member's error is returned. The rescue
-//!    writes links, so on the gated path it runs only while the
+//!    earlier batches and runs (see [Commit evidence](#commit-evidence)). The
+//!    rescue writes links, so on the gated path it runs only while the
 //!    acknowledgement still covers the channel: it is skipped when coverage
 //!    no longer holds, or when a member failed because it did not. It is also
-//!    left to a later run when the deadline left any record of the family
-//!    unread to its end, the root's included: a commit in what is left may
-//!    be earlier than the commits read so far, and in one run of the whole
-//!    family it would claim responses that a later commit must then not
-//!    claim first. The evidence is stored, and the root's cursor says the
+//!    left to a later run when any record of the family was left unread to
+//!    its end, the root's included, by the deadline or (on the gated path)
+//!    because a member failed and the members after it were not read: a
+//!    commit in what is left may be earlier than the commits read so far,
+//!    and in one run of the whole family it would claim responses that a
+//!    later commit must then not claim first. (Claude Code's 0.7.x-compatible
+//!    entry points still rescue what was ingested before a failed member, as
+//!    0.7.x did.) A failed member's error is returned. The evidence is stored, and the root's cursor says the
 //!    rescue is pending ([`Carry::rescue_pending`](crate::harness::cursor::Carry::rescue_pending)),
 //!    so the next run that reads the whole family rescues from it, even when
 //!    it records nothing new, exactly as after a run that was killed.
@@ -126,16 +126,19 @@
 //! floating responses after the commit before it, up to its own time, with
 //! no other lower bound, as 0.7.x's rescue of one run did (`cvc.linkWindow`
 //! governs the time-window linker, not the rescue). A replayed commit is
-//! replayed only while HEAD of the run's worktree or a local branch reaches
-//! it, and claims only rows of the worktree its reporting interaction was
-//! captured in, which must be the run's; one that is not reached any more
-//! claims nothing but still bounds the commit after it. The rescue runs when
+//! replayed only while HEAD of the run's worktree, a local branch, a
+//! remote-tracking branch or a tag reaches it, and claims only rows of the
+//! worktree its reporting interaction was captured in, which must be the
+//! run's. Every other stored commit (no longer reached, reported in another
+//! worktree, or stored when the rescue replays nothing) claims nothing but
+//! still bounds the commit after it. The rescue runs when
 //! this run read a commit, recorded something new, or found the rescue
-//! pending; it replays the stored evidence in the last two cases only, and a
+//! pending; it replays the stored evidence in the last two cases only. A
 //! rescue for a commit the run read alone (its cursor's response, read
-//! again) is 0.7.x's, from that commit. Claude Code's
-//! 0.7.x-compatible entry points store their evidence but replay none, so
-//! that what they link stays exactly what 0.7.x linked.
+//! again) links from that commit, with every stored commit as a boundary.
+//! Claude Code's 0.7.x-compatible entry points store their evidence but
+//! neither replay it nor bound by it, so that what they link stays exactly
+//! what 0.7.x linked.
 //!
 //! # Cursors
 //!
@@ -678,7 +681,10 @@ fn run<A: HarnessAdapter>(
     // recorded something new or found the rescue pending; only those two
     // replay the stored evidence. It writes links: on the gated path, only
     // while the channel is still covered. And only once every record of the
-    // family is read to its end: what is left may hold an earlier commit.
+    // family is read to its end: what is left (after the deadline, or after
+    // a member that failed, on the gated path) may hold an earlier commit.
+    // Claude Code's 0.7.x-compatible entry points still rescue what was
+    // ingested before a failed member, as 0.7.x did.
     let replays = consent == Consent::Covered;
     let replay = replays && (inserted > 0 || carried.rescue_pending);
     let due = !commit_bearing.is_empty() || replay;
@@ -687,7 +693,8 @@ fn run<A: HarnessAdapter>(
             failure,
             Some(EngineError::Privacy(PrivacyError::NotCovered(_)))
         ) || !privacy::capture_covers(layout.repository(), A::ID.channel()).unwrap_or(false));
-    let rescue_skipped = uncovered || (due && cut_short);
+    let left_unread = cut_short || (replays && failure.is_some());
+    let rescue_skipped = uncovered || (due && left_unread);
     let rescued = if due && !rescue_skipped {
         Some(rescue(&run, A::ID, &family, &commit_bearing, replay))
     } else {
@@ -741,8 +748,10 @@ fn run<A: HarnessAdapter>(
 
 /// Rescues the responses the time-window linker cannot reach: those that
 /// created a commit, and the family's reasoning before them, from this run's
-/// evidence and, when `replay`, the family's stored evidence. Attribution
-/// records who linked, matching the linker, not the historical commit author.
+/// evidence and, when `replay`, the family's stored evidence; on the gated
+/// path every stored commit not replayed still bounds the segments.
+/// Attribution records who linked, matching the linker, not the historical
+/// commit author.
 ///
 /// Claude Code's 0.7.x-compatible entry points never replay: they keep 0.7.x's
 /// rescue, from the commits their own run read only, so what they link stays
@@ -760,27 +769,32 @@ fn rescue<E: std::error::Error + Send + Sync + 'static>(
     replay: bool,
 ) -> Result<(FamilyLinks, usize), EngineError<E>> {
     let repo = run.layout.repository();
+    // On the gated path every stored commit takes part: replayed when this
+    // rescue replays and it was reported in this worktree, and otherwise a
+    // boundary that claims nothing, so that no commit this run read claims
+    // the reasoning before it.
     let mut elsewhere = 0usize;
-    let replayed: Vec<ReplayedCommit> = match replay {
-        true => run
+    let stored: Vec<ReplayedCommit> = match run.consent {
+        Consent::Covered => run
             .store
             .harness_commit_evidence_reported_in(harness, family.root())?
             .into_iter()
-            .filter_map(|(evidence, worktree)| {
-                // A commit reported in another worktree claims nothing here.
-                if worktree.as_deref() != Some(run.capture_worktree) {
+            .map(|(evidence, worktree)| {
+                let here = worktree.as_deref() == Some(run.capture_worktree);
+                if replay && !here {
                     elsewhere += 1;
-                    return None;
                 }
-                Some(ReplayedCommit {
+                ReplayedCommit {
                     commit: evidence.commit.as_str().to_owned(),
                     response_at: evidence.response_at,
-                })
+                    replay: replay && here,
+                }
             })
             .collect(),
-        false => Vec::new(),
+        Consent::CallerDecided => Vec::new(),
     };
-    if commit_bearing.is_empty() && replayed.is_empty() {
+    // Boundaries alone claim nothing.
+    if commit_bearing.is_empty() && !stored.iter().any(|commit| commit.replay) {
         return Ok((FamilyLinks::default(), elsewhere));
     }
     let linked_by = repo
@@ -793,7 +807,7 @@ fn rescue<E: std::error::Error + Send + Sync + 'static>(
         family,
         run.capture_worktree,
         commit_bearing,
-        &replayed,
+        &stored,
         linked_by.as_deref(),
     )?;
     Ok((rescued.links, elsewhere + rescued.unreachable))

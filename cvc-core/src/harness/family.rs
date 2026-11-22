@@ -49,14 +49,20 @@
 //! replayed commit takes part exactly as a commit the run read itself, with
 //! three checks more:
 //!
-//! * it is replayed only while HEAD of the run's worktree or a local branch
-//!   still reaches it: a commit that a rebase or an amend left behind gets no
-//!   new links. It still bounds the segments, so a later commit never claims
-//!   the reasoning before it;
+//! * it is replayed only while HEAD of the run's worktree, a local branch,
+//!   a remote-tracking branch or a tag still reaches it: a commit that a
+//!   rebase or an amend left behind gets no new links;
 //! * it claims only rows of the worktree its reporting interaction was
 //!   captured in, which is the run's (the engine replays no other), never a
 //!   row without a worktree;
 //! * it is resolved and its time checked again, as every commit is.
+//!
+//! A stored commit that is not replayed (one no longer reached, one reported
+//! in another worktree, and every stored commit of a rescue that replays
+//! nothing) still bounds the segments: it claims nothing, and a later
+//! commit never claims the reasoning at or before it. Only the commits from
+//! the latest one before the family's oldest floating response on are
+//! considered at all, since nothing before that one is left to claim.
 //!
 //! The segments are those of one rescue of the whole family: every commit
 //! known, read in this run or replayed, in time order, each claiming the
@@ -245,6 +251,9 @@ pub struct ReplayedCommit {
     pub commit: String,
     /// The stored response's time, in seconds.
     pub response_at: i64,
+    /// Replayed, when still reached; otherwise only a boundary between the
+    /// segments, which claims nothing.
+    pub replay: bool,
 }
 
 /// What a rescue did.
@@ -308,10 +317,12 @@ pub(crate) fn link_family_evidence(
             }
         }
     }
+    // Stored commits: those to replay if still reached, and boundaries.
     let mut replays: Vec<(Oid, String, i64)> = Vec::new();
     for commit in replayed {
-        // A replayed commit is a full id the store holds; it is resolved
-        // again, as every commit is before anything is linked to it.
+        // A stored commit is a full id the store holds; it is resolved again,
+        // as every commit is before anything is linked to it, and for its
+        // time.
         let Some((sha, time)) = resolve_commit(repo, &commit.commit, commit.response_at, now)
         else {
             continue;
@@ -319,28 +330,22 @@ pub(crate) fn link_family_evidence(
         if sha != commit.commit || verified.iter().any(|known| known.sha == sha) {
             continue;
         }
-        if let Ok(oid) = Oid::from_str(&sha) {
-            if !replays.iter().any(|(known, _, _)| *known == oid) {
-                replays.push((oid, sha, time));
-            }
+        let Ok(oid) = Oid::from_str(&sha) else {
+            continue;
+        };
+        if replays.iter().any(|(known, _, _)| *known == oid) {
+            continue;
+        }
+        if commit.replay {
+            replays.push((oid, sha, time));
+        } else {
+            verified.push(Verified {
+                sha,
+                time,
+                claims: Claims::Nothing,
+            });
         }
     }
-    let reached = reachable(repo, &replays);
-    let mut unreachable = 0;
-    for (oid, sha, time) in replays {
-        let claims = if reached.contains(&oid) {
-            Claims::Replayed
-        } else {
-            unreachable += 1;
-            Claims::Nothing
-        };
-        verified.push(Verified { sha, time, claims });
-    }
-    if verified.is_empty() {
-        return Ok(Rescued::default());
-    }
-    // Earliest commit first; each claims only what follows the one before.
-    verified.sort_by_key(|commit| commit.time);
 
     // Floating (unlinked) interactions of this worktree, family and source,
     // oldest first. Anything already linked is excluded here and left
@@ -354,6 +359,36 @@ pub(crate) fn link_family_evidence(
         &conversations,
     )?;
     floating.sort_by_key(|response| response.timestamp);
+    let Some(oldest) = floating.first().map(|response| response.timestamp) else {
+        // Nothing is left to claim.
+        return Ok(Rescued::default());
+    };
+    // The latest commit before the oldest floating response bounds every
+    // segment that can claim anything; the commits before it can claim
+    // nothing and bound nothing that matters, so they are not walked for.
+    let floor = verified
+        .iter()
+        .map(|commit| commit.time)
+        .chain(replays.iter().map(|(_, _, time)| *time))
+        .filter(|time| *time < oldest)
+        .max();
+    if let Some(floor) = floor {
+        verified.retain(|commit| commit.time >= floor);
+        replays.retain(|(_, _, time)| *time >= floor);
+    }
+    let reached = reachable(repo, &replays);
+    let mut unreachable = 0;
+    for (oid, sha, time) in replays {
+        let claims = if reached.contains(&oid) {
+            Claims::Replayed
+        } else {
+            unreachable += 1;
+            Claims::Nothing
+        };
+        verified.push(Verified { sha, time, claims });
+    }
+    // Earliest commit first; each claims only what follows the one before.
+    verified.sort_by_key(|commit| commit.time);
 
     let mut claimed = vec![false; floating.len()];
     let mut total = FamilyLinks::default();
@@ -405,10 +440,12 @@ pub(crate) fn link_family_evidence(
     })
 }
 
-/// Which of `commits` HEAD of `repo` (the run's worktree) or a local branch
-/// still reaches. Fail-closed: a commit the walk does not find, because the
-/// repository cannot be walked or the commit lies past
-/// [`REACH_SLACK_SECS`] before the oldest of them, is not reached.
+/// Which of `commits` HEAD of `repo` (the run's worktree), a local branch, a
+/// remote-tracking branch or a tag still reaches: a branch deleted after it
+/// was pushed is still reached through its remote-tracking branch.
+/// Fail-closed: a commit the walk does not find, because the repository
+/// cannot be walked or the commit lies past [`REACH_SLACK_SECS`] before the
+/// oldest of them, is not reached.
 fn reachable(repo: &Repository, commits: &[(Oid, String, i64)]) -> HashSet<Oid> {
     let mut found = HashSet::new();
     let mut wanted: HashSet<Oid> = commits.iter().map(|(oid, _, _)| *oid).collect();
@@ -429,6 +466,15 @@ fn reachable(repo: &Repository, commits: &[(Oid, String, i64)]) -> HashSet<Oid> 
         for (branch, _) in branches.flatten() {
             if let Ok(commit) = branch.get().peel_to_commit() {
                 tips.push(commit.id());
+            }
+        }
+    }
+    for glob in ["refs/remotes/*", "refs/tags/*"] {
+        if let Ok(references) = repo.references_glob(glob) {
+            for reference in references.flatten() {
+                if let Ok(commit) = reference.peel_to_commit() {
+                    tips.push(commit.id());
+                }
             }
         }
     }
