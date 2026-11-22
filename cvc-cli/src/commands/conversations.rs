@@ -54,21 +54,27 @@ fn share_state(summary: &ConversationSummary) -> String {
     }
 }
 
-/// Which agent recorded a conversation, as a listing line says it, or `None`
-/// when that is not known: an agent that is unknown, or a conversation that
-/// more than one source wrote to (a Claude Code session that also holds MCP
-/// thoughts, say). For an imported conversation the agent is what its id names,
-/// the publisher's claim, and the words say so.
-pub(crate) fn agent_words(summary: &ConversationSummary) -> Option<String> {
-    let agent = summary.agent?;
+/// What follows the agent of an imported conversation wherever it is named.
+const IMPORTED_AGENT_CAVEAT: &str = "(as its imported id says)";
+
+/// Which agent recorded a conversation, as every reader names it (the plain
+/// listing, the share preamble, and the view's row, strip and details), or
+/// `None` when that is not known: an agent that is unknown, or a conversation
+/// that more than one source wrote to (a Claude Code session that also holds
+/// MCP thoughts, say). For an imported conversation the agent is what its id
+/// names, the publisher's claim, and the label always says so.
+pub(crate) fn agent_label(summary: &ConversationSummary) -> Option<String> {
+    let agent = summary.agent?.display();
     Some(if summary.imported {
-        format!(
-            "recorded by {} (as its imported id says)",
-            sanitize_for_terminal(agent.display())
-        )
+        format!("{agent} {IMPORTED_AGENT_CAVEAT}")
     } else {
-        format!("recorded by {}", sanitize_for_terminal(agent.display()))
+        agent.to_owned()
     })
+}
+
+/// [`agent_label`] as a listing line says it: `recorded by <label>`.
+fn agent_words(summary: &ConversationSummary) -> Option<String> {
+    agent_label(summary).map(|label| format!("recorded by {}", sanitize_for_terminal(&label)))
 }
 
 /// Renders one summary line. Kept width-stable so the picker and the listing

@@ -16,7 +16,7 @@ use cvc_core::models::FutureSharePolicy;
 use cvc_core::privacy::CaptureAcknowledgement;
 
 use super::text::{self, Glyphs};
-use crate::commands::conversations::RemoteOverview;
+use crate::commands::conversations::{agent_label, RemoteOverview};
 use crate::commands::failure::FlowFailure;
 use crate::commands::sync::PublishOutcome;
 
@@ -1594,18 +1594,6 @@ pub struct DetailsInput<'a> {
     pub backlog: Option<HarnessId>,
 }
 
-/// Which agent recorded the conversation, for the details: `None` when that is
-/// not known (an unknown agent, or more than one source). An imported
-/// conversation's agent is only what its id names.
-fn recorded_by(summary: &ConversationSummary) -> Option<String> {
-    let agent = summary.agent?.display();
-    Some(if summary.imported {
-        format!("{agent}, as its imported id says; not verified here")
-    } else {
-        agent.to_owned()
-    })
-}
-
 /// What a backlog means, and where the catch-up command is.
 fn backlog_words(harness: HarnessId) -> String {
     format!(
@@ -1684,7 +1672,7 @@ pub fn details_page(input: &DetailsInput, g: &Glyphs) -> Vec<Page> {
             value: lineage,
         });
     }
-    if let Some(agent) = recorded_by(summary) {
+    if let Some(agent) = agent_label(summary) {
         page.push(Page::Field {
             label: "Recorded by",
             value: agent,
@@ -1808,8 +1796,8 @@ pub fn strip_lines(input: &DetailsInput, g: &Glyphs) -> Vec<String> {
     );
     let mut lines = vec![
         text::title(&summary.title),
-        match summary.agent {
-            Some(agent) => format!("{}: {counts}", agent.display()),
+        match agent_label(summary) {
+            Some(agent) => format!("{agent}: {counts}"),
             None => counts,
         },
     ];

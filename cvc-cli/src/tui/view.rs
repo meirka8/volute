@@ -443,7 +443,7 @@ impl Canvas<'_> {
 
         if plan.agent > 0 {
             // The agent, then the backlog tag in the waiting tone.
-            let (main, tag) = agent_cell(row.agent, row.backlog);
+            let (main, tag) = agent_cell(row.agent.as_deref(), row.backlog);
             let after = self.put(x, y, &main, plan.agent, base);
             if let Some(tag) = tag {
                 let room = (x as usize + plan.agent).saturating_sub(after as usize);
@@ -1834,6 +1834,50 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("Recorded by      Codex"), "{text}");
+    }
+
+    /// A pulled conversation's agent is only what its id names: the row, the
+    /// strip and the details all say so, in the words the plain listing uses.
+    #[test]
+    fn an_imported_agent_carries_its_caveat_in_the_row_the_strip_and_the_details() {
+        use cvc_core::harness::HarnessId;
+        let mut summaries = conversations();
+        summaries[4].agent = Some(HarnessId::Codex);
+        let imported_id = summaries[4].id.clone();
+        let mut model = model_of(
+            summaries,
+            vec![remote("origin")],
+            (140, 30),
+            Glyphs::UNICODE,
+        );
+        let label = "Codex (as its imported id says)";
+        let lines = rendered(&model);
+        let row = lines
+            .iter()
+            .find(|l| l.contains("Imported from a teammate"))
+            .unwrap();
+        assert!(row.contains(label), "{}", dump(&lines));
+        assert!(row.trim_end().ends_with("imported"), "{row}");
+        // No row names the agent without the caveat.
+        assert!(!lines
+            .iter()
+            .any(|l| l.contains("Codex") && !l.contains(label)));
+
+        while model.selected_id() != Some(imported_id.as_str()) {
+            model.handle_key(key(KeyCode::Down));
+        }
+        let lines = rendered(&model);
+        assert!(
+            contains(&lines, &format!("{label}: 9 thoughts")),
+            "{}",
+            dump(&lines)
+        );
+        model.handle_key(key(KeyCode::Enter));
+        let text = dump(&rendered(&model));
+        assert!(
+            text.contains(&format!("Recorded by      {label}")),
+            "{text}"
+        );
     }
 
     #[test]

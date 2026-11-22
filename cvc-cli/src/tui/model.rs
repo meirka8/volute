@@ -28,7 +28,7 @@ use super::words::{
     self, Available, Destination, DetailsInput, FlowKind, Lineage, Page, RemoteRow, RemoteView,
     Seg, ShareAsk, Tone,
 };
-use crate::commands::conversations::RemoteOverview;
+use crate::commands::conversations::{agent_label, RemoteOverview};
 use crate::commands::failure::FlowFailure;
 use crate::commands::sync::{PublishOutcome, ShareOutcome};
 
@@ -273,11 +273,12 @@ pub fn when_cell(when: When, short: bool, g: &Glyphs) -> (String, Option<String>
 /// The header of the column that names the agent.
 pub const AGENT_HEAD: &str = "recorded by";
 
-/// The text of an agent cell: the agent that recorded the conversation, and a
+/// The text of an agent cell: the agent that recorded the conversation, as
+/// [`agent_label`](crate::commands::conversations::agent_label) names it, and a
 /// tag after it when its session has a backlog. Both empty when neither is
 /// known.
-pub fn agent_cell(agent: Option<HarnessId>, backlog: bool) -> (String, Option<String>) {
-    let main = agent.map_or_else(String::new, |agent| agent.display().to_owned());
+pub fn agent_cell(agent: Option<&str>, backlog: bool) -> (String, Option<String>) {
+    let main = agent.unwrap_or_default().to_owned();
     let tag = backlog.then(|| {
         if main.is_empty() {
             "backlog".to_owned()
@@ -295,8 +296,9 @@ pub struct RowView {
     pub disclosure: Disclosure,
     pub when: When,
     pub title: String,
-    /// The agent that recorded it ([`ConversationSummary::agent`]).
-    pub agent: Option<HarnessId>,
+    /// The agent that recorded it, as
+    /// [`agent_label`](crate::commands::conversations::agent_label) names it.
+    pub agent: Option<String>,
     /// A hook run left its session unread to the end.
     pub backlog: bool,
     pub thoughts: i64,
@@ -751,7 +753,7 @@ impl Model {
             disclosure,
             when,
             title: text::title(&summary.title),
-            agent: summary.agent,
+            agent: agent_label(summary),
             backlog: self.backlog.contains_key(&summary.id),
             thoughts: summary.thoughts,
             linked: summary.linked,
@@ -802,7 +804,8 @@ impl Model {
             columns.linked = columns.linked.max(summary.linked.to_string().len());
             let (state, _) = words::state_label(summary, has_destination, &g);
             columns.state = columns.state.max(text::width(&state));
-            let (agent, tag) = agent_cell(summary.agent, self.backlog.contains_key(&summary.id));
+            let label = agent_label(summary);
+            let (agent, tag) = agent_cell(label.as_deref(), self.backlog.contains_key(&summary.id));
             let agent = text::width(&agent) + tag.map_or(0, |tag| text::width(&tag));
             if agent > 0 {
                 columns.agent = columns.agent.max(agent).max(text::width(AGENT_HEAD));
