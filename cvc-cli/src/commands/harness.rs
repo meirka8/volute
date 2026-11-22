@@ -731,8 +731,51 @@ impl AdapterVisitor for Status {
         let layout = discover_initialized()?;
         let installed = adapter.status(&InstallContext { layout: &layout })?;
         let coverage = privacy::capture_coverage_summary(layout.repository())?;
-        Ok(status_lines(A::ID, adapter.scopes(), &installed, &coverage))
+        let mut lines = status_lines(A::ID, adapter.scopes(), &installed, &coverage);
+        let backlog = CvcStore::open_initialized(layout.db_path())
+            .map_err(anyhow::Error::from)
+            .and_then(|store| Ok(cvc_core::harness::engine::backlog::<A>(&store)?));
+        match backlog {
+            Ok(sessions) => {
+                lines.extend(backlog_lines(A::ID, adapter.locates_sessions(), &sessions))
+            }
+            Err(error) => lines.push(format!(
+                "problem: cannot read where its sessions were read up to: {}",
+                printable(&error.to_string())
+            )),
+        }
+        Ok(lines)
     }
+}
+
+/// The sessions whose last final hook run ran out of time before it read
+/// every record of the session to its end (#149): a later event may never
+/// come, so the person is told how to catch up. Nothing when there are none.
+fn backlog_lines(harness: HarnessId, by_session: bool, sessions: &[String]) -> Vec<String> {
+    /// Sessions listed by id; the rest are counted.
+    const SHOWN: usize = 10;
+    if sessions.is_empty() {
+        return Vec::new();
+    }
+    let catch_up = if by_session {
+        format!("cvc ingest {} --session <id>", harness.name())
+    } else {
+        format!("cvc ingest {} --transcript <file>", harness.name())
+    };
+    let mut lines = vec![format!(
+        "backlog: {} session(s) whose last hook run stopped at its time limit before reading the session to its end; catch up with `{catch_up}`",
+        sessions.len()
+    )];
+    lines.extend(
+        sessions
+            .iter()
+            .take(SHOWN)
+            .map(|session| format!("backlog_session: {}", printable(session))),
+    );
+    if sessions.len() > SHOWN {
+        lines.push(format!("backlog_more: {}", sessions.len() - SHOWN));
+    }
+    lines
 }
 
 /// What `cvc harness status <harness>` prints, one `key: value` per line.
@@ -1292,6 +1335,28 @@ mod tests {
 
         let third = settings::install(&layout, &resolved.path).unwrap();
         assert_eq!(third.action, InstallAction::AlreadyPresent);
+    }
+
+    /// No backlog prints nothing, so that the status of a repository without
+    /// one reads as before; a backlog names its sessions as plain text, at
+    /// most ten, and the catch-up command the harness takes.
+    #[test]
+    fn a_backlog_is_listed_with_its_catch_up_command() {
+        assert!(backlog_lines(HarnessId::ClaudeCode, false, &[]).is_empty());
+        assert_eq!(
+            backlog_lines(HarnessId::ClaudeCode, false, &["s1".into(), "s\u{1b}[2J2".into()]),
+            [
+                "backlog: 2 session(s) whose last hook run stopped at its time limit before reading the session to its end; catch up with `cvc ingest claude-code --transcript <file>`",
+                "backlog_session: s1",
+                "backlog_session: s?[2J2",
+            ]
+        );
+        let many: Vec<String> = (0..12).map(|n| format!("codex:t{n:02}")).collect();
+        let lines = backlog_lines(HarnessId::Codex, true, &many);
+        assert!(lines[0].ends_with("catch up with `cvc ingest codex --session <id>`"));
+        assert_eq!(lines.len(), 12);
+        assert_eq!(lines[10], "backlog_session: codex:t09");
+        assert_eq!(lines[11], "backlog_more: 2");
     }
 
     #[test]
