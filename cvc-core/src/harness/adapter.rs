@@ -318,6 +318,10 @@ pub struct Read<W, C> {
     /// [`Finality::Incremental`] whatever the run's finality, so that a
     /// response the limit cut is not closed early.
     pub limited: bool,
+    /// How many bytes of the record the window holds, which the engine times
+    /// its batches by (see [`ReadLimit`]); `None` for a record not counted in
+    /// bytes, whose batches are estimated at the engine's floor rate.
+    pub window_bytes: Option<u64>,
     /// Where the conversation's own history begins in the record, when the
     /// reader found that the record starts with history inherited from
     /// another conversation (Codex `history_base` or `forked_from_id`, a

@@ -40,13 +40,41 @@
 //! harness's own capture source ([`Family::claimed_source`]): another
 //! source's rows in a member conversation (an MCP thought, say) are never
 //! claimed.
+//!
+//! # Replayed commits
+//!
+//! A run only reads a record from its cursor, so a commit whose response an
+//! earlier batch or run read is known to a later rescue from the family's
+//! stored evidence alone ([`crate::db::HarnessCommitEvidence`]). Such a
+//! replayed commit takes part exactly as a commit the run read itself, with
+//! three checks more:
+//!
+//! * it is replayed only while HEAD of the run's worktree or a local branch
+//!   still reaches it: a commit that a rebase or an amend left behind gets no
+//!   new links. It still bounds the segments, so a later commit never claims
+//!   the reasoning before it;
+//! * it claims only rows of the worktree its reporting interaction was
+//!   captured in, which is the run's (the engine replays no other), never a
+//!   row without a worktree;
+//! * it is resolved and its time checked again, as every commit is.
+//!
+//! The segments are those of one rescue of the whole family: every commit
+//! known, read in this run or replayed, in time order, each claiming the
+//! floating responses after the commit before it, up to its own time, with
+//! no other lower bound (`cvc.linkWindow` is the time-window linker's, not
+//! the rescue's). So many runs that each rescue what they know reach the
+//! links one run of the whole family makes.
 use crate::db::{CvcStore, DbError, RelationKind, MAX_RELATION_DEPTH};
 use crate::harness::HarnessId;
 use crate::linker::MAX_CLOCK_SKEW_SECS;
 use crate::models::{CommitSha, InteractionId};
 use chrono::{DateTime, Utc};
-use git2::Repository;
-use std::collections::BTreeSet;
+use git2::{BranchType, Oid, Repository, Sort};
+use std::collections::{BTreeSet, HashSet};
+
+/// How far before the oldest replayed commit the reachability walk goes on
+/// looking, for history whose commit times are out of order.
+const REACH_SLACK_SECS: i64 = 24 * 60 * 60;
 
 const GENERATED_LINK_TYPE: &str = "generated";
 
@@ -205,24 +233,32 @@ pub fn link_family_commits(
         &[],
         linked_by,
     )
+    .map(|rescued| rescued.links)
 }
 
 /// A commit the family's evidence recorded in an earlier batch or run
-/// ([`CvcStore::harness_commit_evidence`]), replayed by a later rescue. It
-/// links only responses made within `window_secs` before the commit's own
-/// time (`cvc.linkWindow`), so that a commit recorded long ago does not claim
-/// what a much later run records.
+/// ([`CvcStore::harness_commit_evidence`]), replayed by a later rescue (see
+/// the module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayedCommit {
     /// The full commit id, as stored.
     pub commit: String,
     /// The stored response's time, in seconds.
     pub response_at: i64,
-    pub window_secs: u64,
+}
+
+/// What a rescue did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Rescued {
+    pub(crate) links: FamilyLinks,
+    /// Replayed commits that HEAD and the local branches no longer reach:
+    /// they bounded the segments and claimed nothing.
+    pub(crate) unreachable: usize,
 }
 
 /// [`link_family_commits`] over this run's `responses` and the family's
-/// `replayed` evidence. A commit both name is this run's, and unbounded.
+/// `replayed` evidence, all of it reported in this worktree (see the module
+/// docs). A commit both name is this run's.
 pub(crate) fn link_family_evidence(
     repo: &Repository,
     store: &CvcStore,
@@ -231,48 +267,48 @@ pub(crate) fn link_family_evidence(
     responses: &[CommitBearingResponse],
     replayed: &[ReplayedCommit],
     linked_by: Option<&str>,
-) -> Result<FamilyLinks, DbError> {
+) -> Result<Rescued, DbError> {
     if responses.is_empty() && replayed.is_empty() {
-        return Ok(FamilyLinks::default());
+        return Ok(Rescued::default());
     }
     let now = Utc::now().timestamp();
 
     // Resolve each candidate to a real commit and keep only those whose time is
     // plausible for the response that reported them: a commit cannot precede
     // the reasoning that made it (beyond clock skew), nor sit in the future.
-    // Each commit has the earliest response time it may claim: none for this
-    // run's own evidence, as before durable evidence; the link window before
-    // it for a replayed one.
+    #[derive(PartialEq, Eq)]
+    enum Claims {
+        /// A commit this run read: rows of this worktree, and rows without
+        /// one, as before durable evidence.
+        ThisRun,
+        /// A replayed commit: rows of this worktree only.
+        Replayed,
+        /// A replayed commit no longer reached: none.
+        Nothing,
+    }
     struct Verified {
         sha: String,
         time: i64,
-        earliest: Option<i64>,
+        claims: Claims,
     }
     let mut verified: Vec<Verified> = Vec::new();
-    let mut add = |sha: String, time: i64, earliest: Option<i64>| match verified
-        .iter_mut()
-        .find(|commit| commit.sha == sha)
-    {
-        Some(commit) => {
-            commit.earliest = match (commit.earliest, earliest) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                _ => None,
-            }
-        }
-        None => verified.push(Verified {
-            sha,
-            time,
-            earliest,
-        }),
-    };
     for response in responses {
         let response_ts = response.timestamp.timestamp();
         for candidate in &response.candidates {
-            if let Some((sha, time)) = resolve_commit(repo, candidate, response_ts, now) {
-                add(sha, time, None);
+            let Some((sha, time)) = resolve_commit(repo, candidate, response_ts, now) else {
+                continue;
+            };
+            match verified.iter_mut().find(|commit| commit.sha == sha) {
+                Some(commit) => commit.claims = Claims::ThisRun,
+                None => verified.push(Verified {
+                    sha,
+                    time,
+                    claims: Claims::ThisRun,
+                }),
             }
         }
     }
+    let mut replays: Vec<(Oid, String, i64)> = Vec::new();
     for commit in replayed {
         // A replayed commit is a full id the store holds; it is resolved
         // again, as every commit is before anything is linked to it.
@@ -280,57 +316,69 @@ pub(crate) fn link_family_evidence(
         else {
             continue;
         };
-        if sha != commit.commit || commit.window_secs == 0 {
+        if sha != commit.commit || verified.iter().any(|known| known.sha == sha) {
             continue;
         }
-        let window = i64::try_from(commit.window_secs).unwrap_or(i64::MAX);
-        add(sha, time, Some(time.saturating_sub(window)));
+        if let Ok(oid) = Oid::from_str(&sha) {
+            if !replays.iter().any(|(known, _, _)| *known == oid) {
+                replays.push((oid, sha, time));
+            }
+        }
+    }
+    let reached = reachable(repo, &replays);
+    let mut unreachable = 0;
+    for (oid, sha, time) in replays {
+        let claims = if reached.contains(&oid) {
+            Claims::Replayed
+        } else {
+            unreachable += 1;
+            Claims::Nothing
+        };
+        verified.push(Verified { sha, time, claims });
     }
     if verified.is_empty() {
-        return Ok(FamilyLinks::default());
+        return Ok(Rescued::default());
     }
-    // Earliest commit first, so each claims only the reasoning since the last.
+    // Earliest commit first; each claims only what follows the one before.
     verified.sort_by_key(|commit| commit.time);
 
     // Floating (unlinked) interactions of this worktree, family and source,
     // oldest first. Anything already linked is excluded here and left
     // untouched.
-    struct Floating {
-        id: InteractionId,
-        ts: i64,
-        root: bool,
-    }
-    let mut floating: Vec<Floating> = store
-        .floating_interaction_times_of_source(worktree_fingerprint, family.claimed_source())?
-        .into_iter()
-        .filter(|(_, conversation_id, _)| family.contains(conversation_id))
-        .map(|(id, conversation_id, ts)| Floating {
-            root: family.is_root(&conversation_id),
-            ts,
-            id,
-        })
+    let conversations: Vec<&str> = std::iter::once(family.root())
+        .chain(family.members())
         .collect();
-    floating.sort_by_key(|response| response.ts);
+    let mut floating = store.floating_family_interactions(
+        worktree_fingerprint,
+        family.claimed_source(),
+        &conversations,
+    )?;
+    floating.sort_by_key(|response| response.timestamp);
 
     let mut claimed = vec![false; floating.len()];
     let mut total = FamilyLinks::default();
+    let mut after = i64::MIN;
     for commit in &verified {
+        let (from, to) = (after, commit.time);
+        after = after.max(commit.time);
+        if commit.claims == Claims::Nothing {
+            continue;
+        }
         // A commit can only have been produced by reasoning at or before it, so
-        // responses after it belong to a later commit, not this one. No skew on
-        // this bound: the committing response is written before its tool runs,
-        // so it always precedes the commit time.
+        // responses after it belong to a later commit, not this one; and
+        // reasoning at or before the commit before it is that commit's. No
+        // skew on these bounds: the committing response is written before its
+        // tool runs, so it always precedes the commit time.
         let mut ids: Vec<&InteractionId> = Vec::new();
         let mut root_ids = 0usize;
         for (index, response) in floating.iter().enumerate() {
-            if !claimed[index]
-                && response.ts <= commit.time
-                && commit
-                    .earliest
-                    .is_none_or(|earliest| response.ts >= earliest)
-            {
+            let in_segment = response.timestamp > from && response.timestamp <= to;
+            let in_worktree = commit.claims == Claims::ThisRun
+                || response.capture_worktree.as_deref() == Some(worktree_fingerprint);
+            if !claimed[index] && in_segment && in_worktree {
                 claimed[index] = true;
                 ids.push(&response.id);
-                root_ids += usize::from(response.root);
+                root_ids += usize::from(family.is_root(&response.conversation_id));
             }
         }
         if ids.is_empty() {
@@ -342,7 +390,7 @@ pub(crate) fn link_family_evidence(
         // Every id is floating, so each is inserted; the count is attributed
         // root-first only so that a row another process linked in the
         // meantime can never make the two figures add up to more than was made.
-        let inserted = store.link_automatic_interaction_batch_trusted(
+        let inserted = store.link_rescued_interaction_batch(
             &links,
             &CommitSha::new(&commit.sha),
             linked_by,
@@ -351,5 +399,57 @@ pub(crate) fn link_family_evidence(
         total.root += to_root;
         total.members += inserted - to_root;
     }
-    Ok(total)
+    Ok(Rescued {
+        links: total,
+        unreachable,
+    })
+}
+
+/// Which of `commits` HEAD of `repo` (the run's worktree) or a local branch
+/// still reaches. Fail-closed: a commit the walk does not find, because the
+/// repository cannot be walked or the commit lies past
+/// [`REACH_SLACK_SECS`] before the oldest of them, is not reached.
+fn reachable(repo: &Repository, commits: &[(Oid, String, i64)]) -> HashSet<Oid> {
+    let mut found = HashSet::new();
+    let mut wanted: HashSet<Oid> = commits.iter().map(|(oid, _, _)| *oid).collect();
+    let Some(oldest) = commits.iter().map(|(_, _, time)| *time).min() else {
+        return found;
+    };
+    let Ok(mut walk) = repo.revwalk() else {
+        return found;
+    };
+    if walk.set_sorting(Sort::TIME).is_err() {
+        return found;
+    }
+    let mut tips = Vec::new();
+    if let Ok(head) = repo.head().and_then(|head| head.peel_to_commit()) {
+        tips.push(head.id());
+    }
+    if let Ok(branches) = repo.branches(Some(BranchType::Local)) {
+        for (branch, _) in branches.flatten() {
+            if let Ok(commit) = branch.get().peel_to_commit() {
+                tips.push(commit.id());
+            }
+        }
+    }
+    for tip in tips {
+        let _ = walk.push(tip);
+    }
+    let cutoff = oldest.saturating_sub(REACH_SLACK_SECS);
+    for oid in walk {
+        let Ok(oid) = oid else {
+            break;
+        };
+        if wanted.remove(&oid) {
+            found.insert(oid);
+            if wanted.is_empty() {
+                break;
+            }
+        }
+        match repo.find_commit(oid) {
+            Ok(commit) if commit.time().seconds() >= cutoff => {}
+            _ => break,
+        }
+    }
+    found
 }

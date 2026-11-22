@@ -329,8 +329,10 @@ mod tests {
                 members: 3,
             },
             rescue_skipped: false,
+            not_replayed: 0,
             cut_short: false,
             backlog: false,
+            rescue_pending: false,
         };
         let summary = Summary::new(HarnessId::ClaudeCode, run);
         assert_eq!(summary.session_id, "s");

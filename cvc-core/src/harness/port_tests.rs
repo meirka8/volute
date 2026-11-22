@@ -26,7 +26,7 @@ use crate::harness::drift::{
     Drift, DriftError, DriftRule, FormatPin, MalformedLine, PlaceholderStyle,
 };
 use crate::harness::engine::{self, EngineError, EngineOptions, EngineReport};
-use crate::harness::family::Family;
+use crate::harness::family::{Family, FamilyLinks};
 use crate::harness::lock::FamilyLock;
 use crate::harness::{
     derived_interaction_id, test_registry, HarnessId, PassiveChannel, SESSION_LOCK_WAIT,
@@ -58,6 +58,16 @@ thread_local! {
 /// The reads this thread's fake made since the last call, in order.
 fn take_reads() -> Vec<(Instant, Instant)> {
     READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
+}
+
+thread_local! {
+    /// The byte limit each read of the fake on this thread was given.
+    static LIMITS: RefCell<Vec<Option<u64>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The limits this thread's fake was read with since the last call.
+fn take_limits() -> Vec<Option<u64>> {
+    LIMITS.with(|limits| std::mem::take(&mut *limits.borrow_mut()))
 }
 
 /// The fake record's format, pinned to major version 1.
@@ -205,6 +215,7 @@ impl RecordSource for Fake {
         context: &ReadContext<'_>,
     ) -> Result<Read<FakeWindow, JsonlCursor>, FakeError> {
         let began = Instant::now();
+        LIMITS.with(|limits| limits.borrow_mut().push(context.limit.bytes));
         let read = self.read_window(source, from, context)?;
         READS.with(|reads| reads.borrow_mut().push((began, Instant::now())));
         Ok(read)
@@ -264,6 +275,7 @@ impl Fake {
             replaced: None,
             record_len: Some(bytes.len() as u64),
             limited: bytes[offset..].contains(&b'\n'),
+            window_bytes: Some(offset as u64 - start),
             own_history_start,
         })
     }
@@ -595,6 +607,66 @@ impl Fixture {
         .unwrap();
     }
 
+    /// The commits the fake's response `key` of `conversation` is linked to.
+    fn links_of(&self, conversation: &str, key: &str) -> Vec<String> {
+        let id = derived_interaction_id(HarnessId::Codex, conversation, key);
+        self.conn()
+            .prepare(
+                "SELECT git_commit_hash FROM artifact_links WHERE interaction_id=?1 ORDER BY 1",
+            )
+            .unwrap()
+            .query_map(params![id.as_str()], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Every link, as `(response key, commit)`.
+    fn all_links(&self) -> Vec<(String, String)> {
+        self.conn()
+            .prepare("SELECT i.source_request_id, l.git_commit_hash FROM artifact_links l JOIN interactions i ON i.id = l.interaction_id ORDER BY 1, 2")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Points the current branch at a new commit made at `T0 + seconds` in
+    /// place of its tip, as an amend does: the old tip is no longer reached.
+    fn amend(&self, seconds: i64) -> String {
+        let repo = self.layout.repository();
+        let head = repo.head().unwrap();
+        let old = head.peel_to_commit().unwrap();
+        let signature = Signature::new(
+            "Fixture",
+            "fixture@example.invalid",
+            &Time::new(T0 + seconds, 0),
+        )
+        .unwrap();
+        let parents: Vec<git2::Commit<'_>> = old.parents().collect();
+        let parents: Vec<&git2::Commit<'_>> = parents.iter().collect();
+        let tree = old.tree().unwrap();
+        let new = repo
+            .commit(None, &signature, &signature, "amended", &tree, &parents)
+            .unwrap();
+        repo.reference(head.name().unwrap(), new, true, "amend")
+            .unwrap();
+        new.to_string()
+    }
+
+    /// A floating row of the fake's own source in `conversation`, as one
+    /// recorded in this worktree would be.
+    fn own_row(&self, conversation: &str, id: &str, seconds: i64) {
+        let worktree = self.layout.worktree_origin().unwrap();
+        self.conn()
+            .execute(
+                "INSERT INTO interactions(id,conversation_id,timestamp,author,user_prompt,capture_source,scrubber_version,capture_worktree) VALUES (?1,?2,?3,'agent','a response','codex',1,?4)",
+                params![id, conversation, T0 + seconds, worktree],
+            )
+            .unwrap();
+    }
+
     /// A row another source recorded in `conversation`, which keeps the fake
     /// from recording into it.
     fn foreign_row(&self, conversation: &str, id: &str, seconds: i64) {
@@ -611,6 +683,15 @@ impl Fixture {
         )
         .unwrap();
     }
+}
+
+/// The conversations the backlog lists.
+fn backlog_ids(store: &CvcStore) -> Vec<String> {
+    engine::backlog::<Fake>(store)
+        .unwrap()
+        .into_iter()
+        .map(|backlog| backlog.conversation_id)
+        .collect()
 }
 
 fn response(key: &str, seconds: i64) -> Value {
@@ -1139,108 +1220,112 @@ fn a_two_second_budget_stops_between_batches_and_the_next_run_goes_on() {
     // And the run was over by its deadline.
     assert!(took < budget, "{took:?}: {log:?}");
     assert!(report.backlog);
-    assert_eq!(
-        engine::backlog::<Fake>(&fixture.store).unwrap(),
-        ["codex:t1"]
-    );
+    assert_eq!(backlog_ids(&fixture.store), ["codex:t1"]);
 
     fs::remove_file(fixture.root.join("delay-ms")).unwrap();
     let rest = fixture.ingest(&path, "t1").unwrap();
     assert_eq!(rest.root.inserted, 40 - first);
     assert_eq!(rest.root.already_present, 0);
     assert!(!rest.cut_short && !rest.backlog, "{rest:?}");
-    assert!(engine::backlog::<Fake>(&fixture.store).unwrap().is_empty());
+    assert!(backlog_ids(&fixture.store).is_empty());
     assert_eq!(fixture.count("SELECT COUNT(*) FROM interactions"), 40);
     assert_eq!(rest.root.cursor.byte_offset, 40 * line);
 }
 
-/// A run whose deadline is already past reads nothing. A final one leaves
-/// the backlog flag, an incremental one does not, and neither takes the flag
-/// away; a run that reads everything does.
+/// A run whose deadline is already past reads nothing and leaves the
+/// backlog flag, whatever its event: the run that holds the lock when a
+/// session's last event comes may be one the deadline stops too. Only a run
+/// that reads everything takes the flag away.
 #[test]
-fn only_a_final_run_out_of_time_sets_the_backlog_flag() {
+fn any_run_out_of_time_sets_the_backlog_flag_until_one_reads_everything() {
     let fixture = Fixture::new(Ack::WithCodex);
     let (path, _) = forty(&fixture);
     let past = |finality| batched(Some(Instant::now()), 1024, finality);
     let incremental = fixture
         .ingest_options(&path, "t1", past(Finality::Incremental))
         .unwrap();
-    assert!(incremental.cut_short && !incremental.backlog);
+    assert!(incremental.cut_short && incremental.backlog);
     assert_eq!(incremental.root.inserted, 0);
-    // Nothing was written: no cursor, no flag.
-    assert!(fixture
+    // Only the flag was written, at the start of the record.
+    let cursor = fixture
         .store
         .harness_cursor(HarnessId::Codex, "codex:t1")
         .unwrap()
-        .is_none());
+        .unwrap();
+    assert_eq!(
+        (cursor.state["byte_offset"].as_u64(), &cursor.state["carry"]),
+        (Some(0), &json!({"backlog": true}))
+    );
     let final_run = fixture
         .ingest_options(&path, "t1", past(Finality::Final))
         .unwrap();
     assert!(final_run.cut_short && final_run.backlog);
     assert_eq!(final_run.root.inserted, 0);
-    assert_eq!(
-        engine::backlog::<Fake>(&fixture.store).unwrap(),
-        ["codex:t1"]
-    );
+    assert_eq!(backlog_ids(&fixture.store), ["codex:t1"]);
     let again = fixture
         .ingest_options(&path, "t1", past(Finality::Incremental))
         .unwrap();
-    assert!(again.backlog, "an incremental run keeps the flag");
+    assert!(again.backlog);
     let done = fixture
         .ingest_options(&path, "t1", batched(None, 1024, Finality::Incremental))
         .unwrap();
     assert!(!done.cut_short && !done.backlog);
     assert_eq!(done.root.inserted, 40);
-    assert!(engine::backlog::<Fake>(&fixture.store).unwrap().is_empty());
+    assert!(backlog_ids(&fixture.store).is_empty());
 }
 
-/// R9: a response much larger than the window. Each run with a short budget
+/// R9: a response much larger than the window. A run with a short budget
 /// grows the window as far as its time allows and leaves the grown window
-/// with the cursor; the next run starts from it, so short runs get past the
-/// response. Runs that started again from the base window every time would
-/// never get past it.
+/// with the cursor, and the next run's first read is of that window, not of
+/// the base one. The rate a window is afforded at is the slowest the run
+/// measured on a batch that closed responses, and never less than a second
+/// per MiB: a batch that only grows the window measures nothing.
 #[test]
 fn a_grown_window_carries_over_to_the_next_run() {
     let fixture = Fixture::new(Ack::WithCodex);
+    // A 20 KiB response, then one of 300 KiB and a small one.
+    let mut first = response("resp:a", 1);
+    first["text"] = json!("x".repeat(20 * 1024));
     let mut big = response("resp:big", 2);
-    big["text"] = json!("x".repeat(40_000));
-    let path = fixture.record("t1", &[response("resp:a", 1), big, response("resp:z", 3)]);
-    // Every read takes 60 ms, whatever it reads.
+    big["text"] = json!("x".repeat(300 * 1024));
+    let path = fixture.record("t1", &[first, big, response("resp:z", 3)]);
+    // Every read takes 60 ms, whatever it reads: the first, which closes a
+    // response, measures about 3 s per MiB.
     fs::write(fixture.root.join("delay-ms"), "60").unwrap();
-    let base = 512;
-    let mut windows = Vec::new();
-    let mut runs = 0;
-    loop {
-        runs += 1;
-        assert!(
-            runs <= 10,
-            "short runs did not get past the response: {windows:?}"
-        );
+    let base = 24 * 1024;
+    let run = || {
+        take_limits();
         let report = fixture
             .ingest_options(
                 &path,
                 "t1",
                 batched(
-                    Some(Instant::now() + Duration::from_millis(500)),
+                    Some(Instant::now() + Duration::from_millis(1500)),
                     base,
                     Finality::Incremental,
                 ),
             )
             .unwrap();
-        let carried = report.root.cursor.carry.stall_window;
-        if !report.cut_short {
-            assert_eq!(carried, None);
-            break;
-        }
-        let grown = carried.expect("a run cut short while the window grew keeps it");
-        assert!(grown > base, "{grown}");
-        // Never back to the base window, and further with every run.
-        if let Some(last) = windows.last() {
-            assert!(grown > *last, "{windows:?} then {grown}");
-        }
-        windows.push(grown);
-    }
-    assert!(!windows.is_empty(), "one run read it all");
+        (report, take_limits())
+    };
+    let (report, limits) = run();
+    assert!(report.cut_short, "{report:?} {limits:?}");
+    assert_eq!(report.root.inserted, 1);
+    let grown = report.root.cursor.carry.stall_window.expect("it grew");
+    assert!(grown > 2 * base && grown < 300 * 1024, "{grown} {limits:?}");
+    // It grew from the base window by doubling, and stopped where twice the
+    // next one's estimate no longer fit.
+    assert_eq!(limits[0], Some(base), "{limits:?}");
+    assert_eq!(limits.last().unwrap().unwrap() * 2, grown, "{limits:?}");
+
+    let (report, limits) = run();
+    assert_eq!(
+        limits[0],
+        Some(grown),
+        "the next run starts from it: {limits:?}"
+    );
+    assert!(!report.cut_short, "{report:?} {limits:?}");
+    assert_eq!(report.root.cursor.carry.stall_window, None);
     assert_eq!(fixture.count("SELECT COUNT(*) FROM interactions"), 3);
 }
 
@@ -1354,14 +1439,17 @@ fn a_run_that_fails_between_batches_loses_nothing_and_the_next_run_links_its_com
     }
 }
 
-/// A commit replayed from the store links only responses within the link
-/// window before it, and none when the window is 0; the commits a run reads
-/// itself are not bounded, as before.
+/// Every commit the rescue knows takes part in one order, read in this run
+/// or replayed from the store: each claims the reasoning after the commit
+/// before it, up to its own time, with no other lower bound. A response
+/// recorded late (after the committing one was read) before the first commit
+/// is the first commit's, never a later one's, however long before the
+/// commit it was made; and `cvc.linkWindow`, the time-window linker's, does
+/// not bound the rescue, so many runs link as one manual run does.
 #[test]
-fn a_replayed_commit_links_only_within_the_link_window() {
+fn every_commit_known_claims_only_the_reasoning_since_the_one_before() {
     let fixture = Fixture::new(Ack::WithCodex);
-    let sha = fixture.commit(100_000);
-    let set_window = |seconds: &str| {
+    let set_window = |fixture: &Fixture, seconds: &str| {
         fixture
             .layout
             .repository()
@@ -1370,37 +1458,203 @@ fn a_replayed_commit_links_only_within_the_link_window() {
             .set_str("cvc.linkWindow", seconds)
             .unwrap()
     };
-    set_window("3600");
-    let mut committing = response("resp:c", 99_990);
-    committing["commit"] = json!(sha);
-    let old = response("resp:old", 100_000 - 4000);
-    let path = fixture.record("t1", &[old.clone(), committing.clone()]);
-    let report = fixture.ingest(&path, "t1").unwrap();
-    assert_eq!(report.linked.root, 2, "its own run's commit is not bounded");
-
-    // Responses recorded after the committing one was read, which the next
-    // run never reads again: only the one in the window before the commit
-    // is linked, from the stored evidence.
-    let mut lines = vec![
-        old,
-        committing,
-        response("resp:older", 100_000 - 5000),
-        response("resp:near", 100_000 - 600),
-        response("resp:after", 100_010),
-    ];
+    set_window(&fixture, "3600");
+    let c1 = fixture.commit(100_000);
+    let c2 = fixture.commit(100_100);
+    let mut committing = response("resp:c1", 99_990);
+    committing["commit"] = json!(c1);
+    let mut lines = vec![response("resp:old", 100_000 - 4000), committing];
     let path = fixture.record("t1", &lines);
     let report = fixture.ingest(&path, "t1").unwrap();
-    assert_eq!(report.root.inserted, 3);
-    assert_eq!(report.linked.root, 1);
-    assert!(fixture.linked("codex:t1", "resp:near"));
-    assert!(!fixture.linked("codex:t1", "resp:older"));
-    assert!(!fixture.linked("codex:t1", "resp:after"));
+    assert_eq!(report.linked.root, 2);
 
-    // At 0, the link window links nothing from the store at all.
-    set_window("0");
+    // The next run never reads resp:c1 again: C1 is replayed, C2 is read.
+    let mut second = response("resp:c2", 100_090);
+    second["commit"] = json!(c2);
+    lines.extend([
+        response("resp:older", 100_000 - 50_000),
+        response("resp:near", 100_000 - 600),
+        response("resp:mid", 100_050),
+        second,
+    ]);
+    let path = fixture.record("t1", &lines);
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!((report.root.inserted, report.linked.root), (4, 4));
+    for (key, commit) in [
+        ("resp:older", &c1),
+        ("resp:near", &c1),
+        ("resp:mid", &c2),
+        ("resp:c2", &c2),
+    ] {
+        assert_eq!(
+            fixture.links_of("codex:t1", key),
+            std::slice::from_ref(commit),
+            "{key}"
+        );
+    }
+
+    // At 0, the link window still bounds nothing of the rescue.
+    set_window(&fixture, "0");
     lines.push(response("resp:late", 100_000 - 60));
     let path = fixture.record("t1", &lines);
     let report = fixture.ingest(&path, "t1").unwrap();
-    assert_eq!((report.root.inserted, report.linked.root), (1, 0));
-    assert!(!fixture.linked("codex:t1", "resp:late"));
+    assert_eq!((report.root.inserted, report.linked.root), (1, 1));
+    assert_eq!(
+        fixture.links_of("codex:t1", "resp:late"),
+        std::slice::from_ref(&c1)
+    );
+
+    // One manual run of the whole record links exactly the same.
+    let manual = Fixture::new(Ack::WithCodex);
+    set_window(&manual, "0");
+    assert_eq!((manual.commit(100_000), manual.commit(100_100)), (c1, c2));
+    let path = manual.record("t1", &lines);
+    manual.ingest(&path, "t1").unwrap();
+    assert_eq!(manual.all_links(), fixture.all_links());
+}
+
+/// A stored commit that a rebase or an amend left behind is not replayed:
+/// it gets no new links, and the run says so.
+#[test]
+fn a_rewritten_commit_is_not_replayed() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let c1 = fixture.commit(100);
+    let mut committing = response("resp:c1", 90);
+    committing["commit"] = json!(c1);
+    let mut lines = vec![committing];
+    let path = fixture.record("t1", &lines);
+    assert_eq!(fixture.ingest(&path, "t1").unwrap().linked.root, 1);
+
+    let amended = fixture.amend(101);
+    assert_ne!(amended, c1);
+    lines.push(response("resp:late", 80));
+    let path = fixture.record("t1", &lines);
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!(report.root.inserted, 1);
+    assert_eq!((report.linked.root, report.not_replayed), (0, 1));
+    assert!(fixture.links_of("codex:t1", "resp:late").is_empty());
+}
+
+/// A replayed commit claims only rows of the worktree its reporting
+/// interaction was captured in: a run in another worktree of the repository
+/// does not replay it, and a run in its own does not claim the other
+/// worktree's rows.
+#[test]
+fn a_replayed_commit_links_no_row_of_another_worktree() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let c1 = fixture.commit(100);
+    let mut committing = response("resp:c1", 90);
+    committing["commit"] = json!(c1);
+    let mut lines = vec![committing];
+    let path = fixture.record("t1", &lines);
+    assert_eq!(fixture.ingest(&path, "t1").unwrap().linked.root, 1);
+
+    // A linked worktree of the same repository, sharing the store.
+    let other = fixture._temp.path().join("other-worktree");
+    fixture
+        .layout
+        .repository()
+        .worktree("other", &other, None)
+        .unwrap();
+    let layout = RepositoryLayout::discover(&other).unwrap();
+    assert_eq!(layout.db_path(), fixture.layout.db_path());
+    assert_ne!(
+        layout.worktree_origin().unwrap(),
+        fixture.layout.worktree_origin().unwrap()
+    );
+    lines.push(response("resp:there", 80));
+    let path = fixture.record("t1", &lines);
+    let located = Fake.locate_file(&path, Some("t1")).unwrap();
+    let report = engine::ingest(
+        &Fake,
+        &layout,
+        &fixture.store,
+        &fixture.policy,
+        located,
+        Fixture::options(false),
+    )
+    .unwrap();
+    assert_eq!(report.root.inserted, 1);
+    assert_eq!((report.linked.root, report.not_replayed), (0, 1));
+
+    // Back in the first worktree, a run that records something new replays
+    // the commit, and claims only its own worktree's rows.
+    lines.push(response("resp:here", 85));
+    let path = fixture.record("t1", &lines);
+    let report = fixture.ingest(&path, "t1").unwrap();
+    assert_eq!((report.root.inserted, report.linked.root), (1, 1));
+    assert_eq!(fixture.links_of("codex:t1", "resp:here"), [c1]);
+    assert!(fixture.links_of("codex:t1", "resp:there").is_empty());
+}
+
+/// A run cut short anywhere in the family, the root's own record included,
+/// leaves the rescue it was due to a later run, and says it is pending on
+/// the root's cursor. A later run that reads the whole family rescues from
+/// the stored evidence even when it records nothing new; one that has
+/// nothing new and nothing pending does not rescue at all.
+#[test]
+fn a_skipped_rescue_is_pending_until_a_run_reads_the_whole_family() {
+    let fixture = Fixture::new(Ack::WithCodex);
+    let sha = fixture.commit(100);
+    let mut root = response("resp:r", 30);
+    root["child"] = json!("c1");
+    root["commit"] = json!(sha);
+    let path = fixture.record("r1", &[root.clone(), response("resp:r2", 40)]);
+    fixture.record("c1.member", &[]);
+    // Every read takes 400 ms, and a batch reads one line: the root's first
+    // batch leaves no time for the next within a second.
+    fs::write(fixture.root.join("delay-ms"), "400").unwrap();
+    let line = format!("{root}\n").len() as u64;
+    let options = || {
+        batched(
+            Some(Instant::now() + Duration::from_secs(1)),
+            line + 5,
+            Finality::Final,
+        )
+    };
+    let carry = || {
+        let stored = fixture
+            .store
+            .harness_cursor(HarnessId::Codex, "codex:r1")
+            .unwrap()
+            .unwrap();
+        JsonlCursor::decode_stored(&stored).unwrap().carry
+    };
+    // Cut short in the root's own record: no rescue, though the root has no
+    // member yet whose record is left.
+    let report = fixture.ingest_options(&path, "r1", options()).unwrap();
+    assert!(report.root.cut_short && report.rescue_skipped, "{report:?}");
+    assert_eq!(report.root.inserted, 1);
+    assert!(report.rescue_pending && carry().rescue_pending && carry().backlog);
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM artifact_links"), 0);
+
+    // The root read to its end, its member left unread: no rescue still.
+    let report = fixture.ingest_options(&path, "r1", options()).unwrap();
+    assert!(!report.root.cut_short && report.cut_short, "{report:?}");
+    assert_eq!(report.members.len(), 1);
+    assert!(report.rescue_skipped && report.rescue_pending);
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM artifact_links"), 0);
+
+    // A run that reads it all, and records nothing new, rescues.
+    fs::remove_file(fixture.root.join("delay-ms")).unwrap();
+    let report = fixture.ingest(&path, "r1").unwrap();
+    assert_eq!(report.root.inserted + report.members[0].inserted, 0);
+    assert!(!report.rescue_skipped && !report.rescue_pending && !report.backlog);
+    assert_eq!(report.linked.root, 2);
+    assert!(!carry().rescue_pending && !carry().backlog);
+
+    // Nothing new and nothing pending: no rescue, so a row that is floating
+    // now stays so...
+    fixture.own_row("codex:r1", "6b1f0c0e-1111-4aaa-8bbb-000000000071", 50);
+    let report = fixture.ingest(&path, "r1").unwrap();
+    assert_eq!(report.linked, FamilyLinks::default());
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM artifact_links"), 2);
+    // ...until a run records something new, whose rescue claims both.
+    let path = fixture.record(
+        "r1",
+        &[root, response("resp:r2", 40), response("resp:r3", 60)],
+    );
+    let report = fixture.ingest(&path, "r1").unwrap();
+    assert_eq!((report.root.inserted, report.linked.root), (1, 2));
+    assert_eq!(fixture.count("SELECT COUNT(*) FROM artifact_links"), 4);
 }

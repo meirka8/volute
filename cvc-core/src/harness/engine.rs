@@ -26,18 +26,26 @@
 //! 4. One commit rescue over the whole family
 //!    ([`crate::harness::family::link_family_commits`]): from the commits the
 //!    batches of this run reported, and from the family's stored evidence of
-//!    earlier batches and runs. If a member fails, the rescue still runs over
-//!    what was ingested (the root's cursor is already past its committing
-//!    response, which would never be read again), and the member's error is
-//!    returned. The rescue writes links, so on the gated path it runs only
-//!    while the acknowledgement still covers the channel: it is skipped when
-//!    coverage no longer holds, or when a member failed because it did not.
-//!    It is also left to a later run when the deadline left a member of the
-//!    family unread (or read in part): a commit in that member's record may
-//!    be earlier than the commits read so far, and would claim, as one run of
-//!    the whole family does, responses a later commit must not claim first.
-//!    The evidence is stored, so the next run that reads the whole family
-//!    links from it, exactly as after a run that was killed.
+//!    earlier batches and runs (see [Commit evidence](#commit-evidence)). If
+//!    a member fails, the rescue still runs over what was ingested (the
+//!    root's cursor is already past its committing response, which would
+//!    never be read again), and the member's error is returned. The rescue
+//!    writes links, so on the gated path it runs only while the
+//!    acknowledgement still covers the channel: it is skipped when coverage
+//!    no longer holds, or when a member failed because it did not. It is also
+//!    left to a later run when the deadline left any record of the family
+//!    unread to its end, the root's included: a commit in what is left may
+//!    be earlier than the commits read so far, and in one run of the whole
+//!    family it would claim responses that a later commit must then not
+//!    claim first. The evidence is stored, and the root's cursor says the
+//!    rescue is pending ([`Carry::rescue_pending`](crate::harness::cursor::Carry::rescue_pending)),
+//!    so the next run that reads the whole family rescues from it, even when
+//!    it records nothing new, exactly as after a run that was killed.
+//! 5. The family's flags on the root's cursor, last: the backlog flag
+//!    ([`Carry::backlog`](crate::harness::cursor::Carry::backlog)) and the
+//!    pending rescue, each written only when it changes, in a batch of its
+//!    own. A flag that cannot be written is left as it was; it never fails
+//!    the run.
 //!
 //! # Batches
 //!
@@ -60,10 +68,10 @@
 //!   size it grew to is kept with the cursor
 //!   ([`Carry::stall_window`](crate::harness::cursor::Carry::stall_window)),
 //!   so that the next run starts with it rather than growing again from the
-//!   start. A run whose first estimate does not fit that window reads one
-//!   window of the base size first, to time its batches, and keeps the grown
-//!   window. A response that needs more than a hook's budget to read is read
-//!   by an operator's run (and a final event leaves the backlog flag, below).
+//!   start; a stored size is read back no larger than [`MAX_WINDOW_BYTES`],
+//!   and one no larger than the base window is ignored. A response that
+//!   needs more than a hook's budget to read is read by an operator's run:
+//!   the run that stops before it leaves the backlog flag (below).
 //! * Ids, chain parents and stimuli are derived from each window exactly as
 //!   for a hook run that read the record when it ended there.
 //! * A title the person set is kept against a generated title found in a
@@ -77,11 +85,15 @@
 //! time it had when it started if that is less (two seconds of a 20-second
 //! budget, a quarter of a second of Codex's two-second `SessionEnd`). It
 //! starts a batch only while what is left beyond the reserve covers twice
-//! the batch's estimated time: the time per byte of its last batch that
-//! stopped at its limit, or one second per MiB before it has one (cvc 0.7.0
-//! took about 0.8 s per MB end to end). A window that does not fit is read
-//! smaller, down to [`MIN_WINDOW_BYTES`], unless it grew for a response that
-//! a smaller one does not close. The run waits for the lock until four
+//! the batch's estimated time: its bytes at the slowest rate this run has
+//! measured, and never faster than one second per MiB (cvc 0.7.0 took about
+//! 0.8 s per MB end to end). A rate is measured only on a batch that closed
+//! responses, over the bytes its window held: a batch that closed nothing
+//! (a window growing for an open response) tells nothing of the cost of
+//! the window that will close it, so such a window is afforded at the
+//! slowest rate known. A window that does not fit is read smaller, down to
+//! [`MIN_WINDOW_BYTES`], unless it grew for a response that a smaller one
+//! does not close. The run waits for the lock until four
 //! seconds (twice the largest reserve) before its deadline, so that a run
 //! that waited still has the time to read a record the holder caught up, or
 //! for an eighth of its time if that is longer: 16 s of a 20-second budget,
@@ -91,11 +103,12 @@
 //! these limits and waits for the lock as long as its options say.
 //!
 //! A run the deadline stopped reports it ([`TargetReport::cut_short`],
-//! [`EngineReport::cut_short`]). A final run (the agent stopped, or its
-//! session ended) that it stopped may be the session's last, so it sets the
-//! family's backlog flag on the root's cursor ([`Carry::backlog`](crate::harness::cursor::Carry::backlog),
-//! [`backlog`]), which the next run that reads every record of the family to
-//! its end clears.
+//! [`EngineReport::cut_short`]) and sets the family's backlog flag on the
+//! root's cursor ([`Carry::backlog`](crate::harness::cursor::Carry::backlog),
+//! [`backlog`]): the event may have been the session's last, and the run
+//! that holds the lock when the last one comes may be one the deadline
+//! stops too. The next run that reads every record of the family to its end
+//! clears it.
 //!
 //! # Commit evidence
 //!
@@ -106,11 +119,23 @@
 //! committed, the cursor is past its committing response, which is never read
 //! again; the stored evidence is what lets a later batch's or run's rescue
 //! link a response (a subagent's, say) recorded after it, as one run would
-//! have: hook runs reach the links a `--rescan` reaches. A commit replayed
-//! from the store links only responses made within `cvc.linkWindow` before
-//! its own time, and none when that is 0. Claude Code's 0.7.x-compatible
-//! entry points store their evidence but replay none, so that what they
-//! link stays exactly what 0.7.x linked.
+//! have: hook runs reach the links one manual run reaches.
+//!
+//! Every commit the rescue knows, read in this run or replayed from the
+//! store, takes part in one order, by time: each claims the family's
+//! floating responses after the commit before it, up to its own time, with
+//! no other lower bound, as 0.7.x's rescue of one run did (`cvc.linkWindow`
+//! governs the time-window linker, not the rescue). A replayed commit is
+//! replayed only while HEAD of the run's worktree or a local branch reaches
+//! it, and claims only rows of the worktree its reporting interaction was
+//! captured in, which must be the run's; one that is not reached any more
+//! claims nothing but still bounds the commit after it. The rescue runs when
+//! this run read a commit, recorded something new, or found the rescue
+//! pending; it replays the stored evidence in the last two cases only, and a
+//! rescue for a commit the run read alone (its cursor's response, read
+//! again) is 0.7.x's, from that commit. Claude Code's
+//! 0.7.x-compatible entry points store their evidence but replay none, so
+//! that what they link stays exactly what 0.7.x linked.
 //!
 //! # Cursors
 //!
@@ -148,14 +173,13 @@ use crate::db::{
 };
 use crate::harness::adapter::{HarnessAdapter, Located, ReadContext, ReadLimit, RecordSource};
 use crate::harness::candidate::{Finality, PlanInput, TitleRank};
-use crate::harness::cursor::{CursorCodec, EpochReason, Progress};
+use crate::harness::cursor::{Carry, CursorCodec, EpochReason, Progress};
 use crate::harness::drift::Drift;
 use crate::harness::family::{self, CommitBearingResponse, Family, FamilyLinks, ReplayedCommit};
 use crate::harness::fields;
 use crate::harness::lock::{FamilyLock, SESSION_LOCK_WAIT};
 use crate::harness::seal::{seal, SealContext};
 use crate::harness::{derived_interaction_id, HarnessId};
-use crate::linker::LinkPolicy;
 use crate::models::{CommitSha, Conversation, InteractionId};
 use crate::privacy::{self, PreparedPolicy, PrivacyError};
 use crate::repository::{RepositoryLayout, RepositoryLayoutError};
@@ -177,13 +201,19 @@ pub const HOOK_BATCH: ReadLimit = ReadLimit {
 /// a batch below it would cost more in its commit than it reads.
 pub const MIN_WINDOW_BYTES: u64 = 64 * 1024;
 
+/// The largest window a batch reads: the most a read ever buffers (Claude
+/// Code's limit for one read of a transcript). A stored grown window is read
+/// back no larger.
+pub const MAX_WINDOW_BYTES: u64 = 512 * 1024 * 1024;
+
 /// The most a run with a deadline keeps for its commit rescue and the commit
 /// of a batch already under way.
 const RESERVE_MAX: Duration = Duration::from_secs(2);
 /// A run with a deadline keeps at most this share of its time as the
 /// reserve, and waits for the lock for at least this share of it.
 const RESERVE_SHARE: u32 = 8;
-/// What a batch is estimated to take per MiB before the run has timed one.
+/// What a batch is estimated to take per MiB at the least: the rate before
+/// the run has timed one, and the floor under every rate it measures.
 const PRIOR_SECS_PER_MIB: f64 = 1.0;
 /// A batch starts only while the time left beyond the reserve covers this
 /// many times its estimate.
@@ -314,15 +344,21 @@ pub struct EngineReport<C> {
     /// The links the family's commit rescue made.
     pub linked: FamilyLinks,
     /// The rescue did not run: the acknowledgement no longer covered the
-    /// harness's channel when it was due, or the deadline left a member of
-    /// the family unread (the next run that reads the whole family rescues
-    /// from the stored evidence; see the module docs).
+    /// harness's channel when it was due, or it was due and the deadline
+    /// left a record of the family unread (the next run that reads the whole
+    /// family rescues from the stored evidence; see the module docs).
     pub rescue_skipped: bool,
+    /// Stored commits the rescue did not replay: no longer reached from HEAD
+    /// or a local branch, or reported in another worktree.
+    pub not_replayed: usize,
     /// The deadline came before every record of the family was read to its
     /// end: a later run goes on from the cursors.
     pub cut_short: bool,
     /// The family's backlog flag as this run left it ([`Carry::backlog`](crate::harness::cursor::Carry::backlog)).
     pub backlog: bool,
+    /// The rescue is pending as this run left it
+    /// ([`Carry::rescue_pending`](crate::harness::cursor::Carry::rescue_pending)).
+    pub rescue_pending: bool,
 }
 
 /// Why a run failed. Nothing of the batch that failed was stored; earlier
@@ -426,18 +462,31 @@ pub(crate) fn ingest_claude_code_caller_decided(
     )
 }
 
-/// The conversations of `A`'s harness whose cursor carries the backlog flag
-/// ([`Carry::backlog`](crate::harness::cursor::Carry::backlog)): the roots of families whose last final hook run ran
-/// out of time before it read every record to its end. A cursor this
-/// codec cannot read is not listed.
-pub fn backlog<A: RecordSource>(store: &CvcStore) -> Result<Vec<String>, DbError> {
+/// A family a hook run left unread to the end ([`backlog`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backlog {
+    /// The family root's conversation.
+    pub conversation_id: String,
+    /// The root's record as its cursor last located it, where the codec
+    /// keeps one (a transcript's path).
+    pub record: Option<String>,
+}
+
+/// The families of `A`'s harness whose root's cursor carries the backlog
+/// flag ([`Carry::backlog`](crate::harness::cursor::Carry::backlog)): a hook
+/// run left them unread to the end, and no run has read them to the end
+/// since. A cursor this codec cannot read is not listed.
+pub fn backlog<A: RecordSource>(store: &CvcStore) -> Result<Vec<Backlog>, DbError> {
     Ok(store
         .harness_cursors(A::ID)?
         .into_iter()
-        .filter(|stored| {
-            A::Cursor::decode_stored(stored).is_ok_and(|cursor| cursor.carry().backlog)
+        .filter_map(|stored| {
+            let cursor = A::Cursor::decode_stored(&stored).ok()?;
+            cursor.carry().backlog.then(|| Backlog {
+                record: cursor.record().map(str::to_owned),
+                conversation_id: stored.cursor_key,
+            })
         })
-        .map(|stored| stored.cursor_key)
         .collect())
 }
 
@@ -450,11 +499,10 @@ struct Budget {
     deadline: Option<Instant>,
     /// Kept at the end, for the rescue and the commit of a batch under way.
     reserve: Duration,
-    /// What one byte of the record took, over the last batch of this run
-    /// that stopped at its limit; [`PRIOR_SECS_PER_MIB`] before one has.
+    /// The slowest a byte of the record has been read in this run, over the
+    /// batches that closed responses, and never less than
+    /// [`PRIOR_SECS_PER_MIB`].
     secs_per_byte: f64,
-    /// A batch of this run has been timed.
-    timed: bool,
 }
 
 impl Budget {
@@ -466,7 +514,6 @@ impl Budget {
             deadline,
             reserve: RESERVE_MAX.min(available / RESERVE_SHARE),
             secs_per_byte: PRIOR_SECS_PER_MIB / MIB,
-            timed: false,
         }
     }
 
@@ -512,11 +559,11 @@ impl Budget {
         }
     }
 
-    /// A batch that stopped at its limit of `bytes` took `took`.
+    /// A batch that closed responses, over a window of `bytes`, took
+    /// `took`. The slowest rate is kept.
     fn spent(&mut self, bytes: u64, took: Duration) {
         if bytes > 0 {
-            self.secs_per_byte = (took.as_secs_f64() / bytes as f64).max(f64::MIN_POSITIVE);
-            self.timed = true;
+            self.secs_per_byte = self.secs_per_byte.max(took.as_secs_f64() / bytes as f64);
         }
     }
 }
@@ -599,7 +646,7 @@ fn run<A: HarnessAdapter>(
     let mut commit_bearing = Vec::new();
     let root = ingest_target(adapter, &run, &mut budget, &mut located)?;
     commit_bearing.extend(root.commit_bearing);
-    let carried_backlog = root.carried_backlog;
+    let carried = root.carried;
     let root = root.report;
     // Whatever happens to the members, the root is in the store now, so the
     // family is rescued before the outcome is returned.
@@ -625,88 +672,122 @@ fn run<A: HarnessAdapter>(
         }
     }
     let cut_short = root.cut_short || reports.iter().any(|report| report.cut_short);
-    // The backlog flag: set by a final run the deadline stopped, cleared by
-    // a run that read everything; a failed run leaves it as it was.
-    let backlog = match (&failure, cut_short) {
-        (Some(_), _) => carried_backlog,
-        (None, false) => false,
-        (None, true) => options.finality == Finality::Final || carried_backlog,
+    let inserted = root.inserted + reports.iter().map(|report| report.inserted).sum::<usize>();
+
+    // The rescue is due when this run read a commit, or (on the gated path)
+    // recorded something new or found the rescue pending; only those two
+    // replay the stored evidence. It writes links: on the gated path, only
+    // while the channel is still covered. And only once every record of the
+    // family is read to its end: what is left may hold an earlier commit.
+    let replays = consent == Consent::Covered;
+    let replay = replays && (inserted > 0 || carried.rescue_pending);
+    let due = !commit_bearing.is_empty() || replay;
+    let uncovered = consent == Consent::Covered
+        && (matches!(
+            failure,
+            Some(EngineError::Privacy(PrivacyError::NotCovered(_)))
+        ) || !privacy::capture_covers(layout.repository(), A::ID.channel()).unwrap_or(false));
+    let rescue_skipped = uncovered || (due && cut_short);
+    let rescued = if due && !rescue_skipped {
+        Some(rescue(&run, A::ID, &family, &commit_bearing, replay))
+    } else {
+        None
     };
-    let backlog = if backlog != carried_backlog && write_backlog(adapter, &run, &located, backlog)?
+
+    // Then the family's flags, each only when it changes. The backlog flag
+    // is set by a run the deadline stopped and cleared by one that read
+    // everything; a failed run leaves it as it was. The rescue is pending
+    // when it was due and did not run, or failed.
+    let backlog = match failure {
+        Some(_) => carried.backlog,
+        None => cut_short,
+    };
+    let rescue_pending = if replays {
+        match &rescued {
+            Some(outcome) => outcome.is_err(),
+            None => due,
+        }
+    } else {
+        carried.rescue_pending
+    };
+    let flags = (backlog, rescue_pending);
+    let flags = if flags != (carried.backlog, carried.rescue_pending)
+        // A flag that cannot be written is left as it was.
+        && write_root_flags(adapter, &run, &located, flags).unwrap_or(false)
     {
-        backlog
+        flags
     } else {
-        carried_backlog
+        (carried.backlog, carried.rescue_pending)
     };
-    // The rescue writes links: on the gated path, only while the channel is
-    // still covered. And only once every member is read: a member's commit
-    // may be earlier than the ones read so far.
-    let member_left = reports.iter().any(|report| report.cut_short);
-    let rescue_skipped = member_left
-        || consent == Consent::Covered
-            && (matches!(
-                failure,
-                Some(EngineError::Privacy(PrivacyError::NotCovered(_)))
-            ) || !privacy::capture_covers(layout.repository(), A::ID.channel())
-                .unwrap_or(false));
-    let linked = if rescue_skipped {
-        Ok(FamilyLinks::default())
-    } else {
-        rescue(&run, A::ID, &family, &commit_bearing)
-    };
+
     if let Some(error) = failure {
         return Err(error);
     }
+    let (linked, not_replayed) = match rescued {
+        Some(outcome) => outcome?,
+        None => (FamilyLinks::default(), 0),
+    };
     Ok(EngineReport {
         root,
         members: reports,
-        linked: linked?,
+        linked,
         rescue_skipped,
+        not_replayed,
         cut_short,
-        backlog,
+        backlog: flags.0,
+        rescue_pending: flags.1,
     })
 }
 
 /// Rescues the responses the time-window linker cannot reach: those that
 /// created a commit, and the family's reasoning before them, from this run's
-/// evidence and, on the gated path, the family's stored evidence.
-/// Attribution records who linked, matching the linker, not the historical
-/// commit author.
+/// evidence and, when `replay`, the family's stored evidence. Attribution
+/// records who linked, matching the linker, not the historical commit author.
 ///
-/// Claude Code's 0.7.x-compatible entry points keep 0.7.x's rescue, from the
-/// commits their own run read only: what they link stays exactly what 0.7.x
-/// linked. Their batches still store their evidence, for the gated runs
-/// after them.
+/// Claude Code's 0.7.x-compatible entry points never replay: they keep 0.7.x's
+/// rescue, from the commits their own run read only, so what they link stays
+/// exactly what 0.7.x linked. Their batches still store their evidence, for
+/// the gated runs after them.
+///
+/// Returns the links and how many stored commits were not replayed: those
+/// reported in another worktree, and those HEAD and the local branches no
+/// longer reach.
 fn rescue<E: std::error::Error + Send + Sync + 'static>(
     run: &Run<'_>,
     harness: HarnessId,
     family: &Family,
     commit_bearing: &[CommitBearingResponse],
-) -> Result<FamilyLinks, EngineError<E>> {
+    replay: bool,
+) -> Result<(FamilyLinks, usize), EngineError<E>> {
     let repo = run.layout.repository();
-    let replayed: Vec<ReplayedCommit> = match run.consent {
-        Consent::Covered => {
-            let window_secs = LinkPolicy::from_repository(repo).window_secs();
-            run.store
-                .harness_commit_evidence(harness, family.root())?
-                .into_iter()
-                .map(|evidence| ReplayedCommit {
+    let mut elsewhere = 0usize;
+    let replayed: Vec<ReplayedCommit> = match replay {
+        true => run
+            .store
+            .harness_commit_evidence_reported_in(harness, family.root())?
+            .into_iter()
+            .filter_map(|(evidence, worktree)| {
+                // A commit reported in another worktree claims nothing here.
+                if worktree.as_deref() != Some(run.capture_worktree) {
+                    elsewhere += 1;
+                    return None;
+                }
+                Some(ReplayedCommit {
                     commit: evidence.commit.as_str().to_owned(),
                     response_at: evidence.response_at,
-                    window_secs,
                 })
-                .collect()
-        }
-        Consent::CallerDecided => Vec::new(),
+            })
+            .collect(),
+        false => Vec::new(),
     };
     if commit_bearing.is_empty() && replayed.is_empty() {
-        return Ok(FamilyLinks::default());
+        return Ok((FamilyLinks::default(), elsewhere));
     }
     let linked_by = repo
         .signature()
         .ok()
         .and_then(|signature| signature.email().map(str::to_owned));
-    Ok(family::link_family_evidence(
+    let rescued = family::link_family_evidence(
         repo,
         run.store,
         family,
@@ -714,18 +795,20 @@ fn rescue<E: std::error::Error + Send + Sync + 'static>(
         commit_bearing,
         &replayed,
         linked_by.as_deref(),
-    )?)
+    )?;
+    Ok((rescued.links, elsewhere + rescued.unreachable))
 }
 
-/// Writes the family's backlog flag on the root's cursor, where it stands,
-/// in a batch of its own: `Ok(false)` when it cannot be written (the
-/// channel is no longer covered, the stored cursor is another codec's or
-/// one this codec keeps no flag in, the record was replaced since).
-fn write_backlog<A: HarnessAdapter>(
+/// Writes the family's `(backlog, rescue pending)` flags on the root's
+/// cursor, where it stands, in a batch of its own: `Ok(false)` when they
+/// cannot be written (the channel is no longer covered, the stored cursor is
+/// another codec's or one this codec keeps no flags in, the record was
+/// replaced since).
+fn write_root_flags<A: HarnessAdapter>(
     adapter: &A,
     run: &Run<'_>,
     root: &Located<A::Source>,
-    backlog: bool,
+    (backlog, rescue_pending): (bool, bool),
 ) -> Result<bool, EngineError<A::Error>> {
     let grant = match run.consent {
         Consent::Covered => {
@@ -749,6 +832,7 @@ fn write_backlog<A: HarnessAdapter>(
     }
     let mut carry = resume.from.carry();
     carry.backlog = backlog;
+    carry.rescue_pending = rescue_pending;
     let cursor = resume.from.with_carry(carry.clone());
     if cursor.carry() != carry {
         return Ok(false);
@@ -831,12 +915,12 @@ fn commit_with_cursor<A: HarnessAdapter>(
 // ---- one conversation -----------------------------------------------------------------
 
 /// One conversation's committed batches: its report, the responses of the
-/// batches that reported creating commits, and the backlog flag its stored
-/// cursor carried.
+/// batches that reported creating commits, and what its stored cursor
+/// carried.
 struct Target<C> {
     report: TargetReport<C>,
     commit_bearing: Vec<CommitBearingResponse>,
-    carried_backlog: bool,
+    carried: Carry,
 }
 
 /// Where a conversation's next batch reads, and what it carries over from
@@ -887,52 +971,42 @@ fn ingest_target<A: HarnessAdapter>(
     let carried = position.from.carry();
     let base = run.options.batch.bytes;
     // The window to read, and whether it grew for a response that a smaller
-    // one does not close.
+    // one does not close. A stored size is the engine's own, but is read
+    // back within bounds all the same.
     let mut window = match (base, carried.stall_window) {
-        (Some(base), Some(grown)) if grown > base => (Some(grown), true),
+        (Some(base), Some(grown)) if grown > base => (Some(grown.min(MAX_WINDOW_BYTES)), true),
         _ => (base, false),
     };
     let mut report = TargetReport::unread(key, position.from.clone());
     let mut commit_bearing = Vec::new();
     loop {
-        let now = Instant::now();
-        let limit = match budget.next_limit(window.0, window.1, now) {
-            Some(limit) => limit,
-            // A window an earlier run grew, which the estimate before any
-            // batch is timed does not fit: one window of the base size first
-            // times this run's batches (it closes nothing, and keeps the
-            // grown window), and the grown one is tried at that rate.
-            None if window.1 && !budget.timed => match budget.next_limit(base, false, now) {
-                Some(limit) => limit,
-                None => {
-                    report.cut_short = true;
-                    break;
-                }
-            },
-            None => {
-                report.cut_short = true;
-                break;
-            }
+        let Some(limit) = budget.next_limit(window.0, window.1, Instant::now()) else {
+            report.cut_short = true;
+            break;
         };
-        // What the window grows to when this batch closes nothing: never
-        // less than the window wanted, which a timing batch may be below.
+        // What the window grows to when this batch closes nothing.
         let grow_to = limit
             .bytes
-            .map(|bytes| bytes.saturating_mul(2).max(window.0.unwrap_or(0)));
+            .map(|bytes| bytes.saturating_mul(2).min(MAX_WINDOW_BYTES));
         let started = Instant::now();
         let batch = ingest_batch(adapter, run, located, &mut position, limit, grow_to)?;
         commit_bearing.extend(batch.commit_bearing);
         add_batch(&mut report, batch.report);
+        // Only a batch that closed responses tells what reading costs.
+        if batch.closed {
+            if let Some(bytes) = batch.window_bytes {
+                budget.spent(bytes, started.elapsed());
+            }
+        }
         if !batch.limited {
             break;
         }
         // A window that cannot grow any more and closed nothing: an adapter
         // that will not read further is not read again.
-        if batch.stalled && limit.bytes.is_none_or(|bytes| bytes == u64::MAX) {
+        if batch.stalled && limit.bytes.is_none_or(|bytes| bytes >= MAX_WINDOW_BYTES) {
             report.cut_short = true;
             break;
         }
-        budget.spent(limit.bytes.unwrap_or(0), started.elapsed());
         window = if batch.stalled {
             (grow_to, true)
         } else {
@@ -942,7 +1016,7 @@ fn ingest_target<A: HarnessAdapter>(
     Ok(Target {
         report,
         commit_bearing,
-        carried_backlog: carried.backlog,
+        carried,
     })
 }
 
@@ -981,6 +1055,10 @@ struct Batch<C> {
     /// No response closed in the window, which the next batch reads again,
     /// larger.
     stalled: bool,
+    /// The window closed responses past where the read began.
+    closed: bool,
+    /// How many bytes the window held, when the adapter counts them.
+    window_bytes: Option<u64>,
 }
 
 /// Reads, plans, seals and commits one window of a conversation's record,
@@ -1037,18 +1115,18 @@ fn ingest_batch<A: HarnessAdapter>(
             own_history_start: read.own_history_start.as_ref(),
         },
     );
-    // The window closed no response past where the read began. A rescan's
-    // first read begins at the start of the record, which any closed
-    // response is past.
-    let stalled = read.limited
-        && if rescan {
-            plan.candidates.is_empty()
-        } else {
-            !matches!(
-                plan.resume.progress(&read.trusted),
-                Progress::Forward | Progress::NewEpoch
-            )
-        };
+    // Whether the window closed a response past where the read began (a
+    // rescan's first read begins at the start of the record, which any
+    // closed response is past). A limited window that did not has stalled.
+    let closed_any = if rescan {
+        !plan.candidates.is_empty()
+    } else {
+        matches!(
+            plan.resume.progress(&read.trusted),
+            Progress::Forward | Progress::NewEpoch
+        )
+    };
+    let stalled = read.limited && !closed_any;
 
     let carried = position.from.carry();
     let existing = store.get_conversation(&key)?;
@@ -1160,6 +1238,7 @@ fn ingest_batch<A: HarnessAdapter>(
     // valid: a rescan reads from the start, so its plan may end earlier than
     // an earlier run left the cursor. The next read starts where the plan
     // ends.
+    let planned_extra = plan.resume.carry().extra;
     let mut cursor = plan.resume.clone();
     let mut next = plan.resume;
     if let Some(floor) = &position.floor {
@@ -1183,10 +1262,14 @@ fn ingest_batch<A: HarnessAdapter>(
             }
         }
     }
-    // What the cursor carries: the title rank once a title the person set
-    // is stored (with this batch's captures), and the grown window while no
-    // response closes.
-    let mut carry = carried.clone();
+    // What the cursor carries: the adapter's own positions as planned, the
+    // title rank once a title the person set is stored (with this batch's
+    // captures), and the grown window while no response closes; the
+    // family's flags as they were.
+    let mut carry = Carry {
+        extra: planned_extra,
+        ..carried.clone()
+    };
     if !captures.is_empty() {
         if let Some((_, TitleRank::UserSet)) = hinted {
             carry.title_rank = Some(TitleRank::UserSet);
@@ -1302,6 +1385,8 @@ fn ingest_batch<A: HarnessAdapter>(
         commit_bearing,
         limited: read.limited,
         stalled,
+        closed: closed_any,
+        window_bytes: read.window_bytes,
     })
 }
 
@@ -1386,20 +1471,31 @@ mod tests {
         assert_eq!(window(&session_end, base, false, now + MS(1700)), None);
     }
 
-    /// Once a batch is timed, its rate replaces the estimate.
+    /// A batch slower than the estimate raises it, and the slowest rate of
+    /// the run is kept; one faster than a second per MiB never lowers it.
     #[test]
-    fn a_timed_batch_sets_the_rate() {
+    fn the_slowest_rate_of_the_run_is_kept_and_never_below_the_floor() {
         let now = Instant::now();
+        let mib = 1024 * 1024;
         let mut budget = Budget::new(Some(now + S(20)), now);
+        // At the floor, 18 s afford 9 MiB.
+        assert_eq!(window(&budget, 9 * mib, true, now), Some(9 * mib));
         // 1 MiB in 2 s: 18 s afford 4.5 MiB.
-        budget.spent(1024 * 1024, S(2));
-        assert_eq!(
-            window(&budget, 4 * 1024 * 1024, true, now),
-            Some(4 * 1024 * 1024)
-        );
-        assert_eq!(window(&budget, 5 * 1024 * 1024, true, now), None);
-        // A batch too quick to time affords any window.
+        budget.spent(mib, S(2));
+        assert_eq!(window(&budget, 4 * mib, true, now), Some(4 * mib));
+        assert_eq!(window(&budget, 5 * mib, true, now), None);
+        // A faster batch later does not make the estimate cheaper.
+        budget.spent(mib, MS(100));
+        assert_eq!(window(&budget, 5 * mib, true, now), None);
+        // Nor does one too quick to time, nor one of no bytes.
         budget.spent(1024, Duration::ZERO);
-        assert_eq!(window(&budget, u64::MAX, true, now), Some(u64::MAX));
+        budget.spent(0, S(60));
+        assert_eq!(window(&budget, 4 * mib, true, now), Some(4 * mib));
+        let fresh = {
+            let mut fresh = Budget::new(Some(now + S(20)), now);
+            fresh.spent(mib, Duration::ZERO);
+            fresh
+        };
+        assert_eq!(window(&fresh, 10 * mib, true, now), None, "the floor");
     }
 }

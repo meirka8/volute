@@ -699,6 +699,19 @@ pub struct HarnessCommitEvidence {
     pub response_at: i64,
 }
 
+/// A floating interaction as a family's commit rescue sees it
+/// ([`CvcStore::floating_family_interactions`]): no captured text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FloatingInteraction {
+    pub(crate) id: InteractionId,
+    pub(crate) conversation_id: String,
+    /// In seconds.
+    pub(crate) timestamp: i64,
+    /// The worktree it was captured in; `None` on rows from before
+    /// attribution, which every worktree's linker may claim.
+    pub(crate) capture_worktree: Option<String>,
+}
+
 /// What a child conversation is to its parent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelationKind {
@@ -2500,6 +2513,43 @@ impl CvcStore {
             .collect()
     }
 
+    /// [`Self::harness_commit_evidence`], each row with the worktree its
+    /// reporting interaction was captured in (joined through
+    /// `interaction_id`), so that a replayed commit claims only rows of that
+    /// worktree.
+    pub(crate) fn harness_commit_evidence_reported_in(
+        &self,
+        harness: HarnessId,
+        family_root: &str,
+    ) -> Result<Vec<(HarnessCommitEvidence, Option<String>)>> {
+        self.conn
+            .prepare("SELECT e.family_root, e.interaction_id, e.commit_oid, e.response_at, i.capture_worktree FROM harness_commit_evidence e JOIN interactions i ON i.id = e.interaction_id WHERE e.harness=?1 AND e.family_root=?2 ORDER BY e.response_at, e.interaction_id, e.commit_oid")?
+            .query_map(params![harness.name(), family_root], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .map(|row| {
+                let (family_root, interaction, commit, response_at, worktree) = row?;
+                Ok((
+                    HarnessCommitEvidence {
+                        family_root,
+                        interaction_id: interaction.parse().map_err(|_| {
+                            DbError::Migration("stored commit evidence is malformed".into())
+                        })?,
+                        commit: CommitSha::new(commit),
+                        response_at,
+                    },
+                    worktree,
+                ))
+            })
+            .collect()
+    }
+
     /// Every commit-evidence row of `harness` for the family rooted at
     /// `family_root`, ordered by response time, interaction and candidate.
     pub fn harness_commit_evidence(
@@ -3511,39 +3561,52 @@ impl CvcStore {
         self.floating_interactions(Some(capture_worktree))
     }
 
-    /// The id, conversation and time of each interaction
-    /// [`Self::get_floating_interactions_for_worktree`] returns, of one
-    /// capture source only when `capture_source` names one (a harness family
-    /// rescue claims only its own harness's rows), and nothing else: what a
-    /// family's commit rescue, which runs at the end of every harness run,
-    /// needs to choose what to claim, without reading any captured text.
-    pub(crate) fn floating_interaction_times_of_source(
+    /// The interactions [`Self::get_floating_interactions_for_worktree`]
+    /// returns that are in one of `conversations`, of one capture source only
+    /// when `capture_source` names one (a harness family rescue claims only
+    /// its own harness's rows): their id, conversation, time and worktree,
+    /// and none of their captured text. What a family's commit rescue needs
+    /// to choose what to claim, filtered here rather than by its caller.
+    pub(crate) fn floating_family_interactions(
         &self,
         capture_worktree: &str,
         capture_source: Option<&str>,
-    ) -> Result<Vec<(InteractionId, String, i64)>> {
+        conversations: &[&str],
+    ) -> Result<Vec<FloatingInteraction>> {
+        let conversations = serde_json::to_string(conversations)
+            .map_err(|error| DbError::Migration(error.to_string()))?;
         self.conn
             .prepare(
-                "SELECT i.id, i.conversation_id, i.timestamp
+                "SELECT i.id, i.conversation_id, i.timestamp, i.capture_worktree
                  FROM interactions i
                  LEFT JOIN artifact_links al ON i.id = al.interaction_id
                  WHERE al.interaction_id IS NULL
                    AND (i.capture_worktree IS NULL OR i.capture_worktree = ?1)
-                   AND (?2 IS NULL OR i.capture_source = ?2)",
+                   AND (?2 IS NULL OR i.capture_source = ?2)
+                   AND i.conversation_id IN (SELECT value FROM json_each(?3))",
             )?
-            .query_map(params![capture_worktree, capture_source], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
+            .query_map(
+                params![capture_worktree, capture_source, conversations],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )?
             .map(|row| {
-                let (id, conversation_id, timestamp) = row?;
+                let (id, conversation_id, timestamp, capture_worktree) = row?;
                 let id = id
                     .parse()
                     .map_err(|_| DbError::Migration("stored interaction id is malformed".into()))?;
-                Ok((id, conversation_id, timestamp))
+                Ok(FloatingInteraction {
+                    id,
+                    conversation_id,
+                    timestamp,
+                    capture_worktree,
+                })
             })
             .collect()
     }
@@ -4393,6 +4456,49 @@ impl CvcStore {
 
         self.apply_busy_timeout()?;
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let inserts =
+            Self::link_automatic_tx(&transaction, links, commit_sha, linked_by, trusted_local)?;
+        transaction.commit()?;
+        Ok(inserts)
+    }
+
+    /// [`Self::link_automatic_interaction_batch_trusted`] for a harness
+    /// family's commit rescue, which is not a Git hook and may wait: the
+    /// transaction is retried while another writer holds the database, up to
+    /// the harness retry budget, capped by [`Self::cap_write_waits`].
+    pub(crate) fn link_rescued_interaction_batch(
+        &self,
+        links: &[(&InteractionId, &str)],
+        commit_sha: &CommitSha,
+        linked_by: Option<&str>,
+    ) -> Result<usize> {
+        if let Some((_, link_type)) = links
+            .iter()
+            .find(|(_, link_type)| !matches!(*link_type, "generated" | "temporal"))
+        {
+            return Err(DbError::InvalidLink((*link_type).to_owned()));
+        }
+        if !is_safe_commit_sha(commit_sha.as_str()) {
+            return Err(DbError::InvalidLink("invalid commit SHA".into()));
+        }
+        let linked_by = linked_by
+            .map(privacy::scrub)
+            .transpose()
+            .map_err(|e| DbError::InvalidLink(e.to_string()))?;
+        let linked_by = linked_by.as_deref();
+        self.with_immediate_write_retry(|tx| {
+            Self::link_automatic_tx(tx, links, commit_sha, linked_by, true)
+        })
+    }
+
+    /// The inserts of an automatic link batch, inside `transaction`.
+    fn link_automatic_tx(
+        transaction: &Transaction<'_>,
+        links: &[(&InteractionId, &str)],
+        commit_sha: &CommitSha,
+        linked_by: Option<&str>,
+        trusted_local: bool,
+    ) -> Result<usize> {
         let mut inserts = 0;
         for (interaction_id, link_type) in links {
             match transaction.execute(
@@ -4453,7 +4559,6 @@ impl CvcStore {
                 transaction.execute("INSERT OR IGNORE INTO derivation_observations(event_id,source_fingerprint,source_key,origin,trusted_local) VALUES(?1,NULL,?1,'local_api',1)", params![key])?;
             }
         }
-        transaction.commit()?;
         Ok(inserts)
     }
 
@@ -6141,6 +6246,55 @@ mod harness_batch_tests {
             .harness_cursors(HarnessId::ClaudeCode)
             .unwrap()
             .is_empty());
+    }
+
+    /// The rescue's link batch is retried while another writer holds the
+    /// database past the two-second busy timeout a single attempt (the
+    /// linker's, which a Git hook runs) gives up at, and under a deadline it
+    /// gives up by the deadline instead.
+    #[test]
+    fn the_rescues_link_batch_is_retried_and_capped_by_the_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cvc").join("index.db");
+        let store = CvcStore::open(&path).unwrap();
+        let a = capture(HarnessId::Codex, "codex:t1", "resp:a");
+        let id = a.interaction_id().clone();
+        store
+            .capture_harness_batch(batch("codex:t1").with_captures(vec![a]))
+            .unwrap();
+        let links = [(&id, "generated")];
+        let sha = commit(1);
+
+        let holder = {
+            let path = path.clone();
+            let (held, wait) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let other = Connection::open(&path).unwrap();
+                other.execute_batch("BEGIN IMMEDIATE").unwrap();
+                held.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(2600));
+                other.execute_batch("ROLLBACK").unwrap();
+            });
+            wait.recv().unwrap();
+            thread
+        };
+        let started = Instant::now();
+        {
+            let _cap = store.cap_write_waits(Some(started + Duration::from_millis(300)));
+            assert!(matches!(
+                store.link_rescued_interaction_batch(&links, &sha, None),
+                Err(DbError::Sqlite(_))
+            ));
+        }
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert_eq!(
+            store
+                .link_rescued_interaction_batch(&links, &sha, None)
+                .unwrap(),
+            1
+        );
+        assert!(started.elapsed() >= Duration::from_millis(2500));
+        holder.join().unwrap();
     }
 
     /// Under a deadline, a batch that meets another writer's lock gives up by

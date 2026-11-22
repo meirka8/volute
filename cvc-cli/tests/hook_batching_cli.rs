@@ -980,7 +980,7 @@ fn a_session_end_hook_out_of_time_is_silent_and_harness_status_lists_the_backlog
     let status = fixture.cvc_ok(&["harness", "status", "claude-code"]);
     assert!(
         status.contains(
-            "backlog: 1 session(s) whose last hook run stopped at its time limit before reading the session to its end; catch up with `cvc ingest claude-code --transcript <file>`"
+            "backlog: 1 session(s) that a hook run left unread to the end, and that no run has read to the end since; catch up with `cvc ingest claude-code --transcript ~/.claude/projects/<workspace>/<id>.jsonl`"
         ),
         "{status}"
     );

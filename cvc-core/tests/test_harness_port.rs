@@ -149,6 +149,7 @@ impl<const CLAUDE: bool> RecordSource for Outsider<CLAUDE> {
             replaced: None,
             record_len: None,
             limited: false,
+            window_bytes: None,
             own_history_start: None,
         })
     }
@@ -394,6 +395,7 @@ fn every_cursor_codec_round_trips() {
         time_updated_ms: 1,
         last_id: "ses_1".into(),
         overlap_ms: 0,
+        carry: Carry::default(),
     };
     assert_eq!(
         SqliteWatermark::decode(1, 0, &watermark.encode()).unwrap(),
@@ -402,6 +404,7 @@ fn every_cursor_codec_round_trips() {
     let seq = SeqCursor {
         db_id: "d".into(),
         seq: 4,
+        carry: Carry::default(),
     };
     assert_eq!(SeqCursor::decode(1, 0, &seq.encode()).unwrap(), seq);
     let spool = SpoolCursor::new("spool-1", 2);

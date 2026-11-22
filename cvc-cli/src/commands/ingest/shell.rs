@@ -230,8 +230,9 @@ impl<A: HarnessAdapter> Capture<A> for EngineCapture {
             EngineOptions::hook(run.finality, run.deadline),
         ) {
             // The deadline came first: the next event goes on from the
-            // cursors. A final event's run leaves the backlog flag that
-            // `cvc harness status` shows; a hook prints nothing of it.
+            // cursors. The run leaves the backlog flag that `cvc harness
+            // status` shows until a run reads everything; a hook prints
+            // nothing of it.
             Ok(report) if report.cut_short => Ok(Captured::CutShort),
             Ok(_) => Ok(Captured::Recorded),
             // Another run holds this session's lock and has held it for the

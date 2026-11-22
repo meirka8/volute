@@ -546,6 +546,7 @@ impl RecordSource for Adapter {
             replaced: (trusted != saved).then_some(EpochReason::Rewritten),
             record_len: Some(record_len),
             limited,
+            window_bytes: Some(bytes.len() as u64),
             // A Claude Code transcript holds the session's own history only.
             own_history_start: None,
         })

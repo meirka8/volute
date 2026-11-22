@@ -309,7 +309,8 @@ const TABLES: &[(&str, &str)] = &[
     ),
     (
         "conversation_relations",
-        "SELECT child_id, parent_id, kind, harness FROM conversation_relations ORDER BY child_id",
+        "SELECT child_id, parent_id, kind, harness, spawn_interaction_id, spawn_call_id, \
+         evidence FROM conversation_relations ORDER BY child_id",
     ),
     (
         "derivation_observations",
@@ -400,6 +401,15 @@ fn walk(repo: &Repository, tree: &git2::Tree<'_>, prefix: &str, files: &mut Vec<
             _ => files.push((path, entry.id().to_string())),
         }
     }
+}
+
+/// The conversations the backlog lists.
+fn backlog_ids(store: &CvcStore) -> Vec<String> {
+    engine::backlog::<Adapter>(store)
+        .unwrap()
+        .into_iter()
+        .map(|backlog| backlog.conversation_id)
+        .collect()
 }
 
 /// The typed cursor of `conversation`.
@@ -736,7 +746,7 @@ fn many_hook_runs_reach_the_state_of_one_manual_run() {
     let incremental = fixture.hook_runs(&store, &path, Finality::Incremental, budget, batch);
     let last = fixture.hook_runs(&store, &path, Finality::Final, budget, batch);
     assert!(incremental + last > 2, "{incremental} + {last} runs");
-    assert!(engine::backlog::<Adapter>(&store).unwrap().is_empty());
+    assert!(backlog_ids(&store).is_empty());
     assert_same(
         &expected,
         &fixture.snapshot(&store),
@@ -753,9 +763,9 @@ fn many_hook_runs_reach_the_state_of_one_manual_run() {
         hook_options(Finality::Final, Some(Instant::now() + budget), batch),
     );
     assert!(first.cut_short && first.backlog);
-    assert_eq!(engine::backlog::<Adapter>(&store).unwrap(), [SESSION]);
+    assert_eq!(backlog_ids(&store), [SESSION]);
     fixture.hook_runs(&store, &path, Finality::Final, budget, batch);
-    assert!(engine::backlog::<Adapter>(&store).unwrap().is_empty());
+    assert!(backlog_ids(&store).is_empty());
     assert!(!typed(&store, SESSION).carry.backlog);
     assert_same(&expected, &fixture.snapshot(&store), "final hook runs");
     fixture.reset(store);
@@ -963,12 +973,14 @@ fn a_response_open_past_many_windows_is_read_by_growing_the_window() {
     assert_same(&expected, &fixture.snapshot(&store), "short hook runs");
 }
 
-/// `Stop` and `SessionEnd` may be a session's last events: one that runs out
-/// of time before reading every transcript of the family leaves the backlog
-/// flag, which only a run that reads them all takes away. A hook prints
-/// nothing of it; `cvc harness status` lists it.
+/// Any event may be a session's last, and the run that holds the lock when
+/// the last one comes may be one the deadline stops too: a hook run that
+/// runs out of time before reading every transcript of the family leaves
+/// the backlog flag, whatever its event, and only a run that reads them all
+/// takes it away. A hook prints nothing of it; `cvc harness status` lists
+/// it, with the transcript to catch up from.
 #[test]
-fn a_final_event_out_of_time_leaves_the_backlog_flag_until_a_run_reads_everything() {
+fn a_run_out_of_time_leaves_the_backlog_flag_until_a_run_reads_everything() {
     let fixture = Fixture::new();
     let start = Utc::now().timestamp() - 3600;
     let mut main = Script::main(&fixture.root);
@@ -993,19 +1005,25 @@ fn a_final_event_out_of_time_leaves_the_backlog_flag_until_a_run_reads_everythin
     let store = fixture.store();
     let past = |finality| hook_options(finality, Some(Instant::now()), 16 * 1024);
 
-    // Out of time before anything was read: the final event flags it, the
-    // incremental one does not.
+    // Out of time before anything was read: an incremental event flags it
+    // as a final one does.
     let incremental = fixture.run(&store, &path, past(Finality::Incremental));
-    assert!(incremental.cut_short && !incremental.backlog);
-    assert!(engine::backlog::<Adapter>(&store).unwrap().is_empty());
+    assert!(incremental.cut_short && incremental.backlog);
+    assert_eq!(
+        engine::backlog::<Adapter>(&store).unwrap(),
+        [engine::Backlog {
+            conversation_id: SESSION.to_owned(),
+            record: Some(path.to_str().unwrap().to_owned()),
+        }]
+    );
     let session_end = fixture.run(&store, &path, past(Finality::Final));
     assert!(session_end.cut_short && session_end.backlog);
     assert!(session_end.members.iter().all(|member| member.cut_short));
-    assert_eq!(engine::backlog::<Adapter>(&store).unwrap(), [SESSION]);
+    assert_eq!(backlog_ids(&store), [SESSION]);
     // A later event that runs out of time too keeps it.
     let again = fixture.run(&store, &path, past(Finality::Incremental));
     assert!(again.cut_short && again.backlog);
-    assert_eq!(engine::backlog::<Adapter>(&store).unwrap(), [SESSION]);
+    assert_eq!(backlog_ids(&store), [SESSION]);
     // A run that reads every transcript to its end, in batches, takes it
     // away.
     let complete = fixture.run(
@@ -1014,8 +1032,74 @@ fn a_final_event_out_of_time_leaves_the_backlog_flag_until_a_run_reads_everythin
         hook_options(Finality::Incremental, None, 16 * 1024),
     );
     assert!(!complete.cut_short && !complete.backlog, "{complete:?}");
-    assert!(engine::backlog::<Adapter>(&store).unwrap().is_empty());
+    assert!(backlog_ids(&store).is_empty());
     // The flag is the root's, carried by its typed cursor only.
     assert!(!typed(&store, SESSION).carry.backlog);
     assert!(!typed(&store, &format!("{SESSION}:{AGENT_A}")).carry.backlog);
+}
+
+/// A response that holds one 12 MB line (a huge tool result) needs a window
+/// that no hook budget affords at a second per MiB, the slowest a hook run
+/// assumes before it has measured slower: a run grows the window only while
+/// twice its estimate fits what is left, so it stops well before its deadline
+/// without starting the read that would close the response, keeps the grown
+/// window and the backlog flag, and an operator's run reads it.
+#[test]
+fn a_line_no_hook_budget_affords_is_never_attempted_late() {
+    let fixture = Fixture::new();
+    let start = Utc::now().timestamp() - 3600;
+    let mut main = Script::main(&fixture.root);
+    main.prompt(start, "Read the dump");
+    main.call(
+        "req_00",
+        start + 1,
+        "Read",
+        json!({"file_path": fixture.root.join("dump.txt").to_str().unwrap()}),
+        &filler(7, 12 * 1000 * 1000),
+    );
+    main.respond("req_01", start + 3, "Read it.", "It is long.");
+    main.prompt(start + 4, "Thanks");
+    main.respond("req_02", start + 5, "Done.", "Done.");
+    let path = fixture.lay_out(&main, &[]);
+    let size = fs::metadata(&path).unwrap().len();
+    assert!(size > 12_000_000, "{size}");
+
+    let store = fixture.store();
+    let budget = Duration::from_secs(6);
+    let started = Instant::now();
+    let report = fixture.run(
+        &store,
+        &path,
+        hook_options(
+            Finality::Incremental,
+            Some(started + budget),
+            engine::HOOK_BATCH.bytes.unwrap(),
+        ),
+    );
+    let took = started.elapsed();
+    assert!(report.cut_short && report.backlog, "{report:?}");
+    // Over well inside its budget: the windows it read were the ones twice
+    // their estimate fit, and none of them held the line.
+    assert!(took < budget, "{took:?}");
+    let grown = typed(&store, SESSION).carry.stall_window.expect("it grew");
+    assert!(grown <= 12 * 1024 * 1024, "{grown}");
+    assert!(store.conversation_interaction_count(SESSION).unwrap() < 3);
+    // The next hook run starts from the grown window, and affords it no more.
+    let again = fixture.run(
+        &store,
+        &path,
+        hook_options(
+            Finality::Incremental,
+            Some(Instant::now() + budget),
+            engine::HOOK_BATCH.bytes.unwrap(),
+        ),
+    );
+    assert!(again.cut_short);
+    assert_eq!(typed(&store, SESSION).carry.stall_window, Some(grown));
+
+    // An operator's run reads it and clears the flag.
+    let manual = fixture.manual(&store, &path);
+    assert!(!manual.backlog && !manual.cut_short);
+    assert_eq!(store.conversation_interaction_count(SESSION).unwrap(), 3);
+    assert_eq!(typed(&store, SESSION).carry.stall_window, None);
 }

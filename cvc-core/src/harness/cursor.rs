@@ -105,6 +105,11 @@ pub trait CursorCodec: Clone + Sized {
     fn with_carry(self, _carry: Carry) -> Self {
         self
     }
+    /// The record the cursor reads, as located, where the kind keeps one (a
+    /// JSONL file's path), for the person to be told what to catch up.
+    fn record(&self) -> Option<&str> {
+        None
+    }
 
     /// The cursor a stored row holds, when the row is of this codec's kind.
     fn decode_stored(stored: &crate::db::StoredHarnessCursor) -> Result<Self, CursorError> {
@@ -140,17 +145,26 @@ pub struct Carry {
     /// read of the whole record would.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_rank: Option<crate::harness::candidate::TitleRank>,
-    /// Kept on the family root's cursor: a final event (the agent stopped,
-    /// or its session ended) ran out of time before every record of the
-    /// family was read to its end, so what is left may be read by no later
-    /// event. Cleared by the next run that reads them all to their end.
+    /// Kept on the family root's cursor: a hook run ran out of time before
+    /// every record of the family was read to its end, and no run has read
+    /// them all to their end since. What is left may be read by no later
+    /// event (the session may be over), so `cvc harness status` lists it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub backlog: bool,
     /// The read window in bytes, grown while a response stays open past the
     /// end of a smaller one, so that the next batch or run starts with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_window: Option<u64>,
-    /// Adapter-defined positions (a step hash, a regime), at most 4 KiB.
+    /// Kept on the family root's cursor: the family's commit rescue was due
+    /// and did not run (the run was cut short, or the rescue failed), so the
+    /// next run rescues from the stored evidence even when it records
+    /// nothing new.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rescue_pending: bool,
+    /// The adapter's own: positions and digests (a step hash, a regime
+    /// marker), never content, at most 4 KiB. The planner sets it in the
+    /// cursor it plans to resume from, and the engine keeps it as planned;
+    /// every other field is the engine's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<serde_json::Value>,
 }
@@ -317,6 +331,10 @@ impl CursorCodec for JsonlCursor {
     fn with_carry(self, carry: Carry) -> Self {
         Self { carry, ..self }
     }
+
+    fn record(&self) -> Option<&str> {
+        Some(&self.path)
+    }
 }
 
 /// A `(time_updated, id)` watermark over a SQLite store's rows (OpenCode
@@ -331,6 +349,8 @@ pub struct SqliteWatermark {
     /// How far behind the watermark a read starts again, for rows written
     /// with a time just before it.
     pub overlap_ms: u32,
+    #[serde(default, skip_serializing_if = "Carry::is_empty")]
+    pub carry: Carry,
 }
 
 impl CursorCodec for SqliteWatermark {
@@ -360,6 +380,12 @@ impl CursorCodec for SqliteWatermark {
     fn describe(&self) -> String {
         format!("row {} at {} ms", self.last_id, self.time_updated_ms)
     }
+    fn carry(&self) -> Carry {
+        self.carry.clone()
+    }
+    fn with_carry(self, carry: Carry) -> Self {
+        Self { carry, ..self }
+    }
 }
 
 /// A sequence number into a SQLite store's event log (OpenCode 2.x).
@@ -368,6 +394,8 @@ impl CursorCodec for SqliteWatermark {
 pub struct SeqCursor {
     pub db_id: String,
     pub seq: u64,
+    #[serde(default, skip_serializing_if = "Carry::is_empty")]
+    pub carry: Carry,
 }
 
 impl CursorCodec for SeqCursor {
@@ -392,6 +420,12 @@ impl CursorCodec for SeqCursor {
     fn describe(&self) -> String {
         format!("seq {}", self.seq)
     }
+    fn carry(&self) -> Carry {
+        self.carry.clone()
+    }
+    fn with_carry(self, carry: Carry) -> Self {
+        Self { carry, ..self }
+    }
 }
 
 /// How far a spool of hook payloads has been assembled (Cursor).
@@ -409,6 +443,7 @@ pub struct SpoolCursor {
     pub epoch: u64,
     /// Why `epoch` was opened; `None` in epoch 0.
     pub epoch_reason: Option<EpochReason>,
+    pub carry: Carry,
 }
 
 impl SpoolCursor {
@@ -420,6 +455,7 @@ impl SpoolCursor {
             assembled_through,
             epoch: 0,
             epoch_reason: None,
+            carry: Carry::default(),
         }
     }
 }
@@ -432,6 +468,8 @@ struct SpoolStateV1 {
     assembled_through: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     epoch_reason: Option<EpochReason>,
+    #[serde(default, skip_serializing_if = "Carry::is_empty")]
+    carry: Carry,
 }
 
 impl CursorCodec for SpoolCursor {
@@ -443,6 +481,7 @@ impl CursorCodec for SpoolCursor {
             spool_id: self.spool_id.clone(),
             assembled_through: self.assembled_through,
             epoch_reason: self.epoch_reason,
+            carry: self.carry.clone(),
         })
     }
     fn decode(version: u32, epoch: u64, state: &serde_json::Value) -> Result<Self, CursorError> {
@@ -455,6 +494,7 @@ impl CursorCodec for SpoolCursor {
             assembled_through: state.assembled_through,
             epoch,
             epoch_reason: state.epoch_reason,
+            carry: state.carry,
         })
     }
     /// The epoch first. Within one epoch, rows of two different spools
@@ -473,6 +513,12 @@ impl CursorCodec for SpoolCursor {
     }
     fn describe(&self) -> String {
         format!("spool row {}", self.assembled_through)
+    }
+    fn carry(&self) -> Carry {
+        self.carry.clone()
+    }
+    fn with_carry(self, carry: Carry) -> Self {
+        Self { carry, ..self }
     }
     fn epoch(&self) -> u64 {
         self.epoch
@@ -543,6 +589,7 @@ mod tests {
                 title_rank: Some(crate::harness::candidate::TitleRank::UserSet),
                 backlog: true,
                 stall_window: Some(1 << 20),
+                rescue_pending: true,
                 extra: Some(json!({"regime": "paginated"})),
             },
         };
@@ -552,6 +599,7 @@ mod tests {
             time_updated_ms: 5,
             last_id: "ses_1".into(),
             overlap_ms: 1000,
+            carry: Carry::default(),
         };
         assert_eq!(
             SqliteWatermark::decode(1, 0, &watermark.encode()).unwrap(),
@@ -560,6 +608,7 @@ mod tests {
         let seq = SeqCursor {
             db_id: "d".into(),
             seq: 41,
+            carry: Carry::default(),
         };
         assert_eq!(SeqCursor::decode(1, 0, &seq.encode()).unwrap(), seq);
         let spool = SpoolCursor::new("spool-1", 8);
@@ -643,15 +692,15 @@ mod tests {
         assert_eq!(other.progress(&one), Progress::Backward);
     }
 
-    /// A JSONL cursor carries what the engine keeps between runs, and a
-    /// cursor with nothing to carry encodes as before; a kind that stores no
-    /// carry keeps none.
+    /// Every kind carries what the engine keeps between runs, and a cursor
+    /// with nothing to carry encodes as before.
     #[test]
-    fn the_carry_goes_with_a_jsonl_cursor_and_with_no_other_kind() {
+    fn the_carry_goes_with_every_kind_of_cursor() {
         let carry = Carry {
             title_rank: Some(crate::harness::candidate::TitleRank::UserSet),
             backlog: true,
             stall_window: Some(1 << 23),
+            rescue_pending: false,
             extra: None,
         };
         let cursor = JsonlCursor::start("/p/s1.jsonl")
@@ -668,9 +717,36 @@ mod tests {
             cleared.encode(),
             json!({"path": "/p/s1.jsonl", "byte_offset": 42})
         );
-        let spool = SpoolCursor::new("spool-1", 3).with_carry(carry);
-        assert_eq!(spool.carry(), Carry::default());
-        assert_eq!(spool, SpoolCursor::new("spool-1", 3));
+        assert_eq!(cleared.record(), Some("/p/s1.jsonl"));
+        let spool = SpoolCursor::new("spool-1", 3).with_carry(carry.clone());
+        assert_eq!(spool.carry(), carry);
+        assert_eq!(SpoolCursor::decode(1, 0, &spool.encode()).unwrap(), spool);
+        assert_eq!(
+            spool.clone().with_carry(Carry::default()).encode(),
+            json!({"spool_id": "spool-1", "assembled_through": 3})
+        );
+        assert_eq!(spool.record(), None);
+        let seq = SeqCursor {
+            db_id: "d".into(),
+            seq: 1,
+            carry: Carry::default(),
+        };
+        assert_eq!(seq.encode(), json!({"db_id": "d", "seq": 1}));
+        let seq = seq.with_carry(carry.clone());
+        assert_eq!(SeqCursor::decode(1, 0, &seq.encode()).unwrap(), seq);
+        let watermark = SqliteWatermark {
+            db_id: "d".into(),
+            time_updated_ms: 1,
+            last_id: "a".into(),
+            overlap_ms: 0,
+            carry: Carry::default(),
+        }
+        .with_carry(carry.clone());
+        assert_eq!(watermark.carry(), carry);
+        assert_eq!(
+            SqliteWatermark::decode(1, 0, &watermark.encode()).unwrap(),
+            watermark
+        );
     }
 
     #[test]
@@ -709,6 +785,7 @@ mod tests {
             time_updated_ms: time,
             last_id: id.into(),
             overlap_ms: 0,
+            carry: Carry::default(),
         };
         assert_eq!(at(5, "b").progress(&at(5, "a")), Progress::Forward);
         assert_eq!(at(4, "z").progress(&at(5, "a")), Progress::Backward);
